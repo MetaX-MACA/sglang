@@ -1,0 +1,2 @@
+# export GLOO_SOCKET_IFNAME=网口名
+# export MACA_SMALL_PAGESIZE_ENABLE=1
