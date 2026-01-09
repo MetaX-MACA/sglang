@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import json
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
@@ -15,6 +16,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
+from sglang.srt.function_profiler import profiler as function_profiler
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -283,17 +285,30 @@ class SchedulerProfilerMixin:
                 if getattr(self, "moe_ep_size", 1) > 1:
                     filename_parts.append(f"EP-{getattr(self, 'moe_ep_rank', 0)}")
 
-                filename = (
+                csv_file = (
                     stage_prefix
                     + "-".join(filename_parts)
                     + stage_suffix
-                    + ".trace.json.gz"
+                    + ".csv"
+                )
+                function_profiler.export_profiler_to_csv(
+                    self.torch_profiler, 
+                    os.path.join(self.torch_profiler_output_dir, csv_file), 
+                    self.torch_profiler_record_shapes
                 )
 
-                self.torch_profiler.export_chrome_trace(
-                    os.path.join(self.torch_profiler_output_dir, filename)
-                )
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+                if self.export_trace:
+                    filename = (
+                        stage_prefix
+                        + "-".join(filename_parts)
+                        + stage_suffix
+                        + ".trace.json.gz"
+                    )
+                    self.torch_profiler.export_chrome_trace(
+                        os.path.join(self.torch_profiler_output_dir, filename)
+                    )
+            # comment out to work around hang after exporting trace.
+            #torch.distributed.barrier(self.cpu_group)
 
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()
@@ -378,33 +393,81 @@ class SchedulerProfilerMixin:
 
     def profile(self: Scheduler, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
-            if recv_req.profile_by_stage or recv_req.start_step:
+            self.profile_funcs = None
+            self.tp_ranks = None
+            self.export_trace = True
+            output_dir = recv_req.output_dir
+            start_step = recv_req.start_step
+            num_steps =  recv_req.num_steps
+            activities = recv_req.activities
+            with_stack = recv_req.with_stack
+            record_shapes = recv_req.record_shapes
+            profile_by_stage = recv_req.profile_by_stage    
+            profile_id = recv_req.profile_id
+            merge_profiles = recv_req.merge_profiles 
+            profile_prefix = recv_req.profile_prefix 
+            profile_stages = recv_req.profile_stages
+
+            profiler_config = os.getenv("SGLANG_FUNC_PROFILER_CONFIG")
+            if profiler_config is not None and os.path.exists(profiler_config):
+                logger.info(f"Loading profiler config {profiler_config}")
+                with open(profiler_config, 'r') as json_file:
+                    profiler_config = json.load(json_file)
+                    self.profile_funcs = profiler_config.get("profile_funcs")
+                    self.tp_ranks = profiler_config.get("tp_ranks")
+                    self.export_trace = profiler_config.get("export_trace")
+                    output_dir = profiler_config.get("output_dir")
+                    start_step = profiler_config.get("start_step")
+                    num_steps =  profiler_config.get("num_steps")
+                    activities = profiler_config.get("activities")
+                    with_stack = profiler_config.get("with_stack")
+                    record_shapes = profiler_config.get("record_shapes")
+                    profile_by_stage = profiler_config.get("profile_by_stage")
+                    profile_id = profiler_config.get("profile_id")
+                    merge_profiles = profiler_config.get("merge_profiles") 
+                    profile_prefix = profiler_config.get("profile_prefix") 
+                    profile_stages = profiler_config.get("profile_stages")                                       
+    
+            if self.tp_ranks is not None and self.tp_rank not in self.tp_ranks:
+                return ProfileReqOutput(success=True, message="Succeeded")                      
+            
+            if self.profile_funcs is not None:
+                function_profiler.start_profile(profiler_config)
+                return ProfileReqOutput(success=True, message="Succeeded")                
+            elif profile_by_stage or start_step:
                 return self.init_profile(
-                    recv_req.output_dir,
-                    recv_req.start_step,
-                    recv_req.num_steps,
-                    recv_req.activities,
-                    recv_req.with_stack,
-                    recv_req.record_shapes,
-                    recv_req.profile_by_stage,
-                    recv_req.profile_id,
-                    recv_req.merge_profiles,
-                    recv_req.profile_prefix,
-                    recv_req.profile_stages,
+                    output_dir,
+                    start_step,
+                    num_steps,
+                    activities,
+                    with_stack,
+                    record_shapes,
+                    profile_by_stage,
+                    profile_id,
+                    merge_profiles,
+                    profile_prefix,
+                    profile_stages,
                 )
             else:
                 self.init_profile(
-                    recv_req.output_dir,
-                    recv_req.start_step,
-                    recv_req.num_steps,
-                    recv_req.activities,
-                    recv_req.with_stack,
-                    recv_req.record_shapes,
-                    recv_req.profile_by_stage,
-                    recv_req.profile_id,
-                    recv_req.merge_profiles,
-                    recv_req.profile_prefix,
+                    output_dir,
+                    start_step,
+                    num_steps,
+                    activities,
+                    with_stack,
+                    record_shapes,
+                    profile_by_stage,
+                    profile_id,
+                    merge_profiles,
+                    profile_prefix,
                 )
                 return self.start_profile()
         else:
-            return self.stop_profile()
+            if self.tp_ranks is not None and self.tp_rank not in self.tp_ranks:
+                return ProfileReqOutput(success=True, message="Succeeded.") 
+        
+            if self.profile_funcs is not None:
+                function_profiler.stop_profile()
+                return ProfileReqOutput(success=True, message="Succeeded.") 
+            else:            
+                return self.stop_profile()
