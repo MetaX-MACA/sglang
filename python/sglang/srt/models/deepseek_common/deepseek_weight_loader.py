@@ -548,16 +548,15 @@ class DeepseekV2WeightLoaderMixin:
                     self_attn.w_scale = scale
 
             if w.dtype == torch.int8:
-                if hasattr(self.quant_config, "weight_block_size"):
+                if hasattr(self.quant_config, "weight_block_size") and self.quant_config.weight_block_size is not None:
                     # block-wise int8 need it
                     weight_block_size = self.quant_config.weight_block_size
-                    if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                        weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
-                        w = int8_block_dequant(
-                            weight, weight_scale, weight_block_size
-                        ).to(torch.bfloat16)
+                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                    weight = w
+                    weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                    w = int8_block_dequant(
+                        weight, weight_scale, weight_block_size
+                    ).to(torch.bfloat16)
                 else:
                     if self.enable_dequant_bf16:
                         # channel-wise int8 need it
