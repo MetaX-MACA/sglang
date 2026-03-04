@@ -689,8 +689,8 @@ class CompressedTensorsConfig(QuantizationConfig):
                         "Using CompressedTensorsMxInt4MoE with flashinfer_trtllm backend"
                     )
                     return CompressedTensorsMxInt4MoE(self)
-                elif _is_hip:
-                    logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
+                elif _is_hip or _is_cuda:
+                    logger.info_once("Using CompressedTensorsWNA16TritonMoE")
                     return CompressedTensorsWNA16TritonMoE(self)
                 else:
                     moe_backend = get_moe_runner_backend()
