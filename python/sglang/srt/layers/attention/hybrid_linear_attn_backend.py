@@ -740,7 +740,10 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
-            attn_backend.init_forward_metadata(forward_batch)
+            if forward_batch.forward_mode.is_idle():
+                return
+            else:
+                attn_backend.init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
