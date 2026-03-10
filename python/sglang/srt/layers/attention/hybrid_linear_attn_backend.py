@@ -1079,7 +1079,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.full_attn_backend.init_forward_metadata(forward_batch)
             return
         for attn_backend in self.attn_backend_list:
-            attn_backend.init_forward_metadata(forward_batch)
+            if forward_batch.forward_mode.is_idle():
+                return
+            else:
+                attn_backend.init_forward_metadata(forward_batch)
 
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
