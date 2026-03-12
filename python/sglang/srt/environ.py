@@ -898,7 +898,8 @@ class Envs:
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
-    EXPORT_SERVER_ARGS_DIR=EnvStr("")
+    EXPORT_SERVER_ARGS_DIR = EnvStr("")
+    SGLANG_QWEN3_5_ENABLE_ALT_STREAM = EnvBool(False)
 
     # ===================================================================
     # KV-Canary / Token-Oracle (testing-only)

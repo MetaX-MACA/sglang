@@ -15,6 +15,8 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
+from sglang.srt.environ import envs
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -140,6 +142,7 @@ if _is_npu:
         split_qkvgate_gemma_rmsnorm_rope,
     )
 
+SGLANG_QWEN3_5_ENABLE_ALT_STREAM = envs.SGLANG_QWEN3_5_ENABLE_ALT_STREAM.get()
 
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
@@ -1155,7 +1158,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         if _is_hip:
             self._maybe_autodisable_shared_experts_fusion(config, quant_config)
 
-        alt_stream = torch.cuda.Stream() if _is_cuda or _hip_use_alt_stream else None
+        alt_stream = torch.cuda.Stream() if (_is_cuda or _hip_use_alt_stream) and SGLANG_QWEN3_5_ENABLE_ALT_STREAM else None
 
         # Embedding layer
         if self.pp_group.is_first_rank:
