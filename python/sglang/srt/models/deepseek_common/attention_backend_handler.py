@@ -158,7 +158,7 @@ def handle_attention_nsa(attn, forward_batch):
     backend = forward_batch.attn_backend
     if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
         backend = backend.primary
-    if hasattr(backend, "use_mha") and backend.use_mha:
+    if hasattr(backend, "use_mha") and backend.use_mha and not forward_batch.forward_mode.is_idle():
         return AttnForwardMethod.MHA_ONE_SHOT
     return AttnForwardMethod.MLA
 
