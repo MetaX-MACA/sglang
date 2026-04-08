@@ -73,8 +73,9 @@ class DpPaddingMode(IntEnum):
         # overhead from uneven token distribution.
         # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
         # to enable symmetric memory optimization (needed for NSA CP, etc.).
-        if is_extend_in_batch and dp_size > 1:
-            return DpPaddingMode.SUM_LEN
+        # Comment out to fix TTFT perf drop
+        # if is_extend_in_batch and dp_size > 1:
+        #     return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
         # prefer MAX_LEN when communication cost is equal to enable symmetric memory
