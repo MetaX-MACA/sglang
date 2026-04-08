@@ -298,7 +298,7 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
 
 
 # Detect stragger ranks in model loading
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = 600  # leave more time for post data processing
 
 
 logger = logging.getLogger(__name__)
