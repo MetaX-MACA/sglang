@@ -898,6 +898,7 @@ class Envs:
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+    EXPORT_SERVER_ARGS_DIR=EnvStr("")
 
     # ===================================================================
     # KV-Canary / Token-Oracle (testing-only)
