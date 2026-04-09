@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
+    export_json_on_rank0,
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
     is_hip,
@@ -1090,4 +1091,16 @@ class ModelRunnerKVCacheMixin:
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+        
+        kv_size_ = self.token_to_kv_pool.get_kv_size_bytes()
+        if isinstance(kv_size_, tuple):
+            kv_size_ = sum(kv_size_)
+        
+        export_json_on_rank0(
+            {
+                f"{self.model_config.model_path}_kv_cache": float(kv_size_) / (1024*1024*1024),
+                f"{self.model_config.model_path}_max_total_num_tokens": self.max_total_num_tokens,
+                "avail_mem": get_available_gpu_memory(self.device, self.gpu_id)
+            }
         )
