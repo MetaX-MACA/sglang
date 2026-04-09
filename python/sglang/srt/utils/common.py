@@ -100,6 +100,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
 
+sglang_sys_json_file = None
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 @lru_cache(maxsize=1)
@@ -4107,3 +4108,41 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+def export_json_on_rank0(data:Dict[str, Any]):
+    #dump all args to json
+    export_dir = envs.EXPORT_SERVER_ARGS_DIR.get()
+    if not export_dir:
+        return
+
+    from sglang.srt.distributed import get_tensor_model_parallel_rank, get_pp_group
+    if(get_tensor_model_parallel_rank() !=0 ):
+        return
+
+    def sanitize(obj):
+        if isinstance(obj, (torch.Tensor, np.ndarray)):
+            return obj.tolist()
+        elif isinstance(obj, (torch.device, torch.dtype)):
+            return str(obj)
+        elif hasattr(obj, "__dict__"):
+            return obj.__dict__
+        return f"<{type(obj).__name__}>"
+    
+    global sglang_sys_json_file
+    if sglang_sys_json_file is None:
+        sglang_sys_json_file = export_dir
+        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime()) 
+        pp_rank = get_pp_group().rank_in_group
+        sglang_sys_json_file = os.path.join(sglang_sys_json_file, f"sglang_setting_status_PP{pp_rank}_TP0_{timestamp}.json")
+        with open(sglang_sys_json_file, 'w') as json_file:
+            json.dump({}, json_file, default=sanitize)
+        logger.info(f"Outputting system status to {sglang_sys_json_file}")
+
+    result = None
+    with open(sglang_sys_json_file, 'r') as json_file:
+        result = json.load(json_file)
+        result.update(data)
+
+    if(result is not None):
+        with open(sglang_sys_json_file, 'w') as json_file:
+            json.dump(result, json_file, indent=4, default=sanitize)

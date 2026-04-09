@@ -204,6 +204,7 @@ from sglang.srt.utils import (
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
+    export_json_on_rank0,  
 )
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
@@ -1321,6 +1322,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
             f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
+        
+        out_data = self.server_args.__dict__
+        out_data.update(
+            {
+                "torch_distributed": before_avail_memory - local_gpu_memory,
+                "avail_mem": local_gpu_memory
+            }            
+        )
+        export_json_on_rank0(out_data)
+        
         return pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
@@ -1558,6 +1569,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
+        
+        export_json_on_rank0(
+            {
+                f"{self.model_config.model_path}_weight": before_avail_memory - after_avail_memory,
+                "avail_mem": after_avail_memory
+            }
+        )
+        
         if self.server_args.debug_tensor_dump_output_folder is not None:
             dump_folder = self.server_args.debug_tensor_dump_output_folder
             if self.spec_algorithm.is_eagle():
@@ -3462,7 +3481,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.global_num_tokens_cpu is not None
             and self.pp_group.is_last_rank
         ):
-            forward_batch.post_forward_mlp_sync_batch(ret)
+            if hasattr(ret, "next_token_logits"):
+                forward_batch.post_forward_mlp_sync_batch(ret)
+            else:
+                logging.debug("Skipping post_forward_mlp_sync_batch because ret has no next_token_logits (PPProxyTensors?).")
+            
 
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 

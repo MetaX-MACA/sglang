@@ -76,6 +76,7 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     next_power_of_2,
+    export_json_on_rank0,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -294,6 +295,13 @@ class EAGLEWorker(TpModelWorker):
                 logger,
                 f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB.",
             )
+            
+            export_json_on_rank0(
+                {
+                    "cuda_graph_draft": before_mem - after_mem,
+                    "avail_mem": after_mem
+                }
+            )
 
         # Capture extend
         if self.draft_extend_attn_backend and not _is_npu:
@@ -311,6 +319,13 @@ class EAGLEWorker(TpModelWorker):
                 logger,
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB.",
             )
+            
+            export_json_on_rank0(
+                {
+                    "cuda_graph_draft_extend": before_mem - after_mem,
+                    "avail_mem": after_mem
+                }
+            )     
 
     def apply_runtime_state(self, state: SpecRuntimeState):
         """Apply a pre-built runtime state to this worker."""
