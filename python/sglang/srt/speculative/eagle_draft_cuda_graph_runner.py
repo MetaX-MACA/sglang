@@ -97,7 +97,7 @@ class EAGLEDraftCudaGraphRunner:
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        self.capture_bs, self.compile_bs, self.sum_len_bs = get_batch_sizes_to_capture(model_runner)
 
         # Attention backend
         self.num_tokens_per_bs = self.topk
@@ -323,6 +323,7 @@ class EAGLEDraftCudaGraphRunner:
         )
 
         # Forward batch
+        dp_padding_mode = DpPaddingMode.SUM_LEN if num_seqs in self.sum_len_bs else DpPaddingMode.get_default_mode_in_cuda_graph()
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
             batch_size=num_seqs,
@@ -341,7 +342,7 @@ class EAGLEDraftCudaGraphRunner:
             mrope_positions=mrope_positions,
             global_num_tokens_gpu=global_num_tokens,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            dp_padding_mode=dp_padding_mode,
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
