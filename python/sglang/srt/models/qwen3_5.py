@@ -111,7 +111,7 @@ _is_amx_available = cpu_has_amx_support()
 
 cached_get_processor = lru_cache(get_processor)
 
-SGLANG_QWEN3_5_ENABLE_ALT_STREAM = envs.SGLANG_QWEN3_5_ENABLE_ALT_STREAM.get()
+SGLANG_QWEN3_ENABLE_ALT_STREAM = envs.SGLANG_QWEN3_ENABLE_ALT_STREAM.get()
 
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
@@ -1016,7 +1016,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
 
-        alt_stream = torch.cuda.Stream() if _is_cuda and SGLANG_QWEN3_5_ENABLE_ALT_STREAM else None
+        alt_stream = torch.cuda.Stream() if _is_cuda and SGLANG_QWEN3_ENABLE_ALT_STREAM else None
 
         # Embedding layer
         if self.pp_group.is_first_rank:

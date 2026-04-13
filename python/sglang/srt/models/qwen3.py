@@ -56,7 +56,9 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
-
+    
+from sglang.srt.environ import envs    
+SGLANG_QWEN3_ENABLE_ALT_STREAM = envs.SGLANG_QWEN3_ENABLE_ALT_STREAM.get()
 
 class Qwen3Attention(nn.Module):
     def __init__(
@@ -436,7 +438,7 @@ class Qwen3Model(Qwen2Model):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = torch.cuda.Stream() if _is_cuda and SGLANG_QWEN3_ENABLE_ALT_STREAM else None
         super().__init__(
             config=config,
             quant_config=quant_config,
