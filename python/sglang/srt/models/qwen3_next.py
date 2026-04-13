@@ -71,7 +71,7 @@ _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
 
 from sglang.srt.environ import envs
-SGLANG_QWEN3_5_ENABLE_ALT_STREAM = envs.SGLANG_QWEN3_5_ENABLE_ALT_STREAM.get()
+SGLANG_QWEN3_ENABLE_ALT_STREAM = envs.SGLANG_QWEN3_ENABLE_ALT_STREAM.get()
 
 if _is_npu:
     from sgl_kernel_npu.fla.utils import (
@@ -893,7 +893,7 @@ class Qwen3NextModel(nn.Module):
         super().__init__()
         self.config = config
 
-        alt_stream = torch.cuda.Stream() if _is_cuda and SGLANG_QWEN3_5_ENABLE_ALT_STREAM else None
+        alt_stream = torch.cuda.Stream() if _is_cuda and SGLANG_QWEN3_ENABLE_ALT_STREAM else None
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
