@@ -36,7 +36,7 @@ def create_flashinfer_backend(runner):
         from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
         # Init streams
-        if runner.server_args.speculative_algorithm == "EAGLE":
+        if runner.server_args.speculative_algorithm == "EAGLE"  and runner.hybrid_gdn_config is None:
             if (
                 not hasattr(runner, "plan_stream_for_flashinfer")
                 or not runner.plan_stream_for_flashinfer

@@ -46,9 +46,7 @@ class DraftBackendFactory:
             "aiter": self._create_aiter_decode_backend,
             "fa3": self._create_fa3_decode_backend,
             "hybrid_linear_attn": (
-                self._create_fa3_decode_backend
-                if not is_blackwell()
-                else self._create_triton_decode_backend
+                self._create_flashinfer_decode_backend
             ),
             "flashmla": self._create_flashmla_decode_backend,
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
@@ -73,9 +71,7 @@ class DraftBackendFactory:
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
             "hybrid_linear_attn": (
-                self._create_fa3_prefill_backend
-                if not is_blackwell()
-                else self._create_triton_prefill_backend
+                self._create_flashinfer_prefill_backend
             ),
             "flashmla": self._create_flashmla_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
