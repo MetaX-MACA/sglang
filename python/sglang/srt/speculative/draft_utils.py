@@ -236,14 +236,14 @@ class DraftBackendFactory:
             return self._create_intel_amx_decode_backend()
         if is_blackwell():
             return self._create_triton_decode_backend()
-        return self._create_fa3_decode_backend()
+        return self._create_flashinfer_decode_backend()
 
     def _create_hybrid_linear_attn_prefill_backend(self):
         if is_cpu() and cpu_has_amx_support():
             return self._create_intel_amx_prefill_backend()
         if is_blackwell():
             return self._create_triton_prefill_backend()
-        return self._create_fa3_prefill_backend()
+        return self._create_flashinfer_prefill_backend()
 
     def _create_aiter_decode_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterMultiStepDraftBackend

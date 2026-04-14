@@ -57,7 +57,10 @@ def create_flashinfer_backend(runner):
         )
 
         # Init streams
-        if get_spec().speculative_algorithm == "EAGLE":
+        if (
+            get_spec().speculative_algorithm == "EAGLE"
+            and hybrid_gdn_config(runner.model_config) is None
+        ):
             if (
                 not hasattr(runner, "plan_stream_for_flashinfer")
                 or not runner.plan_stream_for_flashinfer
