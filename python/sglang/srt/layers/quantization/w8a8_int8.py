@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignor
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
+    direct_register_custom_op,
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
@@ -44,22 +45,39 @@ _is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_cuda:
     # from sgl_kernel import int8_scaled_mm
-    from sgl_kernel import cutlass_scaled_mm
+    from sgl_kernel import cutlass_scaled_mm as sgl_cutlass_scaled_mm
+    
+def cutlass_scaled_mm(a: torch.Tensor,
+                    b: torch.Tensor,
+                    scale_a: torch.Tensor,
+                    scale_b: torch.Tensor,
+                    out_dtype: torch.dtype,
+                    bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    
+    return sgl_cutlass_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias)
 
-    @register_fake_if_exists("sgl_kernel::int8_scaled_mm")
-    def _int8_scaled_mm_abstract(
-        mat_a,
-        mat_b,
-        scales_a,
-        scales_b,
-        out_dtype,
-        bias=None,
-    ):
-        M = mat_a.shape[-2]
-        N = mat_b.shape[-1]
-        return mat_a.new_empty((M, N), dtype=out_dtype)
+def cutlass_scaled_mm_fake(a: torch.Tensor,
+                    b: torch.Tensor,
+                    scale_a: torch.Tensor,
+                    scale_b: torch.Tensor,
+                    out_dtype: torch.dtype,
+                    bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        M = a.shape[-2]
+        N = b.shape[-1]
+        return a.new_empty((M, N), dtype=out_dtype)
 
-
+try:
+    direct_register_custom_op(
+        op_name="cutlass_scaled_mm",
+        op_func=cutlass_scaled_mm,
+        mutates_args=[],
+        fake_impl=cutlass_scaled_mm_fake,
+    )
+    cutlass_scaled_mm = torch.ops.sglang.cutlass_scaled_mm
+    
+except AttributeError as error:
+    raise error
+   
 logger = logging.getLogger(__name__)
 
 

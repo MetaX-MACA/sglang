@@ -119,7 +119,7 @@ from sglang.srt.utils import (
 )
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
-
+from sglang.srt.utils.custom_op import register_custom_op
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
 
@@ -154,8 +154,36 @@ _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
 
 
 if _is_cuda:
-    from sgl_kernel import fused_moe_gate_opt
+    from sgl_kernel import fused_moe_gate_opt as _fused_moe_gate_opt
 
+    @register_custom_op(
+    op_name="fused_moe_gate_opt",
+    mutates_args=["out_routing_weights", "out_selected_experts"]
+        )
+    def fused_moe_gate_opt(
+        gating_outputs: torch.Tensor,
+        correction_bias: torch.Tensor,
+        out_routing_weights: torch.Tensor,
+        out_selected_experts: torch.Tensor,
+        topk: int = None,
+        renormalize: bool = None,
+        num_expert_group: int = None,
+        topk_group: int = None,
+        num_shared_experts: Optional[int] = None,
+        scale_factor: Optional[float] = None,
+    ) -> None :
+        _fused_moe_gate_opt(
+            gating_outputs,
+            correction_bias,
+            out_routing_weights,
+            out_selected_experts,
+            topk,
+            renormalize,
+            num_expert_group,
+            topk_group,
+            num_shared_experts,
+            scale_factor,
+        )
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
 
