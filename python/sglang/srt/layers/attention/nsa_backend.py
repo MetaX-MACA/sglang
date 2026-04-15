@@ -683,6 +683,7 @@ class NativeSparseAttnBackend(
                     seq_len_q=1,
                 )
                 if use_flashmla_kv
+                and not forward_batch.forward_mode.is_extend()
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
