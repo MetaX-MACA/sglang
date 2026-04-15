@@ -112,7 +112,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
-
+from sglang.srt.utils.custom_op import register_custom_op
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
 
@@ -129,8 +129,37 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
 if _is_cuda:
-    from sgl_kernel import moe_fused_gate, fused_moe_gate_opt
+    from sgl_kernel import moe_fused_gate
+    from sgl_kernel import fused_moe_gate_opt as _fused_moe_gate_opt
 
+    @register_custom_op(
+    op_name="fused_moe_gate_opt",
+    mutates_args=["out_routing_weights", "out_selected_experts"]
+        )
+    def fused_moe_gate_opt(
+        gating_outputs: torch.Tensor,
+        correction_bias: torch.Tensor,
+        out_routing_weights: torch.Tensor,
+        out_selected_experts: torch.Tensor,
+        topk: int = None,
+        renormalize: bool = None,
+        num_expert_group: int = None,
+        topk_group: int = None,
+        num_shared_experts: Optional[int] = None,
+        scale_factor: Optional[float] = None,
+    ) -> None :
+        _fused_moe_gate_opt(
+            gating_outputs,
+            correction_bias,
+            out_routing_weights,
+            out_selected_experts,
+            topk,
+            renormalize,
+            num_expert_group,
+            topk_group,
+            num_shared_experts,
+            scale_factor,
+        )
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
 
