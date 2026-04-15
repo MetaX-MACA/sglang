@@ -42,6 +42,7 @@ from sglang.srt.layers.quantization.gptq import (
 )
 from sglang.srt.layers.quantization.humming import HummingConfig
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
+from sglang.srt.layers.quantization.gptq import GPTQConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -91,7 +92,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "gguf": GGUFConfig,
-    # "gptq": GPTQConfig,
+    "gptq": GPTQConfig,
     # "gptq_marlin": GPTQMarlinConfig,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,

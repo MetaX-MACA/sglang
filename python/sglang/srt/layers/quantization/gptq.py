@@ -52,7 +52,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs, direct_register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -63,15 +63,47 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 
-# if _is_cuda:
+if _is_cuda:
+    import mcoplib._C  # noqa: F401
+
+    def mx_gptq_gemm(
+        a: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_gptq_qzeros: torch.Tensor,
+        b_gptq_scales: torch.Tensor,
+        b_g_idx: torch.Tensor,
+        use_exllama: bool,
+        bit: int,
+        group_size: int,
+        perm_space: torch.Tensor,
+        temp_space: torch.Tensor,
+        dtype_bf16: bool,
+    ) -> torch.Tensor:
+        return torch.ops._C.gptq_gemm(
+            a,
+            b_q_weight,
+            b_gptq_qzeros,
+            b_gptq_scales,
+            b_g_idx,
+            use_exllama,
+            bit,
+            group_size,
+            perm_space,
+            temp_space,
+            dtype_bf16,
+        )
+
+
+    def mx_gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
+        torch.ops._C.gptq_shuffle(q_weight, q_perm, bit)
 #     from sgl_kernel import gptq_gemm, gptq_shuffle
 
 #     from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
 
-# _is_npu = is_npu()
+_is_npu = is_npu()
 
-# if _is_npu:
-#     import torch_npu
+if _is_npu:
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 ScalarType, scalar_types = get_scalar_types()
@@ -198,7 +230,7 @@ class GPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half] if not _is_npu else [torch.half, torch.bfloat16]
+        return [torch.half, torch.bfloat16] if (_is_cuda or _is_npu) else [torch.half]
 
     @classmethod
     # Need to figure it out
@@ -583,7 +615,10 @@ class GPTQLinearMethod(LinearMethodBase):
                 layer.g_idx.data = torch.empty(
                     (0,), dtype=torch.int, device=layer.g_idx.device
                 )
-            # gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
+            
+            mx_gptq_shuffle(
+                layer.qweight, layer.g_idx, self.quant_config.weight_bits
+            )
 
     def apply(
         self,
@@ -591,23 +626,94 @@ class GPTQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
-        reshaped_x = x.reshape(-1, x.shape[-1])
+        return torch.ops.sglang._apply_gptq(
+            x,
+            layer.qweight,
+            layer.scales,
+            layer.qzeros,
+            bias,
+            layer.g_idx,
+            False,
+            self.quant_config.weight_bits,
+            self.quant_config.group_size,
+            self.quant_config.desc_act,
+        )
 
-        # output = gptq_gemm(
-        #     reshaped_x,
-        #     layer.qweight,
-        #     layer.qzeros,
-        #     layer.scales,
-        #     layer.g_idx,
-        #     self.use_shuffle,
-        #     self.quant_config.weight_bits,
-        # )
-        output=None
-        if bias is not None:
-            output.add_(bias)
-        return output.reshape(out_shape)
+# Register fake implementations for torch.compile support
+def _apply_gptq_fake(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    g_idx: torch.Tensor,
+    use_exllama: bool,
+    weight_bits: int,
+    group_size: int,
+    desc_act: bool,
+) -> torch.Tensor:
+    del scales, qzeros, bias, g_idx, use_exllama, weight_bits, group_size, desc_act
+    out_shape = x.shape[:-1] + (qweight.shape[-1],)
+    return torch.empty(out_shape, dtype=x.dtype, device=x.device)
 
+def _apply_gptq(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    g_idx: torch.Tensor,
+    use_exllama: bool,
+    weight_bits: int,
+    group_size: int,
+    desc_act: bool,
+) -> torch.Tensor:
+    reshaped_x = x.reshape(-1, x.shape[-1])
+    out_shape = x.shape[:-1] + (qweight.shape[-1],)
+
+    perm_space = torch.empty(0, device=x.device)
+    temp_space = torch.empty(0, device=x.device)
+    if weight_bits in (4, 8) or group_size in (64, 128):
+        if desc_act:
+            perm_space = torch.empty(
+                reshaped_x.shape[0],
+                reshaped_x.shape[1],
+                dtype=torch.float16,
+                device=x.device,
+            )
+        if reshaped_x.dtype == torch.bfloat16:
+            temp_space = torch.zeros(
+                reshaped_x.shape[0],
+                qweight.shape[1],
+                dtype=torch.float32,
+                device=x.device,
+            )
+
+    output = mx_gptq_gemm(
+        reshaped_x,
+        qweight,
+        qzeros,
+        scales,
+        g_idx,
+        use_exllama,
+        weight_bits,
+        group_size,
+        perm_space,
+        temp_space,
+        reshaped_x.dtype == torch.bfloat16,
+    )
+    if bias is not None:
+        output.add_(bias)
+    return output.reshape(out_shape)
+
+
+if _is_cuda:
+    direct_register_custom_op(
+        op_name="_apply_gptq",
+        op_func=_apply_gptq,
+        mutates_args=[],
+        fake_impl=_apply_gptq_fake,
+    )
 
 class GPTQMoEAscendMethod(FusedMoEMethodBase):
 
