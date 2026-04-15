@@ -27,8 +27,7 @@ __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sgl_kernel import cutlass_scaled_mm
-
+    from sglang.srt.layers.quantization.w8a8_int8 import cutlass_scaled_mm
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
 

@@ -34,6 +34,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    direct_register_custom_op,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
@@ -88,11 +89,10 @@ if _is_cuda or _is_xpu or _is_musa:
         
     import flashinfer
     from sgl_kernel import fused_add_rmsnorm
-    from flashinfer import rmsnorm 
-    # as flashinfer_rmsnorm
     from flashinfer import (
-        gemma_fused_add_rmsnorm,
-        gemma_rmsnorm
+        gemma_fused_add_rmsnorm as flashinfer_gemma_fused_add_rmsnorm,
+        gemma_rmsnorm as flashinfer_gemma_rmsnorm,
+        rmsnorm as flashinfer_rmsnorm,
     )
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
@@ -144,28 +144,88 @@ if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
     
-if _is_cuda:
-    @torch.library.custom_op("sglang::rmsnorm", mutates_args=())
-    def sgl_rmsnorm(
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        eps: float = 1e-6,
-        out: Optional[torch.Tensor] = None,
-        enable_pdl: bool = False,
-    ) -> torch.Tensor:
-        return rmsnorm(input, weight, eps, out, enable_pdl)
+def rmsnorm(    
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6, 
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    return flashinfer_rmsnorm(input, weight, eps, out, enable_pdl)
 
-    @torch.library.register_fake("sglang::rmsnorm")
-    def _(
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        eps: float = 1e-6,
-        out: Optional[torch.Tensor] = None,
-        enable_pdl: bool = False,
-    ) -> torch.Tensor:
-        if out is None:
-            out = torch.empty_like(input)
-        return out
+def rmsnorm_fake(    
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    return torch.empty_like(input)
+
+def gemma_rmsnorm(    
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6, 
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    return flashinfer_gemma_rmsnorm(input, weight, eps, out, enable_pdl)
+
+def gemma_rmsnorm_fake(    
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    return torch.empty_like(input)
+
+def gemma_fused_add_rmsnorm(    
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    enable_pdl: bool = False,
+) -> None:
+    flashinfer_gemma_fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
+
+def gemma_fused_add_rmsnorm_fake(    
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    enable_pdl: bool = False,
+) -> None:
+    input.copy_(input)
+    residual.copy_(residual)
+
+try:
+    direct_register_custom_op(
+        op_name="rmsnorm",
+        op_func=rmsnorm,
+        mutates_args=["out"],
+        fake_impl=rmsnorm_fake,
+    )
+    rmsnorm = torch.ops.sglang.rmsnorm
+
+    direct_register_custom_op(
+        op_name="gemma_rmsnorm",
+        op_func=gemma_rmsnorm,
+        mutates_args=["out"],
+        fake_impl=gemma_rmsnorm_fake,
+    )
+    gemma_rmsnorm = torch.ops.sglang.gemma_rmsnorm
+
+    direct_register_custom_op(
+        op_name="gemma_fused_add_rmsnorm",
+        op_func=gemma_fused_add_rmsnorm,
+        mutates_args=["input", "residual"],
+        fake_impl=gemma_fused_add_rmsnorm_fake,
+    )
+    gemma_fused_add_rmsnorm = torch.ops.sglang.gemma_fused_add_rmsnorm
+
+except AttributeError as error:
+    raise error
 
 def _forward_with_allreduce_fusion(
     norm_module,
@@ -350,7 +410,7 @@ class RMSNorm(MultiPlatformOp):
                 residual = residual + post_residual_addition
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
-        out = sgl_rmsnorm(x, self.weight.data, self.variance_epsilon)
+        out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         if needs_reshape:
             out = out.reshape(original_shape)
         return out
