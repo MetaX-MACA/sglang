@@ -41,6 +41,7 @@ from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_e
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
 )
+from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.multi_layer_eagle_utils import (
     assign_hidden_states_pool_triton,
     rotate_input_ids_triton,

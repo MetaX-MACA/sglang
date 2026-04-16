@@ -136,9 +136,12 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
             self.swa_v_head_dim = None
         else:
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
-                -1
-            ]
+            if hasattr(model_runner.token_to_kv_pool, "get_v_head_dim"):
+                self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
+            else:
+                self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(
+                    model_runner.start_layer
+                ).shape[-1]
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
@@ -627,6 +630,25 @@ class TritonAttnBackend(AttentionBackend):
                     )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+                if (
+                    self.sliding_window_size is not None
+                    and self.sliding_window_size > 0
+                ):
+                    window_kv_indices = self.cuda_graph_window_kv_indices
+                    window_num_kv_splits = self.cuda_graph_window_num_kv_splits
+                    current_seq_lens = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
+                    window_kv_indptr, window_kv_indices, _, _ = (
+                        update_sliding_window_buffer_cuda_graph(
+                            self.window_kv_indptr,
+                            window_kv_indices,
+                            self.req_to_token,
+                            self.sliding_window_size,
+                            current_seq_lens,
+                            req_pool_indices,
+                            bs,
+                            self.token_to_kv_pool_allocator,
+                        )
+                    )
 
             attn_logits = self.cuda_graph_attn_logits
             swa_attn_logits = self.cuda_graph_swa_attn_logits
@@ -712,6 +734,22 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
+            if self.sliding_window_size is not None and self.sliding_window_size > 0:
+                window_kv_indices = self.cuda_graph_window_kv_indices
+                window_num_kv_splits = self.cuda_graph_window_num_kv_splits
+                window_kv_indptr, window_kv_indices, _, _ = (
+                    update_sliding_window_buffer_cuda_graph(
+                        self.window_kv_indptr,
+                        window_kv_indices,
+                        self.req_to_token,
+                        self.sliding_window_size,
+                        seq_lens,
+                        req_pool_indices,
+                        bs,
+                        self.token_to_kv_pool_allocator,
+                    )
+                )
+
             custom_mask = None
             mask_indptr = None
             max_extend_len = num_tokens_per_bs

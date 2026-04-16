@@ -1135,9 +1135,9 @@ class MiMoV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, PPProxyTensors]:
         if self._is_multimodal:
-            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+            model_output = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 language_model=self.model,
@@ -1146,7 +1146,7 @@ class MiMoV2ForCausalLM(nn.Module):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         else:
-            hidden_states, hidden_states_before_norm = self.model(
+            model_output = self.model(
                 input_ids,
                 positions,
                 forward_batch,
@@ -1154,6 +1154,10 @@ class MiMoV2ForCausalLM(nn.Module):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
 
+        if not self.pp_group.is_last_rank:
+            return model_output
+        
+        hidden_states, hidden_states_before_norm = model_output
         if self.pp_group.is_last_rank:
             return self.logits_processor(
                 input_ids,
@@ -1162,8 +1166,6 @@ class MiMoV2ForCausalLM(nn.Module):
                 forward_batch,
                 hidden_states_before_norm=hidden_states_before_norm,
             )
-        else:
-            return hidden_states
 
     @property
     def start_layer(self):
@@ -1313,6 +1315,13 @@ class MiMoV2ForCausalLM(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
+            # Skip parameters that are owned by other PP stages.
+            if not self.pp_group.is_first_rank and name.startswith("model.embed_tokens."):
+                continue
+            if not self.pp_group.is_last_rank and (
+                name.startswith("model.norm.") or name.startswith("lm_head.")
+            ):
+                continue
 
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
@@ -1401,7 +1410,19 @@ class MiMoV2ForCausalLM(nn.Module):
                                 param, "weight_loader", default_weight_loader
                             )
                             weight_loader(param, loaded_weight)
-                    else:
+                    elif (
+                        not (
+                            (not self.pp_group.is_first_rank)
+                            and name.startswith("model.embed_tokens.")
+                        )
+                        and not (
+                            (not self.pp_group.is_last_rank)
+                            and (
+                                name.startswith("model.norm.")
+                                or name.startswith("lm_head.")
+                            )
+                        )
+                    ):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
     def get_embed_and_head(self):

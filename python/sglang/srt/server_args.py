@@ -2191,7 +2191,9 @@ class ServerArgs:
                         "--attention-context-parallel-size so the effective "
                         f"attention TP size is {expected_attn_tp_size}."
                     )
-
+            if self.speculative_algorithm == "NEXTN":
+                self.speculative_algorithm == "EAGLE"
+                
             if self.speculative_algorithm == "EAGLE":
                 self.enable_multi_layer_eagle = True
                 logger.info(

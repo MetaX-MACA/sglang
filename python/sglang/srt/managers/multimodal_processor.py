@@ -12,6 +12,11 @@ logger = logging.getLogger(__name__)
 
 PROCESSOR_MAPPING = {}
 
+def _should_suppress_gemma4_import_error(module_name: str, err: Exception) -> bool:
+    if "gemma4" not in module_name.lower():
+        return False
+    err_msg = str(err)
+    return ("Gemma4" in err_msg) and ("from 'transformers'" in err_msg)
 
 def import_processors(package_name: str, overwrite: bool = False):
     package = importlib.import_module(package_name)
@@ -20,6 +25,8 @@ def import_processors(package_name: str, overwrite: bool = False):
             try:
                 module = importlib.import_module(name)
             except Exception as e:
+                if _should_suppress_gemma4_import_error(name, e):
+                    continue
                 logger.warning(f"Ignore import error when loading {name}: {e}")
                 continue
             all_members = inspect.getmembers(module, inspect.isclass)
