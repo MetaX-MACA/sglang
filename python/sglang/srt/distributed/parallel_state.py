@@ -547,7 +547,7 @@ class GroupCoordinator:
             if not pynccl_comm:
                 maybe_pynccl_context = nullcontext()
             else:
-                maybe_pynccl_context = pynccl_comm.change_state(enable=True)
+                maybe_pynccl_context = nullcontext()
 
             pymscclpp_comm = self.pymscclpp_comm
             maybe_pymscclpp_context: Any
