@@ -3178,7 +3178,7 @@ class ServerArgs:
                 # H100, A100
                 # (chunked_prefill_size 8k, max_bs 256 if tp < 4 else 512)
                 if self.chunked_prefill_size is None:
-                    self.chunked_prefill_size = 8192
+                    self.chunked_prefill_size = 8200
                 if decode_cuda_graph_config.max_bs is None:
                     if self.tp_size < 4:
                         decode_cuda_graph_config.max_bs = 256
@@ -3274,28 +3274,50 @@ class ServerArgs:
             )
 
         if self.mem_fraction_static is None:
-            # Constant meta data (e.g., from attention backend)
-            reserved_mem = 512
-            # For activation during large prefill
-            if self.chunked_prefill_size > 0:
-                reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
+            # GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
+            # mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity.
+
+            # We want mem_fraction_static to be as large as possible but still has enough room
+            # for activations and cuda graph buffers. We use the following heuristic to
+            # compute the needed size for activations and cuda graph buffers:
+            # - The size of the activation depends on the chunked_prefill_size and model size.
+            # - The size of cuda graph buffers depends on the cuda graph capture range and model size.
+            # For GPUs with more memory, we use a larger chunked_prefill_size and
+            # capture more cuda graphs, so they need to reserve more memory.
+            parallel_size = self.tp_size * self.pp_size
+
+            if gpu_mem < 20 * 1024:
+                # T4, 4080. (chunked_prefill_size 2k, cuda_graph_max_bs 8)
+                reserved_mem = (2.8 + parallel_size / 10) * 1024
+            elif gpu_mem < 35 * 1024:
+                # A10, L40, 4090, 5090. (chunked_prefill_size 2k, cuda_graph_max_bs 8)
+                reserved_mem = (2.8 + parallel_size / 10) * 1024
+            elif gpu_mem < 90 * 1024:
+                # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs 160)
+                reserved_mem = (4.5 + parallel_size / 10) * 1024
+
+                attention_tp_size = self.tp_size  // self.dp_size * self.pp_size
+                if attention_tp_size >= 16:         # TP16
+                    reserved_mem += 3.0 * 1024
+                elif attention_tp_size >= 8:        # TP8
+                    reserved_mem += 2.5 * 1024
+                elif attention_tp_size >= 4:        # TP4
+                    reserved_mem += 1.0 * 1024
+                elif attention_tp_size >= 2:        # TP2
+                    reserved_mem += 0.5 * 1024  
+
+                if self.ep_size > 1:
+                    reserved_mem += 2.0 * 1024                                          
+            elif gpu_mem < 100 * 1024:
+                # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 256)
+                reserved_mem = (12 + parallel_size / 2) * 1024
+            elif gpu_mem < 160 * 1024:
+                # H200. (chunked_prefill_size 8k, cuda_graph_max_bs 256)
+                reserved_mem = (12 + parallel_size / 2) * 1024
             else:
-                reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
-            # For cuda graphs
-            reserved_mem += decode_cuda_graph_config.max_bs * 2
-            # Some adjustments for large parallel size
-            reserved_mem += self.tp_size * self.pp_size / 8 * 1024
-
-            if self.enable_dp_attention:
-                # DP attention needs more padding for some operations
-                reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 3
-
-                # DP attention uses much more memory for large cuda graph max bs,
-                # likely due to some inefficiencies in torch allocator or our implementation.
-                # So we need to reserve more memory.
-                if decode_cuda_graph_config.max_bs > 300:
-                    reserved_mem += decode_cuda_graph_config.max_bs * self.dp_size * 1.5
-
+                # B200, MI300. (chunked_prefill_size 16k, cuda_graph_max_bs 512)
+                reserved_mem = 32 * 1024
+                
             # For piecewise cuda graphs
             if prefill_cuda_graph_config.backend != Backend.DISABLED:
                 if not self.use_mla_backend():
@@ -3305,8 +3327,6 @@ class ServerArgs:
                     # For MLA backend the memory overhead is much higher than expected with fa3
                     reserved_mem += 1.5 * 1024
 
-            if gpu_mem is not None and gpu_mem > 60 * 1024:
-                reserved_mem = max(reserved_mem, 10 * 1024)
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
