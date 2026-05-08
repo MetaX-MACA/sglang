@@ -2,6 +2,7 @@ import enum
 import logging
 from typing import Any, Iterable, Optional, Set, Tuple
 
+import os
 import torch
 import triton
 from torch import nn
@@ -563,7 +564,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+            allow_reduce_scatter=False if os.getenv("MX_DISABLE_DENSE_REDUCE_SCATTER") else True,
         )
 
     def forward(
@@ -736,7 +737,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+            allow_reduce_scatter=False if os.getenv("MX_DISABLE_DENSE_REDUCE_SCATTER") else True,
         )
 
         self.alt_stream = alt_stream

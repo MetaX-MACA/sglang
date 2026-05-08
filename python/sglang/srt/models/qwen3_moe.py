@@ -21,6 +21,7 @@ import logging
 import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
+import os
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -798,7 +799,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+            allow_reduce_scatter=False if os.getenv("MX_DISABLE_DENSE_REDUCE_SCATTER") else True,
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 

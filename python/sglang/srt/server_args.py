@@ -3193,7 +3193,7 @@ class ServerArgs:
                     if self.tp_size < 4:
                         decode_cuda_graph_config.max_bs = 256
                     else:
-                        decode_cuda_graph_config.max_bs = 512
+                        decode_cuda_graph_config.max_bs = 160
             else:
                 # B200, MI300
                 # (chunked_prefill_size 16k, max_bs 512)
