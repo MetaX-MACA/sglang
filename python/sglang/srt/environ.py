@@ -1603,6 +1603,7 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
     SGLANG_QWEN3_ENABLE_ALT_STREAM = EnvBool(False)
+    ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16 = EnvBool(False)
 
     # ===================================================================
     # KV-Canary and Token-Oracle (testing only)

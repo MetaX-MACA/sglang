@@ -941,3 +941,5 @@ void cutlass_scaled_mm_azp(torch::Tensor& out, torch::Tensor const& a,
                            torch::Tensor const& azp_adj,
                            std::optional<torch::Tensor> const& azp,
                            std::optional<torch::Tensor> const& bias);
+
+torch::Tensor mx_awq_dequantize(torch::Tensor _kernel, torch::Tensor _scaling_factors, torch::Tensor _zeros, int64_t split_k_iters, int64_t thx, int64_t thy);
