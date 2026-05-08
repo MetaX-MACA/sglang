@@ -8,5 +8,6 @@ from .gguf import (
 )
 
 from .quantization import (
-    scaled_int8_quant
+    scaled_int8_quant,
+    mx_awq_dequantize
 )
