@@ -55,6 +55,11 @@ padding_size = get_moe_padding_size(_use_aiter)
 enable_mctlass_fused_moe = (os.getenv("ENABLE_MCTLASS_FUSED_MOE", "0") == "1")
 enable_mctlass_fused_moe_python_api = (os.getenv("ENABLE_MCTLASS_FUSED_MOE_PYTHON_API", "0") == "1")
 
+if enable_mctlass_fused_moe_python_api:
+    import mctlassEx
+    from mctlassEx import FusedMoeGEMM
+    gemm = FusedMoeGEMM()
+
 def support_tensor_descriptor():
     return _support_tensor_descriptor
 
@@ -862,15 +867,8 @@ def invoke_fused_moe_kernel(
         )
     elif use_int8_w8a8  and enable_mctlass_fused_moe:
         if enable_mctlass_fused_moe_python_api:
-            import mctlassEx
-            # stream_ptr = torch.cuda.current_stream().cuda_stream
-            # mctlass_op = mctlassEx.mctlassExHandleWrapper()
-            from mctlassEx import FusedMoeGEMM
-            gemm = FusedMoeGEMM()
             C1 = C.view(-1, C.size(-1)).contiguous()
             gemm(A.shape[0], B.shape[1], A.shape[1], B.shape[0], sorted_token_ids.shape[0], top_k, A, B, C1, A_scale, B_scale, None, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, mul_routed_weight, filter_expert = filter_expert)
-            # kernel_m = mctlass_op.mctlass_fuse_moe_get_kernel_m(A, B, C1, top_k)
-            # mctlass_op.mctlass_fuse_moe_gemm(A, B, C1, A_scale, B_scale, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, sorted_token_ids.shape[0], top_k, mul_routed_weight, stream_ptr)
         else:
             cutlass_moe_mm_w8a8(A, B, C,
                                 A_scale, B_scale, topk_weights, sorted_token_ids, expert_ids,
@@ -900,57 +898,61 @@ def invoke_fused_moe_kernel(
             )
         else:
             b_desc = None
-
-        fused_moe_kernel[grid](
-            A,
-            a_desc,
-            B,
-            b_desc,
-            bias,
-            C,
-            A_scale,
-            B_scale,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            add_output_mask,
-            B.shape[1],
-            B.shape[2] - padded_size,
-            sorted_token_ids.shape[0],
-            topk_ids.numel(),
-            A.stride(0),
-            A.stride(1),
-            B.stride(0),
-            B.stride(2),
-            B.stride(1),
-            bias.stride(0) if bias is not None else 0,
-            bias.stride(1) if bias is not None else 0,
-            C.stride(-2),
-            C.stride(-1),
-            A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
-            A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
-            B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
-            B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
-            B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
-            0 if block_shape is None else block_shape[0],
-            0 if block_shape is None else block_shape[1],
-            MUL_ROUTED_WEIGHT=mul_routed_weight,
-            top_k=top_k,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            per_channel_quant=per_channel_quant,
-            even_Ks=even_Ks,
-            c_sorted=c_sorted,
-            filter_expert=filter_expert,
-            swap_ab=swap_ab,
-            FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
-            FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
-            ROUTER_TOPK=router_topk,
-            **config,
-        )
+            
+        if enable_mctlass_fused_moe_python_api:
+            C1 = C.view(-1, C.size(-1)).contiguous()
+            gemm(A.shape[0], B.shape[1], A.shape[1], B.shape[0], sorted_token_ids.shape[0], top_k, A, B, C1, A_scale, B_scale, None, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, mul_routed_weight, filter_expert = filter_expert)
+        else:
+            fused_moe_kernel[grid](
+                A,
+                a_desc,
+                B,
+                b_desc,
+                bias,
+                C,
+                A_scale,
+                B_scale,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                add_output_mask,
+                B.shape[1],
+                B.shape[2] - padded_size,
+                sorted_token_ids.shape[0],
+                topk_ids.numel(),
+                A.stride(0),
+                A.stride(1),
+                B.stride(0),
+                B.stride(2),
+                B.stride(1),
+                bias.stride(0) if bias is not None else 0,
+                bias.stride(1) if bias is not None else 0,
+                C.stride(-2),
+                C.stride(-1),
+                A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+                A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+                B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+                B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
+                B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+                0 if block_shape is None else block_shape[0],
+                0 if block_shape is None else block_shape[1],
+                MUL_ROUTED_WEIGHT=mul_routed_weight,
+                top_k=top_k,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                per_channel_quant=per_channel_quant,
+                even_Ks=even_Ks,
+                c_sorted=c_sorted,
+                filter_expert=filter_expert,
+                swap_ab=swap_ab,
+                FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
+                FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
+                ROUTER_TOPK=router_topk,
+                **config,
+            )
 
 
 @triton.jit
