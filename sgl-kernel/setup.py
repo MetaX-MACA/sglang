@@ -174,7 +174,6 @@ sources = [
     "csrc/moe/moe_fused_gate_opt.cu",
     # "csrc/elementwise/fused_rotary_emb.cu",
     # "csrc/quantization/int8_quant_kernels.cu",
-    # "csrc/quantization/quantize_kernel.cu",
     # "csrc/gemm/marlin/gptq_marlin.cu",
     # "csrc/gemm/marlin/gptq_marlin_repack.cu",
     # "csrc/gemm/marlin/awq_marlin_repack.cu",
@@ -185,7 +184,7 @@ sources = [
     # "csrc/gemm/dsv3_router_gemm_entry.cu",
     # "csrc/gemm/dsv3_router_gemm_float_out.cu",
     "csrc/quantization/int8_quant_kernels.cu",
-    # "csrc/quantization/quantize_kernel.cu",
+    "csrc/quantization/quantize_kernel.cu",
     # "csrc/elementwise/fused_layernorm_dynamic_per_token_quant_custom.cu",
     # "csrc/elementwise/fused_rotary_emb.cu",
     "csrc/moe/cutlass_moe/scaled_mm_c2x.cu",
@@ -308,26 +307,26 @@ ext_modules = [
             ] + version_dependent_macros,
         },
     ),
-    # CUDAExtension(
-    #     name="moe_fused_w4a16",
-    #     sources=[
-    #         "csrc/moe/moe_fused_w4a16.cpp",
-    #         "csrc/moe/moe_fused_w4a16_cuda.cu",
-    #     ],
-    #     include_dirs=include_dirs,
-    #     extra_compile_args={
-    #         "cxx": ["-O3"] + version_dependent_macros,
-    #         "cucc": [
-    #             "-O3",
-    #             "-U__CUDA_NO_HALF_OPERATORS__",
-    #             "-U__CUDA_NO_HALF_CONVERSIONS__",
-    #             "--expt-relaxed-constexpr",
-    #             "--expt-extended-lambda",
-    #         ] + version_dependent_macros,
-    #     },
-    #     libraries=libraries,
-    #     extra_link_args=extra_link_args,
-    # ),
+    CUDAExtension(
+        name="moe_fused_w4a16",
+        sources=[
+            "csrc/moe/moe_fused_w4a16.cpp",
+            "csrc/moe/moe_fused_w4a16_cuda.cu",
+        ],
+        include_dirs=include_dirs,
+        extra_compile_args={
+            "cxx": ["-O3"] + version_dependent_macros,
+            "cucc": [
+                "-O3",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+            ] + version_dependent_macros,
+        },
+        libraries=libraries,
+        extra_link_args=extra_link_args,
+    ),
 #     CUDAExtension(
 #         name="grouped_gemm_mctlass_int8",
 #         sources=[

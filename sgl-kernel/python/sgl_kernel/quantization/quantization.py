@@ -41,3 +41,9 @@ def scaled_int8_quant(
     torch.ops.sgl_kernel.dynamic_scaled_int8_quant.default(output, input.contiguous(),
                                                             input_scales, input_azp)
     return output, input_scales, input_azp
+    
+def mx_awq_dequantize(qweight: torch.Tensor, scales: torch.Tensor,
+                   zeros: torch.Tensor, split_k_iters: int, thx: int,
+                   thy: int) -> torch.Tensor:
+    return torch.ops.sgl_kernel.mx_awq_dequantize.default(qweight, scales, zeros, split_k_iters,
+                                       thx, thy)

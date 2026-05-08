@@ -253,6 +253,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
                             "int N, int K, int EM, int num_valid_tokens, int topk, bool mul_routed_weight) -> ()");
   m.impl("cutlass_moe_mm_w8a8", torch::kCUDA, &cutlass_moe_mm_w8a8);
 
+  m.def("mx_awq_dequantize(Tensor out, Tensor _scaling_factors, Tensor _zeros, int split_k_iter, int thx, int thy) -> Tensor");
+  m.impl("mx_awq_dequantize", torch::kCUDA, &mx_awq_dequantize);
   /*
    * From csrc/moe/cutlass_moe/w4a8
    */
