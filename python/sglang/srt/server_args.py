@@ -1472,7 +1472,7 @@ class ServerArgs:
                     if self.tp_size < 4:
                         self.cuda_graph_max_bs = 256
                     else:
-                        self.cuda_graph_max_bs = 512
+                        self.cuda_graph_max_bs = 160
             else:
                 # B200, MI300
                 # (chunked_prefill_size 16k, cuda_graph_max_bs 512)
