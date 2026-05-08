@@ -37,9 +37,12 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import is_cuda, is_hip, is_musa, next_power_of_2
 
 if is_cuda() or is_musa():
+    import flashinfer
+    from flashinfer import (
+        top_k_renorm_probs,
+        top_p_renorm_probs,
+    )
     from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
         tree_speculative_sampling_target_only,
         verify_tree_greedy,
     )
@@ -342,16 +345,16 @@ class NgramVerifyInput(SpecInput):
             logits_output.next_token_logits / expanded_temperature, dim=-1
         )  # (bs * draft_token_num, vocab_size)
 
-        # NOTE: The test shows that top_p_renorm_prob and top_k_renorm_prob are the key factors
+        # NOTE: The test shows that top_p_renorm_probs and top_k_renorm_probs are the key factors
         # contributing to the poor performance of _sampling_verify.
-        target_probs = top_k_renorm_prob(
+        target_probs = top_k_renorm_probs(
             target_probs,
             torch.repeat_interleave(sampling_info.top_ks, self.draft_token_num, dim=0),
         )  # (bs * draft_token_num, vocab_size)
 
         if sampling_info.need_top_p_sampling:
             # logger.info("Using top-p sampling in speculative decoding verification.")
-            target_probs = top_p_renorm_prob(
+            target_probs = top_p_renorm_probs(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ps, self.draft_token_num, dim=0

@@ -1559,7 +1559,7 @@ class ServerArgs:
                 reserved_mem = (2.8 + parallel_size / 10) * 1024
             elif gpu_mem < 90 * 1024:
                 # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs 160)
-                reserved_mem = (4.5 + parallel_size / 10) * 1024
+                reserved_mem = (4.7 + parallel_size / 10) * 1024
 
                 attention_tp_size = self.tp_size  // self.dp_size * self.pp_size
                 if attention_tp_size >= 16:         # TP16
@@ -1599,7 +1599,7 @@ class ServerArgs:
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
-                    reserved_mem += 4 * 1024
+                    reserved_mem += 1.8 * 1024
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)

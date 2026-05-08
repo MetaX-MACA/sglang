@@ -78,9 +78,11 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
         backend_name in ["flashinfer", "flashmla"]
     ) and attn.flashinfer_mla_disable_ragged
 
+    origin_mode = getattr(forward_batch, "_original_forward_mode", None)
     if (
         not disable_ragged
         and forward_batch.forward_mode.is_extend_without_speculative()
+        and (origin_mode is None or origin_mode.is_extend_without_speculative())
         and (
             (
                 sum_extend_prefix_lens >= attn.chunked_prefix_cache_threshold
