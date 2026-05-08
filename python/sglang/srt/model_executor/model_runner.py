@@ -2885,6 +2885,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["get_embedding"] = True
         return kwargs
 
+    def _should_reroute_padding_only_extend_to_idle(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        # Fix DP MAX_LEN error for Qwen3.5 in hybrid linear attention backend
+        # For DP MAX_LEN pure local empty ranks can be temporarily marked as
+        # EXTEND for shared padding logic even though they carry no real
+        # request/view state. Reroute only that narrow case back to IDLE before
+        # backend/model dispatch so extend-specific metadata is never consumed.
+        original_forward_mode = getattr(forward_batch, "_original_forward_mode", None)
+        return (
+            forward_batch.global_num_tokens_cpu is not None
+            and forward_batch.dp_padding_mode is not None
+            and forward_batch.dp_padding_mode.is_max_len()
+            and forward_batch.is_extend_in_batch
+            and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+            and original_forward_mode is not None
+            and original_forward_mode.is_idle()
+            and forward_batch.batch_size == 0
+            and forward_batch.spec_info is None
+            and forward_batch.seq_lens.numel() == 0
+            and forward_batch.req_pool_indices.numel() == 0
+            and forward_batch.input_ids.numel() > 0
+        )
+
     def forward_split_prefill(
         self,
         forward_batch: ForwardBatch,
