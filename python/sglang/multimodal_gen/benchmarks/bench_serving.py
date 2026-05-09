@@ -188,7 +188,7 @@ async def async_request_image_sglang(
                     output.response_body = resp_json
                     output.success = True
                     output.output_count = _get_response_output_count(resp_json)
-                    if "peak_memory_mb" in resp_json:
+                    if resp_json.get("peak_memory_mb") is not None:
                         output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
                     output.error = f"HTTP {response.status}: {await response.text()}"
@@ -220,7 +220,7 @@ async def async_request_image_sglang(
                     output.response_body = resp_json
                     output.success = True
                     output.output_count = _get_response_output_count(resp_json)
-                    if "peak_memory_mb" in resp_json:
+                    if resp_json.get("peak_memory_mb") is not None:
                         output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
                     output.error = f"HTTP {response.status}: {await response.text()}"
@@ -370,7 +370,7 @@ async def async_request_video_sglang(
                         output.success = True
                         output.response_body = status_data
                         output.output_count = _get_response_output_count(status_data)
-                        if "peak_memory_mb" in status_data:
+                        if resp_json.get("peak_memory_mb") is not None:
                             output.peak_memory_mb = status_data["peak_memory_mb"]
                         break
                     elif status == "failed":
