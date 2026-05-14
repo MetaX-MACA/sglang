@@ -24,6 +24,7 @@ class RandomDataset(BaseDataset):
     num_requests: int
     range_ratio: float
     dataset_path: str
+    repeat_num: int
     return_text: bool
     random_sample: bool
 
@@ -35,6 +36,7 @@ class RandomDataset(BaseDataset):
             num_requests=args.num_prompts,
             range_ratio=args.random_range_ratio,
             dataset_path=args.dataset_path,
+            repeat_num=args.random_repeat_num,
             return_text=not getattr(args, "tokenize_prompt", False),
             random_sample=(args.dataset_name == "random"),
         )
@@ -49,6 +51,7 @@ class RandomDataset(BaseDataset):
             range_ratio=self.range_ratio,
             tokenizer=tokenizer,
             dataset_path=self.dataset_path,
+            repeat_num=self.repeat_num,
             random_sample=self.random_sample,
             return_text=self.return_text,
         )
@@ -61,6 +64,7 @@ def sample_random_requests(
     range_ratio: float,
     tokenizer: PreTrainedTokenizerBase,
     dataset_path: str,
+    repeat_num: int,
     random_sample: bool = True,
     return_text: bool = True,
 ) -> List[DatasetRow]:
@@ -110,7 +114,8 @@ def sample_random_requests(
         ]
         # Shuffle the dataset.
         random.shuffle(dataset)
-
+        if repeat_num is not None:
+            dataset = [dataset[i % repeat_num] for i in range(len(dataset))]
         # Filter out sequences that are too long or too short
         input_requests: List[DatasetRow] = []
         for data in dataset:
