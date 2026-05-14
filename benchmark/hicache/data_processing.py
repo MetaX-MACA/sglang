@@ -560,6 +560,7 @@ def get_dataset(args, tokenizer):
             fixed_output_len=args.fixed_output_len,
         )
     elif args.dataset_name == "random":
+        print(f"{args.random_repeat_num=}")
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
@@ -567,6 +568,7 @@ def get_dataset(args, tokenizer):
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
+            repeat_num=args.random_repeat_num,
         )
     elif args.dataset_name == "generated-shared-prefix":
         input_requests = sample_generated_shared_prefix_requests(

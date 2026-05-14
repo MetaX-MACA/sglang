@@ -2340,6 +2340,12 @@ def cli_main():
         help="Range of sampled ratio of input/output length, "
         "used only for random and image dataset.",
     )
+    parser.add_argument(
+        "--random-repeat-num",
+        default=None,
+        type=int,
+        help="Number of unique non-duplicate requests, used only for random and image dataset.",
+    )
     # image dataset args
     parser.add_argument(
         "--image-count",
