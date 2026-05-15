@@ -626,6 +626,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             out.topk_index = out_copy.topk_index[:raw_bs]
         return out
 
+    def _prealloc_symmetric_memory_pool(self):
+        return
+
 
 class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
     def __init__(self, eagle_worker: MultiLayerEagleDraftWorker):
