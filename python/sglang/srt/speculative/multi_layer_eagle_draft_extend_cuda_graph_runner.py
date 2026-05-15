@@ -613,6 +613,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out.topk_index = out_copy.topk_index[:raw_bs]
         return out
 
+    def _prealloc_symmetric_memory_pool(self):
+        return
+
 
 class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
     """Composite orchestrator that owns speculative_num_steps per-step
