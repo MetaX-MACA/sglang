@@ -503,6 +503,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             return self._replay_graph(shape_key, fb_view)
 
+    def _prealloc_symmetric_memory_pool(self):
+        return
+
 
 class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
     """Owns one shared buffer set and the per-step runners.
