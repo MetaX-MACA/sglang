@@ -15,9 +15,9 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_permute_scales,
     moe_awq_to_marlin_zero_points,
 )
+from sgl_kernel import mx_awq_dequantize
 from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
-from sglang.srt.utils import is_hip, is_xpu
-
+from sglang.srt.utils import is_hip, is_xpu,is_cuda
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -75,6 +75,34 @@ else:
 
 _, scalar_types = get_scalar_types()
 
+def awq_dequantize_wrapper(qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor) -> torch.Tensor:
+    if is_cuda():
+        return mx_awq_dequantize(
+                    qweight,
+                    scales,
+                    qzeros,
+                    0,
+                    0,
+                    0,
+                )
+
+    # qweight: (K, N / 8), int32
+    # qzeros: (K / group_size, N / 8), int32
+    # scales: (K / group_size, N), bfloat16
+    # Torch implementation of awq_dequantize
+    bitshifts = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.int32, device=qweight.device) * 4
+    qweight_unpacked = (qweight.unsqueeze(-1) >> bitshifts) & 0xF
+    qweight_unpacked = qweight_unpacked.flatten(-2)  # (K, N)
+
+    qzeros_unpacked = (qzeros.unsqueeze(-1) >> bitshifts) & 0xF
+    qzeros_unpacked = qzeros_unpacked.flatten(-2)  # (K / group_size, N)
+
+    num_groups = qzeros.shape[0]
+    qweight_unpacked = qweight_unpacked.unflatten(0, (num_groups, -1))
+    qweight = qweight_unpacked - qzeros_unpacked.unsqueeze(1)
+    weight = qweight.float() * scales.unsqueeze(1).float()
+    weight = weight.flatten(0, 1).to(scales.dtype)
+    return weight
 
 class AWQLinearKernel:
     def __init__(self, quant_config: Optional[QuantizationConfig] = None):
@@ -97,7 +125,9 @@ class AWQLinearKernel:
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
-        out = awq_dequantize(qweight, scales, qzeros)
+        out = awq_dequantize_wrapper(qweight, scales, qzeros)
+        if reshaped_x.dtype == torch.bfloat16:
+            out = out.to(torch.bfloat16)
         out = torch.matmul(reshaped_x, out)
 
         if bias is not None:
