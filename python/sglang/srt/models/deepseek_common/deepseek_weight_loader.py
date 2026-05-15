@@ -186,9 +186,9 @@ class DeepseekV2WeightLoaderMixin:
         """
         nextn_conf = self._initialize_nextn_conf(is_nextn)
 
-        weights = self._maybe_quant_weights_to_fp8_ue8m0(
-            weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, nextn_conf
-        )
+        # weights = self._maybe_quant_weights_to_fp8_ue8m0(
+        #     weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, nextn_conf
+        # )
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

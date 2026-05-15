@@ -103,7 +103,7 @@ def awq_dequantize_func():
         - None if the current device is not supported.
     """
     if _is_cuda:
-        from sgl_kernel import awq_dequantize
+        from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import awq_dequantize_wrapper as awq_dequantize
 
         return awq_dequantize
     elif _is_hip:
