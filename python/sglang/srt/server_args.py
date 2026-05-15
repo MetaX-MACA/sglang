@@ -566,12 +566,15 @@ class ServerArgs:
     mm_attention_backend: Optional[str] = None
     fp8_gemm_runner_backend: str = "auto"
     fp4_gemm_runner_backend: str = "auto"
-    nsa_prefill_backend: Optional[str] = (
-        None  # None = auto-detect based on hardware/kv_cache_dtype
-    )
-    nsa_decode_backend: Optional[str] = (
-        None  # auto-detect based on hardware/kv_cache_dtype
-    )
+    #nsa_prefill_backend: Optional[str] = (
+    #    None  # None = auto-detect based on hardware/kv_cache_dtype
+    #)
+    #nsa_decode_backend: Optional[str] = (
+    #    None  # auto-detect based on hardware/kv_cache_dtype
+    #)
+    nsa_prefill_backend: str = "flashmla_sparse"
+    nsa_decode_backend: str = "flashmla_kv"
+
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
 
@@ -1440,6 +1443,8 @@ class ServerArgs:
 
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
+        from sglang.srt.configs.model_config import is_deepseek_nsa
+        hf_config = self.get_model_config().hf_config
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
                 # T4, 4080
@@ -1475,7 +1480,10 @@ class ServerArgs:
                 # H100, A100
                 # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
                 if self.chunked_prefill_size is None:
-                    self.chunked_prefill_size = 8200
+                    if is_deepseek_nsa(hf_config):
+                        self.chunked_prefill_size = 8704
+                    else:
+                        self.chunked_prefill_size = 8200
                 if self.cuda_graph_max_bs is None:
                     if self.tp_size < 4:
                         self.cuda_graph_max_bs = 128
@@ -3585,6 +3593,8 @@ class ServerArgs:
         return False
 
     def _handle_speculative_decoding(self):
+        from sglang.srt.configs.model_config import is_deepseek_nsa
+        hf_config = self.get_model_config().hf_config
         if (
             self.speculative_draft_model_path is not None
             and self.speculative_draft_model_revision is None
@@ -3777,6 +3787,9 @@ class ServerArgs:
 
             if self.max_running_requests is None:
                 self.max_running_requests = 160
+                if is_deepseek_nsa(hf_config):
+                    self.max_running_requests = 128
+                    logger.info(f"{self.max_running_requests=}")
                 logger.warning(
                     "Max running requests is reset to 160 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )

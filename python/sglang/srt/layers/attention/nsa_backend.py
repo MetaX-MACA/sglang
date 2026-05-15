@@ -36,7 +36,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -46,25 +46,25 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 
-if _is_hip:
-    from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
-
-    try:
-        from aiter import (  # noqa: F401
-            flash_attn_varlen_func,
-            mha_batch_prefill_func,
-            paged_attention_ragged,
-        )
-        from aiter.mla import mla_decode_fwd, mla_prefill_fwd  # noqa: F401
-    except ImportError:
-        print(
-            "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
-        )
-else:
-    from sglang.jit_kernel.flash_attention import (
-        flash_attn_varlen_func,
-        flash_attn_with_kvcache,
-    )
+# if _is_hip:
+#     from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
+# 
+#     try:
+#         from aiter import (  # noqa: F401
+#             flash_attn_varlen_func,
+#             mha_batch_prefill_func,
+#             paged_attention_ragged,
+#         )
+#         from aiter.mla import mla_decode_fwd, mla_prefill_fwd  # noqa: F401
+#     except ImportError:
+#         print(
+#             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
+#         )
+# else:
+#     from sglang.jit_kernel.flash_attention import (
+#         flash_attn_varlen_func,
+#         flash_attn_with_kvcache,
+#     )
 
 
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -1343,6 +1343,7 @@ class NativeSparseAttnBackend(
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
+
         assert causal, "NSA is causal only"
 
         nsa_impl = (
@@ -1406,6 +1407,7 @@ class NativeSparseAttnBackend(
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        assert kv_cache.dtype == q.dtype
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1738,7 +1740,7 @@ class NativeSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+        from flash_mla import flash_mla_sparse_fwd
 
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
@@ -1765,13 +1767,25 @@ class NativeSparseAttnBackend(
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_input,
-            kv=kv_cache,
-            indices=indices_input,
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-        )
+        flashmla_opt = get_bool_env_var("MX_ENABLE_FLASH_MLA_OPT", default="true")
+        if flashmla_opt:
+            prefill_mask = (page_table_1 != -1).all(dim=-1, keepdim=True)
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_input,
+                kv=kv_cache,
+                indices=indices_input,
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+                indices_all_valid_per_q=prefill_mask,
+            )
+        else:
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_input,
+                kv=kv_cache,
+                indices=indices_input,
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+            )
 
         # Trim output back to original num_heads if we padded
         if need_padding:
@@ -1789,7 +1803,7 @@ class NativeSparseAttnBackend(
         metadata: NSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
+        from flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.nsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
@@ -1810,30 +1824,51 @@ class NativeSparseAttnBackend(
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
-        if not self.nsa_kv_cache_store_fp8:
-            # inefficiently quantize the whole cache
-            kv_cache = quantize_k_cache(kv_cache)
+        # if not self.nsa_kv_cache_store_fp8:
+        #     # inefficiently quantize the whole cache
+        #     kv_cache = quantize_k_cache(kv_cache)
 
         indices = page_table_1.unsqueeze(1)
         assert (
             indices.shape[-1] == self.nsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
-        o, _ = flash_mla_with_kvcache(
-            q=q_input,
-            k_cache=kv_cache,
-            cache_seqlens=cache_seqlens,
-            head_dim_v=v_head_dim,
-            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
-            softmax_scale=sm_scale,
-            indices=indices,
-            # doc says it is not used, but if pass in None then error
-            block_table=torch.empty(
-                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
-            ),
-            is_fp8_kvcache=True,
-        )
+        flashmla_opt = get_bool_env_var("MX_ENABLE_FLASH_MLA_OPT", default="true")
+
+        if flashmla_opt:
+            decode_mask = (indices != -1).all(dim=-1, keepdim=True)
+            o, _ = flash_mla_with_kvcache(
+                q=q_all,
+                k_cache=kv_cache,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=v_head_dim,
+                tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
+                num_splits=metadata.flashmla_metadata.num_splits,
+                softmax_scale=sm_scale,
+                indices=indices,
+                indices_all_valid_per_q=decode_mask,
+                # doc says it is not used, but if pass in None then error
+                block_table=torch.empty(
+                    (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
+                ),
+                is_fp8_kvcache=False,
+            )
+        else:
+            o, _ = flash_mla_with_kvcache(
+                q=q_all,
+                k_cache=kv_cache,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=v_head_dim,
+                tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
+                num_splits=metadata.flashmla_metadata.num_splits,
+                softmax_scale=sm_scale,
+                indices=indices,
+                # doc says it is not used, but if pass in None then error
+                block_table=torch.empty(
+                    (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
+                ),
+                is_fp8_kvcache=False,
+            )
 
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
@@ -1893,6 +1928,9 @@ class NativeSparseAttnBackend(
             )
 
         # Use FA3 for SM90 (Hopper/H200)
+        fa_version = 3
+        from flash_attn import flash_attn_varlen_func
+
         return flash_attn_varlen_func(
             q=q,
             k=k,
@@ -2217,7 +2255,7 @@ class NativeSparseAttnBackend(
             # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
             self.use_mha = (
                 (
-                    device_sm == 90 or (device_sm >= 100 and device_sm < 110)
+                    device_sm == 80 or device_sm == 90 or (device_sm >= 100 and device_sm < 110)
                 )  # SM90/SM100 only
                 and max_kv_len
                 <= envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
@@ -2285,7 +2323,7 @@ class NativeSparseAttnBackend(
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
-        from sgl_kernel.flash_mla import get_mla_metadata
+        from flash_mla import get_mla_metadata
 
         num_heads_q = self.flashmla_kv_num_q_heads
 
@@ -2296,7 +2334,7 @@ class NativeSparseAttnBackend(
             num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
             num_heads_k=1,
             num_heads_q=num_heads_q,
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=False,
             topk=self.nsa_index_topk,
         )
 

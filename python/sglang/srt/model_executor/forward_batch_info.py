@@ -530,6 +530,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 global_num_tokens_for_logprob, dtype=torch.int64, pin_memory=True
             ).to(device, non_blocking=True)
 
+        #check nsa ds-v3.2
+        from sglang.srt.configs.model_config import is_deepseek_nsa
+        ret.is_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
+
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             return ret
@@ -887,11 +891,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         bs = self.batch_size
 
+        is_idle = False
+        if self.forward_mode.is_idle() and not self.is_nsa:
+            is_idle = True
+
         if (
             self.forward_mode.is_decode()
             or self.forward_mode.is_target_verify()
             or self.forward_mode.is_draft_extend(include_v2=True)
-            or self.forward_mode.is_idle()
+            or is_idle
+            # or self.forward_mode.is_idle()
         ):
             if self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
