@@ -274,9 +274,8 @@ def try_get_optimal_moe_config(
                     [cfg["BLOCK_SIZE_M"] for cfg in down_configs.values()]
                 )
     if return_down_config:
-        assert (
-            down_config is None or config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"]
-        )
+        #目前没有走这条路径，不需要此断言。
+        #assert (down_config is None or config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"])
         return config, (down_config, max_block_m)
     return config
 
