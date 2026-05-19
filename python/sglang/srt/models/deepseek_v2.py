@@ -180,6 +180,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
+    align_packed_tensor_size,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -279,8 +280,10 @@ class DeepseekV2MLP(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ):
-        if (self.tp_size == 1) and x.shape[0] == 0:
-            return x
+        if self.tp_size == 1:
+            target = x[0] if isinstance(x, tuple) else x
+            if target.shape[0] == 0:
+                return x
 
         if (
             getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False)
@@ -575,6 +578,7 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
+        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
@@ -1161,6 +1165,20 @@ class DeepseekV2MoE(nn.Module):
             sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
         )
 
+        tensor_scale_tuple = None
+        if isinstance(hidden_states, tuple):
+            packed_hidden = hidden_states[0]
+            tensor_scale_tuple = hidden_states[2]
+            hidden_states = hidden_states[1]
+        else:
+            packed_hidden = hidden_states
+            if self.use_fused_quant and packed_hidden.shape[0] == 0:
+                packed_hidden = torch.empty(
+                    (0, align_packed_tensor_size(packed_hidden.shape[-1])), 
+                    dtype=hidden_states.dtype, 
+                    device=hidden_states.device
+                )
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
@@ -1175,7 +1193,7 @@ class DeepseekV2MoE(nn.Module):
                     else:
                         shared_output = self._forward_shared_experts(hidden_states)
                 else:
-                    shared_output = self._forward_shared_experts(hidden_states)
+                    shared_output = self._forward_shared_experts(tensor_scale_tuple if (self.use_fused_quant and tensor_scale_tuple) is not None else hidden_states)
             topk_kwargs = (
                 {"input_ids": input_ids_global}
                 if getattr(self, "is_hash", False)
@@ -1354,7 +1372,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         final_hidden_states = self.experts(
-            hidden_states=hidden_states,
+            hidden_states=packed_hidden,
             topk_output=topk_output,
         )
 
@@ -1387,7 +1405,9 @@ class DeepseekV2MoE(nn.Module):
     def _forward_shared_experts(
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
     ):
-        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+        bs = hidden_states[0].shape[0] if isinstance(hidden_states, tuple) \
+            else hidden_states.shape[0]
+        if (bs > 0) and (self.num_fused_shared_experts == 0):
             return self.shared_experts(
                 hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
             )
@@ -2082,10 +2102,15 @@ class DeepseekV2DecoderLayer(nn.Module):
                 swiglu_limit=getattr(config, "swiglu_limit", None),
             )
 
+        # self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.post_attention_layernorm = RMSNorm(
+        #     config.hidden_size, eps=config.rms_norm_eps
+        # )
+        packed_quant = True if self.is_layer_sparse else False
+        fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+            config.hidden_size, eps=config.rms_norm_eps, fused_quant=fused_quant, packed_quant=packed_quant, packed_size=align_packed_tensor_size(config.hidden_size))
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
