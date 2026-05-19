@@ -30,6 +30,7 @@ from sglang.srt.utils import (
     use_intel_xpu_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
@@ -118,6 +119,7 @@ def inplace_fused_experts(
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int4_w4a8: bool = False,
     use_int4_w4a16: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
@@ -149,6 +151,7 @@ def inplace_fused_experts(
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
+        use_int4_w4a8,
         use_int4_w4a16,
         per_channel_quant,
         w1_scale,
@@ -183,6 +186,7 @@ def outplace_fused_experts(
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int4_w4a8: bool = False,
     use_int4_w4a16: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
@@ -215,6 +219,7 @@ def outplace_fused_experts(
         use_fp8_w8a8,
         use_int8_w8a8,
         use_int8_w8a16,
+        use_int4_w4a8,
         use_int4_w4a16,
         per_channel_quant,
         w1_scale,
@@ -245,6 +250,7 @@ def fused_experts(
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int4_w4a8: bool = False,
     use_int4_w4a16: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
@@ -276,6 +282,7 @@ def fused_experts(
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
+            use_int4_w4a8,
             use_int4_w4a16,
             per_channel_quant,
             w1_scale,
@@ -308,6 +315,7 @@ def fused_experts(
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
+            use_int4_w4a8,
             use_int4_w4a16,
             per_channel_quant,
             w1_scale,
@@ -374,6 +382,7 @@ def _prepare_fused_moe_run(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int4_w4a8: bool,
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]],
@@ -393,6 +402,7 @@ def _prepare_fused_moe_run(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a8=use_int4_w4a8,
         use_int4_w4a16=use_int4_w4a16,
         dtype=hidden_states.dtype,
     )
@@ -436,6 +446,7 @@ def _fused_moe_kernel_sequence(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int4_w4a8: bool,
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     w1_scale: Optional[torch.Tensor],
@@ -506,8 +517,29 @@ def _fused_moe_kernel_sequence(
     
     stage1_config = config["stage1"] if "stage1" in config else config
     stage2_config = down_config["stage2"] if "stage2" in down_config else down_config
-    #  and envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE
-    if use_int8_w8a8 and enable_mctlass_fused_moe:
+    if use_int4_w4a8:
+        assert enable_mctlass_fused_moe_python_api, ("int4_w4a8 only support enable_mctlass_fused_moe_python_api now")
+        K = w2.shape[1]
+        w1_view = w1.view(dtype = torch.quint4x2)
+        qcurr_hidden_states, _ = per_token_quant_int8(hidden_states)
+        kernel_m = gemm.get_kernel_m(
+                        qcurr_hidden_states,
+                        w1_view,
+                        intermediate_cache1,
+                        w1_view.size(0),
+                        qcurr_hidden_states.size(0),
+                        N,
+                        K,
+                        topk_ids.shape[1],
+                        mul_weight = False
+                        )
+
+        assert kernel_m > 0, ("cutlass_fused_moe_w4a8 BLOCK_SIZE_M must greater than zero.")
+        # override kernel_m to config["BLOCK_SIZE_M"]
+        stage1_config["BLOCK_SIZE_M"] = kernel_m
+        stage2_config["BLOCK_SIZE_M"] = kernel_m
+        
+    elif use_int8_w8a8 and enable_mctlass_fused_moe:
         # call mctlass gemm_kernel_mnk to calculate kernel_m
         kernel_m = 0
         if enable_mctlass_fused_moe_python_api:
@@ -590,6 +622,7 @@ def _fused_moe_kernel_sequence(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a8=use_int4_w4a8,
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
@@ -789,6 +822,7 @@ def _fused_moe_kernel_sequence(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a8=use_int4_w4a8,
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
@@ -898,6 +932,7 @@ def fused_experts_impl(
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
+    use_int4_w4a8: bool = False,
     use_int4_w4a16: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
@@ -920,7 +955,9 @@ def fused_experts_impl(
         padded_size = 0
 
     # Check constraints.
-    if use_int4_w4a16:
+    if use_int4_w4a8:
+        assert hidden_states.size(1) // 8 == w1.size(2), "hidden size mismatch"
+    elif use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert (
@@ -944,6 +981,7 @@ def fused_experts_impl(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a8=use_int4_w4a8,
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
@@ -964,6 +1002,7 @@ def fused_experts_impl(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
+        use_int4_w4a8=use_int4_w4a8,
         per_channel_quant=per_channel_quant,
         w1_scale=w1_scale,
         w2_scale=w2_scale,

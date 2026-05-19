@@ -950,12 +950,16 @@ class DeepseekV2MoE(nn.Module):
                 shared_output,
             )
         else:
-            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-                self.experts,
-                final_hidden_states,
-                None if self._shared_expert_tp1 else shared_output,
-                self.routed_scaling_factor,
-            )
+            shared = None if self._shared_expert_tp1 else shared_output
+            if shared is not None:
+               final_hidden_states += shared
+            
+        # final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+            #     self.experts,
+            #     final_hidden_states,
+            #     ,
+            #     self.routed_scaling_factor,
+            # )
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,

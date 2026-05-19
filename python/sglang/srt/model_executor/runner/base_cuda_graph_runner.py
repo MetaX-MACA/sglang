@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import require_gathered_buffer
+from sglang.srt.utils import (require_gathered_buffer, get_device_memory_capacity)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
@@ -68,23 +68,23 @@ def get_batch_sizes_to_capture(
     """
 
     server_args = model_runner.server_args
-    capture_bs = list(server_args.cuda_graph_config.decode.bs)
+    decode_bs = server_args.cuda_graph_config.decode.bs
 
-    if capture_bs is None:
+    if decode_bs is None:
         if server_args.speculative_algorithm is None:
             if server_args.disable_cuda_graph_padding:
                 capture_bs = list(range(1, 33)) + list(range(48, 161, 16))
             else:
                 capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
         else:
-            # Since speculative decoding requires more cuda graph memory, we
-            # capture less.
             capture_bs = (
                 list(range(1, 9))
                 + list(range(10, 33, 2))
                 + list(range(40, 65, 8))
                 + list(range(80, 161, 16))
             )
+    else:
+        capture_bs = list(decode_bs)
 
         gpu_mem = get_device_memory_capacity()
         if gpu_mem is not None:
