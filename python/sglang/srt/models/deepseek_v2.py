@@ -789,12 +789,15 @@ class DeepseekV2MoE(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
-        )
+        if shared_output is not None:
+            final_hidden_states += shared_output
+            
+        # final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+        #     self.experts,
+        #     final_hidden_states,
+        #     None if self._shared_expert_tp1 else shared_output,
+        #     self.routed_scaling_factor,
+        # )
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,

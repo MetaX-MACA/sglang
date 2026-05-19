@@ -8,23 +8,128 @@ import torch
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A8Int8DynamicMoEMethod,
 )
-from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
     )
+from compressed_tensors.quantization import QuantizationStrategy
 
-__all__ = ["NPUCompressedTensorsW4A8Int8DynamicMoE"]
+__all__ = ["NPUCompressedTensorsW4A8Int8DynamicMoE","CompressedTensorsW4A8Int8MoEMethod"]
 
 
 logger = logging.getLogger(__name__)
 
+class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEScheme):
+    def __init__(
+        self,
+        quant_config: "CompressedTensorsConfig"  # type: ignore # noqa E501
+    ):
+        self.quant_config = quant_config
+        self.weight_quant = self.quant_config.target_scheme_map["Linear"].get(
+                "weights")
+        self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
+            "input_activations")
+
+        if not (self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+                and self.input_quant.strategy == QuantizationStrategy.TOKEN):
+            raise ValueError(
+                "For INT8 Fused MoE layers, only per-channel scales"
+                "for activations and per-token scales for activations are supported. Found "
+                f"{self.weight_quant}, {self.input_quant}")
+
+        self.static_input_scales = not self.input_quant.dynamic
+
+    def create_weights(self, layer: torch.nn.Module, num_experts: int,
+                       hidden_size: int, intermediate_size_per_partition: int,
+                       params_dtype: torch.dtype, **extra_weight_attrs):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        params_dtype = torch.int32
+        pack_group = 8
+
+        # Weights
+        w13_weight = torch.nn.Parameter(torch.empty(num_experts,
+                                                    2 * intermediate_size_per_partition,
+                                                    hidden_size // pack_group,
+                                                    dtype=params_dtype),
+                                        requires_grad=False)
+
+        layer.register_parameter("w13_weight_packed", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(torch.empty(num_experts,
+                                                   hidden_size,
+                                                   intermediate_size_per_partition // pack_group,
+                                                   dtype=params_dtype),
+                                                    requires_grad=False)
+        layer.register_parameter("w2_weight_packed", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        w13_weight_scale = torch.nn.Parameter(torch.ones(num_experts,
+                                                         2 * intermediate_size_per_partition,
+                                                         1,
+                                                         dtype=torch.float32),
+                                                         requires_grad=False)
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+
+        w2_weight_scale = torch.nn.Parameter(torch.ones(num_experts,
+                                                        hidden_size,
+                                                        1,
+                                                        dtype=torch.float32),
+                                                        requires_grad=False)
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+
+        extra_weight_attrs.update({"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value})
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        # print(f"{w13_weight.shape=}, {w13_weight_scale.shape=}, {w2_weight.shape=}, {w2_weight_scale.shape=}")
+
+        # Input_Scales
+        if self.static_input_scales:
+            raise ValueError(
+                "For INT8 Fused MoE layers, only dynamic scales"
+                "for activations are supported. Found "
+                f"{self.input_quant}")
+        else:
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Note: Has been done in FusedMoE weight loader, do nothing here
+        pass
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.fused_moe_triton import fused_experts
+        quant_info = TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight_packed,
+            w2_weight=layer.w2_weight_packed,
+            use_int4_w4a8=True,
+            per_channel_quant=True,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a13_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale
+        )
+        return self.runner.run(dispatch_output, quant_info)
 
 class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
 
