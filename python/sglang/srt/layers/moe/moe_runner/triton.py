@@ -58,6 +58,7 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     b2: Optional[torch.Tensor] = None
     use_mxfp8: bool = False
     use_fp8_w8a8: bool = False
+    use_int4_w4a8: bool = False
     use_int8_w8a8: bool = False
     use_int8_w8a16: bool = False
     use_int4_w4a16: bool = False
@@ -217,27 +218,28 @@ def fused_experts_none_to_triton(
             fused_experts,
         )
 
-        output = fused_experts(
-            hidden_states=dispatch_output.hidden_states,
-            w1=quant_info.w13_weight,
-            w2=quant_info.w2_weight,
-            topk_output=dispatch_output.topk_output,
-            moe_runner_config=runner_config,
-            b1=quant_info.b13,
-            b2=quant_info.b2,
-            use_fp8_w8a8=quant_info.use_fp8_w8a8,
-            use_int8_w8a8=quant_info.use_int8_w8a8,
-            use_int8_w8a16=quant_info.use_int8_w8a16,
-            use_int4_w4a16=quant_info.use_int4_w4a16,
-            per_channel_quant=quant_info.per_channel_quant,
-            w1_scale=quant_info.w13_scale,
-            w2_scale=quant_info.w2_scale,
-            w1_zp=quant_info.w13_zp,
-            w2_zp=quant_info.w2_zp,
-            a1_scale=quant_info.a13_scale,
-            a2_scale=quant_info.a2_scale,
-            block_shape=quant_info.block_shape,
-        )
+    output = fused_experts(
+        hidden_states=dispatch_output.hidden_states,
+        w1=quant_info.w13_weight,
+        w2=quant_info.w2_weight,
+        topk_output=dispatch_output.topk_output,
+        moe_runner_config=runner_config,
+        b1=quant_info.b13,
+        b2=quant_info.b2,
+        use_fp8_w8a8=quant_info.use_fp8_w8a8,
+        use_int8_w8a8=quant_info.use_int8_w8a8,
+        use_int8_w8a16=quant_info.use_int8_w8a16,
+        use_int4_w4a16=quant_info.use_int4_w4a16,
+        use_int4_w4a8=quant_info.use_int4_w4a8,
+        per_channel_quant=quant_info.per_channel_quant,
+        w1_scale=quant_info.w13_scale,
+        w2_scale=quant_info.w2_scale,
+        w1_zp=quant_info.w13_zp,
+        w2_zp=quant_info.w2_zp,
+        a1_scale=quant_info.a13_scale,
+        a2_scale=quant_info.a2_scale,
+        block_shape=quant_info.block_shape,
+    )
 
     return StandardCombineInput(
         hidden_states=output,

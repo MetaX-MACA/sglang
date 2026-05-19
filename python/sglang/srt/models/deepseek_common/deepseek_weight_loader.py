@@ -246,7 +246,11 @@ class DeepseekV2WeightLoaderMixin:
                             name = name.replace("weight_packed", "weight")
                         name = name.replace(weight_name, param_name)
                         if name not in params_dict:
-                            continue
+                            # To be compatible with the W4A8 weights
+                            try_name = name + "_packed"
+                            if try_name not in params_dict:
+                                continue
+                            name = try_name 
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(
