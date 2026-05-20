@@ -105,6 +105,8 @@ class _DpGatheredBufferWrapper:
     _dp_max_padding: bool
     _global_num_tokens: Optional[List[int]]
     _is_extend_in_batch: bool
+    _global_dp_buffer: torch.tensor = None
+    _local_dp_buffer: torch.tensor = None
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -124,26 +126,34 @@ class _DpGatheredBufferWrapper:
         cls._local_dp_buffer_len = local_dp_buffer_len
         cls._dp_max_padding = dp_max_padding
         cls._global_num_tokens = global_num_tokens
+        if cls._global_dp_buffer is not None:
+            del cls._global_dp_buffer
+            cls._global_dp_buffer = None
+        if cls._local_dp_buffer is not None:
+            del cls._local_dp_buffer
+            cls._local_dp_buffer = None
 
     @classmethod
     def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
-        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
-            buffer = torch.empty(
-                (cls._global_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
-            )
-        return buffer
+        if cls._global_dp_buffer is None:
+            with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
+                cls._global_dp_buffer = torch.empty(
+                    (cls._global_dp_buffer_len, cls._hidden_size),
+                    dtype=cls._dtype,
+                    device=cls._device,
+                )
+        return cls._global_dp_buffer
 
     @classmethod
     def get_local_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
-        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
-            buffer = torch.empty(
-                (cls._local_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
-            )
-        return buffer
+        if cls._local_dp_buffer is None:
+            with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
+                cls._local_dp_buffer = torch.empty(
+                    (cls._local_dp_buffer_len, cls._hidden_size),
+                    dtype=cls._dtype,
+                    device=cls._device,
+                )
+        return cls._local_dp_buffer
 
     @classmethod
     def get_global_dp_buffer_len(cls) -> int:

@@ -276,6 +276,7 @@ class LogitsProcessor(nn.Module):
 
         self.return_full_logits = return_full_logits
         self.enable_mis = get_global_server_args().enable_mis
+        self.empty_hiddens = None
 
         # enable chunked logprobs processing
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
@@ -545,6 +546,12 @@ class LogitsProcessor(nn.Module):
                 input_logprob_indices, dtype=torch.int64, pin_memory=True
             ).to(pruned_states.device, non_blocking=True)
 
+        if logits_metadata.forward_mode.is_idle():
+            if self.empty_hiddens == None:
+                self.empty_hiddens = torch.empty(0, hidden_states.shape[1], device=hidden_states.device)
+
+            pruned_states = self.empty_hiddens
+            
         return (
             pruned_states,
             pruned_states_before_norm,

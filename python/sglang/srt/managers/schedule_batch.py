@@ -2195,6 +2195,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ):
             if len(sorted_indices) == 1:
                 # Always keep at least one request
+                if self.is_hybrid_swa:
+                    full_available_size = (
+                        self.token_to_kv_pool_allocator.full_available_size()
+                    )
+                    swa_available_size = (
+                        self.token_to_kv_pool_allocator.swa_available_size()
+                    )
+                    assert (
+                        full_available_size > 0 and swa_available_size > 0
+                    ), f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
+                else:
+                    assert (
+                        self.token_to_kv_pool_allocator.available_size() > 0
+                    ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
                 break
 
             first_iter = False

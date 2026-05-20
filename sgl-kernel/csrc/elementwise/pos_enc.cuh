@@ -370,11 +370,6 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCacheEnhanced(
     config.blockDim = nthrs;                                          \
     config.dynamicSmemBytes = 0;                                      \
     config.stream = stream;                                           \
-    cudaLaunchAttribute attrs[1] = {};                                \
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; \
-    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl; \
-    config.numAttrs = 1;                                              \
-    config.attrs = attrs;                                             \
                                                                       \
     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                          \
         &config,                                                      \
