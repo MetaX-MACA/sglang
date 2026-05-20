@@ -208,6 +208,7 @@ else:
 
 logger = logging.getLogger(__name__)
 
+enable_sglang_deepep_mode_shared_experts_multi_stream = os.getenv("ENABLE_SGLANG_DEEPEP_MODE_SHARED_EXPERTS_MULTI_STREAM") in ("1", "true")
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -1156,11 +1157,14 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
-                    self.alt_stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(self.alt_stream):
+                    if enable_sglang_deepep_mode_shared_experts_multi_stream:
+                        self.alt_stream.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(self.alt_stream):
+                            shared_output = self._forward_shared_experts(hidden_states)
+                            shared_output.record_stream(self.alt_stream)
+                            shared_event = self.alt_stream.record_event()
+                    else:
                         shared_output = self._forward_shared_experts(hidden_states)
-                        shared_output.record_stream(self.alt_stream)
-                        shared_event = self.alt_stream.record_event()
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
             topk_kwargs = (
@@ -1350,6 +1354,7 @@ class DeepseekV2MoE(nn.Module):
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
+            and enable_sglang_deepep_mode_shared_experts_multi_stream
         ):
             torch.cuda.current_stream().wait_event(shared_event)
 
