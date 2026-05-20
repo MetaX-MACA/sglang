@@ -1066,8 +1066,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if shared_output is not None:
-            final_hidden_states+=shared_output
-        
+            final_hidden_states.add_(shared_output)
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
             use_reduce_scatter=use_reduce_scatter,
