@@ -1,14 +1,14 @@
 [build-system]
 requires = [
   "scikit-build-core>=0.10",
-  "torch>=2.8.0",
+  "torch>=2.6.0",
   "wheel",
 ]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "sglang-kernel"
-version = "0.4.4"
+dynamic = ["version"]
 authors = [
   { name="SGLang Kernel Team", email="sglang@lmsys.org" },
 ]
@@ -17,7 +17,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 classifiers = [
-  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 310",
   "License :: OSI Approved :: Apache Software License",
   "Environment :: GPU :: NVIDIA CUDA"
 ]
