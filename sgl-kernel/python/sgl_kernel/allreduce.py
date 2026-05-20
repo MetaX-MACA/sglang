@@ -92,27 +92,27 @@ if torch.version.hip is not None:
     def qr_max_size() -> int:
         return torch.ops.sgl_kernel.qr_max_size.default()
 
-    # mscclpp
-    def mscclpp_generate_unique_id() -> bytes:
-        raise NotImplementedError()
+    # # mscclpp
+    # def mscclpp_generate_unique_id() -> bytes:
+    #     raise NotImplementedError()
 
-    def mscclpp_init_context(
-        unique_id: bytes,
-        rank: int,
-        world_size: int,
-        scratch: torch.Tensor,
-        put_buffer: torch.Tensor,
-        nranks_per_node: int,
-        rank_to_node: List[int],
-        rank_to_ib: List[int],
-        context_selection: int,
-    ) -> int:
-        raise NotImplementedError()
+    # def mscclpp_init_context(
+    #     unique_id: bytes,
+    #     rank: int,
+    #     world_size: int,
+    #     scratch: torch.Tensor,
+    #     put_buffer: torch.Tensor,
+    #     nranks_per_node: int,
+    #     rank_to_node: List[int],
+    #     rank_to_ib: List[int],
+    #     context_selection: int,
+    # ) -> int:
+    #     raise NotImplementedError()
 
-    def mscclpp_allreduce(
-        context: int, inp: torch.Tensor, out: torch.Tensor, nthreads: int, nblocks: int
-    ) -> None:
-        raise NotImplementedError()
+    # def mscclpp_allreduce(
+    #     context: int, inp: torch.Tensor, out: torch.Tensor, nthreads: int, nblocks: int
+    # ) -> None:
+    #     raise NotImplementedError()
 
 else:
 

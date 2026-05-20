@@ -5,7 +5,7 @@
 #include <flashinfer/vec_dtypes.cuh>
 #include <iostream>
 
-#include "cutlass/array.h"
+#include "mctlass/array.h"
 #include "utils.h"
 
 constexpr uint64_t THREADS_PER_EXPERT = 512;
@@ -180,7 +180,7 @@ __global__ void shuffleRowsKernel(
   if (blockIdx.x < num_dst_rows) {
     // Load 128-bits per thread
     constexpr uint64_t ELEM_PER_THREAD = 128 / sizeof(T) / 8;
-    using DataElem = cutlass::Array<T, ELEM_PER_THREAD>;
+    using DataElem = mctlass::Array<T, ELEM_PER_THREAD>;
 
     // Duplicate and permute rows
     auto const* source_row_ptr = reinterpret_cast<DataElem const*>(input + source_row_idx * num_cols);
@@ -207,8 +207,8 @@ __global__ void shuffleRowsKernel(
 
 DECLARE_SHUFFLE_ROWS(float);
 DECLARE_SHUFFLE_ROWS(half);
-DECLARE_SHUFFLE_ROWS(__nv_bfloat16);
-DECLARE_SHUFFLE_ROWS(__nv_fp8_e4m3);
+// DECLARE_SHUFFLE_ROWS(__nv_bfloat16);
+// DECLARE_SHUFFLE_ROWS(__nv_fp8_e4m3);
 DECLARE_SHUFFLE_ROWS(uint8_t);
 
 #define SHUFFLE_ROWS(T)                                    \
@@ -240,9 +240,9 @@ void shuffle_rows_caller(
   void* output = output_tensor.data_ptr();
   switch (input_tensor.scalar_type()) {
     DTYPE_DISPATCH_CASE(torch::kFloat16, half);
-    DTYPE_DISPATCH_CASE(torch::kBFloat16, __nv_bfloat16);
+    // DTYPE_DISPATCH_CASE(torch::kBFloat16, __nv_bfloat16);
     DTYPE_DISPATCH_CASE(torch::kFloat32, float);
-    DTYPE_DISPATCH_CASE(torch::kFloat8_e4m3fn, __nv_fp8_e4m3);
+    // DTYPE_DISPATCH_CASE(torch::kFloat8_e4m3fn, __nv_fp8_e4m3);
     DTYPE_DISPATCH_CASE(torch::kUInt8, uint8_t);
     default:
       TORCH_CHECK(false, "[moe replicate input] data type dispatch fail!");

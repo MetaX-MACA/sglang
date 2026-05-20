@@ -1,18 +1,18 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
-#include <cutlass/array.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
+#include <mctlass/array.h>
+#include <mctlass/mctlass.h>
+#include <mctlass/numeric_types.h>
 #include <stdio.h>
 #include <torch/all.h>
 
 #include <cfloat>
 #include <type_traits>
 template <typename T, int N>
-using AlignedArray = cutlass::AlignedArray<T, N>;
-using bfloat16_t = cutlass::bfloat16_t;
-using float16_t = cutlass::half_t;
-using float32_t = float;
+using AlignedArray = mctlass::AlignedArray<T, N>;
+using bfloat16_t   = mctlass::bfloat16_t;
+using float16_t    = mctlass::half_t;
+using float32_t    = float;
 
 // QQ NOTE: to handle the case for at::Half, error: more than one operator ">" matches these operands: built-in operator
 // "arithmetic > arithmetic" function "operator>(const __half &, const __half &)"

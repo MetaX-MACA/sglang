@@ -19,6 +19,24 @@ limitations under the License.
 #include "sgl_kernel_ops.h"
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+
+#if TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 6
+  #define stride_tag at::Tag::needs_fixed_stride_order
+#else
+  #define stride_tag
+#endif
+
+  // Compute int8 quantized tensor for given scaling factor.
+  m.def(
+      "static_scaled_int8_quant(Tensor! result, Tensor input, Tensor scale,"
+      "Tensor? azp) -> ()");
+  m.impl("static_scaled_int8_quant", torch::kCUDA, &static_scaled_int8_quant);
+
+  // Compute int8 quantized tensor and scaling factor
+  m.def(
+      "dynamic_scaled_int8_quant(Tensor! result, Tensor input, Tensor! scale, "
+      "Tensor!? azp) -> ()");
+  m.impl("dynamic_scaled_int8_quant", torch::kCUDA, &dynamic_scaled_int8_quant);
   /*
    * From csrc/allreduce
    */
@@ -38,40 +56,40 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
 
-  m.def("mscclpp_generate_unique_id", &mscclpp_generate_unique_id);
-  m.def(
-      "mscclpp_init_context(Tensor unique_id, int rank, int world_size, Tensor scratch, Tensor put_buffer, "
-      "int nranks_per_node, int[] rank_to_node, int[] rank_to_ib, int context_selection) -> int");
-  m.impl("mscclpp_init_context", torch::kCUDA, &mscclpp_init_context);
+//   m.def("mscclpp_generate_unique_id", &mscclpp_generate_unique_id);
+//   m.def(
+//       "mscclpp_init_context(Tensor unique_id, int rank, int world_size, Tensor scratch, Tensor put_buffer, "
+//       "int nranks_per_node, int[] rank_to_node, int[] rank_to_ib, int context_selection) -> int");
+//   m.impl("mscclpp_init_context", torch::kCUDA, &mscclpp_init_context);
 
-  m.def("mscclpp_allreduce(int context, Tensor inp, Tensor! out, int nthreads, int nblocks) -> ()");
-  m.impl("mscclpp_allreduce", torch::kCUDA, &mscclpp_allreduce);
+//   m.def("mscclpp_allreduce(int context, Tensor inp, Tensor! out, int nthreads, int nblocks) -> ()");
+//   m.impl("mscclpp_allreduce", torch::kCUDA, &mscclpp_allreduce);
 
   /*
    * From csrc/attention
    */
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kCUDA, &merge_state_v2);
-  m.def(
-      "cutlass_mla_decode(Tensor! out, Tensor q_nope, Tensor q_pe, Tensor kv_c_and_k_pe_cache, Tensor seq_lens, Tensor "
-      "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
-  m.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
-  m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
+//   m.def(
+//       "cutlass_mla_decode(Tensor! out, Tensor q_nope, Tensor q_pe, Tensor kv_c_and_k_pe_cache, Tensor seq_lens, Tensor "
+//       "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
+//   m.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
+//   m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
 
   /*
    * From csrc/elementwise
    */
-  m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
-  m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
+//   m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
+//   m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
 
   m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
 
-  m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
-  m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
+//   m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
+//   m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
 
-  m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
-  m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
+//   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
+//   m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
 
   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
@@ -113,50 +131,50 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kCUDA, &awq_dequantize);
 
-  m.def(
-      "int8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
-      "bias) -> Tensor");
-  m.impl("int8_scaled_mm", torch::kCUDA, &int8_scaled_mm);
+//   m.def(
+//       "int8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
+//       "bias) -> Tensor");
+//   m.impl("int8_scaled_mm", torch::kCUDA, &int8_scaled_mm);
 
-  m.def(
-      "fp8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
-      "bias) -> Tensor");
-  m.impl("fp8_scaled_mm", torch::kCUDA, &fp8_scaled_mm);
+//   m.def(
+//       "fp8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
+//       "bias) -> Tensor");
+//   m.impl("fp8_scaled_mm", torch::kCUDA, &fp8_scaled_mm);
 
-  m.def(
-      "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype) -> "
-      "Tensor");
-  m.impl("fp8_blockwise_scaled_mm", torch::kCUDA, &fp8_blockwise_scaled_mm);
+//   m.def(
+//       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype) -> "
+//       "Tensor");
+//   m.impl("fp8_blockwise_scaled_mm", torch::kCUDA, &fp8_blockwise_scaled_mm);
 
-  m.def(
-      "sgl_per_token_group_quant_8bit(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
-      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
-  m.impl("sgl_per_token_group_quant_8bit", torch::kCUDA, &sgl_per_token_group_quant_8bit);
+//   m.def(
+//       "sgl_per_token_group_quant_8bit(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
+//       " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
+//   m.impl("sgl_per_token_group_quant_8bit", torch::kCUDA, &sgl_per_token_group_quant_8bit);
 
-  m.def(
-      "sgl_per_token_group_quant_8bit_v2(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
-      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0, bool fuse_silu_and_mul, Tensor? masked_m) -> ()");
-  m.impl("sgl_per_token_group_quant_8bit_v2", torch::kCUDA, &sgl_per_token_group_quant_8bit_v2);
+//   m.def(
+//       "sgl_per_token_group_quant_8bit_v2(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
+//       " float eps, float fp8_min, float fp8_max, bool scale_ue8m0, bool fuse_silu_and_mul, Tensor? masked_m) -> ()");
+//   m.impl("sgl_per_token_group_quant_8bit_v2", torch::kCUDA, &sgl_per_token_group_quant_8bit_v2);
 
-  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
-  m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
+//   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
+//   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 
-  m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
-  m.impl("dsv3_fused_a_gemm", torch::kCUDA, &dsv3_fused_a_gemm);
+//   m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+//   m.impl("dsv3_fused_a_gemm", torch::kCUDA, &dsv3_fused_a_gemm);
 
-  m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
-  m.impl("dsv3_router_gemm", torch::kCUDA, &dsv3_router_gemm);
+//   m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+//   m.impl("dsv3_router_gemm", torch::kCUDA, &dsv3_router_gemm);
 
-  /*
-   * From csrc/gemm/gptq
-   */
-  m.def(
-      "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor b_g_idx, bool "
-      "use_shuffle, int bit) -> Tensor");
-  m.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
+//   /*
+//    * From csrc/gemm/gptq
+//    */
+//   m.def(
+//       "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor b_g_idx, bool "
+//       "use_shuffle, int bit) -> Tensor");
+//   m.impl("gptq_gemm", torch::kCUDA, &gptq_gemm);
 
-  m.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
-  m.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
+//   m.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
+//   m.impl("gptq_shuffle", torch::kCUDA, &gptq_shuffle);
 
   /*
    * From csrc/moe
@@ -195,12 +213,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "(Tensor[])");
   m.impl("kimi_k2_moe_fused_gate", torch::kCUDA, &kimi_k2_moe_fused_gate);
 
-  m.def(
-      "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "
-      "a_scales_ptrs, Tensor b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
-      "stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, Tensor problem_sizes, Tensor "
-      "expert_offsets, Tensor workspace) -> ()");
-  m.impl("fp8_blockwise_scaled_grouped_mm", torch::kCUDA, &fp8_blockwise_scaled_grouped_mm);
+//   m.def(
+//       "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "
+//       "a_scales_ptrs, Tensor b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
+//       "stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, Tensor problem_sizes, Tensor "
+//       "expert_offsets, Tensor workspace) -> ()");
+//   m.impl("fp8_blockwise_scaled_grouped_mm", torch::kCUDA, &fp8_blockwise_scaled_grouped_mm);
 
   m.def(
       "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"
@@ -225,21 +243,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/moe/cutlass_moe/w4a8
    */
-  m.def(
-      "get_cutlass_w4a8_moe_mm_data(Tensor topk_ids, Tensor! expert_offsets, "
-      "                        Tensor! problem_sizes1, Tensor! problem_sizes2, "
-      "                        Tensor! input_permutation, "
-      "                        Tensor! output_permutation, int num_experts, "
-      "                        int n, int k) -> ()");
-  m.impl("get_cutlass_w4a8_moe_mm_data", torch::kCUDA, &get_cutlass_w4a8_moe_mm_data);
+//   m.def(
+//       "get_cutlass_w4a8_moe_mm_data(Tensor topk_ids, Tensor! expert_offsets, "
+//       "                        Tensor! problem_sizes1, Tensor! problem_sizes2, "
+//       "                        Tensor! input_permutation, "
+//       "                        Tensor! output_permutation, int num_experts, "
+//       "                        int n, int k) -> ()");
+//   m.impl("get_cutlass_w4a8_moe_mm_data", torch::kCUDA, &get_cutlass_w4a8_moe_mm_data);
 
-  m.def(
-      "cutlass_w4a8_moe_mm(Tensor! d, Tensor a, Tensor b, "
-      "               Tensor a_scales, Tensor b_scales, Tensor expert_offsets, "
-      "               Tensor problem_sizes, Tensor a_strides, "
-      "               Tensor b_strides, Tensor d_strides, Tensor s_strides,"
-      "               int chunk_size, int topk) -> ()");
-  m.impl("cutlass_w4a8_moe_mm", torch::kCUDA, &cutlass_w4a8_moe_mm);
+//   m.def(
+//       "cutlass_w4a8_moe_mm(Tensor! d, Tensor a, Tensor b, "
+//       "               Tensor a_scales, Tensor b_scales, Tensor expert_offsets, "
+//       "               Tensor problem_sizes, Tensor a_strides, "
+//       "               Tensor b_strides, Tensor d_strides, Tensor s_strides,"
+//       "               int chunk_size, int topk) -> ()");
+//   m.impl("cutlass_w4a8_moe_mm", torch::kCUDA, &cutlass_w4a8_moe_mm);
 
   /*
    * From csrc/speculative
@@ -345,39 +363,39 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From FlashInfer
    */
-  m.def(
-      "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, "
-      "int cublas_handle) -> ()",
-      {at::Tag::needs_fixed_stride_order});
-  m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
+//   m.def(
+//       "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, "
+//       "int cublas_handle) -> ()",
+//       {at::Tag::needs_fixed_stride_order});
+//   m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
 
-  m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
-  m.impl("top_k_renorm_probs", torch::kCUDA, &top_k_renorm_probs);
+//   m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
+//   m.impl("top_k_renorm_probs", torch::kCUDA, &top_k_renorm_probs);
 
-  m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
-  m.impl("top_p_renorm_probs", torch::kCUDA, &top_p_renorm_probs);
+//   m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
+//   m.impl("top_p_renorm_probs", torch::kCUDA, &top_p_renorm_probs);
 
   /*
    * From Sparse Flash Attention
    */
-  m.def(
-      "fwd_sparse(Tensor! q, Tensor k, Tensor v, "
-      "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
-      "Tensor!? out, Tensor? alibi_slopes, "
-      "float p_dropout, float softmax_scale, bool is_causal, "
-      "float softcap, bool return_softmax, Generator? gen)"
-      "-> Tensor[]");
-  m.impl("fwd_sparse", torch::kCUDA, &flash::mha_fwd_sparse);
+//   m.def(
+//       "fwd_sparse(Tensor! q, Tensor k, Tensor v, "
+//       "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
+//       "Tensor!? out, Tensor? alibi_slopes, "
+//       "float p_dropout, float softmax_scale, bool is_causal, "
+//       "float softcap, bool return_softmax, Generator? gen)"
+//       "-> Tensor[]");
+//   m.impl("fwd_sparse", torch::kCUDA, &flash::mha_fwd_sparse);
 
-  m.def(
-      "varlen_fwd_sparse(Tensor! q, Tensor k, Tensor v, "
-      "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
-      "Tensor!? out, Tensor cu_seqlens_q, "
-      "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? alibi_slopes, "
-      "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
-      "bool is_causal, float softcap, bool return_softmax, "
-      "Generator? gen) -> Tensor[]");
-  m.impl("varlen_fwd_sparse", torch::kCUDA, &flash::mha_varlen_fwd_sparse);
+//   m.def(
+//       "varlen_fwd_sparse(Tensor! q, Tensor k, Tensor v, "
+//       "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
+//       "Tensor!? out, Tensor cu_seqlens_q, "
+//       "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? alibi_slopes, "
+//       "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
+//       "bool is_causal, float softcap, bool return_softmax, "
+//       "Generator? gen) -> Tensor[]");
+//   m.impl("varlen_fwd_sparse", torch::kCUDA, &flash::mha_varlen_fwd_sparse);
 
   // Sparse Attention utils
   m.def(
@@ -410,47 +428,65 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/gemm (QServe)
    */
-  m.def(
-      "qserve_w4a8_per_chn_gemm(Tensor _in_feats, Tensor _kernel, Tensor _wscales, Tensor _ascales, Tensor _w_szs, "
-      "Tensor _a_ssums, Tensor! _out_feats) -> ()");
-  m.impl("qserve_w4a8_per_chn_gemm", torch::kCUDA, &qserve_w4a8_per_chn_gemm);
+//   m.def(
+//       "qserve_w4a8_per_chn_gemm(Tensor _in_feats, Tensor _kernel, Tensor _wscales, Tensor _ascales, Tensor _w_szs, "
+//       "Tensor _a_ssums, Tensor! _out_feats) -> ()");
+//   m.impl("qserve_w4a8_per_chn_gemm", torch::kCUDA, &qserve_w4a8_per_chn_gemm);
+
+//   m.def(
+//       "qserve_w4a8_per_group_gemm(Tensor _in_feats, Tensor _kernel, Tensor _zeros, Tensor _scales_i8, Tensor _wscales, "
+//       "Tensor _ascales, Tensor! _out_feats) -> ()");
+//   m.impl("qserve_w4a8_per_group_gemm", torch::kCUDA, &qserve_w4a8_per_group_gemm);
+
+//   /*
+//    * From csrc/quantization/gguf
+//    */
+//   m.def(
+//       "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "
+//       "dtype) -> Tensor");
+//   m.impl("ggml_dequantize", torch::kCUDA, &ggml_dequantize);
+
+//   m.def(
+//       "ggml_mul_mat_vec_a8(Tensor W, Tensor X, int type, SymInt row) "
+//       "-> Tensor");
+//   m.impl("ggml_mul_mat_vec_a8", torch::kCUDA, &ggml_mul_mat_vec_a8);
+
+//   m.def("ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
+//   m.impl("ggml_mul_mat_a8", torch::kCUDA, &ggml_mul_mat_a8);
+
+//   m.def(
+//       "ggml_moe_a8(Tensor X, Tensor W, "
+//       "Tensor sorted_token_ids, Tensor expert_ids, Tensor "
+//       "num_tokens_post_padded, "
+//       "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
+//   m.impl("ggml_moe_a8", torch::kCUDA, &ggml_moe_a8);
+
+//   m.def(
+//       "ggml_moe_a8_vec(Tensor X, Tensor W, "
+//       "Tensor topk_ids, int top_k, "
+//       "int type, SymInt row, SymInt tokens) -> Tensor");
+//   m.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
+
+//   m.def("ggml_moe_get_block_size(int type) -> int");
+//   m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
+
 
   m.def(
-      "qserve_w4a8_per_group_gemm(Tensor _in_feats, Tensor _kernel, Tensor _zeros, Tensor _scales_i8, Tensor _wscales, "
-      "Tensor _ascales, Tensor! _out_feats) -> ()");
-  m.impl("qserve_w4a8_per_group_gemm", torch::kCUDA, &qserve_w4a8_per_group_gemm);
+      "cutlass_scaled_mm(Tensor! out, Tensor a,"
+      "                  Tensor b, Tensor a_scales,"
+      "                  Tensor b_scales, Tensor? bias) -> ()",
+      {stride_tag});
+  m.impl("cutlass_scaled_mm", torch::kCUDA, &cutlass_scaled_mm);
 
-  /*
-   * From csrc/quantization/gguf
-   */
+  // CUTLASS w8a8 GEMM, supporting asymmetric per-tensor or per-row/column
+  // quantization.
   m.def(
-      "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "
-      "dtype) -> Tensor");
-  m.impl("ggml_dequantize", torch::kCUDA, &ggml_dequantize);
-
-  m.def(
-      "ggml_mul_mat_vec_a8(Tensor W, Tensor X, int type, SymInt row) "
-      "-> Tensor");
-  m.impl("ggml_mul_mat_vec_a8", torch::kCUDA, &ggml_mul_mat_vec_a8);
-
-  m.def("ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
-  m.impl("ggml_mul_mat_a8", torch::kCUDA, &ggml_mul_mat_a8);
-
-  m.def(
-      "ggml_moe_a8(Tensor X, Tensor W, "
-      "Tensor sorted_token_ids, Tensor expert_ids, Tensor "
-      "num_tokens_post_padded, "
-      "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
-  m.impl("ggml_moe_a8", torch::kCUDA, &ggml_moe_a8);
-
-  m.def(
-      "ggml_moe_a8_vec(Tensor X, Tensor W, "
-      "Tensor topk_ids, int top_k, "
-      "int type, SymInt row, SymInt tokens) -> Tensor");
-  m.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
-
-  m.def("ggml_moe_get_block_size(int type) -> int");
-  m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
+      "cutlass_scaled_mm_azp(Tensor! out, Tensor a,"
+      "                  Tensor b, Tensor a_scales,"
+      "                  Tensor b_scales, Tensor azp_adj,"
+      "                  Tensor? azp, Tensor? bias) -> ()",
+      {stride_tag});
+  m.impl("cutlass_scaled_mm_azp", torch::kCUDA, &cutlass_scaled_mm_azp);
 
   /*
    * From csrc/mamba
@@ -480,19 +516,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/expert_sepcialization
    */
-  m.def(
-      "es_fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
-      "stride_a, Tensor stride_b, Tensor stride_d, Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> "
-      "()");
-  m.impl("es_fp8_blockwise_scaled_grouped_mm", &es_fp8_blockwise_scaled_grouped_mm);
-  m.def(
-      "es_sm100_mxfp8_blockscaled_grouped_mm(Tensor a, Tensor b, Tensor sfa, Tensor sfb, Tensor d, Tensor "
-      "problem_sizes, Tensor expert_offsets, Tensor blockscale_offsets) -> ()");
-  m.impl("es_sm100_mxfp8_blockscaled_grouped_mm", &es_sm100_mxfp8_blockscaled_grouped_mm);
-  m.def(
-      "es_sm100_mxfp8_blockscaled_grouped_quant(Tensor input, Tensor problem_sizes, Tensor expert_offsets, Tensor "
-      "blockscale_offsets, Tensor quant_output, Tensor scale_factor) -> () ");
-  m.impl("es_sm100_mxfp8_blockscaled_grouped_quant", &es_sm100_mxfp8_blockscaled_grouped_quant);
+//   m.def(
+//       "es_fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
+//       "stride_a, Tensor stride_b, Tensor stride_d, Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> "
+//       "()");
+//   m.impl("es_fp8_blockwise_scaled_grouped_mm", &es_fp8_blockwise_scaled_grouped_mm);
+//   m.def(
+//       "es_sm100_mxfp8_blockscaled_grouped_mm(Tensor a, Tensor b, Tensor sfa, Tensor sfb, Tensor d, Tensor "
+//       "problem_sizes, Tensor expert_offsets, Tensor blockscale_offsets) -> ()");
+//   m.impl("es_sm100_mxfp8_blockscaled_grouped_mm", &es_sm100_mxfp8_blockscaled_grouped_mm);
+//   m.def(
+//       "es_sm100_mxfp8_blockscaled_grouped_quant(Tensor input, Tensor problem_sizes, Tensor expert_offsets, Tensor "
+//       "blockscale_offsets, Tensor quant_output, Tensor scale_factor) -> () ");
+//   m.impl("es_sm100_mxfp8_blockscaled_grouped_quant", &es_sm100_mxfp8_blockscaled_grouped_quant);
 }
 
 REGISTER_EXTENSION(common_ops)
