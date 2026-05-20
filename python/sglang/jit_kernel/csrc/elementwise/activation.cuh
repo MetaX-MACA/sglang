@@ -52,7 +52,7 @@ struct ActivationParams {
 };
 
 template <typename T, ActivationKind kAct, bool kUsePDL, bool kFilterExpert>
-__global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams params) {
+__global__ void act_and_mul_kernel(const   ActivationParams params) {
   using namespace device;
   constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
   using vec_t = AlignedVector<T, kMaxVecBytes / sizeof(T)>;
@@ -86,21 +86,19 @@ struct ActivationKernel {
   static constexpr auto kVecSize = device::kMaxVecBytes / sizeof(T);
   static constexpr auto kBlockSize = 256u;
 
-  template <ActivationKind kAct, bool kFilterExpert>
-  static constexpr auto activation_kernel = act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert>;
+  using KernelFn = void (*)(const ActivationParams);
 
   static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
 
   template <bool kFilterExpert>
-  static auto select_kernel(const std::string& type)
-      -> decltype(activation_kernel<ActivationKind::kSiLU, kFilterExpert>) {
+  static KernelFn select_kernel(const std::string& type) {
     using namespace host;
     if (type == "silu") {
-      return activation_kernel<ActivationKind::kSiLU, kFilterExpert>;
+      return act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, kFilterExpert>;
     } else if (type == "gelu") {
-      return activation_kernel<ActivationKind::kGELU, kFilterExpert>;
+      return act_and_mul_kernel<T, ActivationKind::kGELU, kUsePDL, kFilterExpert>;
     } else if (type == "gelu_tanh") {
-      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert>;
+      return act_and_mul_kernel<T, ActivationKind::kGELUTanh, kUsePDL, kFilterExpert>;
     } else {
       Panic("unsupported activation type: ", type);
     }

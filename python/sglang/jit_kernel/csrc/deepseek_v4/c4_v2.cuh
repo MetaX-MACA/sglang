@@ -190,7 +190,7 @@ SGL_DEVICE void c4_write_decode(InFloat* kv_buf, const InFloat* kv_src) {
 }
 
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kUsePDL>
-C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams params) {
+C4_KERNEL void flash_c4_decode(const  Compress4DecodeParams params) {
   using namespace device;
   using Trait = C4Trait<kHeadDim>;
 
@@ -222,7 +222,7 @@ C4_KERNEL void flash_c4_decode(const __grid_constant__ Compress4DecodeParams par
 }
 
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kUsePDL>
-C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
+C4_KERNEL void flash_c4_prefill(const  Compress4PrefillParams params) {
   using namespace device;
   using Trait = C4Trait<kHeadDim>;
 
@@ -251,7 +251,7 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
 }
 
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kUsePDL>
-WRITE_KERNEL void write_c4_prefill(const __grid_constant__ Compress4PrefillParams params) {
+WRITE_KERNEL void write_c4_prefill(const  Compress4PrefillParams params) {
   using namespace device;
   using Trait = C4Trait<kHeadDim>;
   using StorageIn = AlignedVector<InFloat, kTileElements>;

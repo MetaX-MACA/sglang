@@ -50,9 +50,13 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
 if is_cuda() or is_musa():
+    import flashinfer
+    from flashinfer import (
+        top_k_renorm_probs,
+        top_p_renorm_probs,
+    )
+    
     from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
         tree_speculative_sampling_target_only,
     )
 
@@ -416,13 +420,13 @@ class EagleVerifyInputV2Mixin:
             target_probs = F.softmax(
                 next_token_logits / expanded_temperature, dim=-1
             )  # (bs * num_draft_tokens, vocab_size)
-            target_probs = top_k_renorm_prob(
+            target_probs = top_k_renorm_probs(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
             )  # (bs * num_draft_tokens, vocab_size)
-            target_probs = top_p_renorm_prob(
+            target_probs = top_p_renorm_probs(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ps, self.draft_token_num, dim=0

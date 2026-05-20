@@ -63,15 +63,15 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 
-if _is_cuda:
-    from sgl_kernel import gptq_gemm, gptq_shuffle
+# if _is_cuda:
+#     from sgl_kernel import gptq_gemm, gptq_shuffle
 
-    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+#     from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
 
-_is_npu = is_npu()
+# _is_npu = is_npu()
 
-if _is_npu:
-    import torch_npu
+# if _is_npu:
+#     import torch_npu
 
 logger = logging.getLogger(__name__)
 ScalarType, scalar_types = get_scalar_types()
@@ -99,8 +99,8 @@ def gptq_marlin_moe_repack(
         device=b_q_weight.device,
         dtype=b_q_weight.dtype,
     )
-    for e in range(num_experts):
-        output[e] = gptq_marlin_repack(b_q_weight[e], perm[e], size_k, size_n, num_bits)
+    # for e in range(num_experts):
+    #     output[e] = gptq_marlin_repack(b_q_weight[e], perm[e], size_k, size_n, num_bits)
     return output
 
 
@@ -583,7 +583,7 @@ class GPTQLinearMethod(LinearMethodBase):
                 layer.g_idx.data = torch.empty(
                     (0,), dtype=torch.int, device=layer.g_idx.device
                 )
-            gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
+            # gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
 
     def apply(
         self,
@@ -594,15 +594,16 @@ class GPTQLinearMethod(LinearMethodBase):
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
-        output = gptq_gemm(
-            reshaped_x,
-            layer.qweight,
-            layer.qzeros,
-            layer.scales,
-            layer.g_idx,
-            self.use_shuffle,
-            self.quant_config.weight_bits,
-        )
+        # output = gptq_gemm(
+        #     reshaped_x,
+        #     layer.qweight,
+        #     layer.qzeros,
+        #     layer.scales,
+        #     layer.g_idx,
+        #     self.use_shuffle,
+        #     self.quant_config.weight_bits,
+        # )
+        output=None
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)
@@ -1063,13 +1064,13 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         def transform_w_q(x):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
-            x.data = gptq_marlin_repack(
-                x.data.contiguous(),
-                perm=layer.g_idx_sort_indices,
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                num_bits=c.weight_type.size_bits,
-            )
+            # x.data = gptq_marlin_repack(
+            #     x.data.contiguous(),
+            #     perm=layer.g_idx_sort_indices,
+            #     size_k=c.partition_weight_shape[0],
+            #     size_n=c.partition_weight_shape[1],
+            #     num_bits=c.weight_type.size_bits,
+            # )
             return x
 
         def transform_w_s(x):

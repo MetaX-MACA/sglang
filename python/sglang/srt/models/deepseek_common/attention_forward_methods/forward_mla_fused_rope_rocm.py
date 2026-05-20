@@ -12,12 +12,17 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
 )
 from sglang.srt.utils import BumpAllocator, get_bool_env_var
+from sgl_kernel import cutlass_scaled_batch_mm
+from sgl_kernel import scaled_int8_quant
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
-    from sgl_kernel import bmm_fp8
+    try:
+        from sgl_kernel import bmm_fp8 
+    except:
+        bmm_fp8 = None
 
 if _is_hip:
     from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
@@ -219,6 +224,9 @@ class DeepseekMLARocmForwardMixin:
                 self.w_scale,
                 torch.bfloat16,
             )
+        elif self.w_vc.dtype == torch.int8:
+            attn_output_quant_val, attn_output_quant_scale, _ = scaled_int8_quant(attn_output.transpose(0, 1).contiguous())
+            attn_bmm_output = cutlass_scaled_batch_mm(a = attn_output_quant_val, b = self.w_vc, scale_a = attn_output_quant_scale, scale_b = self.w_vc_scale, out_dtype = attn_output.dtype)
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)

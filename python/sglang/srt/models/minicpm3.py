@@ -43,7 +43,10 @@ from sglang.srt.utils import add_prefix, is_cuda
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 if is_cuda():
-    from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
+    try:
+        from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
+    except:
+        _raw_bmm_fp8 = None
 
     from sglang.srt.utils.custom_op import register_custom_op
 

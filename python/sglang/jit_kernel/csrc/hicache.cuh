@@ -141,7 +141,7 @@ template <
     uint32_t kBlockQuota,
     uint32_t kBlockSize,
     bool kIsMLA = false>
-SGL_HICACHE_KERNEL void hicache_transfer_per_layer(const __grid_constant__ HicacheKernelParams params) {
+SGL_HICACHE_KERNEL void hicache_transfer_per_layer(const  HicacheKernelParams params) {
   using namespace device;
   static_assert(kBlockSize % kWarpThreads == 0);
   static_assert(kWarpThreads % kUnroll == 0);
@@ -180,7 +180,7 @@ template <
     uint32_t kBlockQuota,
     uint32_t kBlockSize,
     bool kIsMLA = false>
-SGL_HICACHE_KERNEL void hicache_transfer_all_layer(const __grid_constant__ HicacheKernelParams params) {
+SGL_HICACHE_KERNEL void hicache_transfer_all_layer(const  HicacheKernelParams params) {
   using namespace device;
   using src_ptr_t = const void*;
   using dst_ptr_t = void*;

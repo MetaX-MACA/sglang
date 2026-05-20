@@ -51,7 +51,7 @@ enum class ForwardMode : bool {
 // Cache layout: 132 bytes/token (128 fp8 nope + 4 fp32 scale).
 // ----------------------------------------------------------------------------
 template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL>
-INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRopeStoreParams params) {
+INDEXER_KERNEL void fused_norm_rope_indexer(const  FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
 
@@ -207,7 +207,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
 // Cache layout: 584 bytes/token = 448 fp8 nope + 64 (=32 bf16x2) rope + 8 scale.
 // ----------------------------------------------------------------------------
 template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL>
-FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormRopeStoreParams params) {
+FLASHMLA_KERNEL void fused_norm_rope_flashmla(const  FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
 

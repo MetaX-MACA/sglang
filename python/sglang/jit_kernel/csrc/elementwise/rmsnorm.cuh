@@ -23,7 +23,7 @@ struct RMSNormParams {
 };
 
 template <int64_t kDim, bool kUsePDL, typename Float>
-__global__ void rmsnorm_cta(const RMSNormParams __grid_constant__ params) {
+__global__ void rmsnorm_cta(const RMSNormParams  params) {
   using namespace device;
   using Storage = norm::StorageType<Float, kDim>;
 
@@ -50,7 +50,7 @@ __global__ void rmsnorm_cta(const RMSNormParams __grid_constant__ params) {
 
 // Pre-Blackwell: 16B vector, each thread loads/stores twice
 template <int64_t kDim, bool kUsePDL, typename Float>
-__global__ __launch_bounds__(kDim / 16) void rmsnorm_cta_double(const RMSNormParams __grid_constant__ params) {
+__global__ __launch_bounds__(kDim / 16) void rmsnorm_cta_double(const RMSNormParams  params) {
   using namespace device;
   using Float2 = packed_t<Float>;
   using Storage = AlignedVector<Float2, 4>;
@@ -119,7 +119,7 @@ __global__ __launch_bounds__(kDim / 16) void rmsnorm_cta_double(const RMSNormPar
 
 // Blackwell: 32B vector, each thread loads/stores once
 template <int64_t kDim, bool kUsePDL, typename Float>
-__global__ __launch_bounds__(kDim / 16) void rmsnorm_cta_wide(const RMSNormParams __grid_constant__ params) {
+__global__ __launch_bounds__(kDim / 16) void rmsnorm_cta_wide(const RMSNormParams  params) {
   using namespace device;
   using Float2 = packed_t<Float>;
   using Storage = AlignedVector<Float2, 8>;
@@ -173,7 +173,7 @@ __global__ __launch_bounds__(kDim / 16) void rmsnorm_cta_wide(const RMSNormParam
 }
 
 template <int64_t kDim, bool kUsePDL, typename Float>
-__global__ void rmsnorm_warp(const RMSNormParams __grid_constant__ params) {
+__global__ void rmsnorm_warp(const RMSNormParams  params) {
   using namespace device;
   using Storage = norm::StorageType<Float, kDim>;
 

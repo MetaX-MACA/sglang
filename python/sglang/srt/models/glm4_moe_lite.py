@@ -80,8 +80,10 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cuda = is_cuda()
 _device_sm = get_device_sm()
 
-if _is_cuda:
-    from sgl_kernel import dsv3_router_gemm
+# if _is_cuda:
+#     from sgl_kernel import dsv3_router_gemm
+
+dsv3_router_gemm=None
 
 logger = logging.getLogger(__name__)
 

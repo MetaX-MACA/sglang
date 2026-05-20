@@ -99,8 +99,8 @@ if _use_aiter:
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
 
-if _is_cuda:
-    from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+# if _is_cuda:
+#     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
 
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
@@ -634,9 +634,9 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     q_input, x_scale = per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=True
     )
-    output = fp8_blockwise_scaled_mm(
-        q_input, weight.T, x_scale, weight_scale.T, out_dtype=input_2d.dtype
-    )
+    # output = fp8_blockwise_scaled_mm(
+    #     q_input, weight.T, x_scale, weight_scale.T, out_dtype=input_2d.dtype
+    # )
     if bias is not None:
         output += bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)
@@ -1540,23 +1540,23 @@ def apply_fp8_linear(
                         input_2d, group_size=input_2d.shape[1]
                     )
 
-    if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
-        cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
-        if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
-            # Massage the input to be 2D
-            qinput = qinput.view(-1, qinput.shape[-1])
-            output = triton_scaled_mm(
-                qinput, weight, x_scale, weight_scale, input.dtype, bias
-            )
-        else:
-            output = fp8_scaled_mm(
-                qinput,
-                weight,
-                x_scale,
-                weight_scale,
-                out_dtype=input.dtype,
-                bias=bias,
-            )
+    # if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
+    #     cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
+    #     if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
+    #         # Massage the input to be 2D
+    #         qinput = qinput.view(-1, qinput.shape[-1])
+    #         output = triton_scaled_mm(
+    #             qinput, weight, x_scale, weight_scale, input.dtype, bias
+    #         )
+    #     else:
+    #         output = fp8_scaled_mm(
+    #             qinput,
+    #             weight,
+    #             x_scale,
+    #             weight_scale,
+    #             out_dtype=input.dtype,
+    #             bias=bias,
+    #         )
         return output.view(*output_shape)
 
     # torch.scaled_mm supports per tensor weights + activations only

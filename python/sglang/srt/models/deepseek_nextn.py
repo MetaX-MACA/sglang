@@ -18,6 +18,7 @@ import logging
 import os
 from typing import Iterable, Optional, Tuple
 
+import os
 import torch
 from safetensors.torch import load_file
 from torch import nn
@@ -254,6 +255,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()
         self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
+        self.enable_dequant_bf16 = True if os.getenv("MX_ENABLE_DEQUANT_BF16") else False
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:

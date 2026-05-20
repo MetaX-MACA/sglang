@@ -19,7 +19,7 @@
 """Inference-only DeepseekV2 model."""
 
 from __future__ import annotations
-
+import os
 import logging
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -185,10 +185,10 @@ if _use_aiter_gfx95:
 if _use_aiter:
     pass
 
-if _is_cuda:
-    from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
-    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
-elif _is_npu:
+# if _is_cuda:
+    # from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
+    # from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+if False:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
         forward_dsa_prepare_npu,
@@ -395,37 +395,37 @@ class MoEGate(nn.Module):
             logits = F.linear(hidden_states, self.weight, None)
         else:
             # NOTE: For some unknown reason, router_gemm seems degrade accept length.
-            if (
-                _is_cuda
-                and hidden_states.shape[0] <= 16
-                and hidden_states.shape[1] == 7168
-                and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
-                and _device_sm >= 90
-            ):
-                if _device_sm in [100, 103] and self.weight.shape[0] == 256:
-                    # router gemm output float32
-                    logits = torch.empty(
-                        hidden_states.shape[0],
-                        self.weight.shape[0],
-                        device=hidden_states.device,
-                        dtype=torch.float32,
-                    )
-                    flashinfer_dsv3_router_gemm(logits, hidden_states, self.weight)
-                else:
-                    logits = dsv3_router_gemm(
-                        hidden_states, self.weight, out_dtype=torch.float32
-                    )
+            # if (
+            #     _is_cuda
+            #     and hidden_states.shape[0] <= 16
+            #     and hidden_states.shape[1] == 7168
+            #     and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
+            #     and _device_sm >= 90
+            # ):
+            #     if _device_sm in [100, 103] and self.weight.shape[0] == 256:
+            #         # router gemm output float32
+            #         logits = torch.empty(
+            #             hidden_states.shape[0],
+            #             self.weight.shape[0],
+            #             device=hidden_states.device,
+            #             dtype=torch.float32,
+            #         )
+            #         flashinfer_dsv3_router_gemm(logits, hidden_states, self.weight)
+            #     else:
+            #         logits = dsv3_router_gemm(
+            #             hidden_states, self.weight, out_dtype=torch.float32
+            #         )
 
-            elif _use_aiter:
-                logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
+            # elif _use_aiter:
+            #     logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
+            # else:
+            if self.is_deepseek_v4:
+                from sglang.jit_kernel.deepseek_v4 import linear_bf16_fp32
+
+                logits = linear_bf16_fp32(hidden_states, self.weight)
             else:
-                if self.is_deepseek_v4:
-                    from sglang.jit_kernel.deepseek_v4 import linear_bf16_fp32
-
-                    logits = linear_bf16_fp32(hidden_states, self.weight)
-                else:
-                    # After testing, we may use the faster code in `if deepseek v4` branch
-                    logits = F.linear(hidden_states, self.weight, None)
+                # After testing, we may use the faster code in `if deepseek v4` branch
+                logits = F.linear(hidden_states, self.weight, None)
 
         return logits
 
@@ -447,7 +447,7 @@ class DeepseekV2MoE(nn.Module):
         self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-
+        self.is_deepseek_v4 = is_deepseek_v4
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
@@ -902,14 +902,17 @@ class DeepseekV2MoE(nn.Module):
             shared_output = self._forward_shared_experts(
                 hidden_states, gemm_output_zero_allocator
             )
+        if self.is_deepseek_v4:
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
+                self.routed_scaling_factor,
+            )
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
-        )
-
+        if shared_output is not None:
+            final_hidden_states+=shared_output
+        
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
             use_reduce_scatter=use_reduce_scatter,
@@ -1514,6 +1517,9 @@ class DeepseekV2AttentionMLA(
         self.w_kc = None
         self.w_vc = None
         self.w_scale = 1.0
+        
+        self.w_kc_scale = None
+        self.w_vc_scale = None
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -1530,16 +1536,17 @@ class DeepseekV2AttentionMLA(
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
             in {"awq", "awq_marlin", "moe_wna16"}
         )
-        self.use_min_latency_fused_a_gemm = (
-            self.has_fused_proj
-            and not self.is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
-            and _is_cuda
-            and 90 <= _device_sm < 120
-        )
+        # self.use_min_latency_fused_a_gemm = (
+        #     self.has_fused_proj
+        #     and not self.is_packed_weight
+        #     and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
+        #     and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
+        #     and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
+        #     and _is_cuda
+        #     and 90 <= _device_sm < 120
+        # )
 
+        self.use_min_latency_fused_a_gemm = False        
         self.init_mha_forward()
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
@@ -2360,6 +2367,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self.enable_dequant_bf16 = True if os.getenv("MX_ENABLE_DEQUANT_BF16") else False      
         self.determine_num_fused_shared_experts()
         self.use_nsa = is_deepseek_nsa(config)
         self.model = DeepseekV2Model(
@@ -2561,22 +2569,22 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
 
-@register_custom_op(
-    op_name="flashinfer_dsv3_router_gemm",
-    mutates_args=[],
-    fake_impl=lambda logits, hidden_states, weight: None,
-)
-def flashinfer_dsv3_router_gemm(
-    logits: torch.Tensor,
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-) -> None:
-    _raw_dsv3_router_gemm(
-        hidden_states,
-        weight.t(),
-        logits,
-        launch_with_pdl=True,
-    )
+# @register_custom_op(
+#     op_name="flashinfer_dsv3_router_gemm",
+#     mutates_args=[],
+#     fake_impl=lambda logits, hidden_states, weight: None,
+# )
+# def flashinfer_dsv3_router_gemm(
+#     logits: torch.Tensor,
+#     hidden_states: torch.Tensor,
+#     weight: torch.Tensor,
+# ) -> None:
+#     _raw_dsv3_router_gemm(
+#         hidden_states,
+#         weight.t(),
+#         logits,
+#         launch_with_pdl=True,
+#     )
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]

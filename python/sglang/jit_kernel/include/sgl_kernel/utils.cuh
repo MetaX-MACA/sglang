@@ -32,8 +32,8 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-#ifndef __grid_constant__
-#define __grid_constant__
+#ifndef  
+#define  
 #endif
 using cudaError_t = hipError_t;
 using cudaStream_t = hipStream_t;

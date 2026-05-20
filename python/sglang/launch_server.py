@@ -11,6 +11,12 @@ from sglang.srt.utils.common import suppress_noisy_warnings
 
 suppress_noisy_warnings()
 
+from pathlib import Path
+import shutil
+cucc_dir = Path(r"/opt/maca/tools/cu-bridge/bin/cucc")
+nvcc_dir = Path(r"/opt/maca/tools/cu-bridge/bin/nvcc")
+if not nvcc_dir.exists():
+    shutil.copy(cucc_dir, nvcc_dir)
 
 def run_server(server_args):
     """Run the server based on server_args.grpc_mode and server_args.encoder_only."""
