@@ -378,6 +378,13 @@ class Scheduler(
         self.priority_scheduling_preemption_threshold = (
             server_args.priority_scheduling_preemption_threshold
         )
+        
+        # if self.tp_rank == 0:
+        #     import debugpy
+        #     debugpy.connect(5678)
+        #     debugpy.wait_for_client()
+        #     #debugpy.breakpoint()
+            
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch

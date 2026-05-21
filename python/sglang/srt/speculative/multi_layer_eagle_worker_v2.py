@@ -545,8 +545,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             ret_topk_index_list.append(ret_topk_index)
 
         # Update req_to_hidden_states_pool for KV Cache reversion
-        if (
-            forward_batch.extend_seq_lens is not None
+        if (can_cuda_graph
+            and forward_batch.extend_seq_lens is not None
             and self.cuda_graph_runner_for_draft_extend is not None
         ):
             if can_cuda_graph:
@@ -724,6 +724,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
+        verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
