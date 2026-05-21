@@ -308,6 +308,7 @@ class FusedMoE(torch.nn.Module):
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
 
+        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
         self.should_fuse_routed_scaling_factor_in_topk = (
             isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
             or (
@@ -1078,10 +1079,11 @@ class FusedMoE(torch.nn.Module):
         ):
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
-            # TODO: should we add some conditions here?
-            final_hidden_states = final_hidden_states[
-                ..., :origin_hidden_states_dim
-            ].contiguous()
+            if not self.use_fused_quant:
+                # TODO: should we add some conditions here?
+                final_hidden_states = final_hidden_states[
+                    ..., :origin_hidden_states_dim
+                ].contiguous()
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

@@ -561,7 +561,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
         capture_bs += [num_max_requests]
 
     sum_len_bs = []
-    if server_args.speculative_algorithm is None:
+    if server_args.speculative_algorithm is None and get_moe_a2a_backend().is_none():
         sum_len_bs = [bs for bs in capture_bs if (bs < 10 and bs % mul_base != 0)]
         
 

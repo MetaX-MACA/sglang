@@ -4146,3 +4146,7 @@ def export_json_on_rank0(data:Dict[str, Any]):
     if(result is not None):
         with open(sglang_sys_json_file, 'w') as json_file:
             json.dump(result, json_file, indent=4, default=sanitize)
+
+def align_packed_tensor_size(k, align_size: int=256):
+    valid_size = k // 2 + 2
+    return math.ceil(valid_size / align_size) * align_size

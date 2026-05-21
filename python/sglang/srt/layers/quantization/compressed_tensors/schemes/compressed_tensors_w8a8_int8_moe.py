@@ -14,6 +14,8 @@ from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
+from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeCompressedInfo
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.utils import set_weight_attrs,use_intel_amx_backend
 
 if TYPE_CHECKING:
@@ -221,7 +223,11 @@ class CompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_deep_gemm():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        else:
+            self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
     def apply(
         self,
@@ -231,11 +237,11 @@ class CompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
+            topk_output = dispatch_output.topk_output
             topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
                 self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
@@ -258,16 +264,28 @@ class CompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             )
             return StandardCombineInput(hidden_states=output)
 
-        quant_info = TritonMoeQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            use_int8_w8a8=True,
-            per_channel_quant=True,
-            w13_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a13_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-        )
+        if self.runner.runner_backend.is_deep_gemm():
+            quant_info = DeepGemmMoeCompressedInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_int8_w8a8=True,
+                per_channel_quant=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
+        else:
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_int8_w8a8=True,
+                per_channel_quant=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
         return self.runner.run(dispatch_output, quant_info)
     
 

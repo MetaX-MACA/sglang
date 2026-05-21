@@ -316,14 +316,17 @@ class _SinglePassGatherer(ABC):
                 raise NotImplementedError
 
         if server_args.moe_a2a_backend != "none":
-            if server_args.deepep_mode == "normal":
-                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
-            elif server_args.deepep_mode == "low_latency":
-                return _DeepepLowLatencySinglePassGatherer(
-                    expert_location_metadata, rank
-                )
-            else:
-                raise NotImplementedError
+            return _DeepepLowLatencySinglePassGatherer(
+                expert_location_metadata, rank
+            )
+            # if server_args.deepep_mode == "normal":
+            #     return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
+            # elif server_args.deepep_mode == "low_latency":
+            #     return _DeepepLowLatencySinglePassGatherer(
+            #         expert_location_metadata, rank
+            #     )
+            # else:
+            #     raise NotImplementedError
 
         return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
 

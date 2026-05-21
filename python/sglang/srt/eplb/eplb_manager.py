@@ -6,6 +6,7 @@ import torch.cuda
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -53,6 +54,9 @@ class EPLBManager:
             yield from self.rebalance()
 
     def rebalance(self):
+        if get_bool_env_var("SGLANG_STATIC_EPLB"):
+            logger.info("[EPLBManager] rebalance skip for ENV:[SGLANG_STATIC_EPLB] on")
+            return
         logger.info("[EPLBManager] rebalance start")
 
         enable_timing = self._rebalance_layers_per_chunk is None
