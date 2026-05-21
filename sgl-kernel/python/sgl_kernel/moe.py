@@ -250,6 +250,29 @@ def apply_shuffle_mul_sum(
         input, output, permutation, factors
     )
 
+def cutlass_moe_mm_gemm_kernel_m_w8a8(num_valid_tokens: int, N: int, K: int, group: int) -> int:
+    return torch.ops.sgl_kernel.cutlass_moe_mm_gemm_kernel_m_w8a8.default(num_valid_tokens, N, K, group)
+
+def cutlass_moe_mm_w8a8(a: torch.Tensor,
+                        b: torch.Tensor,
+                        c: torch.Tensor,
+                        a_scales: torch.Tensor,
+                        b_scales: torch.Tensor,
+                        moe_weight: torch.Tensor,
+                        token_ids:  torch.Tensor,
+                        expert_ids: torch.Tensor,
+                        num_tokens_post_padded: torch.Tensor,
+                        N: int,
+                        K: int,
+                        EM: int,
+                        num_valid_tokens: int,
+                        topk: int,
+                        mul_routed_weight: bool
+                        ) -> torch.Tensor:
+
+    return torch.ops.sgl_kernel.cutlass_moe_mm_w8a8.default(a, b, c, a_scales, b_scales,
+                        moe_weight, token_ids, expert_ids, num_tokens_post_padded,
+                        N, K, EM, num_valid_tokens, topk, mul_routed_weight)
 
 def fused_qk_norm_rope(
     qkv: torch.Tensor,
@@ -286,4 +309,29 @@ def fused_qk_norm_rope(
         high,
         attention_factor,
         rotary_dim if rotary_dim is not None else head_dim,
+    )
+
+def fused_moe_gate_opt(
+    gating_outputs: torch.Tensor,
+    correction_bias: torch.Tensor,
+    out_routing_weights: torch.Tensor,
+    out_selected_experts: torch.Tensor,
+    topk: int = None,
+    renormalize: bool = None,
+    num_expert_group: int = None,
+    topk_group: int = None,
+    num_shared_experts: Optional[int] = None,
+    scale_factor: Optional[float] = None,
+) -> int :
+    return torch.ops.sgl_kernel.fused_moe_gate_opt.default(
+        gating_outputs,
+        correction_bias,
+        out_routing_weights,
+        out_selected_experts,
+        topk,
+        renormalize,
+        num_expert_group,
+        topk_group,
+        num_shared_experts,
+        scale_factor
     )

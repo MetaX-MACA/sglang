@@ -37,6 +37,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "dynamic_scaled_int8_quant(Tensor! result, Tensor input, Tensor! scale, "
       "Tensor!? azp) -> ()");
   m.impl("dynamic_scaled_int8_quant", torch::kCUDA, &dynamic_scaled_int8_quant);
+
+  m.def("fused_moe_gate_opt(Tensor gating_outputs, Tensor correction_bias, Tensor! out_routing_weights, Tensor! out_selected_experts, "
+        "int topk, bool renormalize, int num_expert_group, int topk_group, int? num_fused_shared_experts, float? routed_scaling_factor ) -> int");
+  m.impl("fused_moe_gate_opt", torch::kCUDA, &fused_moe_gate_opt);
+
   /*
    * From csrc/allreduce
    */
@@ -239,6 +244,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool is_neox, Tensor position_ids, float factor, float low, float high, float attention_factor, int rotary_dim) "
       "-> ()");
   m.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
+
+  m.def("cutlass_moe_mm_gemm_kernel_m_w8a8(int num_valid_tokens, int N, int K, int group) -> int");
+  m.impl("cutlass_moe_mm_gemm_kernel_m_w8a8", &cutlass_moe_mm_gemm_kernel_m_w8a8);
+
+  m.def("cutlass_moe_mm_w8a8(Tensor a, Tensor b, Tensor c, Tensor a_scales, Tensor b_scales, Tensor moe_weight,"
+                            "Tensor token_ids, Tensor expert_ids, Tensor num_tokens_post_padded,"
+                            "int N, int K, int EM, int num_valid_tokens, int topk, bool mul_routed_weight) -> ()");
+  m.impl("cutlass_moe_mm_w8a8", torch::kCUDA, &cutlass_moe_mm_w8a8);
 
   /*
    * From csrc/moe/cutlass_moe/w4a8

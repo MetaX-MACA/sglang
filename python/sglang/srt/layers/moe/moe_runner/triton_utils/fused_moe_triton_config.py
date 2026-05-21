@@ -4,6 +4,7 @@ import functools
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -25,6 +26,10 @@ def get_config_file_name(
     down_moe: bool = False,
 ) -> str:
     device_name = get_device_name().replace(" ", "_")
+    
+    if re.match(r'^MetaX_C5(00|50)$', device_name):
+        device_name = "Device_4000"
+    
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
         "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
