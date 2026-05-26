@@ -16,9 +16,10 @@ from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
-if ENABLE_JIT_DEEPGEMM:
-    import deep_gemm
-    from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
+#if ENABLE_JIT_DEEPGEMM:
+#    import deep_gemm
+#    from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
+import deep_gemm
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
@@ -212,11 +213,12 @@ def configure_deep_gemm_num_sms(num_sms):
         yield
     else:
         original_num_sms = deep_gemm.get_num_sms()
-        deep_gemm.set_num_sms(num_sms)
+        #deep_gemm.set_num_sms(num_sms)
         try:
             yield
         finally:
-            deep_gemm.set_num_sms(original_num_sms)
+            #deep_gemm.set_num_sms(original_num_sms)
+            a = 3
 
 
 def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):

@@ -194,3 +194,126 @@ def get_valid_kv_indices(
         bs,
         topk,
     )
+
+
+
+#  Triton kernel int8
+@triton.jit
+def _act_quant_int8_kernel(
+    X_ptr, Y_ptr, S_ptr,
+    M, N,
+    group_size: tl.constexpr,
+    round_scale:tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Triton kernel for activation quantization.
+
+    Each block processes BLOCK_M rows and group_size columns.
+    """
+    # Get block IDs
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    int8_min = -128
+    int8_max = 127
+    int8_max_inv = 1.0 / int8_max
+
+    row_start = pid_m * BLOCK_M
+    col_start = pid_n * group_size
+
+    rows = row_start + tl.arange(0, BLOCK_M)
+    cols = col_start + tl.arange(0, BLOCK_N)
+
+    # mask = (rows < M)[:, None] & (cols < N)[None, :]
+    row_mask = rows < M
+    col_mask = cols < N
+    mask = row_mask[:, None] & col_mask[None, :]
+
+    x_ptrs = X_ptr + rows[:, None] * N + cols[None, :]
+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)  # [BLOCK_M]
+
+    # scale▒~HINT8 not need pow2▒~Lbut still stay round_scale api)
+    if round_scale:
+        log_val = tl.log2(amax * int8_max_inv)
+        log_ceil = tl.ceil(log_val)
+        scale = tl.exp2(log_ceil)
+    else:
+        scale = amax * int8_max_inv
+    # scale = amax * int8_max_inv
+
+    scale_broadcast = scale[:,None]
+
+    # Quantize: y = clamp(x / scale, int8_min, int8_max)
+    y = x / scale_broadcast
+    # y = tl.round(tl.clamp(y, min=-128, max=127))
+    y = tl.where(y >= 0, tl.floor(y + 0.5), tl.ceil(y - 0.5))
+    y = tl.minimum(tl.maximum(y, int8_min), int8_max)
+    y_int8 = y.to(tl.int8)
+
+    y_ptrs = Y_ptr + rows[:, None] * N + cols[None, :]
+    tl.store(y_ptrs, y_int8, mask=mask)
+
+    s_ptrs = S_ptr + rows * (N // group_size) + pid_n
+    tl.store(s_ptrs, scale, mask=rows < M)
+
+
+#launch
+def act_quant_int8(
+    x: torch.Tensor,
+    block_size: int = 128,
+    scale_fmt: Optional[str] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantizes the input tensor `x` using block-wise quantization with Triton.
+
+    Args:
+        x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
+        block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
+        scale_fmt (Optional[str], optional): The format of the scale. Default is None.
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            - The quantized tensor with dtype `torch.int8`.
+            - A tensor of scaling factors with dtype `torch.float32`.
+    """
+
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    # assert x.size(-1) % block_size == 0
+    assert (
+        x.size(-1) % block_size == 0
+    ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
+
+    N = x.size(-1)
+    x_flat = x.view(-1, N)
+    M = x_flat.size(0)
+
+    y = torch.empty_like(x_flat, dtype=torch.int8)
+    y_flat = y.view(-1, N)
+    # scale shape
+    # s = torch.empty((*x.size()[:-1], N // block_size), dtype=torch.float32, device=x.device)
+    s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
+    s_flat = s.view(-1, N // block_size)
+
+    BLOCK_M = 32
+    BLOCK_N = block_size
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    round_scale = scale_fmt is not None
+
+    _act_quant_int8_kernel[grid](
+        X_ptr=x_flat,
+        Y_ptr=y_flat,
+        S_ptr=s_flat,
+        M=M, N=N,
+        group_size=block_size,
+        round_scale=scale_fmt is not None,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=block_size,
+        num_stages=0 if round_scale else 2,
+    )
+
+    y = y.view(*x.shape)
+    s = s.view(*x.shape[:-1], N // block_size)
+    return y, s
