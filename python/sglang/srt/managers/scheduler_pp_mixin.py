@@ -662,7 +662,11 @@ class SchedulerPPMixin:
                     global_num_tokens[dp_rank] = current_seq_len
                     batch.global_num_tokens = global_num_tokens
                     batch.global_num_tokens_for_logprob = global_num_tokens
-
+                else:
+                    global_num_tokens = [current_seq_len]
+                    batch.global_num_tokens = global_num_tokens
+                    batch.global_num_tokens_for_logprob = global_num_tokens
+                    
                 hs = (
                     getattr(model_config, "hc_hidden_size", None)
                     or model_config.hidden_size
