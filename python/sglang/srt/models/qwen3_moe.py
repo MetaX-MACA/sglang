@@ -689,6 +689,11 @@ class Qwen3MoeAttention(nn.Module):
             enable_fused_set_kv_buffer(forward_batch)
             and self.compatible_with_fused_kv_buffer
         )
+        # When fused qk-norm-rope is disabled at runtime, the fused path never
+        # writes KV, so we cannot rely on it as the fallback writer. Force the
+        # backend to perform set_kv_buffer in that case.
+        if not self.use_fused_qk_norm_rope:
+            save_kv_cache = True
         attn_output = self.attn(
             q,
             k,
