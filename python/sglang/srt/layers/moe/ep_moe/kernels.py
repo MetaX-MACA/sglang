@@ -6,6 +6,7 @@ import triton
 from sglang.srt.utils import ceil_div, is_cuda, is_musa
 from sgl_kernel import scaled_int8_quant
 from typing import Optional, List
+from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 logger = logging.getLogger(__name__)
 
 import os

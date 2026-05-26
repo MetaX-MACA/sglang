@@ -720,35 +720,35 @@ class DeepseekV2MoE(nn.Module):
         if not self._enable_a2a_moe:
             bs = hidden_states[0].shape[0] if isinstance(hidden_states, tuple) \
                 else hidden_states.shape[0]
-            if (
-                self.alt_stream is not None
-                and self.num_fused_shared_experts == 0
-                and bs > 0
-                and get_is_capture_mode()
-                and not (
-                    get_global_server_args().enable_torch_compile
-                    and hidden_states.shape[0]
-                    <= get_global_server_args().torch_compile_max_bs
-                    * (get_global_server_args().speculative_num_draft_tokens or 1)
-                )
-            ):
-                return self.forward_normal_dual_stream(
-                    hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
-                    gemm_output_zero_allocator,
-                    input_ids,
-                    input_ids_global=input_ids_global,
-                )
-            else:
-                return self.forward_normal(
-                    hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
-                    gemm_output_zero_allocator,
-                    input_ids,
-                    input_ids_global=input_ids_global,
-                )
+            # if (
+            #     self.alt_stream is not None
+            #     and self.num_fused_shared_experts == 0
+            #     and bs > 0
+            #     and get_is_capture_mode()
+            #     and not (
+            #         get_global_server_args().enable_torch_compile
+            #         and hidden_states.shape[0]
+            #         <= get_global_server_args().torch_compile_max_bs
+            #         * (get_global_server_args().speculative_num_draft_tokens or 1)
+            #     )
+            # ):
+            #     return self.forward_normal_dual_stream(
+            #         hidden_states,
+            #         should_allreduce_fusion,
+            #         use_reduce_scatter,
+            #         gemm_output_zero_allocator,
+            #         input_ids,
+            #         input_ids_global=input_ids_global,
+            #     )
+            # else:
+            return self.forward_normal(
+                hidden_states,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+                input_ids,
+                input_ids_global=input_ids_global,
+            )
         else:
             return self.forward_deepep(
                 hidden_states, forward_batch, input_ids_global=input_ids_global
