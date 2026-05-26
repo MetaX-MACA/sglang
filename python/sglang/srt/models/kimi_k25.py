@@ -16,6 +16,7 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
+from sglang.srt.layers.communicator import get_attn_tp_context
 
 try:
     from transformers.activations import PytorchGELUTanh
@@ -729,16 +730,17 @@ class KimiK25ForConditionalGeneration(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            language_model=self.language_model,
-            data_embedding_funcs={
-                Modality.IMAGE: self.get_image_feature,
-            },
-            positions=positions,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            hidden_states = general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self.language_model,
+                data_embedding_funcs={
+                    Modality.IMAGE: self.get_image_feature,
+                },
+                positions=positions,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
 
         return hidden_states
 
