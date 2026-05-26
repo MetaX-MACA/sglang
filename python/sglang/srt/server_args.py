@@ -3490,6 +3490,8 @@ class ServerArgs:
                 if not user_set_decode:
                     self.dsa_decode_backend = "fa3"
 
+        self.dsa_prefill_backend = "flashmla_sparse"
+        self.dsa_decode_backend = "flashmla_kv"
         logger.warning(
             f"Set DSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend}."
         )

@@ -389,6 +389,13 @@ class Scheduler(
         # Init model configs
         self.init_model_config()
 
+
+        # if tp_rank == 0:
+        #     import debugpy
+        #     debugpy.connect(5678)
+        #     debugpy.wait_for_client()
+        #     #debugpy.breakpoint()
+        
         # Init metrics stats
         self.metrics_collector_context = SchedulerMetricsCollector.init_new(
             server_args=self.server_args,
