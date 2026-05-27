@@ -36,7 +36,7 @@ class RandomDataset(BaseDataset):
             num_requests=args.num_prompts,
             range_ratio=args.random_range_ratio,
             dataset_path=args.dataset_path,
-            repeat_num=args.random_repeat_num,
+            repeat_num=getattr(args, "random_repeat_num", None),
             return_text=not getattr(args, "tokenize_prompt", False),
             random_sample=(args.dataset_name == "random"),
         )
