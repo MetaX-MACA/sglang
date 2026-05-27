@@ -36,7 +36,10 @@ _is_xpu = current_platform.is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda or _is_xpu:
-    from sgl_kernel import fused_add_rmsnorm, rmsnorm
+    from sgl_kernel import fused_add_rmsnorm
+    from flashinfer import (
+        rmsnorm,
+    )
 
 if _is_npu:
     import torch_npu
@@ -445,35 +448,42 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
-            import warnings
+        # if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+        #     import warnings
 
-            warnings.warn(
-                "FusedScaleResidualNormScaleShift cuda not available, using native fallback",
-                stacklevel=2,
+        #     warnings.warn(
+        #         "FusedScaleResidualNormScaleShift cuda not available, using native fallback",
+        #         stacklevel=2,
+        #     )
+        #     return self.forward_native(residual, x, gate, shift, scale)
+
+        # from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+        #     fused_scale_residual_norm_scale_shift,
+        # )
+
+        # if isinstance(gate, int) and gate != 1:
+        #     raise ValueError(
+        #         f"Only gate value of 1 is supported for int type, but got {gate}"
+        #     )
+
+        # return fused_scale_residual_norm_scale_shift(
+        #     residual.contiguous(),
+        #     x.contiguous(),
+        #     gate.contiguous() if isinstance(gate, torch.Tensor) else None,
+        #     _ensure_contiguous(getattr(self.norm, "weight", None)),
+        #     _ensure_contiguous(getattr(self.norm, "bias", None)),
+        #     scale.contiguous(),
+        #     shift.contiguous(),
+        #     self.norm_type,
+        #     self.eps,
+        # )
+        return self.forward_native(
+                residual,
+                x,
+                gate,
+                shift,
+                scale,
             )
-            return self.forward_native(residual, x, gate, shift, scale)
-
-        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_scale_residual_norm_scale_shift,
-        )
-
-        if isinstance(gate, int) and gate != 1:
-            raise ValueError(
-                f"Only gate value of 1 is supported for int type, but got {gate}"
-            )
-
-        return fused_scale_residual_norm_scale_shift(
-            residual.contiguous(),
-            x.contiguous(),
-            gate.contiguous() if isinstance(gate, torch.Tensor) else None,
-            _ensure_contiguous(getattr(self.norm, "weight", None)),
-            _ensure_contiguous(getattr(self.norm, "bias", None)),
-            scale.contiguous(),
-            shift.contiguous(),
-            self.norm_type,
-            self.eps,
-        )
 
     def forward_hip(self, *args, **kwargs):
         # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
@@ -593,28 +603,29 @@ class _NormScaleShift(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
-            import warnings
+        # if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+        #     import warnings
 
-            warnings.warn(
-                "FusedNormScaleShift cuda not available, using native fallback",
-                stacklevel=2,
-            )
-            return self.forward_native(x, shift, scale)
+        #     warnings.warn(
+        #         "FusedNormScaleShift cuda not available, using native fallback",
+        #         stacklevel=2,
+        #     )
+        #     return self.forward_native(x, shift, scale)
 
-        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_norm_scale_shift,
-        )
+        # from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+        #     fused_norm_scale_shift,
+        # )
 
-        return fused_norm_scale_shift(
-            x.contiguous(),
-            _ensure_contiguous(getattr(self.norm, "weight", None)),
-            _ensure_contiguous(getattr(self.norm, "bias", None)),
-            scale.contiguous(),
-            shift.contiguous(),
-            self.norm_type,
-            self.eps,
-        )
+        # return fused_norm_scale_shift(
+        #     x.contiguous(),
+        #     _ensure_contiguous(getattr(self.norm, "weight", None)),
+        #     _ensure_contiguous(getattr(self.norm, "bias", None)),
+        #     scale.contiguous(),
+        #     shift.contiguous(),
+        #     self.norm_type,
+        #     self.eps,
+        # )
+        return self.forward_native(x,shift,scale)
 
     def forward_hip(self, *args, **kwargs):
         # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
@@ -920,19 +931,22 @@ def apply_rmsnorm_tanh_mul_add(
         return residual + torch.tanh(gate) * norm(x)
 
     if _is_cuda and x.is_cuda and x.shape[-1] % 256 == 0 and x.shape[-1] <= 8192:
-        from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
-            fused_norm_tanh_mul_add,
-        )
-
-        return fused_norm_tanh_mul_add(
-            x.contiguous(),
-            norm.weight.data.contiguous(),
-            None,
-            gate.contiguous(),
-            residual.contiguous(),
-            "rms",
-            norm.variance_epsilon,
-        )
+        try:
+            from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+                fused_norm_tanh_mul_add,
+            )
+            
+            return fused_norm_tanh_mul_add(
+                x.contiguous(),
+                norm.weight.data.contiguous(),
+                None,
+                gate.contiguous(),
+                residual.contiguous(),
+                "rms",
+                norm.variance_epsilon,
+            )
+        except ImportError:
+            pass
 
     return residual + torch.tanh(gate) * norm(x)
 

@@ -501,8 +501,8 @@ class TextEncodingStage(PipelineStage):
             }
             if attention_mask is not None:
                 encoder_forward_kwargs["attention_mask"] = attention_mask
-            if "use_cache" in inspect.signature(text_encoder.forward).parameters:
-                encoder_forward_kwargs["use_cache"] = False
+            # if "use_cache" in inspect.signature(text_encoder.forward).parameters:
+                # encoder_forward_kwargs["use_cache"] = False
             self._manage_text_encoder_use(i)
             outputs: BaseEncoderOutput = self._forward_text_encoder(
                 text_encoder, encoder_forward_kwargs

@@ -382,6 +382,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             prior_token_image_embed = self.vision_language_encoder.get_image_features(
                 inputs["pixel_values"], image_grid_thw[:-1]
             )
+            prior_token_image_embed = prior_token_image_embed.pooler_output if hasattr(prior_token_image_embed, "pooler_output") else prior_token_image_embed
             prior_token_image_embed = torch.cat(prior_token_image_embed, dim=0)
             prior_token_image_ids = self.vision_language_encoder.get_image_tokens(
                 prior_token_image_embed, image_grid_thw[:-1]

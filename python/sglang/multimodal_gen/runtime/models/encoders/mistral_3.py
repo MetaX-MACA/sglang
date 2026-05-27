@@ -432,6 +432,9 @@ class Mistral3ForConditionalGeneration(nn.Module):
             and current_platform.is_cuda()
             else nullcontext()
         )
+        
+        sdpa_context = nullcontext()
+        
         with sdpa_context:
             # FLUX.2 uses the text-only Mistral3 path but still expects the
             # same local SDPA kernel choice as the official HF implementation.
