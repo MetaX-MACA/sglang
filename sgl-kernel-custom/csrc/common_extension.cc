@@ -18,7 +18,7 @@ limitations under the License.
 
 #include "sgl_kernel_ops.h"
 
-TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+TORCH_LIBRARY_FRAGMENT(sgl_kernel_custom, m) {
 
 #if TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 6
   #define stride_tag at::Tag::needs_fixed_stride_order

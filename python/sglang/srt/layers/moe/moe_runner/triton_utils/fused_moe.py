@@ -40,7 +40,8 @@ from .fused_moe_triton_kernels import (
 )
 from .moe_align_block_size import moe_align_block_size
 from sgl_kernel import cutlass_moe_mm_gemm_kernel_m_w8a8
-from moe_fused_w4a16 import mctlass_moe_w4a16_gemm_kernel_mnk
+from mcoplib.sgl_moe_fused_w4a16 import mctlass_moe_w4a16_gemm_kernel_mnk
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -90,8 +91,8 @@ if not _is_cuda and not _is_hip and not _is_xpu:
         _has_vllm_ops = False
 
 padding_size = get_moe_padding_size(_use_aiter)
-enable_mctlass_fused_moe = (os.getenv("ENABLE_MCTLASS_FUSED_MOE", "0") == "1")
-enable_mctlass_fused_moe_python_api = (os.getenv("ENABLE_MCTLASS_FUSED_MOE_PYTHON_API", "0") == "1")
+enable_mctlass_fused_moe = (os.getenv("ENABLE_MCTLASS_FUSED_MOE", "1") == "1")
+enable_mctlass_fused_moe_python_api = (os.getenv("ENABLE_MCTLASS_FUSED_MOE_PYTHON_API", "1") == "1")
 enable_maca_sglang_fused_moe_mctlass_w4a16 = envs.ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16.get()
 
 if enable_mctlass_fused_moe_python_api:
