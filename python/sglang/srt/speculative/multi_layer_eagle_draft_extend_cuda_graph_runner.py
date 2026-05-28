@@ -755,3 +755,6 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
 
     def can_run(self, forward_batch):
         return self.runners[0].can_run(forward_batch)
+
+    def _prealloc_symmetric_memory_pool(self):
+        return

@@ -491,3 +491,6 @@ class EAGLEDraftCudaGraphRunner:
                 forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
 
         return out
+
+    def _prealloc_symmetric_memory_pool(self):
+        return

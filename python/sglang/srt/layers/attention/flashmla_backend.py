@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 import torch
 import triton
 from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
@@ -21,6 +22,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 PAGE_SIZE = 64
@@ -83,6 +87,17 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_num_splits = None
         self.cuda_graph_mla_metadata_view = None
         self.cuda_graph_num_splits_view = None
+
+        # get dcp info
+        try:
+            self.dcp_world_size = get_dcp_world_size()
+            self.dcp_rank = get_dcp_rank()
+        except Exception as e:
+            logger.error(
+                "dcp disabled or not initialized, dcp world size and rank will be set to 1 and 0"
+            )
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -421,6 +436,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         if self.is_fp8_kvcache:
+            assert (
+                self.dcp_world_size == 1
+            ), "FlashMLA does not support DCP for FP8 kv cache"
             if layer.k_scale is not None:
                 q_scale = layer.k_scale
                 descale_q = layer.k_scale.reshape(1)
@@ -454,7 +472,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
-            o, _ = flash_mla_with_kvcache(
+            # todo: need check all causal True or False?
+            o, lse = flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
@@ -466,7 +485,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 causal=True,
             )
 
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), lse
 
     def forward_extend(
         self,

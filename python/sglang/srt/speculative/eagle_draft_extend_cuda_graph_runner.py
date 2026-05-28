@@ -561,3 +561,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             out.topk_p = out_copy.topk_p[:unpadding_bs]
             out.topk_index = out_copy.topk_index[:unpadding_bs]
         return out
+
+    def _prealloc_symmetric_memory_pool(self):
+        return

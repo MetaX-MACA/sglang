@@ -50,6 +50,8 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
 from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
+
+from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
@@ -1743,6 +1745,13 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         assert not self.nsa_kv_cache_store_fp8
+
+        if get_dcp_world_size() > 1:
+            valid_mask = loc % get_dcp_world_size() == get_dcp_rank()
+            if not valid_mask.all():
+                loc = loc[valid_mask]
+                cache_k = cache_k[valid_mask]
+
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
