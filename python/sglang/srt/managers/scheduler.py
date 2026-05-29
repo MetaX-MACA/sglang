@@ -2590,7 +2590,7 @@ class Scheduler(
         need_mlp_sync = self.require_mlp_sync
         if (
             need_mlp_sync
-            and not self.spec_algorithm.is_none()
+            and (get_dcp_world_size() > 1 or not self.spec_algorithm.is_none())
             and not self.server_args.speculative_skip_dp_mlp_sync
         ):
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.

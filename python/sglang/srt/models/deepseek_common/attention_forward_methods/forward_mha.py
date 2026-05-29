@@ -239,7 +239,7 @@ class DeepseekMHAForwardMixin:
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
-                if get_dcp_world_size() > 1:
+                if get_dcp_world_size() > 1 and not self.is_nextn:
                     prefix_kv_a, prefix_k_pe = (
                         forward_batch.token_to_kv_pool.get_mla_kv_buffer(
                             self.attn_mqa, forward_batch.dcp_local_prefix_kv_indices
@@ -420,7 +420,7 @@ class DeepseekMHAForwardMixin:
                 kv_indices, q.dtype, forward_batch
             )
 
-            if get_dcp_world_size() > 1:
+            if get_dcp_world_size() > 1 and not self.is_nextn:
                 kv_a_normed = self._all_gather_dcp_kv_cache(kv_a_normed).contiguous()
                 k_pe = self._all_gather_dcp_kv_cache(k_pe).contiguous()
 
@@ -499,7 +499,7 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
-            if get_dcp_world_size() > 1:
+            if get_dcp_world_size() > 1 and not self.is_nextn:
                 kv_indices = (
                     kv_indices[kv_indices % get_dcp_world_size() == get_dcp_rank()]
                     // get_dcp_world_size()

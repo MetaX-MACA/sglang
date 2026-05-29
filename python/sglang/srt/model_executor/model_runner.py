@@ -3239,7 +3239,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Launch model forward
         if not skip_attn_backend_init:
             # prepare kv cache buffer for dcp to gather kv cache
-            if get_dcp_world_size() > 1:
+            # TODO (augusto.yjh) prepare for dcp, mtp model not use dcp, target verify beyond extend, but no need dcp init
+            if (get_dcp_world_size() > 1
+                and forward_batch.extend_prefix_lens_cpu
+                and any(forward_batch.extend_prefix_lens_cpu)
+                and not self.is_draft_worker
+                and not forward_batch.forward_mode.is_target_verify()):
                 update_dcp_forward_extend_info(
                     forward_batch, self.kv_cache_dtype, self.device
                 )
@@ -3310,6 +3315,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and forward_batch.seq_lens.numel() == 0
             and forward_batch.req_pool_indices.numel() == 0
             and forward_batch.input_ids.numel() > 0
+            and get_dcp_world_size() == 1
         )
         
     def forward_split_prefill(

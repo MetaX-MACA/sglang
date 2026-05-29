@@ -1746,7 +1746,8 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         assert not self.nsa_kv_cache_store_fp8
 
-        if get_dcp_world_size() > 1:
+        # mtp kvcache not use dcp
+        if get_dcp_world_size() > 1 and self.layer_num > 1:
             valid_mask = loc % get_dcp_world_size() == get_dcp_rank()
             if not valid_mask.all():
                 loc = loc[valid_mask]
@@ -1811,6 +1812,7 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope,
                 cache_k_rope,
+                is_nextn=(self.layer_num==1),
             )
 
     def get_mla_kv_buffer(

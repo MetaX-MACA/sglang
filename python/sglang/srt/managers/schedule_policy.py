@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.distributed import get_dcp_world_size
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -435,6 +436,8 @@ class PrefillAdder:
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
 
+        self.chunked_prefill_size = rem_chunk_tokens
+
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
         self.rem_total_token_offset = num_mixed_decode_tokens
@@ -802,6 +805,8 @@ class PrefillAdder:
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
+        elif get_dcp_world_size() > 1 and req.extend_input_len < self.chunked_prefill_size:
+            return AddReqResult.OTHER
         else:
             if self.rem_chunk_tokens <= 0 or has_chunked_req:
                 return AddReqResult.OTHER
@@ -930,6 +935,8 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                 )
+            elif get_dcp_world_size() > 1 and input_tokens < self.chunked_prefill_size:
+                return AddReqResult.OTHER
             else:
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size

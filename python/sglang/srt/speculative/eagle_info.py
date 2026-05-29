@@ -44,6 +44,9 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
+from sglang.srt.distributed import (
+    get_dcp_world_size,
+)
 from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
 
 if is_cuda() or is_musa():
@@ -497,7 +500,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 align_evict_mask_to_page_size[len(batch.seq_lens),](
                     batch.seq_lens,
                     evict_mask,
-                    page_size,
+                    page_size * get_dcp_world_size(), # main model kvcache pagesize * dp_world_size* get_dcp_world_size(), # main model kvcache pagesize * dp_world_size
                     self.draft_token_num,
                     next_power_of_2(self.draft_token_num),
                 )

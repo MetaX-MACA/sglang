@@ -877,7 +877,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.is_extend_in_batch, global_num_tokens
         )
         
-        if dp_padding_mode.is_max_len() and self.is_extend_in_batch and is_idle_in_batch:
+        if dp_padding_mode.is_max_len() and self.is_extend_in_batch and is_idle_in_batch and get_dcp_world_size() > 1:
             dp_padding_mode = DpPaddingMode.SUM_LEN
 
         self.dp_padding_mode = dp_padding_mode
@@ -1254,6 +1254,7 @@ def create_dcp_kv_indices(
     prefix_len = tl.load(extend_prefix_lens_ptr + pid)
     local_prefix_len = prefix_len // dcp_world_size
     prefix_start = tl.load(extend_cu_prefix_lens_ptr + pid) // dcp_world_size
+    extend_prefix_lens_sum = extend_prefix_lens_sum.to(tl.int32)
     kv_ind_start = tl.load(kv_indptr + pid)
     num_loop = tl.cdiv(prefix_len, BLOCK_SIZE)
     for i in range(num_loop):
@@ -1336,14 +1337,13 @@ def update_dcp_forward_extend_info(
     extend_cu_lens[1:] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
     extend_cu_lens = extend_cu_lens[:-1]
 
-    create_dcp_kv_indices[(len(forward_batch.seq_lens),)](
-        dcp_kv_indptr,
+    create_dcp_kv_indices[(len(forward_batch.seq_lens),)]( dcp_kv_indptr,
         forward_batch.extend_seq_lens,
         extend_cu_lens,
         forward_batch.extend_prefix_lens,
         extend_cu_prefix_lens,
         dcp_kv_indices,
-        extend_prefix_lens_sum,
+        int(extend_prefix_lens_sum),
         get_dcp_world_size(),
     )
     forward_batch.dcp_kv_indptr = dcp_kv_indptr
