@@ -249,7 +249,6 @@ class DeepEPBuffer:
             # TODO can be false when unneeded
             # allow_mnnvl=True,
         )
-        logger.error(f'## DeepEPBuffer {group.size()=} {num_nvl_bytes=} {num_rdma_bytes=} {num_qps_per_rank=} low_latency_mode={deepep_mode.enable_low_latency()}')
         return cls._buffer
 
     @classmethod
@@ -726,25 +725,25 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         use_nvfp4 = use_fp8 = False
         input_global_scale = None
-        # input_global_scale = self.quant_config.get("input_global_scale", None)
-        # bf16_dispatch = self.quant_config.get("bf16_dispatch", False)
-        # if input_global_scale is not None:
-        #     use_nvfp4 = True
-        # else:
-        #     backend = get_moe_runner_backend()
-        #     # BF16 dispatch is needed when:
-        #     #   - quant_config requests BF16 dispatch explicitly
-        #     #   - flashinfer_cutedsl: kernel quantizes to NVFP4 internally
-        #     #   - NPU with SGLANG_DEEPEP_BF16_DISPATCH: INT8 input + BF16 weight GMM not supported
-        #     #   - deep_gemm with SGLANG_DEEPEP_BF16_DISPATCH: user requests BF16 dispatch
-        #     need_bf16_dispatch = (
-        #         bf16_dispatch
-        #         or backend.is_flashinfer_cutedsl()
-        #         or (_is_npu and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
-        #         or (backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
-        #     )
-        #     if not need_bf16_dispatch:
-        #         use_fp8 = True
+        input_global_scale = self.quant_config.get("input_global_scale", None)
+        bf16_dispatch = self.quant_config.get("bf16_dispatch", False)
+        if input_global_scale is not None:
+            use_nvfp4 = True
+        else:
+            backend = get_moe_runner_backend()
+            # BF16 dispatch is needed when:
+            #   - quant_config requests BF16 dispatch explicitly
+            #   - flashinfer_cutedsl: kernel quantizes to NVFP4 internally
+            #   - NPU with SGLANG_DEEPEP_BF16_DISPATCH: INT8 input + BF16 weight GMM not supported
+            #   - deep_gemm with SGLANG_DEEPEP_BF16_DISPATCH: user requests BF16 dispatch
+            need_bf16_dispatch = (
+                bf16_dispatch
+                or backend.is_flashinfer_cutedsl()
+                or (_is_npu and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
+                or (backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
+            )
+            if not need_bf16_dispatch:
+                use_fp8 = True
 
         # # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
         # # to return int32-packed UE8M0 scales that don't feed the flashinfer
@@ -759,6 +758,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         #     if use_fp8
         #     else dict()
         # )
+        # fp8_deepgemm_scale_opts = dict()
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()

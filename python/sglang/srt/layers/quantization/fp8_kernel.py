@@ -116,7 +116,8 @@ logger = logging.getLogger(__name__)
 
 use_mcoplib = False
 try:
-    from  mcoplib.op import per_token_cast_to_fp8 as per_token_cast_to_fp8_opt
+    import mcoplib.sgl_kernel
+    # from  mcoplib.op import per_token_cast_to_fp8 as per_token_cast_to_fp8_opt
     use_mcoplib = True
 except:
     logger.warning("please pip install mcoplib")
@@ -518,29 +519,6 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     ), (x_amax / 448.0).view(m, -1)
 
 
-def per_token_cast_to_fp8_3d(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 3, f"Input tensor must be 3D, got shape {x.shape}"
-    
-    num_groups, m, n = x.shape
-    assert n % 128 == 0, f"Input size(2) must be divisible by 128, got {n}"
-    
-    quant_list = []
-    scale_list = []
-    
-    for x_group in x:
-        if use_mcoplib:
-            x_group_quant = torch.empty(m, n, dtype=torch.float8_e4m3fn, device='cuda')
-            x_group_scale = torch.empty(m,n//128, dtype=torch.float32, device='cuda')
-            per_token_cast_to_fp8_opt(x_group_quant, x_group_scale, x_group)
-        else:
-            x_group_quant, x_group_scale = per_token_cast_to_fp8(x_group)
-        scale_list.append(x_group_scale.unsqueeze(0))
-        quant_list.append(x_group_quant.unsqueeze(0))
-        
-    final_quant_tensor = torch.cat(quant_list, dim=0)
-    final_scales = torch.cat(scale_list, dim=0)
-    
-    return final_quant_tensor, final_scales
 
 def sglang_per_token_group_quant_fp8(
     x: torch.Tensor,
@@ -571,7 +549,8 @@ def sglang_per_token_group_quant_fp8(
     )
 
     if use_mcoplib:
-        per_token_cast_to_fp8_opt(x_q, x_s, x)
+        # per_token_cast_to_fp8_opt(x_q, x_s, x)
+        torch.ops.sgl_kernel.per_token_cast_to_fp8.default(x_q, x_s, x)
     else:
         x_q, x_s = per_token_cast_to_fp8(x)
 
