@@ -79,6 +79,7 @@ dependencies = [
   "cache-dit==1.1.9",
   "addict",
   "torchao==0.9.0",
+  "compressed-tensors==0.15.0.1",
 ]
 
 [[tool.uv.index]]
