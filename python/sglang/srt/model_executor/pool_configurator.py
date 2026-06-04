@@ -346,7 +346,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
-
+        self.kv_cache_dtype = mr.kv_cache_dtype
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative:
             # Reserve memory for the speculative draft worker by inflating
@@ -368,12 +368,20 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             logger.info("DSV4 compressed attention: online c128 enabled (ring_size=1)")
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        if self.kv_cache_dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        else:
+            assert self.kv_cache_dtype is torch.bfloat16
+            kv_bytes = (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
 
         quant_block_size = 128
-        indexer_bytes = (
-            self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
-        )
+        if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() in ["fp8", "int8"]:
+            indexer_bytes = (
+                self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
+            )
+        else:
+            indexer_bytes = self.indexer_head_dim * 2
+            raise NotImplementedError("index cache with bfloat16 is not implement yet")
 
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         state_dtype_size = 4

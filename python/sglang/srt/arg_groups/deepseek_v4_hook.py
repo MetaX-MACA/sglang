@@ -30,7 +30,7 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
             f"Setting KV cache dtype to {server_args.kv_cache_dtype} for {model_arch}."
         )
     assert server_args.kv_cache_dtype in [
-        "fp8_e4m3"
+        "fp8_e4m3", "bf16"
     ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
     if server_args.speculative_algorithm is not None:

@@ -307,10 +307,10 @@ def get_jit_cuda_arch() -> ArchInfo:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
-    if is_hip_runtime():
-        return False
-    return get_jit_cuda_arch().major >= 9
-
+    # if is_hip_runtime():
+    #     return False
+    # return get_jit_cuda_arch().major >= 9
+    return False
 
 def _find_package_root(package: str) -> Optional[pathlib.Path]:
     spec = importlib.util.find_spec(package)

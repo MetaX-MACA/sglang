@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16P
 from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
-from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.memory_pool import KVCache, get_tensor_size_bytes
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ceil_div
 
@@ -71,7 +71,10 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.scale_pad = 1
         self.quantize_block_size = 64
         self.rope_storage_dtype = torch.bfloat16
-        self.k_with_scale_buffer_dtype = torch.int8
+        if self.dtype is not torch.bfloat16:
+            self.k_with_scale_buffer_dtype = torch.int8
+        else:
+            self.k_with_scale_buffer_dtype = torch.bfloat16
         self._create_buffers()
 
     def _create_buffers(self):
@@ -89,25 +92,32 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
-        dim_per_token = (
-            self.qk_nope_head_dim
-            + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
-            + self.qk_nope_head_dim // self.quantize_block_size
-            + self.scale_pad
-        )
+        if self.dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+            dim_per_token = (
+                self.qk_nope_head_dim
+                + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
+                + self.qk_nope_head_dim // self.quantize_block_size
+                + self.scale_pad
+            )
+        else:
+            dim_per_token = (self.qk_nope_head_dim + self.qk_rope_head_dim)
+
         return dim_per_token
 
     def create_buffer(self, *, num_pages: int):
         bytes_per_token = self.get_bytes_per_token()
         self.kv_cache_total_dim = bytes_per_token
         bytes_per_page_non_padded = self.page_size * bytes_per_token
-        self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
+        if self.dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+            self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
 
-        assert bytes_per_token == 448 + 64 * 2 + 8, (
-            "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
-            "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
-        )
-        assert self.store_dtype == torch.uint8
+            assert bytes_per_token == 448 + 64 * 2 + 8, (
+                "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
+                "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+            )
+            assert self.store_dtype == torch.uint8
+        else:
+             self.bytes_per_page_padded = bytes_per_page_non_padded
 
         return torch.zeros(
             num_pages,
@@ -115,6 +125,11 @@ class DeepSeekV4SingleKVPool(KVCache):
             dtype=self.store_dtype,
             device=self.device,
         )
+    def get_kv_size_bytes(self):
+        kv_size_bytes = 0
+        for kv_cache in self.kv_buffer:
+            kv_size_bytes += get_tensor_size_bytes(kv_cache)
+        return kv_size_bytes
 
     def set_key_buffer(
         self,
@@ -135,13 +150,26 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        return fused_store_cache(
-            input=cache_k,
-            cache=self.kv_buffer[layer_id],
-            indices=loc,
-            page_size=self.page_size,
-            type="flashmla",
-        )
+
+        if cache_k.dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+            return fused_store_cache(       # only support fp8 now
+                input=cache_k,
+                cache=self.kv_buffer[layer_id],
+                indices=loc,
+                page_size=self.page_size,
+                type="flashmla",
+            )
+        else:
+            if cache_k.dtype != self.store_dtype: # state data have different dtype with stor_dtype
+                cache_k = cache_k.to(self.store_dtype)
+            dsv4_index_buf_accessor.SetK.execute(
+                pool=self,
+                buf=self.kv_buffer[layer_id],
+                loc=loc,
+                nope_fp8_rope_bf16_pack=cache_k,
+            )
+
+
 
     def get_key_buffer(self, layer_id: int):
         return self.kv_buffer[layer_id]
@@ -289,6 +317,12 @@ class DeepSeekV4IndexerPool(KVCache):
                     for _ in range(self.layer_num)
                 ]
 
+    def get_kv_size_bytes(self):
+        kv_size_bytes = 0
+        for kv_cache in self.index_k_with_scale_buffer:
+            kv_size_bytes += get_tensor_size_bytes(kv_cache)
+        return kv_size_bytes
+
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
 
@@ -333,7 +367,7 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        return fused_store_cache(
+        return fused_store_cache(   # quant_to_fp8 and store
             input=cache_k,
             cache=self.index_k_with_scale_buffer[layer_id - self.start_layer],
             indices=loc,
@@ -481,6 +515,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
         self.cached_loc = None
+
+    def get_kv_size_bytes(self):
+        return (self.swa_kv_pool.get_kv_size_bytes() 
+                + self.c4_kv_pool.get_kv_size_bytes() 
+                + self.c128_kv_pool.get_kv_size_bytes() 
+                + self.c4_indexer_kv_pool.get_kv_size_bytes()
+        )
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping

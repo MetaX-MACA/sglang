@@ -355,7 +355,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
             if ENABLE_PDL:
                 T.pdl_sync()
 
-            for pz in T.Pipelined(split_size // hidden_block, num_stages=2):
+            for pz in T.Pipelined(split_size // hidden_block, num_stages=1):
                 x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
                 fn_smem = T.alloc_shared((32, hidden_block), T.float32)
 
@@ -382,7 +382,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
                     out_frag,
                     transpose_A=False,
                     transpose_B=True,
-                    wg_wait=0,
+                    # wg_wait=0,
                     clear_accum=False,
                 )
 
@@ -701,7 +701,7 @@ def mhc_pre(
             n_splits, num_tokens, dtype=torch.float32, device=residual.device
         )
 
-        deep_gemm.tf32_hc_prenorm_gemm(
+        deep_gemm.tf32_hc_prenorm_gemm(                 #todo cause kernel-trap
             residual_flat.view(num_tokens, hc_hidden_size),
             fn_flat,
             gemm_out_mul,

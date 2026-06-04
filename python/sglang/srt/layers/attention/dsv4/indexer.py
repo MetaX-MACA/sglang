@@ -12,6 +12,7 @@ from sglang.jit_kernel.deepseek_v4 import (
     fused_q_indexer_rope_hadamard_quant,
     topk_transform_512,
     topk_transform_512_v2,
+    fused_rope
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
@@ -20,7 +21,7 @@ from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
-
+from sglang.srt.layers.attention.nsa.triton_kernel import act_quant_int8
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.attention.dsv4.compressor import (
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 
 
 if is_hip():
@@ -380,7 +382,10 @@ class C4IndexerBackendMixin:
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             fn = fp8_paged_mqa_logits_torch
         else:
-            from deep_gemm import fp8_paged_mqa_logits as fn
+            if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":
+                from deep_gemm import fp8_paged_mqa_logits as fn
+            else:
+                from deep_gemm import int8_paged_mqa_logits as fn
 
         _c4sl = indexer_metadata.c4_seq_lens
         if _c4sl.dim() == 1:
@@ -527,9 +532,24 @@ class C4Indexer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        return fused_q_indexer_rope_hadamard_quant(
-            q, weight, self.weight_scale, self.freqs_cis, positions
-        )
+        if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":
+            return fused_q_indexer_rope_hadamard_quant(
+                q, weight, self.weight_scale, self.freqs_cis, positions
+            )
+        elif envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "int8":
+            fused_rope(
+                q[..., -self.rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+                )
+            q = rotate_activation(q)
+            q_int8, q_scale = act_quant_int8(q)
+            weight_out = fused_scale(weight, self.weight_scale, q_scale)
+            return q_int8, weight_out
+        else:
+            assert envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "bf16"
+            raise NotImplementedError("index cache with bfloat16 is not implement yet")
 
     def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:
         out, _ = self.weights_proj(x)

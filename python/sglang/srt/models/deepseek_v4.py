@@ -505,8 +505,16 @@ class MQALayer(nn.Module):
                 forward_batch=forward_batch,
             )
         else:
-            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
-            kv = None
+            if attn_backend.token_to_kv_pool.dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+                self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
+                kv = None
+            else:
+                kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
+                )
 
         del qkv_a
 
@@ -548,7 +556,7 @@ class MQALayer(nn.Module):
 
         tp_slice, q_padded, q_out = slice(None), None, None
         if self.tp_size > 1:
-            q_padded = x.new_empty(x.shape[0], self.n_heads, self.head_dim)
+            q_padded = x.new_zeros(x.shape[0], self.n_heads, self.head_dim)
             rank = self.tp_rank
             tp_slice = slice(rank * self.n_local_heads, (rank + 1) * self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
@@ -639,14 +647,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
+            prefix=add_prefix("attn", prefix),
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
         self.mlp = deepseek_v2.DeepseekV2MoE(
             config=config,
             quant_config=moe_quant_config_override or quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
             layer_id=self.layer_id,
             alt_stream=alt_streams[0] if alt_streams is not None else None,
             is_nextn=is_nextn,
@@ -1603,8 +1611,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                             elif fuse_wqa_wkv and (
                                 name.endswith(".wq_a.weight")
                                 or name.endswith(".wq_a.weight_scale_inv")
+                                or name.endswith(".wq_a.weight_scale")
                                 or name.endswith(".wkv.weight")
                                 or name.endswith(".wkv.weight_scale_inv")
+                                or name.endswith(".wkv.weight_scale")
                             ):
                                 is_q = ".wq_a." in name
                                 param_name = name.replace(

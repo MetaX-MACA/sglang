@@ -13,7 +13,7 @@ namespace {
 
 constexpr uint32_t kTopK = 512;
 constexpr uint32_t kTopKBlockSize = 512;
-constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
+constexpr uint32_t kSMEM = 12 * 1024 * sizeof(uint32_t);  // 48KB (bytes)
 
 struct TopK512Params {
   const float* __restrict__ scores;

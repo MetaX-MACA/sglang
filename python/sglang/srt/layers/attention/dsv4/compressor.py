@@ -18,7 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+from sglang.srt.layers.attention.nsa.triton_kernel import act_quant, act_quant_int8
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.layernorm import RMSNorm
@@ -27,7 +27,7 @@ from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.utils import add_prefix
-
+from sglang.srt.environ import envs
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -156,23 +156,36 @@ class CompressorBackendMixin:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch)
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            token_to_kv_pool.set_index_k_fused(
-                layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
-                cache_k=new_compressed_kv,
-            )
-        else:
-            new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
-                new_compressed_kv
-            )
+        if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":
+            if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+                token_to_kv_pool.set_index_k_fused(
+                    layer_id=layer_id,
+                    loc=self.forward_metadata.core_metadata.c4_out_loc,
+                    cache_k=new_compressed_kv,
+                )
+            else:
+                new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
+                        new_compressed_kv
+                    )
+                token_to_kv_pool.set_index_k_scale_buffer(
+                    layer_id=layer_id,
+                    loc=self.forward_metadata.core_metadata.c4_out_loc,
+                    index_k=new_compressed_kv_fp8,
+                    index_k_scale=new_compressed_kv_scale,
+                )
+        elif envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "int8":
+            new_compressed_kv_int8, new_compressed_kv_scale = act_quant_int8(
+                        new_compressed_kv
+                    )
             token_to_kv_pool.set_index_k_scale_buffer(
-                layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
-                index_k=new_compressed_kv_fp8,
-                index_k_scale=new_compressed_kv_scale,
-            )
-
+                    layer_id=layer_id,
+                    loc=self.forward_metadata.core_metadata.c4_out_loc,
+                    index_k=new_compressed_kv_int8,
+                    index_k_scale=new_compressed_kv_scale,
+                )
+        else:
+            assert envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "bf16"
+            raise NotImplementedError("index cache with bfloat16 is not implement yet")
 
 def is_overlap_compress(compress_ratio: int) -> bool:
     return compress_ratio == 4

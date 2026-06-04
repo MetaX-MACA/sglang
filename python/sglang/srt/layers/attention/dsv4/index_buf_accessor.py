@@ -6,7 +6,7 @@ from typing import Any
 import torch
 import triton
 import triton.language as tl
-
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
@@ -74,7 +74,11 @@ def _set_k_and_s_triton(
     assert buf.dtype == torch.uint8
     assert loc.dtype in [torch.int64, torch.int32], f"{loc.dtype=}"
 
-    assert k_nope.dtype == fp8_dtype
+    if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":
+        assert k_nope.dtype == fp8_dtype
+    else:
+        assert k_nope.dtype == torch.int8
+        
     assert k_rope.dtype == torch.bfloat16
     assert scale_k_nope.dtype == torch.uint8, f"{scale_k_nope.dtype=}"
 
@@ -84,7 +88,10 @@ def _set_k_and_s_triton(
     assert k_rope.is_contiguous()
     assert scale_k_nope.is_contiguous()
 
-    buf_fp8 = buf.view(fp8_dtype)
+    if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":
+        buf_fp8 = buf.view(fp8_dtype)
+    else:
+        buf_fp8 = buf.view(torch.int8)
     buf_bf16 = buf.view(torch.bfloat16)
     buf_uint8 = buf.view(torch.uint8)
 
@@ -255,3 +262,117 @@ def _set_k_and_s_torch(
         buf_fp8[nope_offset[i] : nope_offset[i] + nope_dim] = k_nope[i]
         buf_bf16[rope_offset[i] : rope_offset[i] + rope_dim] = k_rope[i]
         buf_scale[s_offset[i] : s_offset[i] + scale_dim] = scale_k_nope[i]
+
+
+def _set_k_bf16_triton(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_size: int,
+):
+    num_pages, buf_numel_per_page = buf.shape
+    (num_tokens_to_write,) = loc.shape
+    num_tokens_to_write_k, nope_rope_dim = k_cache.shape
+
+    assert num_tokens_to_write == num_tokens_to_write_k, (
+        f"{num_tokens_to_write=} {num_tokens_to_write_k=}"
+    )
+    assert buf.dtype == torch.bfloat16
+    assert loc.dtype in [torch.int64, torch.int32], f"{loc.dtype=}"
+    assert k_cache.dtype == torch.bfloat16
+    assert buf.is_contiguous()
+    assert loc.is_contiguous()
+    assert k_cache.is_contiguous()
+
+    block_size = triton.next_power_of_2(nope_rope_dim)
+    _set_k_bf16_triton_kernel[(num_tokens_to_write,)](
+        buf,
+        loc,
+        k_cache,
+        k_cache.stride(0),
+        PAGE_SIZE=page_size,
+        BUF_NUMEL_PER_PAGE=buf_numel_per_page,
+        NOPE_ROPE_DIM=nope_rope_dim,
+        BLOCK_SIZE=block_size,
+    )
+
+
+@triton.jit
+def _set_k_bf16_triton_kernel(
+    buf_ptr,
+    loc_ptr,
+    k_cache_ptr,
+    k_cache_stride: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    NOPE_ROPE_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < NOPE_ROPE_DIM
+
+    loc = tl.load(loc_ptr + token_idx)
+    loc_page_index = loc // PAGE_SIZE
+    loc_token_offset_in_page = loc % PAGE_SIZE
+    out_offset = (
+        loc_page_index * BUF_NUMEL_PER_PAGE
+        + loc_token_offset_in_page * NOPE_ROPE_DIM
+        + offsets
+    )
+    in_offset = token_idx * k_cache_stride + offsets
+    values = tl.load(k_cache_ptr + in_offset, mask=mask)
+    tl.store(buf_ptr + out_offset, values, mask=mask)
+    
+class SetK:
+    @classmethod
+    def execute(cls, pool, buf, loc, nope_fp8_rope_bf16_pack):
+        cls.triton(pool, buf, loc, nope_fp8_rope_bf16_pack)
+
+    @classmethod
+    def torch(cls, pool, buf, loc, nope_fp8_rope_bf16_pack):
+        _set_k_bf16_torch(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
+
+    @classmethod
+    def triton(cls, pool, buf, loc, nope_fp8_rope_bf16_pack):
+        _set_k_bf16_triton(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
+
+def _set_k_bf16_torch(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_size: int,
+):
+    num_pages, buf_numel_per_page = buf.shape  #8, 256*512
+    (num_tokens_to_write,) = loc.shape # 8
+
+    num_tokens_to_write_nope_rope, nope_rope_dim = k_cache.shape #8, 512
+
+    assert (
+        num_tokens_to_write
+        == num_tokens_to_write_nope_rope
+    ), f"{num_tokens_to_write=} {num_tokens_to_write_nope_rope=}"
+
+    assert buf.dtype == torch.bfloat16
+    assert loc.dtype in [
+        torch.int64,
+        torch.int32,
+    ], f"{loc.dtype=}"
+
+    assert k_cache.dtype == torch.bfloat16
+
+    assert buf.is_contiguous()
+    assert loc.is_contiguous()
+    assert k_cache.is_contiguous()
+
+    buf_bf16 = buf.view(torch.bfloat16).flatten()
+
+    loc_page_index = loc // page_size # [256, 257, 258, 259, 260, 261,   0,   0] ->[1, 1, 1, 1, 1, 1,   0,   0]
+    loc_token_offset_in_page = loc % page_size #[0,1,2,3,4,5,0,0]
+
+    offset = loc_page_index * buf_numel_per_page + loc_token_offset_in_page * (
+        nope_rope_dim
+    )#[k+0, k+1*512, k+2*512, k+3*512, k+4*512, k+5*512, k+6*512, 0+0*512, 0+0*512]
+
+    for i in range(num_tokens_to_write):
+        buf_bf16[offset[i] : offset[i] + nope_rope_dim] = k_cache[i]

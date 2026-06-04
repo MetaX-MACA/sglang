@@ -581,13 +581,13 @@ class Envs:
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
 
     # CUDA kernels
-    SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
-    SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
+    SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(False)         # cause kernel-trap problem, close temporarily
+    SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(False)        # tilang op cause loop answer, close temporarily
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
-    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
+    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)    # need confirm
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
-    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
+    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(False)           # jit op in v2 only support fp8 now, close temporarily
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
 
@@ -617,18 +617,18 @@ class Envs:
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
-    SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)                  # jit compile faile, close temporarily
 
     # GEMM / kernel fusion
-    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
-    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
+    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(False)        # need confirm, close temporarily
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
-    SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
+    SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(False)     # need confirm, close temporarily
 
     # CUDA graph
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
@@ -639,6 +639,9 @@ class Envs:
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
+
+    # Cache type
+    SGLANG_DSV4_INDEX_CACHE_TYPE = EnvStr("int8")
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)

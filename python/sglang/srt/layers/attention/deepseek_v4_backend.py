@@ -1041,7 +1041,7 @@ class DeepseekV4AttnBackend(
                 cache_seqlens=None,
                 tile_scheduler_metadata=flashmla_metadata,
                 softmax_scale=self.softmax_scale,
-                is_fp8_kvcache=True,
+                is_fp8_kvcache=True if self.token_to_kv_pool.dtype in (torch.float8_e5m2, torch.float8_e4m3fn) else False, 
                 indices=swa_page_indices,
                 topk_length=swa_topk_lengths,
                 attn_sink=attn_sink,

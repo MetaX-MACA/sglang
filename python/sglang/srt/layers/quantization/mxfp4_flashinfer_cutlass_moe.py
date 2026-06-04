@@ -43,7 +43,6 @@ os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
 
 if is_flashinfer_available():
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-    from flashinfer.fused_moe.core import ActivationType
 
     try:
         from flashinfer.fused_moe import (
@@ -52,6 +51,7 @@ if is_flashinfer_available():
         )
 
         _FI_HAS_SM90_CUTLASS_MXFP4 = True
+        from flashinfer.fused_moe.core import ActivationType
     except ImportError:
         interleave_moe_scales_for_sm90_mixed_gemm = None
         interleave_moe_weights_for_sm90_mixed_gemm = None
