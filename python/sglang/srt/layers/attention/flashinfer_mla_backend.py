@@ -697,6 +697,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info, cuda_graph_bs
+    ):
+        # For the MLA flashinfer path the patch is a no-op, mirroring the upstream
+        # Triton/AITER backends. Note the MLA here refers to the implementation for 
+        # specific models (such as GLM, DeepSeek and so on).
+        pass
+
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
     ):

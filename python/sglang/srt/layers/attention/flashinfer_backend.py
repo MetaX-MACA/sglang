@@ -1312,6 +1312,14 @@ class FlashInferAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Here is a no-op (same as Triton/AITER): this path reads the custom mask at
+        # kernel-launch time rather than baking it into precomputed plan metadata, so
+        # there is nothing to recompute.
+        pass
+
     @debug_kernel_api
     def forward_extend(
         self,
