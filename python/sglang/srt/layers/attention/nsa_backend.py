@@ -2151,6 +2151,15 @@ class NativeSparseAttnBackend(
         """Get the fill value for sequence length in CUDA graph."""
         return 1
 
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # For this NSA backend the fix-up is a no-op (same as the upstream Triton and
+        # AITER backends): the native-sparse verify path does not bake the
+        # draft-dependent mask/positions into the overlapped plan metadata, so nothing
+        # needs to be recomputed here.
+        pass
+
     def set_nsa_prefill_impl(self, forward_batch: Optional[ForwardBatch] = None):
         """
         Decide all attention prefill dispatch strategies for this batch.
