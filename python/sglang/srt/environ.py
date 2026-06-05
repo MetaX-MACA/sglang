@@ -575,7 +575,7 @@ class Envs:
     # ====================================================================
 
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
-    SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
+    SGLANG_DSV4_FP4_EXPERTS = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
@@ -585,9 +585,9 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(False)        # tilang op cause loop answer, close temporarily
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
-    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)    # need confirm
+    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
-    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(False)           # jit op in v2 only support fp8 now, close temporarily
+    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
 
@@ -620,14 +620,14 @@ class Envs:
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)                  # jit compile faile, close temporarily
 
     # GEMM / kernel fusion
-    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
-    SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
+    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("deep_gemm")
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(False)        # need confirm, close temporarily
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
 
     # Cache / overlap
-    SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
+    SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(False)     # need confirm, close temporarily
 
     # CUDA graph
