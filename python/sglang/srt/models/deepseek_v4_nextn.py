@@ -26,6 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer, DeepseekV4ForCausalLM
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
 logger = logging.getLogger(__name__)
 
@@ -62,19 +63,26 @@ class DeepseekV4ModelNextN(nn.Module):
         )
         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
-
+        
+        is_ignore = False
+        if isinstance(quant_config, W8A8Int8Config) and "mtp.0.e_proj" in quant_config.ignore:
+            is_ignore = True
         self.e_proj = ReplicatedLinear(
             config.hidden_size,
             config.hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=quant_config if not is_ignore else None,
             prefix=add_prefix("e_proj", prefix),
         )
+        
+        is_ignore = False
+        if isinstance(quant_config, W8A8Int8Config) and "mtp.0.h_proj" in quant_config.ignore:
+            is_ignore = True
         self.h_proj = ReplicatedLinear(
             config.hidden_size,
             config.hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=quant_config if not is_ignore else None,
             prefix=add_prefix("h_proj", prefix),
         )
 
