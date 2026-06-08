@@ -64,7 +64,7 @@ dependencies = [
   "watchfiles",
   "xgrammar==0.2.0",
   "smg-grpc-servicer>=0.5.0",
-  "kernels==0.14.1",
+  "kernels<0.15",
   "jsonschema",
   "imageio",
   "remote_pdb",
@@ -77,6 +77,7 @@ dependencies = [
   "addict",
   "torchao==0.9.0",
   "compressed-tensors==0.15.0.1",
+  "kernels-data<0.15",
 ]
 
 [[tool.uv.index]]
