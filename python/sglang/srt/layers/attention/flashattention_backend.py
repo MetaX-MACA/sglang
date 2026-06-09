@@ -276,6 +276,9 @@ class FlashAttentionBackend(AttentionBackend):
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
 
+        if batch_size == 0:
+            self.forward_metadata = metadata
+            return
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
             if forward_batch.spec_info is not None:
@@ -625,6 +628,10 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        if forward_batch.batch_size == 0:
+            return q.new_zeros(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            )
         if k is not None:
             assert v is not None
 
