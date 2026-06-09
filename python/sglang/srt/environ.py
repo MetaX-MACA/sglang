@@ -627,7 +627,7 @@ class Envs:
     # ===================================================================
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
-    SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
+    SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(0)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
