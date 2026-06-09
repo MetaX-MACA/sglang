@@ -541,8 +541,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ).to(device, non_blocking=True)
 
         #check nsa ds-v3.2
-        from sglang.srt.configs.model_config import is_deepseek_nsa
+        from sglang.srt.configs.model_config import is_deepseek_nsa, is_deepseek_v4
         ret.is_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
+        ret.is_ds_compressed = is_deepseek_v4(model_runner.model_config.hf_config)
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -907,7 +908,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         bs = self.batch_size
 
         is_idle = False
-        if self.forward_mode.is_idle() and not self.is_nsa:
+        if self.forward_mode.is_idle() and not self.is_nsa  and not self.is_ds_compressed:
             is_idle = True
 
         if (

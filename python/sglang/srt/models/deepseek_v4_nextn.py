@@ -9,7 +9,7 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
-    dp_gather_partial,
+    dp_gather_replicate,
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
@@ -153,7 +153,7 @@ class DeepseekV4ModelNextN(nn.Module):
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
-            dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
+            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids
