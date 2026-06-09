@@ -46,8 +46,7 @@ class PrecomputedMetadata:
     max_len: int  # for decode/draft_extend
     max_seqlen_k: int  # for target_verify
 
-    # FlashMLA (optional)
-    flashmla_metadata: Optional[torch.Tensor] = None
+
 
 
 def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
@@ -145,14 +144,6 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         else:
             real_page_table = None  # Will use page_indices directly
 
-        # Compute FlashMLA metadata if needed
-        flashmla_metadata = None
-        if self.nsa_decode_impl == "flashmla_kv":
-            flashmla_metadata = self._compute_flashmla_metadata(
-                cache_seqlens=nsa_cache_seqlens,
-                seq_len_q=1,
-            )
-
         return PrecomputedMetadata(
             cache_seqlens=cache_seqlens,
             cu_seqlens_k=cu_seqlens_k,
@@ -164,7 +155,6 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             seqlens_expanded_size=seqlens_expanded_size,
             max_len=max_len,
             max_seqlen_k=max_len,
-            flashmla_metadata=flashmla_metadata,
         )
 
     def _precompute_target_verify_mode(
@@ -224,14 +214,6 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         else:
             real_page_table = None
 
-        # FlashMLA metadata
-        flashmla_metadata = None
-        if self.nsa_decode_impl == "flashmla_kv":
-            flashmla_metadata = self._compute_flashmla_metadata(
-                cache_seqlens=nsa_cache_seqlens,
-                seq_len_q=1,
-            )
-
         return PrecomputedMetadata(
             cache_seqlens=cache_seqlens,
             cu_seqlens_k=cu_seqlens_k,
@@ -243,7 +225,6 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             seqlens_expanded_size=seqlens_expanded_size,
             max_len=-1,  # Not used in this mode
             max_seqlen_k=max_seqlen_k,
-            flashmla_metadata=flashmla_metadata,
         )
 
     def _precompute_draft_extend_mode(
@@ -302,14 +283,6 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         else:
             real_page_table = None
 
-        # FlashMLA metadata
-        flashmla_metadata = None
-        if self.nsa_decode_impl == "flashmla_kv":
-            flashmla_metadata = self._compute_flashmla_metadata(
-                cache_seqlens=nsa_cache_seqlens,
-                seq_len_q=1,
-            )
-
         return PrecomputedMetadata(
             cache_seqlens=cache_seqlens,
             cu_seqlens_k=cu_seqlens_k,
@@ -321,5 +294,4 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             seqlens_expanded_size=seqlens_expanded_size,
             max_len=max_seqlen_k,
             max_seqlen_k=max_seqlen_k,
-            flashmla_metadata=flashmla_metadata,
         )

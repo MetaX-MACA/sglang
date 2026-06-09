@@ -281,6 +281,22 @@ class Indexer(MultiPlatformOp):
         else:
             yield
 
+    def _get_indexer_act_quant(self, forward_batch: ForwardBatch):
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+        if getattr(token_to_kv_pool, "int8_cache", self.int8_cache):
+            from sglang.srt.layers.attention.nsa.triton_kernel import (
+                act_quant_int8 as act_quant,
+            )
+
+            return act_quant
+
+        if getattr(token_to_kv_pool, "fp8_indexer_cache", False):
+            from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+
+            return act_quant
+
+        return None
+
     def _weights_proj_bf16_in_fp32_out(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
     ) -> torch.Tensor:
@@ -290,7 +306,7 @@ class Indexer(MultiPlatformOp):
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
         if _is_cuda:
-            return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
+            return torch.mm(x.float(), self.weights_proj.weight.t().float())
 
         weights, _ = self.weights_proj(x)
         if _is_hip:
@@ -1239,14 +1255,12 @@ class Indexer(MultiPlatformOp):
         # elif not _is_npu:
         #     from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
-        if self.int8_cache:
-            from sglang.srt.layers.attention.nsa.triton_kernel import act_quant_int8 as act_quant
-        else:
-            act_quant = None
 
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
+        act_quant = self._get_indexer_act_quant(forward_batch)
+        
         # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x

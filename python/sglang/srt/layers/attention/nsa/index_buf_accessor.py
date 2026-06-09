@@ -24,6 +24,19 @@ if _use_aiter_preshuffle:
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
+
+def _get_arg(name: str, pos: int, args, kwargs):
+    if name in kwargs:
+        return kwargs[name]
+    return args[pos] if len(args) > pos else None
+
+
+def _buffer_has_scale(pool, buf: torch.Tensor) -> bool:
+    if buf is not None:
+        return buf.dtype != torch.bfloat16
+    return getattr(pool, "indexer_cache_has_scale", False)
+
+
 """
 k: data, 128 item per token, fp8
 s: scale, 1 item per token, fp32
@@ -33,12 +46,12 @@ s: scale, 1 item per token, fp32
 class GetK:
     @classmethod
     def execute(cls, *args, **kwargs):
-        buf = args[1]
-        if buf.dtype == torch.bfloat16:
-            return cls.torch_fast(*args, **kwargs) 
-        else:
+        pool = _get_arg("pool", 0, args, kwargs)
+        buf = _get_arg("buf", 1, args, kwargs)
+        if _buffer_has_scale(pool, buf):
             return cls.triton(*args, **kwargs)
-            
+        else:
+            return cls.torch_fast(*args, **kwargs)
 
     @classmethod
     def slow(
@@ -179,6 +192,11 @@ class GetS:
 class GetKAndS:
     @classmethod
     def execute(cls, *args, **kwargs):
+        pool = _get_arg("pool", 0, args, kwargs)
+        buf = _get_arg("buf", 1, args, kwargs)
+        assert _buffer_has_scale(
+            pool, buf
+        ), "get_index_k_scale_buffer requires an FP8/INT8 indexer cache"
         # The aiter path uses cp_gather_indexer_k_quant_cache(preshuffle=True),
         # which only matches the layout produced when the rest of the indexer
         # is on the page_size=64 preshuffle path. Otherwise fall back to the
@@ -425,9 +443,9 @@ class SetKAndS:
     def triton(cls, pool, buf, loc, index_k, index_k_scale):
         loc = loc.to(torch.int64)
 
-        if buf.dtype == torch.bfloat16:
-            assert index_k_scale is None
-            _set_k_triton(
+        if _buffer_has_scale(pool, buf):
+            assert index_k_scale is not None
+            _set_k_and_s_triton(
                 buf=buf,
                 loc=loc,
                 index_k=index_k,
@@ -435,8 +453,8 @@ class SetKAndS:
                 page_size=pool.page_size,
             )
         else:
-            assert index_k_scale is not None
-            _set_k_and_s_triton(
+            assert index_k_scale is None
+            _set_k_triton(
                 buf=buf,
                 loc=loc,
                 index_k=index_k,

@@ -1998,9 +1998,25 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 class NSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     int8_cache = True if os.getenv("MX_ENABLE_NSA_INT8") else False
-    index_k_with_scale_buffer_dtype = torch.uint8 if os.getenv("MX_ENABLE_NSA_INT8") else torch.bfloat16
+    index_k_with_scale_buffer_dtype = torch.bfloat16
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
+    
+    @staticmethod
+    def _env_enabled(name: str) -> bool:
+        return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
 
+    @classmethod
+    def use_fp8_indexer_cache(cls, dtype: torch.dtype) -> bool:
+        return (not cls._env_enabled("MX_ENABLE_NSA_INT8")) and (
+            dtype == fp8_dtype or cls._env_enabled("MX_ENABLE_NSA_FP8_INDEXER")
+        )
+
+    @classmethod
+    def indexer_cache_has_scale_for_dtype(cls, dtype: torch.dtype) -> bool:
+        return cls._env_enabled("MX_ENABLE_NSA_INT8") or cls.use_fp8_indexer_cache(
+            dtype
+        )
+        
     def __init__(
         self,
         size: int,
@@ -2039,6 +2055,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
+        self.int8_cache = self._env_enabled("MX_ENABLE_NSA_INT8")
+        self.fp8_indexer_cache = self.use_fp8_indexer_cache(dtype)
+        self.indexer_cache_has_scale = self.indexer_cache_has_scale_for_dtype(dtype)
+        self.index_k_with_scale_buffer_dtype = (
+            torch.uint8 if self.indexer_cache_has_scale else torch.bfloat16
+        )
         if index_buf_size is None:
             index_buf_size = size
         # num head == 1 and head dim == 128 for index_k in NSA
@@ -2060,7 +2082,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             if self.custom_mem_pool
             else nullcontext()
         ):
-            if self.int8_cache:
+            if self.indexer_cache_has_scale:
                 self.index_k_with_scale_buffer = [
                     torch.zeros(
                         # Layout:
@@ -2097,6 +2119,60 @@ class NSATokenToKVPool(MLATokenToKVPool):
         del self.kv_buffer
         del self.index_k_with_scale_buffer
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Move latent KV and the NSA indexer cache in lockstep."""
+        super().move_kv_cache(tgt_loc, src_loc)
+
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for index_k in self.index_k_with_scale_buffer:
+            flat_buf = index_k.flatten()
+            buf_numel_per_page = index_k.shape[1]
+            arange_k = torch.arange(
+                self.index_head_dim, dtype=torch.int64, device=index_k.device
+            )
+            tgt_page = tgt_loc_flat // self.page_size
+            src_page = src_loc_flat // self.page_size
+            tgt_offset = tgt_loc_flat % self.page_size
+            src_offset = src_loc_flat % self.page_size
+
+            tgt_k_indices = (
+                (tgt_page * buf_numel_per_page)[:, None]
+                + (tgt_offset * self.index_head_dim)[:, None]
+                + arange_k[None, :]
+            ).flatten()
+            src_k_indices = (
+                (src_page * buf_numel_per_page)[:, None]
+                + (src_offset * self.index_head_dim)[:, None]
+                + arange_k[None, :]
+            ).flatten()
+            flat_buf[tgt_k_indices] = flat_buf[src_k_indices].clone()
+
+            if not self.indexer_cache_has_scale:
+                continue
+
+            scale_bytes_per_token = self.index_head_dim // self.quant_block_size * 4
+            arange_s = torch.arange(
+                scale_bytes_per_token, dtype=torch.int64, device=index_k.device
+            )
+            s_offset_in_page = self.page_size * self.index_head_dim
+            tgt_s_indices = (
+                (tgt_page * buf_numel_per_page)[:, None]
+                + s_offset_in_page
+                + (tgt_offset * scale_bytes_per_token)[:, None]
+                + arange_s[None, :]
+            ).flatten()
+            src_s_indices = (
+                (src_page * buf_numel_per_page)[:, None]
+                + s_offset_in_page
+                + (src_offset * scale_bytes_per_token)[:, None]
+                + arange_s[None, :]
+            ).flatten()
+            flat_buf[tgt_s_indices] = flat_buf[src_s_indices].clone()
+            
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)

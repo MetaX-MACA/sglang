@@ -91,21 +91,21 @@ namespace device {
 // Architecture detection: SGL_CUDA_ARCH is injected by load_jit() and is
 // available in both host and device compilation passes, whereas __CUDA_ARCH__
 // is only defined by nvcc during the device pass.
-#if !defined(USE_ROCM)
-#if !defined(SGL_CUDA_ARCH)
-#error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
-#endif
-#if defined(__CUDA_ARCH__)
-    #if (__CUDA_ARCH__ != SGL_CUDA_ARCH)
-    #warning "SGL_CUDA_ARCH mismatch: injected arch flag does not match device target"
-    #endif
-#endif
-#define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
-#define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
-#else  // USE_ROCM
+// #if !defined(USE_ROCM)
+// #if !defined(SGL_CUDA_ARCH)
+// #error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
+// #endif
+// #if defined(__CUDA_ARCH__)
+//     #if (__CUDA_ARCH__ != SGL_CUDA_ARCH)
+//     #warning "SGL_CUDA_ARCH mismatch: injected arch flag does not match device target"
+//     #endif
+// #endif
+// #define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
+// #define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
+// #else  // USE_ROCM
 #define SGL_ARCH_HOPPER_OR_GREATER 0
 #define SGL_ARCH_BLACKWELL_OR_GREATER 0
-#endif
+// #endif
 
 // Maximum vector size in bytes supported by current architecture.
 // Pre-Blackwell / AMD: 128-bit (16 bytes)
