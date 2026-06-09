@@ -21,6 +21,10 @@ import torch.nn.functional as F
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
+from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
+    dequantize_k_cache_paged,
+)
+
 if envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
     # NOTE: should eventually be the only compressor backend
     from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -37,10 +41,16 @@ else:
 
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
+    _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
     copy_metadata,
     maybe_copy_inplace,
 )
+
+from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+    SparsePrefillChunkCache,
+)
+
 from sglang.srt.layers.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
@@ -55,13 +65,16 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, log_info_on_rank0
 
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+import triton
+import triton.language as tl
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +103,298 @@ def _create_flashmla_metadata():
 def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
 
+@triton.jit
+def _dsv4_build_unified_prefill_indices_kernel(
+    swa_indices_ptr,
+    extra_indices_ptr,
+    swa_lengths_ptr,
+    extra_lengths_ptr,
+    out_ptr,
+    swa_stride_0: tl.constexpr,
+    swa_stride_1: tl.constexpr,
+    swa_stride_2: tl.constexpr,
+    extra_stride_0: tl.constexpr,
+    extra_stride_1: tl.constexpr,
+    extra_stride_2: tl.constexpr,
+    swa_len_stride_0: tl.constexpr,
+    swa_len_stride_1: tl.constexpr,
+    extra_len_stride_0: tl.constexpr,
+    extra_len_stride_1: tl.constexpr,
+    out_stride_0: tl.constexpr,
+    out_stride_1: tl.constexpr,
+    out_stride_2: tl.constexpr,
+    H_KV: tl.constexpr,
+    SWA_TOPK: tl.constexpr,
+    EXTRA_TOPK: tl.constexpr,
+    OUT_TOPK: tl.constexpr,
+    SWA_LENGTH_H: tl.constexpr,
+    EXTRA_LENGTH_H: tl.constexpr,
+    EXTRA_OFFSET: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    HAS_SWA_LENGTH: tl.constexpr,
+    HAS_EXTRA_LENGTH: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    q_id = row_id // H_KV
+    h_id = row_id - q_id * H_KV
+    block_id = tl.program_id(1)
+    offsets = block_id * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+
+    values = tl.full((BLOCK_TOPK,), -1, dtype=tl.int32)
+
+    swa_mask = offsets < SWA_TOPK
+    swa_raw = tl.load(
+        swa_indices_ptr
+        + q_id * swa_stride_0
+        + h_id * swa_stride_1
+        + offsets * swa_stride_2,
+        mask=swa_mask,
+        other=-1,
+    )
+    swa_length_valid = swa_mask
+    if HAS_SWA_LENGTH:
+        swa_len_h_id = tl.minimum(h_id, SWA_LENGTH_H - 1)
+        swa_len = tl.load(
+            swa_lengths_ptr + q_id * swa_len_stride_0 + swa_len_h_id * swa_len_stride_1
+        )
+        swa_length_valid = swa_mask & (offsets < swa_len)
+    values = tl.where(swa_length_valid, swa_raw, values)
+
+    if HAS_EXTRA:
+        extra_offsets = offsets - SWA_TOPK
+        extra_mask = (offsets >= SWA_TOPK) & (extra_offsets < EXTRA_TOPK)
+        extra_raw = tl.load(
+            extra_indices_ptr
+            + q_id * extra_stride_0
+            + h_id * extra_stride_1
+            + extra_offsets * extra_stride_2,
+            mask=extra_mask,
+            other=-1,
+        )
+        extra_length_valid = extra_mask
+        if HAS_EXTRA_LENGTH:
+            extra_len_h_id = tl.minimum(h_id, EXTRA_LENGTH_H - 1)
+            extra_len = tl.load(
+                extra_lengths_ptr
+                + q_id * extra_len_stride_0
+                + extra_len_h_id * extra_len_stride_1
+            )
+            extra_length_valid = extra_mask & (extra_offsets < extra_len)
+        extra_shifted = tl.where(extra_raw >= 0, extra_raw + EXTRA_OFFSET, extra_raw)
+        values = tl.where(extra_length_valid, extra_shifted, values)
+
+    out_mask = offsets < OUT_TOPK
+    tl.store(
+        out_ptr + q_id * out_stride_0 + h_id * out_stride_1 + offsets * out_stride_2,
+        values,
+        mask=out_mask,
+    )
+
+
+def _dsv4_build_unified_prefill_indices_triton(
+    *,
+    swa_page_indices: torch.Tensor,
+    extra_indices: Optional[torch.Tensor],
+    swa_topk_lengths: Optional[torch.Tensor],
+    extra_topk_lengths: Optional[torch.Tensor],
+    extra_offset: int,
+) -> torch.Tensor:
+    assert swa_page_indices.ndim == 3
+    num_q, h_kv, swa_topk = swa_page_indices.shape
+    has_extra = extra_indices is not None
+    extra_topk = 0
+    if has_extra:
+        assert extra_indices is not None
+        assert extra_indices.ndim == 3
+        assert extra_indices.shape[:2] == (num_q, h_kv)
+        extra_topk = extra_indices.shape[-1]
+
+    out_topk = ceil_align(swa_topk + extra_topk, 128)
+    out = torch.empty(
+        (num_q, h_kv, out_topk),
+        dtype=swa_page_indices.dtype,
+        device=swa_page_indices.device,
+    )
+
+    swa_lengths_2d = _dsv4_topk_length_2d(swa_topk_lengths)
+    extra_lengths_2d = _dsv4_topk_length_2d(extra_topk_lengths)
+
+    empty_indices = swa_page_indices
+    empty_lengths = torch.empty(
+        (1, 1), dtype=torch.int32, device=swa_page_indices.device
+    )
+    extra_indices_arg = extra_indices if extra_indices is not None else empty_indices
+    swa_lengths_arg = swa_lengths_2d if swa_lengths_2d is not None else empty_lengths
+    extra_lengths_arg = (
+        extra_lengths_2d if extra_lengths_2d is not None else empty_lengths
+    )
+
+    block_topk = 128
+    grid = (num_q * h_kv, triton.cdiv(out_topk, block_topk))
+    _dsv4_build_unified_prefill_indices_kernel[grid](
+        swa_page_indices,
+        extra_indices_arg,
+        swa_lengths_arg,
+        extra_lengths_arg,
+        out,
+        swa_page_indices.stride(0),
+        swa_page_indices.stride(1),
+        swa_page_indices.stride(2),
+        extra_indices_arg.stride(0),
+        extra_indices_arg.stride(1),
+        extra_indices_arg.stride(2),
+        swa_lengths_arg.stride(0),
+        swa_lengths_arg.stride(1),
+        extra_lengths_arg.stride(0),
+        extra_lengths_arg.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        H_KV=h_kv,
+        SWA_TOPK=swa_topk,
+        EXTRA_TOPK=extra_topk,
+        OUT_TOPK=out_topk,
+        SWA_LENGTH_H=swa_lengths_arg.shape[1],
+        EXTRA_LENGTH_H=extra_lengths_arg.shape[1],
+        EXTRA_OFFSET=extra_offset,
+        HAS_EXTRA=has_extra,
+        HAS_SWA_LENGTH=swa_lengths_2d is not None,
+        HAS_EXTRA_LENGTH=extra_lengths_2d is not None,
+        BLOCK_TOPK=block_topk,
+    )
+    return out
+
+
+def _dsv4_build_unified_prefill_inputs_from_real_decode(
+    q: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    extra_k_cache: Optional[torch.Tensor],
+    swa_page_indices: torch.Tensor,
+    extra_indices: Optional[torch.Tensor],
+    swa_topk_lengths: Optional[torch.Tensor],
+    extra_topk_lengths: Optional[torch.Tensor],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    return _dsv4_build_unified_prefill_inputs_from_real_decode_triton(
+        q=q,
+        swa_k_cache=swa_k_cache,
+        extra_k_cache=extra_k_cache,
+        swa_page_indices=swa_page_indices,
+        extra_indices=extra_indices,
+        swa_topk_lengths=swa_topk_lengths,
+        extra_topk_lengths=extra_topk_lengths,
+    )
+
+def _dsv4_build_unified_prefill_inputs_from_real_decode_triton(
+    q: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    extra_k_cache: Optional[torch.Tensor],
+    swa_page_indices: torch.Tensor,
+    extra_indices: Optional[torch.Tensor],
+    swa_topk_lengths: Optional[torch.Tensor],
+    extra_topk_lengths: Optional[torch.Tensor],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    assert q.ndim == 4 and q.shape[1] == 1
+    assert q.shape[-1] == 512
+    assert swa_k_cache.shape[-1] == 512
+
+
+    q_prefill = q.squeeze(1).contiguous()
+    swa_num_tokens = swa_k_cache.shape[0] * swa_k_cache.shape[1]
+
+    kv_parts = [swa_k_cache.reshape(-1, 1, q.shape[-1])]
+    if extra_k_cache is None:
+        # _dsv4_dequantize_model1_fp8_sparse_k_cache_into(
+        #     swa_k_cache, kv_unified, out_token_offset=0
+        # )
+        kv_unified1 = swa_k_cache
+        assert kv_unified1.shape[-1] == q.shape[-1]
+    else:
+        # _dsv4_dequantize_two_model1_fp8_sparse_k_caches_into(
+        #     swa_k_cache, extra_k_cache, kv_unified
+        # )
+        if extra_indices is None:
+            assert False
+        assert extra_k_cache.shape[-1] == 512
+        kv_parts.append(extra_k_cache.reshape(-1, 1, q.shape[-1]))
+    
+    kv_unified = torch.cat(kv_parts, dim=0).contiguous()
+
+    # if extra_k_cache is None:
+    #     kv_unified = swa_k_cache.reshape(-1, 1, q.shape[-1]).contiguous()
+    # else:
+    #     if extra_indices is None:
+    #         assert False
+    #     assert extra_k_cache.shape[-1] == 512
+    #     extra_num_tokens = extra_k_cache.shape[0] * extra_k_cache.shape[1]
+    #     kv_unified = torch.empty(
+    #         (swa_num_tokens + extra_num_tokens, 1, q.shape[-1]),
+    #         dtype=torch.bfloat16,
+    #         device=q.device,
+    #     )
+    #     kv_unified[:swa_num_tokens, :] = swa_k_cache.reshape(-1, 1, q.shape[-1])
+    #     kv_unified[swa_num_tokens:, :] = extra_k_cache.reshape(-1, 1, q.shape[-1])
+    #     if not kv_unified.is_contiguous():
+    #         kv_unified = kv_unified.contiguous()
+
+    indices_unified = _dsv4_build_unified_prefill_indices_triton(
+        swa_page_indices=swa_page_indices,
+        extra_indices=extra_indices,
+        swa_topk_lengths=swa_topk_lengths,
+        extra_topk_lengths=extra_topk_lengths,
+        extra_offset=swa_num_tokens,
+    )
+    return q_prefill, kv_unified, indices_unified
+
+
+def _dsv4_run_bf16_sparse_prefill_attention(
+    *,
+    q_prefill: torch.Tensor,
+    kv_unified: torch.Tensor,
+    indices_unified: torch.Tensor,
+    sm_scale: float,
+    d_v: int,
+    attn_sink: Optional[torch.Tensor],
+    compress_ratio: Literal[0, 4, 128],
+) -> Optional[torch.Tensor]:
+    global _DSV4_BF16_SPARSE_PREFILL_LAST_LOG_TIME_BY_RATIO
+
+    import flash_mla
+
+    if q_prefill.ndim != 3 or kv_unified.ndim != 3:
+        assert False
+        return None
+    if q_prefill.shape[-1] != kv_unified.shape[-1]:
+        assert False
+        return None
+    topk_length_unified = None
+
+    if False:
+        now = time.monotonic()
+        last_log_time = _DSV4_BF16_SPARSE_PREFILL_LAST_LOG_TIME_BY_RATIO.get(
+            compress_ratio, 0.0
+        )
+        should_log_hit = q_prefill.shape[0] >= 512 and (now - last_log_time >= 0.2)
+        if should_log_hit:
+            _DSV4_BF16_SPARSE_PREFILL_LAST_LOG_TIME_BY_RATIO[compress_ratio] = now
+            logger.warning(
+                "DSV4 BF16 sparse prefill hit: source=fp8_dequant ratio=%s q=%s kv_unified=%s indices=%s",
+                compress_ratio,
+                tuple(q_prefill.shape),
+                tuple(kv_unified.shape),
+                tuple(indices_unified.shape),
+            )
+    
+    return flash_mla.flash_mla_sparse_fwd(
+        q_prefill,
+        kv_unified,
+        indices_unified,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length_unified,
+    )[0]
+
 
 @dataclass
 class DSV4AttnMetadata:
@@ -110,6 +415,7 @@ class DSV4AttnMetadata:
     c4_topk_lengths_clamp1: Optional[torch.Tensor] = None
     c4_sparse_topk_lengths: torch.Tensor = field(init=False)
     c4_sparse_page_indices: torch.Tensor = field(init=False)
+    c4_sparse_raw_indices: Optional[torch.Tensor] = field(init=False, default=None)
 
     c128_out_loc: Optional[torch.Tensor] = None
     c128_page_indices: Optional[torch.Tensor] = None
@@ -157,6 +463,7 @@ class DSV4AttnMetadata:
                 "c4_topk_lengths_clamp1",
                 "c4_sparse_topk_lengths",
                 "c4_sparse_page_indices",
+                "c4_sparse_raw_indices",
             ],
             assign_fields=[
                 "c1_flashmla_metadata",
@@ -241,7 +548,7 @@ class DSV4AttnMetadata:
                 f"!= pre_global_len={pre_global_len} (must remain global for compressor write path)"
             )
 
-    def init_flashmla_related(self):
+    def init_flashmla_related(self, is_prefill: bool = False):
         # c4_sparse_topk is set from model_config.index_topk per-model
         # (small model: 512, large model: 1024).
         assert self.c4_sparse_topk in (512, 1024), (
@@ -258,6 +565,9 @@ class DSV4AttnMetadata:
             dtype=torch.int32,
             device=self.c4_topk_lengths_clamp1.device,
         )
+        if is_prefill:
+            self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
+
         self.c4_sparse_page_indices = _pad_last_dim(self.c4_sparse_page_indices)
         self.c1_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
@@ -272,6 +582,11 @@ class DSV4Metadata:
     c4_compress_metadata: Optional[FusedCompressMetadata] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
 
+    # Lazily populated on the first call to ``_forward_prefill_sparse`` and
+    # reused across every layer in the chunk. Reset to ``None`` on copy_ so
+    # cuda-graph replay rebuilds it for the next forward.
+    sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
+
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
         return self.core_attn_metadata
@@ -283,6 +598,7 @@ class DSV4Metadata:
         maybe_copy_inplace(
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
+        self.sparse_prefill_cache = None
 
 
 @dataclass
@@ -1043,8 +1359,45 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            import flash_mla
+            if forward_batch.forward_mode.is_extend_without_speculative() and (
+                q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            ):
+                if swa_k_cache.dtype == torch.bfloat16:
+                    prefill_inputs = _dsv4_build_unified_prefill_inputs_from_real_decode(
+                        q=q,
+                        swa_k_cache=swa_k_cache,
+                        extra_k_cache=extra_k_cache,
+                        swa_page_indices=swa_page_indices,
+                        extra_indices=extra_indices,
+                        swa_topk_lengths=swa_topk_lengths,
+                        extra_topk_lengths=extra_topk_lengths,
+                    )
+                    if prefill_inputs is not None:
+                        q_prefill, kv_unified, indices_unified = prefill_inputs
+                        o_sparse = _dsv4_run_bf16_sparse_prefill_attention(
+                            q_prefill=q_prefill,
+                            kv_unified=kv_unified,
+                            indices_unified=indices_unified,
+                            sm_scale=self.softmax_scale,
+                            d_v=self.head_dim_v,
+                            attn_sink=attn_sink,
+                            compress_ratio=compress_ratio,
+                        )
+                        if o_sparse is not None:
+                            return o_sparse
+                else:
+                    return self._forward_prefill_sparse(
+                        q=q,
+                        layer_id=layer_id,
+                        compress_ratio=compress_ratio,
+                        forward_batch=forward_batch,
+                        token_to_kv_pool=token_to_kv_pool,
+                        core_attn_metadata=core_attn_metadata,
+                        attn_sink=attn_sink,
+                    )
 
+            import flash_mla
             o = flash_mla.flash_mla_with_kvcache(
                 q=q,
                 k_cache=swa_k_cache,
@@ -1066,6 +1419,108 @@ class DeepseekV4AttnBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _forward_prefill_sparse(
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        compress_ratio: Literal[0, 4, 128],
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        core_attn_metadata: DSV4AttnMetadata,
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """Unified prefill via flash_mla_sparse_fwd. Replaces the
+        flash_mla_with_kvcache call on the extend path. Per request,
+        positionally gathers the SWA window (always) and the compressed
+        cache (c4/c128) into a flat bf16 workspace, then lets
+        flash_mla_sparse_fwd consume the workspace via per-query rebased
+        indices. Chunk-invariant scaffolding lives in
+        ``self.forward_metadata.sparse_prefill_cache``.
+        """
+        from flash_mla import flash_mla_sparse_fwd
+
+        # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
+        q_flat = q.squeeze(1)
+
+        cache = self.forward_metadata.sparse_prefill_cache
+        if cache is None:
+            # ``swa_window_size`` on the pool is its storage page size, not
+            # the model's SWA window — pass both explicitly.
+            cache = SparsePrefillChunkCache.build(
+                seq_lens=forward_batch.seq_lens.to(torch.int32),
+                extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
+                req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+                req_to_token=self.req_to_token,
+                full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
+                swa_window_size=SWA_WINDOW,
+                swa_page_size=token_to_kv_pool.swa_window_size,
+                num_qo_tokens=q_flat.shape[0],
+            )
+            self.forward_metadata.sparse_prefill_cache = cache
+
+        # Resolve the workspace + indices for this ratio, then dequant
+        # SWA + compressed regions directly into the workspace (no torch.cat).
+        compressed_slice = None
+        extra_k_cache = None
+        extra_page_size = None
+        flat_token_ids = None
+        if compress_ratio == 0:
+            workspace = cache.c0_workspace
+            combined_indices = cache.c0_combined_indices
+            combined_lens = cache.c0_combined_lens
+            swa_slice = workspace
+        else:
+            extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            if compress_ratio == 128:
+                assert core_attn_metadata.c128_page_indices is not None
+                cache.ensure_c128(core_attn_metadata.c128_page_indices)
+                flat_token_ids = cache.c128_flat_token_ids
+                workspace = cache.c128_workspace
+                combined_indices = cache.c128_combined_indices
+                combined_lens = cache.c128_combined_lens
+            else:
+                assert core_attn_metadata.c4_sparse_raw_indices is not None, (
+                    "sparse-prefill c4 path requires c4_sparse_raw_indices "
+                    "(allocated in init_flashmla_related when is_prefill=True)"
+                )
+                cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
+                flat_token_ids = cache.c4_flat_token_ids
+                workspace = cache.c4_workspace
+                combined_indices, combined_lens = cache.combine_c4_layer(
+                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices,
+                )
+            n_compressed = flat_token_ids.shape[0]
+            compressed_slice = workspace[:n_compressed]
+            swa_slice = workspace[n_compressed:]
+
+        if compressed_slice is not None:
+            dequantize_k_cache_paged(
+                extra_k_cache,
+                flat_token_ids,
+                page_size=extra_page_size,
+                out=compressed_slice,
+            )
+        dequantize_k_cache_paged(
+            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+            cache.swa_token_ids,
+            page_size=cache.swa_page_size,
+            out=swa_slice,
+        )
+        kv = workspace
+
+        # log_info_on_rank0(logger, f"---------------------{combined_lens.shape=}, {combined_lens=}")
+        o, _, _ = flash_mla_sparse_fwd(
+            q=q_flat,
+            kv=kv,
+            indices=combined_indices.unsqueeze(1),
+            sm_scale=self.softmax_scale,
+            d_v=self.head_dim_v,
+            attn_sink=attn_sink,
+            topk_length=combined_lens,
+        )
+        return o
 
     def expand_prefill_casually(
         self,
@@ -1162,10 +1617,11 @@ class DeepseekV4AttnBackend(
 
         if need_compress:
             core_attn_metadata.init_compression_metadata()
-            core_attn_metadata.init_flashmla_related()
+            core_attn_metadata.init_flashmla_related(is_prefill=is_prefill)
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
             core_attn_metadata.c4_sparse_page_indices = None
+            core_attn_metadata.c4_sparse_raw_indices = None
             core_attn_metadata.c1_flashmla_metadata = _create_flashmla_metadata()
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None

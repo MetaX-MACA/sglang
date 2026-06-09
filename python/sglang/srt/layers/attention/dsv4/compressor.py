@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+import logging
+logger = logging.getLogger(__name__)
 
 class FusedCompressMetadata(NamedTuple):
     write_loc: torch.Tensor
