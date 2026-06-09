@@ -51,14 +51,14 @@ from sglang.srt.utils import BumpAllocator
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
-from sgl_kernel import cutlass_scaled_batch_mm
+from mctlassEx import ScaledGEMM
 from sgl_kernel import scaled_int8_quant
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
-    
+    scaled_gemm_int8 = ScaledGEMM()
     try:
         from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
     except:
@@ -720,9 +720,31 @@ class DeepseekMLAForwardMixin:
                 )
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         elif self.w_vc.dtype == torch.int8:
-            attn_output_quant_val, attn_output_quant_scale, _ = scaled_int8_quant(attn_output.transpose(0, 1).contiguous())
-            attn_bmm_output = cutlass_scaled_batch_mm(a = attn_output_quant_val, b = self.w_vc, scale_a = attn_output_quant_scale, scale_b = self.w_vc_scale, out_dtype = attn_output.dtype)
-            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)   
+            # attn_output_quant_val, attn_output_quant_scale, _ = scaled_int8_quant(attn_output.transpose(0, 1).contiguous())
+            # attn_bmm_output = cutlass_scaled_batch_mm(a = attn_output_quant_val, b = self.w_vc, scale_a = attn_output_quant_scale, scale_b = self.w_vc_scale, out_dtype = attn_output.dtype)
+            # attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+            attn_output_quant_val, attn_output_quant_scale, _ = scaled_int8_quant(
+                attn_output.transpose(0, 1).contiguous()
+            )
+
+            num_heads, num_tokens, kv_lora = attn_output_quant_val.shape
+            v_head_dim = self.w_vc.shape[2]
+
+            attn_bmm_output = torch.empty(
+                (num_heads, num_tokens, v_head_dim),
+                dtype=attn_output.dtype,
+                device=attn_output.device,
+            )
+            scaled_gemm_int8(
+                [num_tokens, v_head_dim, kv_lora],
+                attn_output_quant_val,
+                self.w_vc,
+                attn_bmm_output,
+                attn_output_quant_scale.reshape(num_heads, num_tokens, 1),
+                self.w_vc_scale,
+                None,
+            )
+            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
             if is_in_tc_piecewise_cuda_graph():
                 # torch dynamo requires out= op was called where output tensor was non-contiguous
