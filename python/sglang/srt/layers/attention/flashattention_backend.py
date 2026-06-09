@@ -719,7 +719,11 @@ class FlashAttentionBackend(AttentionBackend):
             if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0
             else self.max_context_len
         )
-
+        
+        if batch_size == 0:
+            self.forward_metadata = metadata
+            return
+        
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
             if forward_batch.spec_info is not None:
@@ -1267,6 +1271,11 @@ class FlashAttentionBackend(AttentionBackend):
     ):
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
+        
+        if forward_batch.batch_size == 0:
+            return q.new_zeros(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            )
         is_cp_mode = (
             forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
