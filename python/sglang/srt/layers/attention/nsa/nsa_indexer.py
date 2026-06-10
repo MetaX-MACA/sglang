@@ -211,7 +211,7 @@ class Indexer(MultiPlatformOp):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        self.int8_cache = True if os.getenv("MX_ENABLE_NSA_INT8") else False
+        self.int8_cache = envs.MX_ENABLE_NSA_INT8.get()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attn_context_model_parallel_world_size()
             self.cp_rank = get_attn_context_model_parallel_rank()

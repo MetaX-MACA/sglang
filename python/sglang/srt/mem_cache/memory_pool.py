@@ -1997,25 +1997,13 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 class NSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
-    int8_cache = True if os.getenv("MX_ENABLE_NSA_INT8") else False
+    int8_cache = envs.MX_ENABLE_NSA_INT8.get()
     index_k_with_scale_buffer_dtype = torch.bfloat16
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
     
-    @staticmethod
-    def _env_enabled(name: str) -> bool:
-        return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
-
     @classmethod
-    def use_fp8_indexer_cache(cls, dtype: torch.dtype) -> bool:
-        return (not cls._env_enabled("MX_ENABLE_NSA_INT8")) and (
-            dtype == fp8_dtype or cls._env_enabled("MX_ENABLE_NSA_FP8_INDEXER")
-        )
-
-    @classmethod
-    def indexer_cache_has_scale_for_dtype(cls, dtype: torch.dtype) -> bool:
-        return cls._env_enabled("MX_ENABLE_NSA_INT8") or cls.use_fp8_indexer_cache(
-            dtype
-        )
+    def indexer_int8_cache(cls, dtype: torch.dtype) -> bool:
+        return cls.int8_cache or dtype == fp8_dtype
         
     def __init__(
         self,
@@ -2055,9 +2043,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
-        self.int8_cache = self._env_enabled("MX_ENABLE_NSA_INT8")
-        self.fp8_indexer_cache = self.use_fp8_indexer_cache(dtype)
-        self.indexer_cache_has_scale = self.indexer_cache_has_scale_for_dtype(dtype)
+        self.int8_cache = envs.MX_ENABLE_NSA_INT8.get()
+        self.indexer_cache_has_scale = self.indexer_int8_cache(dtype)
         self.index_k_with_scale_buffer_dtype = (
             torch.uint8 if self.indexer_cache_has_scale else torch.bfloat16
         )

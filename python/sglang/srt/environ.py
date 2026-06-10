@@ -665,6 +665,9 @@ class Envs:
     EXPORT_SERVER_ARGS_DIR = EnvStr("")
     SGLANG_QWEN3_ENABLE_ALT_STREAM = EnvBool(False)
     ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16 = EnvBool(True)
+    
+    # Metax
+    MX_ENABLE_NSA_INT8 = EnvBool(True)
 
 
 envs = Envs()

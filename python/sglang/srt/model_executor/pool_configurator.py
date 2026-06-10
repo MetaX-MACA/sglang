@@ -153,7 +153,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
             if is_deepseek_nsa(model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
-                if NSATokenToKVPool.indexer_cache_has_scale_for_dtype(kv_cache_dtype):
+                if NSATokenToKVPool.indexer_int8_cache(kv_cache_dtype):
                     indexer_size_per_token = (
                         index_head_dim
                         + index_head_dim // NSATokenToKVPool.quant_block_size * 4
