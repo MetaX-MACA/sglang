@@ -103,6 +103,17 @@ def _create_flashmla_metadata():
 def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
 
+def _dsv4_topk_length_2d(topk_length: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if topk_length is None:
+        return None
+    if topk_length.ndim == 1:
+        return topk_length.unsqueeze(1)
+    if topk_length.ndim == 2:
+        return topk_length
+    if topk_length.ndim == 3 and topk_length.shape[-1] == 1:
+        return topk_length.squeeze(-1)
+    raise AssertionError(f"unsupported topk_length shape: {tuple(topk_length.shape)}")
+
 @triton.jit
 def _dsv4_build_unified_prefill_indices_kernel(
     swa_indices_ptr,
