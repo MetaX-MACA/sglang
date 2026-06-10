@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING, Optional, Union
 import torch
 import os
-enable_mctlass_fused_moe_python_api = (os.getenv("ENABLE_MCTLASS_FUSED_MOE_PYTHON_API", "0") == "1")
+enable_mctlass_fused_moe_python_api = (os.getenv("ENABLE_MCTLASS_FUSED_MOE_PYTHON_API", "1") == "1")
 
 # Batch gemm in vllm, support w8a8 int8 quantization
 def cutlass_scaled_batch_mm(a: torch.Tensor, b: torch.Tensor,
