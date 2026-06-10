@@ -18,11 +18,14 @@ from .utils import make_name
 @cache_once
 def _jit_compress_norm_rope_module(
     dtype: torch.dtype,
+    cache_dtype: torch.dtype,
     head_dim: int,
     rope_dim: int,
     page_size: int,
 ) -> Module:
-    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    args = make_cpp_args(
+        dtype, cache_dtype, head_dim, rope_dim, page_size, is_arch_support_pdl()
+    )
     return load_jit(
         make_name(f"fused_norm_rope_v2"),
         *args,
@@ -334,7 +337,7 @@ def compress_norm_rope_store(
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_compress_norm_rope_module(
-        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
+        kv.dtype, kvcache.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
     )
     module.forward(
         kv,
