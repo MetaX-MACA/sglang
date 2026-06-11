@@ -19,7 +19,7 @@ from functools import cached_property, wraps
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
-
+import torch
 import numpy as np
 import pybase64
 import requests
@@ -703,3 +703,29 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     module_name, obj_name = qualname.rsplit(".", 1)
     module = importlib.import_module(module_name)
     return getattr(module, obj_name)
+
+
+
+def dump_kernel_tensor(name: str, x, dump_bin: bool = False, path: str = "./dump/", print_tensor: bool = False) -> None:
+    """Dump kernel input/output tensors"""
+    if isinstance(x, torch.Tensor):
+        print(
+            f"kernel_name, {name}, dtype: {x.dtype}, "
+            f"shape: {x.shape}, value: {x if print_tensor else '...'}"
+        )
+    else:
+        print(f"kernel_name, {name}, value: {x}")
+
+    if dump_bin:
+        try:
+            from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+            tp_rank = get_tensor_model_parallel_rank()
+        except (ImportError, AssertionError, RuntimeError):
+            tp_rank = 0
+
+        os.makedirs(path, exist_ok=True)
+        filepath = os.path.join(path, f"rank_{tp_rank}_{name}.pt")
+        if isinstance(x, torch.Tensor):
+            torch.save(x.cpu(), filepath)
+        else:
+            torch.save(x, filepath)
