@@ -461,10 +461,20 @@ def apply_qk_norm(
         )
         return q, k
 
-    q_by_head = _reshape_for_qk_norm(q, head_dim)
-    q_by_head = q_norm(q_by_head)
-    k_by_head = _reshape_for_qk_norm(k, head_dim)
-    k_by_head = k_norm(k_by_head)
+    if alt_stream is not None and get_is_capture_mode():
+        current_stream = get_current_device_stream_fast()
+        alt_stream.wait_stream(current_stream)
+        q_by_head = _reshape_for_qk_norm(q, head_dim)
+        q_by_head = q_norm(q_by_head)
+        with torch.cuda.stream(alt_stream):
+            k_by_head = _reshape_for_qk_norm(k, head_dim)
+            k_by_head = k_norm(k_by_head)
+        current_stream.wait_stream(alt_stream)
+    else:
+        q_by_head = _reshape_for_qk_norm(q, head_dim)
+        q_by_head = q_norm(q_by_head)
+        k_by_head = _reshape_for_qk_norm(k, head_dim)
+        k_by_head = k_norm(k_by_head)
     q = q_by_head.view(q.shape)
     k = k_by_head.view(k.shape)
     return q, k
