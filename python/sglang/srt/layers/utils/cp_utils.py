@@ -12,6 +12,7 @@ from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     get_attention_cp_group,
     get_attention_cp_size,
+    get_attention_cp_rank,
     is_allocation_symmetric,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -109,6 +110,33 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         dim=-1,
     )
     return positions
+
+
+def cp_split_and_rebuild_input_ids(forward_batch, input_ids: torch.Tensor):
+    from sglang.srt.layers.attention.nsa.utils import (
+        is_nsa_prefill_cp_round_robin_split
+    )
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+
+    if is_nsa_prefill_cp_round_robin_split():
+        cp_rank = get_attention_cp_rank()
+        cp_size = get_attention_cp_size()
+
+        if not get_moe_a2a_backend().is_none():
+            assert get_moe_a2a_backend().is_deepep(), (
+                "CP requires DeepEP (moe_a2a_backend == deepep). "
+                "Only DeepEP is tested with CP's per-rank token split."
+            )
+            input_ids = input_ids[cp_rank::cp_size].contiguous()
+            input_ids_global = input_ids
+        else:
+            input_ids_tmp = input_ids.view((-1, cp_size)).permute((1, 0))
+            input_ids = input_ids_tmp[cp_rank, :].flatten()
+            input_ids_global = input_ids_tmp.flatten()
+
+        return input_ids_global, input_ids
+
+    raise NotImplementedError("in-seq-split mode not support yet")
 
 
 def cp_all_gather_reorganized_into_tensor(

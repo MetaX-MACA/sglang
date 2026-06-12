@@ -30,6 +30,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
+    cp_split_and_rebuild_input_ids,
     prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -181,6 +182,7 @@ class DeepseekV4ModelNextN(nn.Module):
         if nsa_use_prefill_cp(forward_batch):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            input_ids_global, input_ids = cp_split_and_rebuild_input_ids(forward_batch, input_ids)
 
         hidden_states = self.decoder(
             positions=positions,

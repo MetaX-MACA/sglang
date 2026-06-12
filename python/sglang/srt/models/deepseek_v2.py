@@ -925,6 +925,9 @@ class DeepseekV2MoE(nn.Module):
             should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        elif self.tp_size > 1:
+            if shared_output is not None and self._shared_expert_tp1:
+                raise Exception("route expert output is not complete, can not add with shared_output")
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:
