@@ -33,7 +33,7 @@ CHUNK_SIZE = 64
     # NT_BUCKET is kept in the autotune key for forward-compatibility (allows
     # future per-bucket configs once the kernel is refactored to write final
     # state to a separate output buffer).
-    configs=[triton.Config({"BV": 32}, num_warps=4, num_stages=2)],
+    configs=[triton.Config({"BV": 32}, num_warps=4, num_stages=1)],
     key=["H", "K", "V", "BT", "USE_GK", "NT_BUCKET"],
     **autotune_cache_kwargs,
 )
