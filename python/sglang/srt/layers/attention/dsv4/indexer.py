@@ -399,7 +399,6 @@ class C4IndexerBackendMixin:
             indexer_metadata.deep_gemm_metadata,
             indexer_metadata.max_c4_seq_len,
             False,
-            backend="tilelang"
         )
 
         assert indexer_metadata.page_table is core_metadata.page_table
