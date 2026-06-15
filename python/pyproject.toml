@@ -54,7 +54,6 @@ dependencies = [
   "sglang-kernel==0.4.2.post2",
   "soundfile==0.13.1",
   "tiktoken",
-  "tokenspeed_mla==0.1.1",
   "tqdm",
   "mistral_common>=1.11.0",
   "transformers==5.6.0",
@@ -77,6 +76,7 @@ dependencies = [
   "torchao==0.9.0",
   "compressed-tensors==0.15.0.1",
   "kernels-data<0.15",
+  "apache-tvm-ffi==0.1.3.dev11",
 ]
 
 [[tool.uv.index]]
