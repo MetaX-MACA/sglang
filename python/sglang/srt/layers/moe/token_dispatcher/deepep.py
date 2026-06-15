@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     is_blackwell,
     is_hip,
     is_npu,
+    is_maca,
     load_json_config,
 )
 
@@ -42,6 +43,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 )
 
 _is_npu = is_npu()
+_is_maca = is_maca()
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -741,6 +743,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 or backend.is_flashinfer_cutedsl()
                 or (_is_npu and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
                 or (backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
+                or (_is_maca and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
             )
             if not need_bf16_dispatch:
                 use_fp8 = True
