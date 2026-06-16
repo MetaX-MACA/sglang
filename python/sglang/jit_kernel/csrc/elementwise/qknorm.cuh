@@ -35,7 +35,7 @@ constexpr uint32_t kThreadsPerBlock = kWarpsPerBlock * device::kWarpThreads;
 
 // Warp-level kernel for head_dim <= 256
 template <int64_t kHeadDim, bool kUsePDL, typename Float>
-__global__ void fused_qknorm_warp(const QKNormParams __grid_constant__ params) {
+__global__ void fused_qknorm_warp(const QKNormParams  params) {
   using namespace device;
   using Storage = norm::StorageType<Float, kHeadDim>;
 
@@ -69,7 +69,7 @@ __global__ void fused_qknorm_warp(const QKNormParams __grid_constant__ params) {
 
 // For CTA level, used for head_dim > 256 (512,1024)
 template <int64_t kHeadDim, bool kUsePDL, typename Float>
-__global__ void fused_qknorm_cta(const QKNormParams __grid_constant__ params) {
+__global__ void fused_qknorm_cta(const QKNormParams  params) {
   using namespace device;
   using Storage = norm::StorageType<Float, kHeadDim>;
 

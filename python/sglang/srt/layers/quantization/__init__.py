@@ -26,7 +26,8 @@ from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+# from sglang.srt.layers.quantization.fp8 import Fp8Config
+Fp8Config=None
 from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import (
@@ -43,13 +44,13 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 )
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
-from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
-from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
+# from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+# from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
-from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
-from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
+# from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
+# from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.platforms import current_platform
@@ -70,13 +71,13 @@ if TYPE_CHECKING:
 
 # Base quantization methods
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
-    "fp8": Fp8Config,
-    "mxfp8": Fp8Config,
+    # "fp8": Fp8Config,
+    # "mxfp8": Fp8Config,
     "blockwise_int8": BlockInt8Config,
     "modelopt": ModelOptFp8Config,  # Auto-detect, defaults to FP8
     "modelopt_fp8": ModelOptFp8Config,
     "modelopt_fp4": ModelOptFp4Config,
-    "nvfp4_online": NvFp4OnlineConfig,
+    # "nvfp4_online": NvFp4OnlineConfig,
     "modelopt_mixed": ModelOptMixedPrecisionConfig,
     "w8a8_int8": W8A8Int8Config,
     "w8a8_fp8": W8A8Fp8Config,
@@ -84,28 +85,28 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "gguf": GGUFConfig,
-    "gptq": GPTQConfig,
-    "gptq_marlin": GPTQMarlinConfig,
+    # "gptq": GPTQConfig,
+    # "gptq_marlin": GPTQMarlinConfig,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
     "qoq": QoQConfig,
-    "w4afp8": W4AFp8Config,
+    # "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
     "fbgemm_fp8": FBGEMMFp8Config,
     "quark": QuarkConfig,
     "quark_mxfp4": QuarkConfig,
     "auto-round": AutoRoundConfig,
     "modelslim": ModelSlimConfig,
-    "quark_int4fp8_moe": QuarkInt4Fp8Config,
+    # "quark_int4fp8_moe": QuarkInt4Fp8Config,
 }
 
 
-if is_cpu() or is_cuda() or (_is_mxfp_supported and is_hip()):
-    BASE_QUANTIZATION_METHODS.update(
-        {
-            "mxfp4": Mxfp4Config,
-        }
-    )
+# if is_cpu() or is_cuda() or (_is_mxfp_supported and is_hip()):
+#     BASE_QUANTIZATION_METHODS.update(
+#         {
+#             "mxfp4": Mxfp4Config,
+#         }
+#     )
 
 
 if is_npu():
@@ -116,13 +117,13 @@ if is_npu():
     )
 
 
-if is_mps():
-    BASE_QUANTIZATION_METHODS.update(
-        {
-            "mlx_q4": MlxQuantizationConfig,
-            "mlx_q8": MlxQuantizationConfig,
-        }
-    )
+# if is_mps():
+#     BASE_QUANTIZATION_METHODS.update(
+#         {
+#             "mlx_q4": MlxQuantizationConfig,
+#             "mlx_q8": MlxQuantizationConfig,
+#         }
+#     )
 
 # subset of above quant methods, supported on CPU
 CPU_QUANTIZATION_METHODS = {
@@ -130,8 +131,8 @@ CPU_QUANTIZATION_METHODS = {
     "w8a8_int8": W8A8Int8Config,
     "compressed-tensors": CompressedTensorsConfig,
     "awq": AWQCPUConfig,
-    "gptq": CPUGPTQConfig,
-    "mxfp4": Mxfp4Config,
+    # "gptq": CPUGPTQConfig,
+    # "mxfp4": Mxfp4Config,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}

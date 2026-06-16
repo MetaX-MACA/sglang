@@ -559,10 +559,17 @@ class DeepseekV2WeightLoaderMixin:
                             weight, weight_scale, weight_block_size
                         ).to(torch.bfloat16)
                 else:
-                    # channel-wise int8 need it
-                    w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
-                        torch.bfloat16
-                    )
+                    if self.enable_dequant_bf16:
+                        # channel-wise int8 need it
+                        w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
+                            torch.bfloat16
+                        )
+                    else:
+                        w_kc_scale, w_vc_scale = self_attn.kv_b_proj.weight_scale.unflatten(
+                            0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                        ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                        self_attn.w_kc_scale = w_kc_scale.transpose(1, 2).contiguous().transpose(1, 2)
+                        self_attn.w_vc_scale = w_vc_scale.contiguous().transpose(1, 2)
 
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
@@ -584,6 +591,11 @@ class DeepseekV2WeightLoaderMixin:
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
+                
+                self_attn.w_kc = self_attn.w_kc.contiguous()                
+                if (self.enable_dequant_bf16 is False) and self_attn.w_kc.dtype == torch.int8 and self_attn.w_kc_scale is not None:
+                    self_attn.w_kc = (self_attn.w_kc.to(torch.float32) * self_attn.w_kc_scale).to(torch.bfloat16)                    
+                
                 w_vc = w_vc.contiguous().transpose(1, 2)
                 if _is_npu:
                     w_vc = w_vc.contiguous()

@@ -165,13 +165,13 @@ def fp4_gemm(
         return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
 
 
-if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
+# if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
 
-    @register_fake_if_exists("sgl_kernel::scaled_fp4_quant")
-    def _sgl_kernel_scaled_fp4_quant_fake(
-        output, input, output_scale, input_global_scale
-    ):
-        return
+#     @register_fake_if_exists("sgl_kernel::scaled_fp4_quant")
+#     def _sgl_kernel_scaled_fp4_quant_fake(
+#         output, input, output_scale, input_global_scale
+#     ):
+#         return
 
 
 # FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
@@ -1694,14 +1694,17 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         w_n, _ = layer.weight.shape
         output_shape = [x_m, output_size]
 
-        assert x_fp4.dtype == torch.uint8
-        assert layer.weight.dtype == torch.uint8
-        assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
-        assert layer.alpha.dtype == torch.float32
+        # # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
+        # x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
+
+        # assert x_fp4.dtype == torch.uint8
+        # assert layer.weight.dtype == torch.uint8
+        # assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
+        # assert layer.alpha.dtype == torch.float32
 
         # Pad activations to match weight K-dimension padding
-        weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
-        x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
+        # weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
+        # x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
 
         w = layer.weight
         w_scale_interleaved = layer.weight_scale_interleaved
@@ -1712,18 +1715,19 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
 
-        out = fp4_gemm(
-            x_fp4,
-            w,
-            x_scale_interleaved,
-            w_scale_interleaved,
-            layer.alpha,
-            output_dtype,
-            w_n,
-        )
+        # out = fp4_gemm(
+        #     x_fp4,
+        #     w,
+        #     x_scale_interleaved,
+        #     w_scale_interleaved,
+        #     layer.alpha,
+        #     output_dtype,
+        #     w_n,
+        # )
 
         # Slice output to remove N-dimension padding
-        out = slice_nvfp4_output(out, output_size)
+        # out = slice_nvfp4_output(out, output_size)
+        out=None
 
         if bias is not None:
             out = out + bias

@@ -33,8 +33,8 @@ _is_musa = is_musa()
 if _is_cuda:
     try:
         import pynvml
-    except ImportError as e:
-        logger.warning("Failed to import pynvml with %r", e)
+    except :
+        pynvml=None
 
 if _is_musa:
     try:

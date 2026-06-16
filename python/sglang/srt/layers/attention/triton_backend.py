@@ -190,7 +190,7 @@ class TritonAttnBackend(AttentionBackend):
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
-        self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        self.max_kv_splits = 16
         if self.use_mla:
             self.max_kv_splits = _mla_decode_kv_splits_cap(
                 self.max_kv_splits,
@@ -759,6 +759,7 @@ class TritonAttnBackend(AttentionBackend):
                 max_extend_len = max(forward_batch.extend_seq_lens_cpu)
             else:
                 max_extend_len = int(forward_batch.extend_seq_lens.max())
+            self.max_kv_splits = 16 if max_extend_len > 256 else 2
             num_kv_splits = None
 
         swa_out_cache_loc = None

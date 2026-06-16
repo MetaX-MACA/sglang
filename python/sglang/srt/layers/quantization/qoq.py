@@ -19,8 +19,8 @@ from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
-if _is_cuda:
-    from sgl_kernel import qserve_w4a8_per_chn_gemm, qserve_w4a8_per_group_gemm
+# if _is_cuda:
+#     from sgl_kernel import qserve_w4a8_per_chn_gemm, qserve_w4a8_per_group_gemm
 
 
 QoQ_SUPPORTED_WEIGHT_BITS = [4]

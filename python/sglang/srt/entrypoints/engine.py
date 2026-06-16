@@ -1275,14 +1275,14 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Check flashinfer version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
-        if server_args.attention_backend == "flashinfer":
-            assert_pkg_version(
-                "flashinfer_python",
-                "0.6.12",
-                "Please uninstall the old version and "
-                "reinstall the latest version by following the instructions "
-                "at https://docs.flashinfer.ai/installation.html.",
-            )
+        # if server_args.attention_backend == "flashinfer":
+        #     assert_pkg_version(
+        #         "flashinfer_python",
+        #         "0.6.12",
+        #         "Please uninstall the old version and "
+        #         "reinstall the latest version by following the instructions "
+        #         "at https://docs.flashinfer.ai/installation.html.",
+        #     )
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",

@@ -47,7 +47,7 @@ constexpr auto next_pow2(uint32_t target, uint32_t factor = 1) {
 }
 
 template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename IdType, uint32_t kWorkThreads>
-__global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params) {
+__global__ void fused_rope_kernel(const FusedRopeParams params) {
   using namespace device;
 
   constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(float);
@@ -135,7 +135,7 @@ __global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params
 }
 
 template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename IdType, uint32_t kWorkThreads>
-__global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStoreParams params) {
+__global__ void fused_rope_store_kernel(const FusedRopeStoreParams params) {
   using namespace device;
 
   constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(float);

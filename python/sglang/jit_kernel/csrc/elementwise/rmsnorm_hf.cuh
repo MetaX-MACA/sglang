@@ -40,7 +40,7 @@ struct RMSNormHFParams {
 // warp reduce is sufficient. Grid-strided over rows.
 // ---------------------------------------------------------------------------
 template <int64_t kDim, bool kUsePDL, typename Float>
-__global__ __launch_bounds__(32) void rmsnorm_hf_warp_kernel(const RMSNormHFParams __grid_constant__ params) {
+__global__ __launch_bounds__(32) void rmsnorm_hf_warp_kernel(const RMSNormHFParams   params) {
   using namespace device;
   constexpr int kElemsPerThread = kDim / kWarpThreads;
 
@@ -87,7 +87,7 @@ __global__ __launch_bounds__(32) void rmsnorm_hf_warp_kernel(const RMSNormHFPara
 //             y  = cast_to_dtype(float(xn) * float(w))
 // ---------------------------------------------------------------------------
 template <int64_t kDim, bool kUsePDL, typename Float>
-__global__ __launch_bounds__(512) void rmsnorm_hf_scalar_kernel(const RMSNormHFParams __grid_constant__ params) {
+__global__ __launch_bounds__(512) void rmsnorm_hf_scalar_kernel(const RMSNormHFParams   params) {
   using namespace device;
   constexpr int kNumThreads = 512;
   constexpr int kNumWarps = kNumThreads / kWarpThreads;
