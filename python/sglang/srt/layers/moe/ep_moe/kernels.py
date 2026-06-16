@@ -10,7 +10,8 @@ from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 logger = logging.getLogger(__name__)
 
 import os
-from mctlassEx import MaskedGroupedGEMM
+from mctlassEx import MaskedGroupedGEMM, ContinuousGroupedGEMM
+gemm = ContinuousGroupedGEMM()
 import mcoplib
 # from mcoplib.sgl_grouped_gemm_mctlass_int8 import (
 from mcoplib.sgl_grouped_gemm_mctlass_int8 import (

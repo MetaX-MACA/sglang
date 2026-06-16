@@ -11,7 +11,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     m_grouped_gemm_nt_masked,
     silu_and_mul_masked_fwd_no_pack,
 )
-
+from sglang.srt.layers.moe.token_dispatcher.deepep import _DeepEPDispatcherImplLowLatency
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
@@ -190,7 +190,8 @@ class DeepEPMoE(FusedMoE):
         if _use_aiter or _is_npu:
             self.deprecate_flag = False
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            if isinstance(quant_config, Fp8Config) or isinstance(quant_config, CompressedTensorsConfig) or isinstance(quant_config, W8A8Int8Config):
+            if isinstance(quant_config, Fp8Config) or isinstance(quant_config, CompressedTensorsConfig) or isinstance(quant_config, W8A8Int8Config) and \
+            self.dispatcher._inners[0].deepep_mode.name == 'LOW_LATENCY':
                 self.deprecate_flag = True
             else:
                 self.deprecate_flag = False
