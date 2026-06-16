@@ -434,7 +434,8 @@ class ModelConfig:
             "DeepseekV32ForCausalLM",
             "GlmMoeDsaForCausalLM",
         ]:
-            self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+            model_type = getattr(self.hf_config, "model_type", None)
+            self.hf_config.architectures[0] = "JoyAILLMFlashForCausalLMNextN" if model_type == "joyai_llm_flash" else "DeepseekV3ForCausalLMNextN"
 
         if (
             is_draft_model
@@ -618,6 +619,7 @@ class ModelConfig:
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
+            or "JoyAILLMFlashForCausalLMNextN" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
