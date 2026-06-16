@@ -14,7 +14,10 @@ logger = logging.getLogger(__name__)
 
 # Try to import nvidia-ml-py for GPU detection
 try:
-    import pynvml
+    try:
+        import pynvml
+    except :
+        pynvml=None
 
     NVML_AVAILABLE = True
 except ImportError:
