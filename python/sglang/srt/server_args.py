@@ -2803,6 +2803,7 @@ class ServerArgs:
                 "to be specified."
             )
 
+
         if self.enable_http2:
             try:
                 import granian  # noqa: F401

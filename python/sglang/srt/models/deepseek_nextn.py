@@ -327,8 +327,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     ) -> torch.Tensor:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         if self.dsa_enable_prefill_cp:
+            cur_cp_seq_len = len(input_ids) // (self.cp_size * 2)
             if can_dsa_cp_split(
-                len(input_ids), self.cp_size, self.use_dsa, forward_batch
+                cur_cp_seq_len, self.cp_size, self.use_dsa, forward_batch
             ):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),

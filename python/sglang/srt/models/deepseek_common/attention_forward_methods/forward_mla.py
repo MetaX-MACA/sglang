@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp, is_dsa_enable_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -455,7 +455,7 @@ class DeepseekMLAForwardMixin:
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch, is_dsa_enable_prefill_cp()) or mla_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe

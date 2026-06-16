@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import (require_gathered_buffer, get_device_memory_capacity)
+from sglang.srt.utils import (require_gathered_buffer, get_device_memory_capacity, enable_specific_device_opt)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
@@ -114,7 +114,7 @@ def get_batch_sizes_to_capture(
         capture_bs += [num_max_requests]
 
     sum_len_bs = []
-    if (server_args.speculative_algorithm is None and get_moe_a2a_backend().is_none() and get_parallel().attn_cp_size <= 1):
+    if not server_args.enable_two_batch_overlap and (server_args.speculative_algorithm is None or enable_specific_device_opt()) and get_moe_a2a_backend().is_none() and get_parallel().attn_cp_size <= 1:
         sum_len_bs = [bs for bs in capture_bs if bs < 10 and bs % mul_base != 0]
 
     # Model input token count = bs * num_tokens_per_bs; must be a multiple of attn_tp_size.
