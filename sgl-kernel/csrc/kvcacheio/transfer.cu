@@ -24,15 +24,16 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
 
 #pragma unroll
   for (int j = lane_id; j < total_chunks; j += WARP_SIZE) {
-#if !defined(USE_ROCM) && !defined(USE_MUSA)
-    uint64_t tmp;
-    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src + j) : "memory");
-    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst + j), "l"(tmp) : "memory");
+// #if !defined(USE_ROCM) && !defined(USE_MUSA)
+//     uint64_t tmp;
+//     asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src + j) : "memory");
+//     asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst + j), "l"(tmp) : "memory");
 
-#else
-    uint64_t tmp = __builtin_nontemporal_load(src + j);
-    __builtin_nontemporal_store(tmp, dst + j);
-#endif
+// #else
+    // uint64_t tmp = __builtin_nontemporal_load(src + j);
+    // __builtin_nontemporal_store(tmp, dst + j);
+    dst[j] = src[j];
+// #endif
   }
 }
 
