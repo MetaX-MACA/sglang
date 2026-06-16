@@ -168,7 +168,7 @@ class CompressStatePool:
                 else nullcontext()
             ):
                 self.kv_score_buffer = KVAndScore(
-                    torch.empty(
+                    torch.zeros(
                         (self._size, self.last_dim),
                         dtype=dtype,
                         device=device,
