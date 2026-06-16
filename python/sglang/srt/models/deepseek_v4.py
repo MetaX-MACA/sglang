@@ -510,16 +510,9 @@ class MQALayer(nn.Module):
                 forward_batch=forward_batch,
             )
         else:
-            if attn_backend.token_to_kv_pool.dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
-                self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
-                kv = None
-            else:
-                kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-                attn_backend.store_cache(
-                    layer_id=self.layer_id,
-                    swa_k=kv,
-                    forward_batch=forward_batch,
-                )
+            assert attn_backend.token_to_kv_pool.dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.bfloat16)
+            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
+            kv = None
 
         del qkv_a
 

@@ -187,9 +187,19 @@ def _jit_fused_store_module(
     input_dtype: torch.dtype,
     index_dtype: torch.dtype,
     page_size: int,
+    store_dtype: torch.dtype
 ) -> Module:
-    args = make_cpp_args(input_dtype, index_dtype, page_size, is_arch_support_pdl())
+    args = make_cpp_args(input_dtype, index_dtype, store_dtype, page_size, is_arch_support_pdl())
     cname = "FlashMLA" if name == "flashmla" else "Indexer"
+    if cname == "FlashMLA":
+        assert store_dtype is torch.uint8
+    else:
+        if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":
+            assert store_dtype is torch.uint8
+        elif  envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "int8":
+            assert store_dtype is torch.int8
+        else:
+            assert store_dtype is torch.bfloat16
     kernel_class = f"FusedStoreCache{cname}Kernel<{args}>"
     return load_jit(
         make_name("store_" + name),
@@ -868,6 +878,7 @@ def fused_store_cache(
         input_dtype=input.dtype,
         index_dtype=indices.dtype,
         page_size=page_size,
+        store_dtype=cache.dtype
     )
     module.run(input, cache, indices)
 

@@ -539,16 +539,9 @@ class C4Indexer(nn.Module):
                 q, weight, self.weight_scale, self.freqs_cis, positions
             )
         elif envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "int8":
-            fused_rope(
-                q[..., -self.rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions=positions,
-                )
-            q = rotate_activation(q)
-            q_int8, q_scale = act_quant_int8(q)
-            weight_out = fused_scale(weight, self.weight_scale, q_scale)
-            return q_int8, weight_out
+            return fused_q_indexer_rope_hadamard_quant(
+                q, weight, self.weight_scale, self.freqs_cis, positions, torch.int8
+            )
         else:
             assert envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "bf16"
             raise NotImplementedError("index cache with bfloat16 is not implement yet")

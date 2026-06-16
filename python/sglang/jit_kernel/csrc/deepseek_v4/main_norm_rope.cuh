@@ -22,6 +22,19 @@ using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
 
+
+// Clamp to [INT8_MIN, INT8_MAX].
+SGL_DEVICE int8_t int8_clip(float val) {
+  namespace math = device::math;
+  return static_cast<int8_t>(math::max(math::min(val, 127.0f), -128.0f));
+}
+
+// Pack two fp32 values into a single int8x2 with clamping.
+SGL_DEVICE char2 pack_int8(float x, float y) {
+  return char2{int8_clip(x), int8_clip(y)};
+}
+
+
 // 4 warps per block: warp-per-(token, head) work-item dispatch (Q kernel).
 constexpr uint32_t kFusedQBlockSize = 128;
 constexpr uint32_t kFusedQNumWarps = kFusedQBlockSize / device::kWarpThreads;
@@ -453,7 +466,9 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const FusedQIndexerRopeHadamar
   static_assert(kRopeSize <= kWarpThreads);
 
   constexpr bool kUseFp8Output = std::is_same_v<OutDType, fp8_e4m3_t>;
-  static_assert(kUseFp8Output || std::is_same_v<OutDType, bf16_t>, "OutDType must be fp8_e4m3_t or bf16_t");
+  constexpr bool kUseInt8Output = std::is_same_v<OutDType, int8_t>;
+
+  static_assert(kUseFp8Output || kUseInt8Output || std::is_same_v<OutDType, bf16_t>, "OutDType must be fp8_e4m3_t or bf16_t or int8_t");
 
   using Storage = AlignedVector<DType, kVecSize>;
   using Float4 = AlignedVector<float, kVecSize>;
@@ -558,6 +573,26 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const FusedQIndexerRopeHadamar
     result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
 
     // fp8 row pointer: 128 fp8 / row = 32 OutStorage / row, one per lane.
+    auto out_row = static_cast<uint8_t*>(params.q_output) + work_id * kHeadDim;
+    result.store(out_row, lane_id);
+    if (lane_id == 0) {
+      params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    }
+  } else if constexpr (kUseInt8Output) {
+    float local_max = math::abs(data[0]);
+#pragma unroll
+    for (int i = 1; i < kVecSize; ++i) {
+      local_max = math::max(local_max, math::abs(data[i]));
+    }
+    const auto abs_max = warp::reduce_max(local_max);
+    const auto scale = fmaxf(1e-4f, abs_max) / 127.0f;
+    const auto inv_scale = 1.0f / scale;
+    using OutStorage = AlignedVector<char2, 2>;  // 4 int8 / lane
+    OutStorage result;
+    result[0] = pack_int8(data[0] * inv_scale, data[1] * inv_scale);
+    result[1] = pack_int8(data[2] * inv_scale, data[3] * inv_scale);
+
+    // int8 row pointer: 128 int8 / row = 32 OutStorage / row, one per lane.
     auto out_row = static_cast<uint8_t*>(params.q_output) + work_id * kHeadDim;
     result.store(out_row, lane_id);
     if (lane_id == 0) {

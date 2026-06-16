@@ -24,6 +24,19 @@ using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
 
+
+// Clamp to [INT8_MIN, INT8_MAX].
+SGL_DEVICE int8_t int8_clip(float val) {
+  namespace math = device::math;
+  return static_cast<int8_t>(math::max(math::min(val, 127.0f), -128.0f));
+}
+
+// Pack two fp32 values into a single int8x2 with clamping.
+SGL_DEVICE char2 pack_int8(float x, float y) {
+  return char2{int8_clip(x), int8_clip(y)};
+}
+
+
 constexpr uint32_t kBlockSize = 256;
 constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
 
@@ -62,12 +75,13 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const FusedNormRopeStoreParams param
   constexpr int64_t kVecSize = 4;
   constexpr uint32_t kRopeSize = kRopeDim / kVecSize;
   constexpr bool kUseFp8Cache = std::is_same_v<CacheDType, uint8_t>;
+  constexpr bool kUseInt8Cache = std::is_same_v<CacheDType, int8_t>;
   constexpr int64_t kFp8PageBytes = 132ll << kPageBits;
   constexpr int64_t kBf16PageElems = kHeadDim << kPageBits;
   static_assert(kHeadDim == kWarpThreads * kVecSize);
   static_assert(kRopeDim == kWarpThreads * 2);
   static_assert(kRopeSize <= kWarpThreads);
-  static_assert(kUseFp8Cache || std::is_same_v<CacheDType, bf16_t>, "CacheDType must be uint8_t or bf16_t");
+  static_assert(kUseFp8Cache || kUseInt8Cache || std::is_same_v<CacheDType, bf16_t>, "CacheDType must be uint8_t or bf16_t or int8");
   using Storage = AlignedVector<DType, kVecSize>;
   using Float4 = AlignedVector<float, kVecSize>;
 
@@ -185,18 +199,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const FusedNormRopeStoreParams param
     const int32_t page = out_loc >> kPageBits;
     const int32_t offset = out_loc & ((1 << kPageBits) - 1);
 
-    if constexpr (!kUseFp8Cache) {
-      using CacheStorage = AlignedVector<CacheDType, kVecSize>;
-      auto cache_ptr =
-          static_cast<CacheDType*>(params.kvcache) + page * kBf16PageElems + offset * kHeadDim;
-      CacheStorage result;
-#pragma unroll
-      for (int i = 0; i < kVecSize; ++i) {
-        result[i] = cast<CacheDType>(data[i]);
-      }
-      PDLTriggerSecondary<kUsePDL>();
-      result.store(cache_ptr, lane_id);
-    } else {
+    if constexpr (kUseFp8Cache) {
       using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
       float local_max = math::abs(data[0]);
 #pragma unroll
@@ -216,7 +219,38 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const FusedNormRopeStoreParams param
       result.store(value_ptr, lane_id);
       // The single fp32 scale is identical across all lanes -- write from any lane.
       if (lane_id == 0) reinterpret_cast<float*>(scale_ptr)[0] = scale;
-    }
+    } else if constexpr (kUseInt8Cache) {
+      using OutStorage = AlignedVector<char2, 2>;
+      float local_max = math::abs(data[0]);
+#pragma unroll
+      for (int i = 1; i < kVecSize; ++i) {
+        local_max = math::max(local_max, math::abs(data[i]));
+      }
+      const auto abs_max = warp::reduce_max(local_max);
+      const auto scale = fmaxf(1e-4f, abs_max) / 127.0f;
+      const auto inv_scale = 1.0f / scale;
+      const auto page_ptr = static_cast<int8_t*>(params.kvcache) + page * kFp8PageBytes;
+      const auto value_ptr = page_ptr + offset * 128;
+      const auto scale_ptr = page_ptr + (128 << kPageBits) + offset * 4;
+      OutStorage result;
+      result[0] = pack_int8(data[0] * inv_scale, data[1] * inv_scale);
+      result[1] = pack_int8(data[2] * inv_scale, data[3] * inv_scale);
+      PDLTriggerSecondary<kUsePDL>();
+      result.store(value_ptr, lane_id);
+      // The single fp32 scale is identical across all lanes -- write from any lane.
+      if (lane_id == 0) reinterpret_cast<float*>(scale_ptr)[0] = scale;
+    } else {
+      using CacheStorage = AlignedVector<CacheDType, kVecSize>;
+      auto cache_ptr =
+          static_cast<CacheDType*>(params.kvcache) + page * kBf16PageElems + offset * kHeadDim;
+      CacheStorage result;
+#pragma unroll
+      for (int i = 0; i < kVecSize; ++i) {
+        result[i] = cast<CacheDType>(data[i]);
+      }
+      PDLTriggerSecondary<kUsePDL>();
+      result.store(cache_ptr, lane_id);
+    } 
   }
 }
 
@@ -370,18 +404,19 @@ struct FusedNormRopeKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr bool kIsIndexer = (kHeadDim == 128);
   static constexpr bool kUseFp8Cache = std::is_same_v<CacheDType, uint8_t>;
+  static constexpr bool kUseInt8Cache = std::is_same_v<CacheDType, int8_t>;
   static constexpr int64_t kIndexerFp8Bytes = 132 * kPageSize;
   static constexpr int64_t kIndexerBf16Elems = 128 * kPageSize;
   static constexpr int64_t kFlashMLAFp8Bytes = host::div_ceil(584 * kPageSize, 576) * 576;
   static constexpr int64_t kFlashMLABf16Elems = 512 * kPageSize;
   static constexpr int64_t kPageStride =
-      kIsIndexer ? (kUseFp8Cache ? kIndexerFp8Bytes : kIndexerBf16Elems)
+      kIsIndexer ? ((kUseFp8Cache || kUseInt8Cache) ? kIndexerFp8Bytes : kIndexerBf16Elems)
                  : (kUseFp8Cache ? kFlashMLAFp8Bytes : kFlashMLABf16Elems);
 
   /// TODO: Let's fix the config for now.
   static_assert(kRopeDim == 64 && (kHeadDim == 128 || kHeadDim == 512));
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
-  static_assert(kUseFp8Cache || std::is_same_v<CacheDType, bf16_t>, "CacheDType must be uint8_t or bf16_t");
+  static_assert(kUseFp8Cache || kUseInt8Cache || std::is_same_v<CacheDType, bf16_t>, "CacheDType must be uint8_t or int8 or bf16_t");
 
   template <ForwardMode kMode>
   static constexpr auto select_kernel() {
