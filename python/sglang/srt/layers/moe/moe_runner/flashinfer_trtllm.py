@@ -98,9 +98,10 @@ if TYPE_CHECKING:
     )
 
 if is_flashinfer_available():
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-elif is_cuda_alike():
-    from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
+    fp4_quantize = None
+    # from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+# elif is_cuda_alike():
+#     from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
 else:
     fp4_quantize = None
 

@@ -82,7 +82,7 @@ SGL_DEVICE void warp_g2s_copy(const void* __restrict__ src, void* __restrict__ d
 }
 
 template <int64_t kNopeBytes, int64_t kRopeBytes, int kNumWarps, bool kUsePDL, typename TLoc>
-__global__ void set_mla_kv_buffer_kernel(const __grid_constant__ SetMlaKVBufferParams params) {
+__global__ void set_mla_kv_buffer_kernel(const  SetMlaKVBufferParams params) {
   using namespace device;
   static_assert((kNopeBytes + kRopeBytes) % 16 == 0, "TMA bulk store requires total row to be 16-byte aligned");
 

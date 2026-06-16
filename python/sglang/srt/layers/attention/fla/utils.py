@@ -248,6 +248,7 @@ def get_available_device() -> str:
 @lru_cache(maxsize=None)
 def _check_platform() -> Literal["nvidia", "amd", "intel", "musa"]:
     device = get_available_device()
+
     if device == "cuda":
         return "nvidia"
     elif device == "hip":
@@ -262,6 +263,9 @@ def _check_platform() -> Literal["nvidia", "amd", "intel", "musa"]:
 # However, the torch backend is 'cuda' for both Nvidia and AMD GPUs.
 # Therefore, we need to check the triton backend to determine the actual GPU vendor.
 device = get_available_device() if get_available_device() != "hip" else "cuda"
+if device == "maca":
+    device = "cuda"
+
 device_torch_lib = getattr(torch, device)
 device_platform = _check_platform()
 

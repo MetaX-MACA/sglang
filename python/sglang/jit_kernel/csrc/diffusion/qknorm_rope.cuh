@@ -51,7 +51,7 @@ SGL_DEVICE float load_cache_value(const float* ptr, int64_t idx) {
 }
 
 template <int64_t kHeadDim, int64_t kRopeDim, bool kIsNeox, bool kUsePDL, typename DType, typename IdType>
-__global__ void fused_qknorm_rope_warp(const QKNormRopeParams __grid_constant__ params) {
+__global__ void fused_qknorm_rope_warp(const QKNormRopeParams  params) {
   using namespace device;
 
   static_assert(std::is_same_v<DType, fp16_t> || std::is_same_v<DType, bf16_t>);
