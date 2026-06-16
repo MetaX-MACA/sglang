@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.kvcache.cache_ops import absorbed_bmm_concat_cast_q_fp8
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp, is_dsa_enable_prefill_cp
+from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,

@@ -101,7 +101,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
 )
-from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
+from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu, get_bool_env_var
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+ENABLE_KV_LAYOUT_FIX = get_bool_env_var("SGLANG_ENABLE_KV_LAYOUT_FIX", "false")
 
 
 def _bootstrap_addr(req: Req) -> str:
@@ -546,11 +547,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
-            kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
-            num_draft_entries = len(draft_kv_data_ptrs)
+
+            if not self.is_mla_backend and ENABLE_KV_LAYOUT_FIX:
+                # Interleave target and draft K/V pointers to maintain [All K] + [All V] layout
+                half_t = len(kv_data_ptrs) // 2
+                half_d = len(draft_kv_data_ptrs) // 2
+                kv_data_ptrs = kv_data_ptrs[:half_t] + draft_kv_data_ptrs[:half_d] + kv_data_ptrs[half_t:] + draft_kv_data_ptrs[half_d:]
+                kv_data_lens = kv_data_lens[:half_t] + draft_kv_data_lens[:half_d] + kv_data_lens[half_t:] + draft_kv_data_lens[half_d:]
+                kv_item_lens = kv_item_lens[:half_t] + draft_kv_item_lens[:half_d] + kv_item_lens[half_t:] + draft_kv_item_lens[half_d:]
+            else:
+                kv_data_ptrs += draft_kv_data_ptrs
+                kv_data_lens += draft_kv_data_lens
+                kv_item_lens += draft_kv_item_lens
+                kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
+                num_draft_entries = len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

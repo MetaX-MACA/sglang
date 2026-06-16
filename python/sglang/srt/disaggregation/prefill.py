@@ -80,6 +80,9 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from sglang.srt.utils import get_bool_env_var
+
+ENABLE_KV_LAYOUT_FIX = get_bool_env_var("SGLANG_ENABLE_KV_LAYOUT_FIX", "false")
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -249,10 +252,18 @@ class PrefillBootstrapQueue:
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 draft_kv_pool.get_contiguous_buf_infos()
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
-            num_draft_entries = len(draft_kv_data_ptrs)
+            if not self.is_mla_backend and ENABLE_KV_LAYOUT_FIX:
+                # Interleave target and draft K/V pointers to maintain [All K] + [All V] layout
+                half_t = len(kv_data_ptrs) // 2
+                half_d = len(draft_kv_data_ptrs) // 2
+                kv_data_ptrs = kv_data_ptrs[:half_t] + draft_kv_data_ptrs[:half_d] + kv_data_ptrs[half_t:] + draft_kv_data_ptrs[half_d:]
+                kv_data_lens = kv_data_lens[:half_t] + draft_kv_data_lens[:half_d] + kv_data_lens[half_t:] + draft_kv_data_lens[half_d:]
+                kv_item_lens = kv_item_lens[:half_t] + draft_kv_item_lens[:half_d] + kv_item_lens[half_t:] + draft_kv_item_lens[half_d:]
+            else:
+                kv_data_ptrs += draft_kv_data_ptrs
+                kv_data_lens += draft_kv_data_lens
+                kv_item_lens += draft_kv_item_lens
+                num_draft_entries = len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

@@ -1360,6 +1360,13 @@ _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
     "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
 )
 
+_SGLANG_ENABLE_SPECIFIC_DEVICE_OPT = get_bool_env_var(
+    "SGLANG_ENABLE_SPECIFIC_DEVICE_OPT", str("MetaX C600" in torch.cuda.get_device_name(0))
+)
+
+def enable_specific_device_opt() -> bool:
+    global _SGLANG_ENABLE_SPECIFIC_DEVICE_OPT
+    return _SGLANG_ENABLE_SPECIFIC_DEVICE_OPT
 
 class DynamicGradMode(_DecoratorContextManager):
     """
