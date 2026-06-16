@@ -233,7 +233,7 @@ class EagleDraftInputV2Mixin:
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
         batch.spec_info = self
-        batch.input_ids = predict
+        batch.input_ids = predict.to(torch.int64)
         batch.seq_lens = batch.seq_lens + num_draft_tokens
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
         batch.seq_lens_sum += extend_num_tokens
@@ -460,19 +460,19 @@ class EagleVerifyInputV2Mixin:
                 deterministic=True,
             )
 
-            # Sync sampling results across TP ranks: different GPUs may
-            # produce slightly different target_probs due to floating-point
-            # non-determinism in softmax/top_k/top_p, causing different
-            # sampled tokens. Broadcast from rank 0 to ensure consistency.
-            tp_group = (
-                get_attention_tp_group()
-                if is_dp_attention_enabled()
-                else get_tp_group()
-            )
-            if tp_group.world_size > 1:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
+        # Sync sampling results across TP ranks: different GPUs may
+        # produce slightly different target_probs due to floating-point
+        # non-determinism in softmax/top_k/top_p, causing different
+        # sampled tokens. Broadcast from rank 0 to ensure consistency.
+        tp_group = (
+            get_attention_tp_group()
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
 
         if SIMULATE_ACC_LEN > 0:
             # Do simulation
