@@ -401,19 +401,19 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 deterministic=True,
             )
 
-            # Sync sampling results across TP ranks: different GPUs may
-            # produce slightly different target_probs due to floating-point
-            # non-determinism in softmax/top_k/top_p, causing different
-            # sampled tokens. Broadcast from rank 0 to ensure consistency.
-            tp_group = (
-                get_attention_tp_group()
-                if is_dp_attention_enabled()
-                else get_tp_group()
-            )
-            if tp_group.world_size > 1:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
+        # Sync sampling results across TP ranks: different GPUs may
+        # produce slightly different target_probs due to floating-point
+        # non-determinism in softmax/top_k/top_p, causing different
+        # sampled tokens. Broadcast from rank 0 to ensure consistency.
+        tp_group = (
+            get_attention_tp_group()
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
 
         if SIMULATE_ACC_LEN > 0.0:
             # Do simulation
@@ -576,7 +576,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 num_correct_drafts=num_correct_drafts,
                 num_accept_tokens=num_correct_drafts + 1,
                 num_accept_tokens_cpu=num_accept_tokens_list,
-                input_ids=accept_tokens,
+                input_ids=accept_tokens.to(torch.int64),
                 seq_lens=batch.seq_lens,
                 seq_lens_cpu=batch.seq_lens_cpu,
                 req_pool_indices=batch.req_pool_indices,
@@ -648,7 +648,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     num_accept_tokens_cpu=draft_input_num_accept_tokens_cpu,
                     num_correct_drafts=unfinished_num_correct_drafts,
                     num_accept_tokens=unfinished_num_correct_drafts + 1,
-                    input_ids=predict[unfinished_accept_index],
+                    input_ids=predict[unfinished_accept_index].to(torch.int64),
                     seq_lens=batch.seq_lens[unfinished_index_device],
                     seq_lens_cpu=batch.seq_lens_cpu[unfinished_index],
                     req_pool_indices=batch.req_pool_indices[unfinished_index_device],
