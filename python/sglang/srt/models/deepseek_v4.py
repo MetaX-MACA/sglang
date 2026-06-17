@@ -895,7 +895,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            norm=self.post_attention_layernorm,
+            # norm=self.post_attention_layernorm,   # cause precision problem, shutdown
         )
         if not norm_fused:
             hidden_states = self.post_attention_layernorm(hidden_states)

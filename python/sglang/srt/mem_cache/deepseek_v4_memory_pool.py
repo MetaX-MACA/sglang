@@ -159,7 +159,7 @@ class DeepSeekV4SingleKVPool(KVCache):
                 type="flashmla",
             )
         else:
-            if cache_k.dtype != self.store_dtype: # state data have different dtype with stor_dtype
+            if cache_k.dtype != self.store_dtype: # state data have different dtype with store_dtype
                 cache_k = cache_k.to(self.store_dtype)
             dsv4_index_buf_accessor.SetK.execute(
                 pool=self,

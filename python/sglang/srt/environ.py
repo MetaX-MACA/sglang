@@ -581,8 +581,8 @@ class Envs:
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
 
     # CUDA kernels
-    SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(False)         # cause kernel-trap problem, close temporarily
-    SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(False)        # tilang op cause loop answer, close temporarily
+    SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)

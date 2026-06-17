@@ -450,6 +450,18 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
 
+@functools.cache
+def compute_num_split(num_tokrns: int, hc_hidden_size: int) -> int:
+    """
+    reference from vllm, maybe not the best
+    """
+    n_split = 16 if num_tokrns >= 512 else 64
+    # deep_gemm.tf32_hc_prenorm_gemm requirement
+    assert 0 == (hc_hidden_size % 8)
+    assert 0 == (hc_hidden_size % n_split)
+    assert 0 == ((hc_hidden_size / n_split) % 8)
+    return n_split
+
 def get_mhc_pre_token_count_representatives(
     max_num_tokens: int, hc_hidden_size: int
 ) -> Tuple[int, ...]:
@@ -459,7 +471,7 @@ def get_mhc_pre_token_count_representatives(
 
     representatives_by_split: dict[int, int] = {}
     for num_tokens in range(1, max_num_tokens + 1):
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        n_splits = compute_num_split(num_tokens, hc_hidden_size)
         representatives_by_split[n_splits] = num_tokens
 
     return tuple(
@@ -692,7 +704,7 @@ def mhc_pre(
     if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
         import deep_gemm
 
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        n_splits = compute_num_split(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
             n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
