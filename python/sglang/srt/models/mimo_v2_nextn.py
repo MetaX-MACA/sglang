@@ -27,6 +27,8 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_tp_size,
+    get_attention_tp_rank,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -307,17 +309,58 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
             name = self.map_model_name_to_mtp_param_name(name)
 
             # Support fused qkv_proj checkpoint (Pro format)
+            # if "qkv_proj" in name:
+            #     if name in params_dict:
+            #         param = params_dict[name]
+            #         load_mimo_v2_qkv_proj_weight(
+            #             name,
+            #             param,
+            #             loaded_weight,
+            #             expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
+            #                 self.config
+            #             ),
+            #         )
+            #     continue
+
             if "qkv_proj" in name:
                 if name in params_dict:
+                    tp_size = get_attention_tp_size()
+                    tp_rank = get_attention_tp_rank()
                     param = params_dict[name]
-                    load_mimo_v2_qkv_proj_weight(
-                        name,
-                        param,
-                        loaded_weight,
-                        expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
-                            self.config
-                        ),
-                    )
+                    # MTP draft reuses MiMoV2Attention; its fused qkv checkpoint is
+                    # interleaved for TP=num_kv_heads. De-interleave to natural
+                    # [Q|K|V] and take this rank's natural GQA shard (covers any
+                    # attention tp: 1 for dp-attention, == or > num_kv_heads).
+                    attn_mod = self.get_submodule(name[: name.rfind(".qkv_proj.")])
+                    nkv = attn_mod.total_num_kv_heads
+                    nh = attn_mod.total_num_heads
+                    hd = attn_mod.head_dim
+                    vhd = attn_mod.v_head_dim
+                    bq, bk, bv = (nh // nkv) * hd, hd, vhd
+                    block = bq + bk + bv
+                    if loaded_weight.shape[0] == nkv * block:
+                        trailing = loaded_weight.shape[1:]
+                        w = loaded_weight.reshape(nkv, block, *trailing)
+                        q_all = w[:, :bq].reshape(nkv * bq, *trailing)
+                        k_all = w[:, bq : bq + bk].reshape(nkv * bk, *trailing)
+                        v_all = w[:, bq + bk :].reshape(nkv * bv, *trailing)
+                        qph = nh // tp_size
+                        q0 = tp_rank * qph
+                        q_shard = q_all[q0 * hd : (q0 + qph) * hd]
+                        if nkv >= tp_size:
+                            kvph = nkv // tp_size
+                            kv0 = tp_rank * kvph
+                        else:
+                            kvph = 1
+                            kv0 = tp_rank // (tp_size // nkv)
+                        k_shard = k_all[kv0 * hd : (kv0 + kvph) * hd]
+                        v_shard = v_all[kv0 * vhd : (kv0 + kvph) * vhd]
+                        loaded_weight = torch.cat([q_shard, k_shard, v_shard], dim=0)
+                    elif loaded_weight.shape[0] % tp_size == 0:
+                        # already-sharded / divisible per-channel tensor
+                        loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
+                    # else: per-tensor scalar (e.g. shape [1]) -> replicate as-is
+                    default_weight_loader(param, loaded_weight)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

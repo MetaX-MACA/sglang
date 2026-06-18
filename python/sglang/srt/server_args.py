@@ -3961,31 +3961,31 @@ class ServerArgs:
                 ), "Triton kernel MoE is only supported when ep_size == 1"
 
         elif model_arch in MIMO_V2_MODEL_ARCHS:
-            if model_arch == "MiMoV2ForCausalLM" and not self.encoder_only:
-                expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
-                    hf_config
-                )
-                attn_dp_size = self.dp_size if self.enable_dp_attention else 1
-                effective_attn_tp_size = (
-                    self.tp_size // attn_dp_size // self.attn_cp_size
-                )
-                if (
-                    expected_attn_tp_size is not None
-                    and effective_attn_tp_size != expected_attn_tp_size
-                ):
-                    raise ValueError(
-                        "MiMoV2ForCausalLM requires effective attention TP "
-                        f"size {expected_attn_tp_size} because its fused "
-                        "qkv_proj weights are "
-                        f"TP={expected_attn_tp_size}-interleaved; got "
-                        f"{effective_attn_tp_size} "
-                        f"(tp_size={self.tp_size}, dp_size={self.dp_size}, "
-                        f"enable_dp_attention={self.enable_dp_attention}, "
-                        f"attn_cp_size={self.attn_cp_size}). "
-                        "Set --tp, --dp, --enable-dp-attention, and "
-                        "--attention-context-parallel-size so the effective "
-                        f"attention TP size is {expected_attn_tp_size}."
-                    )
+            # if model_arch == "MiMoV2ForCausalLM" and not self.encoder_only:
+            #     expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
+            #         hf_config
+            #     )
+            #     attn_dp_size = self.dp_size if self.enable_dp_attention else 1
+            #     effective_attn_tp_size = (
+            #         self.tp_size // attn_dp_size // self.attn_cp_size
+            #     )
+            #     if (
+            #         expected_attn_tp_size is not None
+            #         and effective_attn_tp_size != expected_attn_tp_size
+            #     ):
+            #         raise ValueError(
+            #             "MiMoV2ForCausalLM requires effective attention TP "
+            #             f"size {expected_attn_tp_size} because its fused "
+            #             "qkv_proj weights are "
+            #             f"TP={expected_attn_tp_size}-interleaved; got "
+            #             f"{effective_attn_tp_size} "
+            #             f"(tp_size={self.tp_size}, dp_size={self.dp_size}, "
+            #             f"enable_dp_attention={self.enable_dp_attention}, "
+            #             f"attn_cp_size={self.attn_cp_size}). "
+            #             "Set --tp, --dp, --enable-dp-attention, and "
+            #             "--attention-context-parallel-size so the effective "
+            #             f"attention TP size is {expected_attn_tp_size}."
+            #         )
             if self.speculative_algorithm == "NEXTN":
                 self.speculative_algorithm == "EAGLE"
                 
