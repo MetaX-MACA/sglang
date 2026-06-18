@@ -833,7 +833,8 @@ class C4IndexerBackendMixin:
                 indexer_metadata.deep_gemm_metadata,
                 indexer_metadata.max_c4_seq_len,
                 False,
-            )
+                backend="triton" if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8" else "tilelang",
+        )
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
