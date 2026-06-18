@@ -148,6 +148,7 @@ ALLOC_MEMORY_FUNCS = defaultdict(
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
+        "cuda": alloc_with_pin_memory,
     },
 )
 
