@@ -36,43 +36,49 @@ template <int kUnit>
 using PackageType = decltype(get_mem_package<kUnit>());
 
 SGL_DEVICE uint1 load_nc(const uint1* __restrict__ src) {
-  uint32_t tmp;
-  asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
-  return uint1{tmp};
+  // uint32_t tmp;
+  // asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
+  // return uint1{tmp};
+  return uint1{__ldg(reinterpret_cast<const uint32_t*>(src))};
 }
 
 SGL_DEVICE uint2 load_nc(const uint2* __restrict__ src) {
-  uint32_t tmp0, tmp1;
-  asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
-  return uint2{tmp0, tmp1};
+  // uint32_t tmp0, tmp1;
+  // asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
+  // return uint2{tmp0, tmp1};
+  return __ldg(src);
 }
 
 SGL_DEVICE uint4 load_nc(const uint4* __restrict__ src) {
-  uint32_t tmp0, tmp1, tmp2, tmp3;
-  asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];"
-               : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3)
-               : "l"(src));
-  return uint4{tmp0, tmp1, tmp2, tmp3};
+  // uint32_t tmp0, tmp1, tmp2, tmp3;
+  // asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];"
+  //              : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3)
+  //              : "l"(src));
+  // return uint4{tmp0, tmp1, tmp2, tmp3};
+  return __ldg(src);
 }
 
 SGL_DEVICE void store_nc(uint1* __restrict__ dst, const uint1& value) {
-  uint32_t tmp = value.x;
-  asm volatile("st.global.L1::no_allocate.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
+  // uint32_t tmp = value.x;
+  // asm volatile("st.global.L1::no_allocate.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
+  *reinterpret_cast<uint32_t*>(dst) = value.x;
 }
 
 SGL_DEVICE void store_nc(uint2* __restrict__ dst, const uint2& value) {
-  uint32_t tmp0 = value.x;
-  uint32_t tmp1 = value.y;
-  asm volatile("st.global.L1::no_allocate.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
+  // uint32_t tmp0 = value.x;
+  // uint32_t tmp1 = value.y;
+  // asm volatile("st.global.L1::no_allocate.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
+  __stcs(dst, value);
 }
 
 SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
-  uint32_t tmp0 = value.x;
-  uint32_t tmp1 = value.y;
-  uint32_t tmp2 = value.z;
-  uint32_t tmp3 = value.w;
-  asm volatile(
-      "st.global.L1::no_allocate.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
+  // uint32_t tmp0 = value.x;
+  // uint32_t tmp1 = value.y;
+  // uint32_t tmp2 = value.z;
+  // uint32_t tmp3 = value.w;
+  // asm volatile(
+  //     "st.global.L1::no_allocate.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
+  __stcs(dst, value);
 }
 
 }  // namespace details
@@ -141,7 +147,8 @@ template <
     uint32_t kBlockQuota,
     uint32_t kBlockSize,
     bool kIsMLA = false>
-SGL_HICACHE_KERNEL void hicache_transfer_per_layer(const  HicacheKernelParams params) {
+// SGL_HICACHE_KERNEL void hicache_transfer_per_layer(const __grid_constant__ HicacheKernelParams params) {
+SGL_HICACHE_KERNEL void hicache_transfer_per_layer(const HicacheKernelParams params) {
   using namespace device;
   static_assert(kBlockSize % kWarpThreads == 0);
   static_assert(kWarpThreads % kUnroll == 0);
@@ -180,7 +187,9 @@ template <
     uint32_t kBlockQuota,
     uint32_t kBlockSize,
     bool kIsMLA = false>
-SGL_HICACHE_KERNEL void hicache_transfer_all_layer(const  HicacheKernelParams params) {
+// SGL_HICACHE_KERNEL void hicache_transfer_all_layer(const __grid_constant__ HicacheKernelParams params) {
+SGL_HICACHE_KERNEL void hicache_transfer_all_layer(const HicacheKernelParams params) {
+
   using namespace device;
   using src_ptr_t = const void*;
   using dst_ptr_t = void*;

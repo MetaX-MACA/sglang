@@ -1998,7 +1998,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 class NSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     int8_cache = envs.MX_ENABLE_NSA_INT8.get()
-    index_k_with_scale_buffer_dtype = torch.bfloat16
+    index_k_with_scale_buffer_dtype = torch.uint8 if envs.MX_ENABLE_NSA_INT8.get() else torch.bfloat16
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
     
     @classmethod
