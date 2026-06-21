@@ -91,6 +91,8 @@ from sglang.srt.utils import (
     add_prefix,
     log_info_on_rank0,
     make_layers,
+    align_packed_tensor_size,
+    get_bool_env_var,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -288,7 +290,12 @@ class MQALayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("wkv", prefix),
             )
-        self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
+        self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.q_norm = RMSNorm(
+            self.q_lora_rank,
+            eps=self.eps,
+            fused_quant=self.fused_quant,
+        )
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -483,14 +490,22 @@ class MQALayer(nn.Module):
         attn_backend: DeepseekV4AttnBackend,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        int8_x = None
+        if isinstance(x, tuple):
+            int8_x = (x[0], x[1])
+            x = x[2]
         if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x)
+            qkv_a, _ = self.wqkv_a(int8_x if int8_x is not None else x)
             q_lora = qkv_a[..., : self.q_lora_rank]
         else:
             q_lora, _ = self.wq_a(x)
             qkv_a = None
         q_lora = self.q_norm(q_lora)
-        q = self._compute_q_b(q_lora, positions, q_out)
+        int8_q = None
+        if isinstance(q_lora, tuple):
+            int8_q = (q_lora[0], q_lora[1])
+            q_lora = q_lora[2]
+        q = self._compute_q_b(int8_q if int8_q is not None else q_lora, positions, q_out)
 
         use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
@@ -534,7 +549,8 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
+        num_token = x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
+        if not get_attn_tp_context().input_scattered and num_token == 0:
             assert (
                 not self.wo_b.reduce_results
             ), "short-circuiting allreduce will lead to hangs"
@@ -548,13 +564,13 @@ class MQALayer(nn.Module):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
             and get_is_capture_mode()
-            and x.shape[0] <= self._multi_stream_bs_limit
+            and num_token <= self._multi_stream_bs_limit
             and not (self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch))
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
         if self.tp_size > 1:
-            q_padded = x.new_zeros(x.shape[0], self.n_heads, self.head_dim)
+            q_padded = x.new_zeros(num_token, self.n_heads, self.head_dim)
             rank = self.tp_rank
             tp_slice = slice(rank * self.n_local_heads, (rank + 1) * self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
@@ -659,9 +675,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_deepseek_v4=True,
         )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=(self.fused_quant and get_attention_tp_size() == 1),
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.fused_quant,
+            packed_quant=True,
+            packed_size=align_packed_tensor_size(config.hidden_size, 512),
         )
 
         self.hc_mult = hc_mult = config.hc_mult
@@ -869,7 +894,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
-            norm=self.input_layernorm,
+            # norm=self.input_layernorm,
         )
         if not norm_fused:
             hidden_states = self.input_layernorm(hidden_states)
@@ -931,8 +956,20 @@ class DeepseekV4DecoderLayer(nn.Module):
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_attention_tp_size(), get_attention_tp_rank()
-            _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
-            hidden_states = _a2a_scatter_chunks[r].contiguous()
+            if isinstance(hidden_states, tuple):
+                packed_out, bf16_out, (int8_out, int8_scale) = hidden_states
+                _a2a_scatter_chunks_packed_out = list(packed_out.tensor_split(s))
+                _a2a_scatter_chunks = list(bf16_out.tensor_split(s))
+                _a2a_scatter_chunks_int8_out = list(int8_out.tensor_split(s))
+                _a2a_scatter_chunks_int8_scale = list(int8_scale.tensor_split(s))
+                packed_out = _a2a_scatter_chunks_packed_out[r].contiguous()
+                bf16_out = _a2a_scatter_chunks[r].contiguous()
+                int8_out = _a2a_scatter_chunks_int8_out[r].contiguous()
+                int8_scale = _a2a_scatter_chunks_int8_scale[r].contiguous()
+                hidden_states = (packed_out, bf16_out, (int8_out, int8_scale))
+            else:
+                _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
+                hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
         hidden_states = self.mlp(
@@ -992,9 +1029,12 @@ class DeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
-        self.alt_streams = (
-            [torch.cuda.Stream() for _ in range(5)] if (_is_cuda or _is_hip) else None
-        )
+        if envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get():
+            self.alt_streams = (
+                [torch.cuda.Stream() for _ in range(5)] if (_is_cuda or _is_hip) else None
+            )
+        else:
+            self.alt_streams = None
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV4DecoderLayer(

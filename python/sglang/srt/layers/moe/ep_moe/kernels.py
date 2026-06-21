@@ -1637,14 +1637,27 @@ def m_grouped_gemm_nt_masked(
     excepted_m: int,
     scale_b: torch.Tensor = None,
     use_triton_kernel: bool = True,
-    unpack_tensor: bool = False
+    unpack_tensor: bool = False,
 ):
     assert a.dim() == 3 and b.dim() == 3
     num_groups, m, k = a.shape
     _, n, _ = b.shape
     
-    a_quant_val, a_quant_scale, _ = scaled_int8_quant(a)
-    A_packed = torch.cat([a_quant_val, a_quant_scale.view(num_groups,m,-1).view(torch.int8)], dim=-1)
+    if unpack_tensor:
+        A_packed = a.view(torch.int8)
+        if k == 2560:
+            k = 4096
+        elif k == 1280:
+            k = 2048
+        elif k == 4096:
+            k = 7168
+        elif k == 1792:
+            k = 3072
+        else:
+            raise NotImplementedError(f"{k} not support")
+    else: 
+        a_quant_val, a_quant_scale, _ = scaled_int8_quant(a)
+        A_packed = torch.cat([a_quant_val, a_quant_scale.view(num_groups,m,-1).view(torch.int8)], dim=-1)
     # a_quant_val, a_quant_scale = per_token_quant_int8(a)
     # A_packed = torch.cat([a_quant_val, a_quant_scale.view(torch.int8)], dim=-1)
     gemm = MaskedGroupedGEMM()

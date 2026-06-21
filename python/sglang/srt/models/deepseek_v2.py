@@ -258,7 +258,8 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.act_fn = SiluAndMul(self.fused_quant)
 
     def forward(
         self,
@@ -322,13 +323,16 @@ class DeepseekV2MLP(nn.Module):
                 down_output,
             )
             return down_output
-        # Fallback: fused silu+clamp kernel (still faster than unfused)
-        if self.swiglu_limit is not None:
-            M, N = gate_up.shape
-            x = gate_up.new_empty((M, N // 2))
-            silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+        if self.fused_quant:
+            x = self.act_fn(gate_up, self.swiglu_limit)
         else:
-            x = self.act_fn(gate_up)
+            # Fallback: fused silu+clamp kernel (still faster than unfused)
+            if self.swiglu_limit is not None:
+                M, N = gate_up.shape
+                x = gate_up.new_empty((M, N // 2))
+                silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+            else:
+                x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
@@ -1014,7 +1018,7 @@ class DeepseekV2MoE(nn.Module):
             packed_hidden = hidden_states
             if self.use_fused_quant and packed_hidden.shape[0] == 0:
                 packed_hidden = torch.empty(
-                    (0, align_packed_tensor_size(packed_hidden.shape[-1])), 
+                    (0, align_packed_tensor_size(packed_hidden.shape[-1], 512)),
                     dtype=hidden_states.dtype, 
                     device=hidden_states.device
                 )
@@ -1033,7 +1037,7 @@ class DeepseekV2MoE(nn.Module):
                     else:
                         shared_output = self._forward_shared_experts(hidden_states)
                 else:
-                    shared_output = self._forward_shared_experts(tensor_scale_tuple if (self.use_fused_quant and tensor_scale_tuple) is not None else hidden_states)
+                    shared_output = self._forward_shared_experts(hidden_states)
             topk_kwargs = (
                 {"input_ids": input_ids_global}
                 if getattr(self, "is_hash", False)

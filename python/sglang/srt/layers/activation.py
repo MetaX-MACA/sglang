@@ -78,8 +78,9 @@ logger = logging.getLogger(__name__)
 
 
 class SiluAndMul(MultiPlatformOp):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, fused_quant=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.fused_quant = fused_quant
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
 
@@ -87,7 +88,24 @@ class SiluAndMul(MultiPlatformOp):
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_cuda(self, x: torch.Tensor, limit: Optional[float]=None) -> torch.Tensor:
+        if self.fused_quant:
+            int8_out = torch.empty(
+                (x.shape[0], x.shape[1] // 2),
+                device=x.device, 
+                dtype=torch.int8,
+            )
+            int8_scale = torch.empty(
+                (x.shape[0], 1),
+                device=x.device, 
+                dtype=torch.float32
+            )
+            torch.ops.sgl_kernel.fused_silu_mul_dq_nomask_quant_nopack.default(
+                int8_out, int8_scale, x, limit, None
+            )
+            return int8_out, int8_scale
+
+        assert limit is None
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)

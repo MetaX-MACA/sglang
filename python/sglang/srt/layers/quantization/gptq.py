@@ -64,8 +64,6 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    import mcoplib._C  # noqa: F401
-
     def mx_gptq_gemm(
         a: torch.Tensor,
         b_q_weight: torch.Tensor,

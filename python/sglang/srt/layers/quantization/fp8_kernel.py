@@ -87,8 +87,6 @@ if _is_hip:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
     else:
         try:
-            import mcoplib._C  # noqa: F401
-
             _has_vllm = True
         except ImportError:
             # Fallback: vllm not available, will use native PyTorch implementation

@@ -9,6 +9,7 @@ from mcoplib.op import  fused_silu_mul_dq_reorder_quant
 from sglang.srt.layers.moe.ep_moe.kernels import (
     grouped_gemm_triton,
     m_grouped_gemm_nt_masked,
+    silu_and_mul_masked_fwd,
     silu_and_mul_masked_fwd_no_pack,
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep import _DeepEPDispatcherImplLowLatency
@@ -227,6 +228,7 @@ class DeepEPMoE(FusedMoE):
             
         self.activation = activation
         self.grouped_gemm_runner = None
+        self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
         
         # if (
         #     self.deepep_mode.enable_low_latency()
@@ -528,7 +530,7 @@ class DeepEPMoE(FusedMoE):
             expected_m,
             self.w13_weight_scale,
             use_triton_kernel = False,
-            unpack_tensor=True
+            unpack_tensor=self.fused_quant,
         )
         # Act
         down_input = torch.empty(
@@ -541,10 +543,10 @@ class DeepEPMoE(FusedMoE):
             dtype=gateup_output.dtype,
         )
 
-        # if self.use_fused_quant:
-        #     down_input = silu_and_mul_masked_fwd(gateup_output, masked_m)
-        # else:
-        silu_and_mul_masked_fwd_no_pack(gateup_output, down_input, masked_m)
+        if self.fused_quant:
+            down_input = silu_and_mul_masked_fwd(gateup_output, masked_m)
+        else:
+            silu_and_mul_masked_fwd_no_pack(gateup_output, down_input, masked_m)
 
         # GroupGemm-1
         n = self.w2_weight.size(1)
@@ -559,7 +561,7 @@ class DeepEPMoE(FusedMoE):
             expected_m,
             self.w2_weight_scale,
             use_triton_kernel = False,
-            unpack_tensor=False
+            unpack_tensor=self.fused_quant,
         )
         return down_output
 
