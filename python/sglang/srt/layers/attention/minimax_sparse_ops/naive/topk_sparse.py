@@ -14,6 +14,8 @@ def naive_flash_decode_with_gqa_share_sparse(
     block_size: int,
     topk_idx: torch.Tensor,  # [num_kv_heads, batch_size, topk]
     sm_scale: Optional[float] = None,
+    use_tma: bool = False,
+    
 ) -> torch.Tensor:
     """
     Naive implementation of sparse attention with GQA group sharing.
