@@ -7,7 +7,6 @@ cross-checks against the AOT implementation.
 
 import itertools
 import os
-import sys
 from typing import Optional
 
 import pytest
@@ -490,4 +489,4 @@ def test_topk_sigmoid_vs_aot(num_tokens, num_experts, topk, dtype, renormalize):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    pytest.main([__file__, "-v"])

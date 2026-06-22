@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
+from ..common.utils import get_cu_seqblocks, robust_allocator
 
 
 @triton.heuristics(
@@ -273,6 +273,59 @@ def _flash_attn_fwd_with_block_score_kernel(
         tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.jit
+def _compare_and_swap(x, ids, flip, i: tl.constexpr, n_dims: tl.constexpr):
+    n_outer: tl.constexpr = x.numel >> n_dims
+    shape: tl.constexpr = [n_outer * 2**i, 2, 2 ** (n_dims - i - 1)]
+    y = tl.reshape(x, shape)
+    # slice left/right with 'stride' 2**(n_dims - i - 1)
+    mask = tl.arange(0, 2)[None, :, None]
+    left = tl.broadcast_to(tl.sum(y * (1 - mask), 1)[:, None, :], shape).to(y.dtype)
+    right = tl.broadcast_to(tl.sum(y * mask, 1)[:, None, :], shape).to(y.dtype)
+    left = tl.reshape(left, x.shape)
+    right = tl.reshape(right, x.shape)
+    # idx
+    y_idx = tl.reshape(ids, shape)
+    left_idx = tl.broadcast_to(tl.sum(y_idx * (1 - mask), 1)[:, None, :], shape)
+    right_idx = tl.broadcast_to(tl.sum(y_idx * mask, 1)[:, None, :], shape)
+    left_idx = tl.reshape(left_idx, x.shape).to(y_idx.dtype)
+    right_idx = tl.reshape(right_idx, x.shape).to(y_idx.dtype)
+    # actual compare-and-swap
+    idtype = tl.core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
+    ileft = left.to(idtype, bitcast=True)
+    iright = right.to(idtype, bitcast=True)
+    ix = x.to(idtype, bitcast=True)
+
+    cond = (left > right) != flip
+    ret = ix ^ tl.where(cond, ileft ^ iright, tl.zeros_like(ix))
+    new_ids = ids ^ tl.where(cond, left_idx ^ right_idx, tl.zeros_like(ids))
+    return ret.to(x.dtype, bitcast=True), new_ids
+
+
+@triton.jit
+def _bitonic_merge(
+    x, ids, stage: tl.constexpr, order: tl.constexpr, n_dims: tl.constexpr
+):
+    n_outer: tl.constexpr = x.numel >> n_dims
+    tl.static_assert(stage <= n_dims)
+    # flip denotes whether to re-arrange sub-sequences of elements in ascending or
+    # descending order.
+    # if flip = 00000000... then all elements will be re-arranged ascendingly at this stage
+    # if flip = 00110011... then all the elements will be re-arranged alternatingly (with
+    # a stride of 2) at this stage
+    if order == 2:
+        shape: tl.constexpr = [n_outer * 2 ** (n_dims - 1 - stage), 2, 2**stage]
+        flip = tl.reshape(
+            tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape
+        )
+    else:
+        flip = order
+    # perform `stage` rounds of `compare-and-swap`
+    for i in tl.static_range(stage):
+        x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
+    return x, ids
+
+
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
 @triton.autotune(
     configs=[
@@ -463,9 +516,9 @@ def flash_prefill_with_topk_index(
     assert qk_head_dim <= 256 and v_head_dim <= 256, "head_dim must be less than 256"
     if sink is not None:
         assert sink.shape[0] == num_heads and sink.shape[1] == qk_head_dim
-    assert (
-        init_blocks + local_blocks <= topk
-    ), "init_blocks + local_blocks must be less than topk"
+    assert init_blocks + local_blocks <= topk, (
+        "init_blocks + local_blocks must be less than topk"
+    )
     if sm_scale is None:
         sm_scale = qk_head_dim**-0.5
     if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:

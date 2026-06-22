@@ -1,5 +1,6 @@
 import json
 from types import SimpleNamespace
+from types import SimpleNamespace
 from typing import Dict, List, TypedDict
 
 import torch
@@ -156,15 +157,8 @@ def get_model_config(
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
     elif architecture == "MiniMaxM3SparseForConditionalGeneration":
-        # Serving fuses the shared expert into the routed-expert tensor by
-        # default (E = num_local_experts + 1), so tune for that shape unless
-        # fusion is explicitly disabled.
-        E = config.num_local_experts // ep_size + (
-            0 if disable_shared_experts_fusion else 1
-        )
-        topk = config.num_experts_per_tok + (
-            0 if disable_shared_experts_fusion or topk_ids_dir is None else 1
-        )
+        E = config.num_local_experts // ep_size
+        topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
     else:
         # Default: Mixtral
@@ -176,14 +170,13 @@ def get_model_config(
         intermediate_size, tp_size, ep_size
     )
 
-    # gfx942 (MI300X) remaps MXFP8 [1,32]->[128,128] at load; tune must match.
-    # sm100/gfx95 run native [1,32] and must not remap (mirrors fp8.py).
-    if (
-        architecture == "MiniMaxM3SparseForConditionalGeneration"
-        and is_hip()
-        and not is_gfx95_supported()
-        and block_shape == [1, 32]
-    ):
+    # MiniMax-M3 ships an MXFP8 checkpoint (weight_block_size=[1,32]) but on
+    # gfx942 the weights are converted to block-fp8 [128,128] at load, so the
+    # serving MoE kernel looks up block_shape=[128,128] configs. Tune for that.
+    if architecture == "MiniMaxM3SparseForConditionalGeneration" and block_shape == [
+        1,
+        32,
+    ]:
         block_shape = [128, 128]
 
     # text_config may not carry torch_dtype; fall back to bf16.
