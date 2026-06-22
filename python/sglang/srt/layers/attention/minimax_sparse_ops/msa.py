@@ -50,16 +50,10 @@ def _build_page_table(
     """
     P = page_size
     n_pages = (seq_lens.to(torch.int64) + (P - 1)) // P  # [batch]
-    offsets = (
-        torch.cumsum(n_pages, 0) - n_pages
-    )  # [batch] exclusive page offset per request
+    offsets = torch.cumsum(n_pages, 0) - n_pages  # [batch] exclusive page offset per request
     total = int(n_pages.sum().item())
-    idx = torch.arange(
-        total, device=req_to_token.device
-    )  # packed page slot -> (req, page)
-    req = torch.searchsorted(
-        offsets + n_pages, idx, right=True
-    )  # request id per packed slot
+    idx = torch.arange(total, device=req_to_token.device)  # packed page slot -> (req, page)
+    req = torch.searchsorted(offsets + n_pages, idx, right=True)  # request id per packed slot
     logical_first = (idx - offsets[req]) * P  # first logical position of that page
     rows = slot_ids[req].to(torch.int64)
     return (req_to_token[rows, logical_first] // P).to(torch.int32)
@@ -143,9 +137,6 @@ def build_msa_decode_meta(
     them — only ``kv_block_indexes`` (the per-layer top-k selection) changes. Building these
     once per forward instead of once per layer removes the dominant host-side overhead
     (page-table build + the host-side ``fmha_sm100_plan``) from the 57-layer decode loop.
-
-    Used only by the standalone parity harnesses; the serving backend builds eager-decode
-    metadata via ``build_msa_decode_cg_plan`` + ``update_msa_decode_cg_meta`` instead.
     """
     from fmha_sm100 import fmha_sm100_plan
 
@@ -170,28 +161,22 @@ def build_msa_decode_meta(
 
 
 # ---------------------------------------------------------------------------
-# Eager-only MSA decode plan (NOT used under CUDA graph)
+# CUDA-graph decode support
 #
-# WARNING: the fmha_sm100 sparse decode kernel is NOT cuda-graph-safe — captured
-# and replayed it returns silently wrong results that compound across replays
-# (~14% GSM8K loss on B200). The backend routes decode to the cuda-graph-safe
-# Triton sparse path whenever decode runs under a CUDA graph (see
-# MiniMaxSparseAttnBackend._use_msa_decode); this plan is reachable ONLY in eager
-# decode (no decode CUDA graph), where there is no capture/replay. Do NOT wire it
-# back into a captured graph — that reintroduces the ~14% regression.
+# fmha_sm100's sparse decode worklist is length-INDEPENDENT: _fmha_sm100_plan
+# builds its tile schedule from ``[kv_block_num * page_size] * batch`` (a fixed
+# topk*P per request), never from the real kv lengths. Only four plan tensors
+# carry the real lengths and feed the kernel's masking:
+# ``{kv_segment_lens, kv_segment_offsets, kv_page_indptr, qo_offset}``.
 #
-# The build-once / replay-update structure below (refreshing the four length
-# tensors ``{kv_segment_lens, kv_segment_offsets, kv_page_indptr, qo_offset}`` and
-# the page table in place) is a leftover from the abandoned capture-once attempt;
-# it is kept only because eager decode reuses one per-forward plan across layers.
+# So a plan built once for a batch size can be replayed in a CUDA graph for any
+# real seq_lens by refreshing just those four tensors (and the page table) in
+# place — the FlashInfer capture-once / replay-update pattern. Validated on B200:
+# captured replay is bit-identical to eager and tracks in-place length mutation
+# (cos 1.0 vs eager, 0.99999 vs dense ref).
 # ---------------------------------------------------------------------------
 
-_MSA_CG_LEN_KEYS = (
-    "kv_segment_lens",
-    "kv_segment_offsets",
-    "kv_page_indptr",
-    "qo_offset",
-)
+_MSA_CG_LEN_KEYS = ("kv_segment_lens", "kv_segment_offsets", "kv_page_indptr", "qo_offset")
 
 
 def _check_cg_plan_layout(plan) -> None:
@@ -305,9 +290,7 @@ def msa_sparse_decode_main(
     seq_lens: torch.Tensor,  # [batch] cached KV length per request
     block_size_k: int,  # == page_size == 128
     sm_scale: Optional[float] = None,
-    kv_indices: Optional[
-        torch.Tensor
-    ] = None,  # precomputed page table (per-forward cache)
+    kv_indices: Optional[torch.Tensor] = None,  # precomputed page table (per-forward cache)
     plan=None,  # precomputed fmha_sm100 plan (per-forward cache)
 ) -> torch.Tensor:
     """Drop-in for flash_decode_with_gqa_share_sparse using MSA fmha_sm100.
@@ -315,10 +298,9 @@ def msa_sparse_decode_main(
     Each request is one decode query at absolute position seq_len-1 attending to its
     cached KV through the topk selected 128-blocks. Returns o [batch, num_q_heads, head_dim].
 
-    ``kv_indices`` / ``plan`` are shared across all sparse layers of a forward; the serving
-    backend builds them once via ``build_msa_decode_cg_plan`` + ``update_msa_decode_cg_meta``
-    (eager decode only) and passes them in. When omitted (only the standalone parity
-    harnesses) they are built here via ``build_msa_decode_meta``.
+    ``kv_indices`` / ``plan`` are shared across all sparse layers of a forward; the backend
+    builds them once via ``build_msa_decode_meta`` and passes them in. When omitted (e.g. the
+    standalone parity harnesses) they are built here.
     """
     from fmha_sm100 import fmha_sm100
 
