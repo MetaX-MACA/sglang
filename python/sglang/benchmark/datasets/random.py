@@ -3,6 +3,7 @@ import random
 from argparse import Namespace
 from dataclasses import dataclass
 from typing import List
+import os
 
 import numpy as np
 from transformers import PreTrainedTokenizerBase
@@ -16,6 +17,8 @@ from sglang.benchmark.datasets.common import (
 )
 from sglang.benchmark.utils import download_and_cache_hf_file, is_file_valid_json
 
+_BENCH_NUM_SAMPLES = int(os.getenv("SGLANG_BENCH_NUM_SAMPLES", "0"))
+_BENCH_MIN_PROMPT_LENGTH = int(os.getenv("SGLANG_BENCH_MIN_PROMPT_LENGTH", "8192"))
 
 @dataclass
 class RandomDataset(BaseDataset):
@@ -116,6 +119,9 @@ def sample_random_requests(
         random.shuffle(dataset)
         if repeat_num is not None:
             dataset = [dataset[i % repeat_num] for i in range(len(dataset))]
+        samples = []
+        samples_idx = 0
+
         # Filter out sequences that are too long or too short
         input_requests: List[DatasetRow] = []
         for data in dataset:
@@ -124,9 +130,19 @@ def sample_random_requests(
                 break
 
             # Tokenize the prompts and completions.
-            prompt = data[0]
-            prompt_token_ids = tokenizer.encode(prompt)
-            prompt_len = len(prompt_token_ids)
+            if _BENCH_NUM_SAMPLES == 0 or len(samples) < _BENCH_NUM_SAMPLES:
+                prompt = data[0]
+                prompt_token_ids = tokenizer.encode(prompt)
+                prompt_len = len(prompt_token_ids)
+
+            if _BENCH_NUM_SAMPLES > 0:
+                if len(samples) < _BENCH_NUM_SAMPLES:
+                    if prompt_len < _BENCH_MIN_PROMPT_LENGTH:
+                        continue
+                    samples.append(prompt_token_ids)
+                prompt_token_ids = samples[samples_idx % len(samples)]
+                samples_idx += 1
+                prompt_len = len(prompt_token_ids)
 
             # Skip empty prompt
             if prompt_len == 0:
