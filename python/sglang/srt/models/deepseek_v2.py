@@ -258,7 +258,7 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT") or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL")
         self.act_fn = SiluAndMul(self.fused_quant)
 
     def forward(

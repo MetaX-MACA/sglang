@@ -290,7 +290,7 @@ class MQALayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("wkv", prefix),
             )
-        self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT") or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL")
         self.q_norm = RMSNorm(
             self.q_lora_rank,
             eps=self.eps,
