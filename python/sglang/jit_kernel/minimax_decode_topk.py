@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_module(seq_dtype: torch.dtype) -> "Module":
-    args = make_cpp_args(seq_dtype, True)  # SeqLenT, kUsePDL
+    args = make_cpp_args(seq_dtype, False)  # SeqLenT, kUsePDL
     return load_jit(
         "minimax_decode_topk",
         *args,
