@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
-    scaled_gemm_int8 = ScaledGEMM()
+    _scaled_gemm_int8 = ScaledGEMM()
     try:
         from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
     except:
@@ -90,6 +90,16 @@ if _is_cuda:
             )
         _bmm_fp8_op(A, B, out, A_scale, B_scale)
         return out
+
+    def _scaled_gemm_int8_fake_impl(M: int, N: int, K: int, A: torch.Tensor, B:torch.Tensor, C:torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor, bias: torch.Tensor)->None:
+        return
+
+    @register_custom_op(fake_impl=_scaled_gemm_int8_fake_impl)
+    def scaled_gemm_int8(M: int, N: int, K: int, A: torch.Tensor, B:torch.Tensor, C:torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor, bias: torch.Tensor)->None:
+        gemm_shapes = [M, N, K]
+        _scaled_gemm_int8(gemm_shapes, A, B, C, scale_a, scale_b, bias)
+        return 
+
 
 
 if _use_aiter:
@@ -774,7 +784,9 @@ class DeepseekMLAForwardMixin:
                 device=attn_output.device,
             )
             scaled_gemm_int8(
-                [num_tokens, v_head_dim, kv_lora],
+                num_tokens,
+                v_head_dim,
+                kv_lora,
                 attn_output_quant_val,
                 self.w_vc,
                 attn_bmm_output,
