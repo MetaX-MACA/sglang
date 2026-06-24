@@ -268,7 +268,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
 
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128
-    index_k_with_scale_buffer_dtype = torch.uint8 if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() is "fp8" else torch.int8
+    index_k_with_scale_buffer_dtype = torch.uint8 if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8" else torch.int8
 
     def __init__(
         self,

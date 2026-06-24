@@ -7,7 +7,6 @@ import triton.language as tl
 from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import get_bool_env_var, is_hip
-from sglang.srt.environ import envs
 import os
 
 _is_hip = is_hip()
@@ -511,12 +510,7 @@ def _set_k_and_s_triton(
     if _is_fp8_fnuz:
         assert index_k.dtype == torch.float8_e4m3fnuz
     else:
-        if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":
-            assert index_k.dtype == torch.float8_e4m3fn
-        elif envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "int8":
-            assert index_k.dtype == torch.int8
-        else:
-            raise Exception("invalid index_k dtype")
+        assert index_k.dtype in [torch.float8_e4m3fn, torch.int8]
     assert index_k_scale.dtype == torch.float32
 
     assert buf.is_contiguous()
