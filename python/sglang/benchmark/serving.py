@@ -7,9 +7,9 @@
 Benchmark online serving with dynamic requests.
 
 Usage:
-python3 -m sglang.bench_serving --backend sglang --num-prompt 10
+python3 -m sglang.benchmark.serving --backend sglang --num-prompt 10
 
-python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
+python3 -m sglang.benchmark.serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
 """
 from asyncio.exceptions import CancelledError
 import argparse
@@ -2175,7 +2175,7 @@ class LoRAPathAction(argparse.Action):
             getattr(namespace, self.dest).append(lora_name)
 
 
-if __name__ == "__main__":
+def cli_main():
     parser = ArgumentParser(description="Benchmark the online serving throughput.")
     parser.add_argument(
         "--backend",
@@ -2714,3 +2714,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     _validate_parsed_gsp_args(parser, args)
     run_benchmark(args)
+
+
+if __name__ == "__main__":
+    cli_main()
