@@ -327,6 +327,7 @@ class Router:
             "jwt_jwks_uri",
             "jwt_role_claim",
             "jwt_role_mapping",
+            "enable_shortest_queue",
         ]
         for field in fields_to_remove:
             args_dict.pop(field, None)

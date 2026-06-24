@@ -5607,6 +5607,9 @@ class ServerArgs:
             choices=[
                 "auto",
                 "round_robin",
+                "decode_round_robin",
+                "shortest_queue",
+                "minimum_tokens",
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
