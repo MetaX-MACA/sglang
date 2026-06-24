@@ -692,6 +692,8 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_flashinfer()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        self.use_single_stream_dispatch_overlap = get_bool_env_var('USE_SINGLE_STREAM_DISPATCH_OVERLAP')
+
 
     def get_moe_weights(self):
         return [
@@ -1055,7 +1057,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        if sbo_overlap_dispatch_flag:
+        if sbo_overlap_dispatch_flag or self.use_single_stream_dispatch_overlap:
             shared_output = None
 
             def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
