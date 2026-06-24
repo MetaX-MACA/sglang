@@ -581,7 +581,17 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
         # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
         backend = "triton"
 
-    FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend(backend)
+    backend = Fp8GemmRunnerBackend(backend)
+
+    if (
+        backend.is_auto()
+        and server_args.quantization == "mxfp8"
+        and _is_sm100_supported
+        and is_flashinfer_available()
+    ):
+        backend = Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
+
+    FP8_GEMM_RUNNER_BACKEND = backend
 
 
 def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
@@ -1306,7 +1316,6 @@ def flashinfer_mxfp8_blockscaled_linear(
     weight_t = weight.contiguous().t()
 
     if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
-
         weight_scale_t = weight_scale.contiguous().view(-1)
         output = flashinfer_mm_mxfp8(
             q_input,
