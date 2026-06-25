@@ -1509,6 +1509,9 @@ class ModelRunner:
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp()
 
+        if self._should_reroute_padding_only_extend_to_idle(forward_batch):
+            forward_batch.forward_mode = ForwardMode.IDLE
+
         # Hisparse coordinator — backends now read it from self.model_runner.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
