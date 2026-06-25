@@ -65,6 +65,7 @@ from typing import (
     Dict,
     Generic,
     List,
+    NamedTuple,
     Optional,
     Protocol,
     Sequence,
@@ -105,6 +106,15 @@ logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
 
 sglang_sys_json_file = None
+
+class Range(NamedTuple):
+    start: int
+    end: int
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
+
 
 def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
     """Flatten array.array('q') buffers into one int64 CPU tensor.
