@@ -1219,6 +1219,8 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
+            self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only
@@ -3212,6 +3214,11 @@ class Scheduler(
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
+
+        # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in batch.reqs:
+                self.maybe_send_cached_prefix_chunk(req)
 
         # Run forward
         if self.is_generation:
