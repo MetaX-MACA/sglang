@@ -22,10 +22,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_maca
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_maca = is_maca()
 
 if _is_cuda or _is_hip:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
@@ -62,108 +63,82 @@ def _fwd_kernel(
     cur_kv_head = cur_head // kv_group_num
 
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
-    cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
+    cur_batch_start = tl.load(B_Start_Loc + cur_batch)
 
-    block_start_loc = BLOCK_M * start_m
-
-    # initialize offsets
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_d = offs_d < Lk  # mask the padded tail of the D dimension
+
     off_q = (
-        (cur_batch_in_all_start_index + offs_m[:, None]) * stride_qbs
+        (cur_batch_start + offs_m[:, None]) * stride_qbs
         + cur_head * stride_qh
         + offs_d[None, :]
     )
-    off_k = offs_n[None, :] * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None]
-    off_v = offs_n[:, None] * stride_vbs + cur_kv_head * stride_vh + offs_d[None, :]
-
-    mask_d = offs_d < Lk
-
     q = tl.load(
         Q + off_q,
-        mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d[None, :]),
+        mask=(offs_m[:, None] < cur_batch_seq_len) & mask_d[None, :],
         other=0.0,
     )
 
-    k_ptrs = K + off_k
-    v_ptrs = V + off_v
+    k_base = K + cur_kv_head * stride_kh
+    v_base = V + cur_kv_head * stride_vh
 
-    # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
-    block_mask = tl.where(block_start_loc < cur_batch_seq_len, 1, 0)
-
+    # Causal: a query only attends to keys up to its own position.
     end_n = (
-        cur_batch_seq_len
-        if not IS_CAUSAL
-        else tl.minimum((start_m + 1) * BLOCK_M, cur_batch_seq_len)
+        tl.minimum((start_m + 1) * BLOCK_M, cur_batch_seq_len)
+        if IS_CAUSAL
+        else cur_batch_seq_len
     )
-    for start_n in range(0, block_mask * end_n, BLOCK_N):
+
+    for start_n in range(0, end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        # -- compute qk ----
-        k = tl.load(
-            k_ptrs + (cur_batch_in_all_start_index + start_n) * stride_kbs,
-            mask=((start_n + offs_n[None, :]) < cur_batch_seq_len) & (mask_d[:, None]),
-            other=0.0,
-        )
-        # mask = tl.load(mask_ptrs + start_n, mask=start_n + offs_n < cur_batch_end_loc, other=0.0)
+        n_idx = start_n + offs_n
+        n_mask = n_idx < cur_batch_seq_len
 
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k)
-        qk *= sm_scale
+        off_k = (cur_batch_start + n_idx[None, :]) * stride_kbs + offs_d[:, None]
+        k = tl.load(k_base + off_k, mask=n_mask[None, :] & mask_d[:, None], other=0.0)
 
+        qk = tl.dot(q, k) * sm_scale
         if IS_CAUSAL:
-            qk += tl.where(
-                (start_n + offs_n[None, :] < cur_batch_seq_len)
-                & (offs_m[:, None] >= (start_n + offs_n[None, :])),
-                0,
+            qk = tl.where(
+                n_mask[None, :] & (offs_m[:, None] >= n_idx[None, :]),
+                qk,
                 float("-inf"),
             )
         else:
-            qk += tl.where(
-                (start_n + offs_n[None, :]) < cur_batch_seq_len, 0, float("-inf")
-            )
+            qk = tl.where(n_mask[None, :], qk, float("-inf"))
 
-        # -- compute m_ij, p, l_ij
-        m_ij = tl.max(qk, 1)
+        # ---- FlashAttention-2 online softmax update ----
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
         p = tl.exp(qk - m_ij[:, None])
         l_ij = tl.sum(p, 1)
-        # -- update m_i and l_i
-        m_i_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_i_new)
-        beta = tl.exp(m_ij - m_i_new)
-        l_i_new = alpha * l_i + beta * l_ij
-        # -- update output accumulator --
-        # scale p
-        p_scale = beta / l_i_new
-        p = p * p_scale[:, None]
-        # scale acc
-        acc_scale = l_i / l_i_new * alpha
-        acc = acc * acc_scale[:, None]
-        # update acc
-        v = tl.load(
-            v_ptrs + (cur_batch_in_all_start_index + start_n) * stride_vbs,
-            mask=((start_n + offs_n[:, None]) < cur_batch_seq_len) & (mask_d[None, :]),
-            other=0.0,
-        )
+        alpha = tl.exp(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        acc = acc * alpha[:, None]
 
-        p = p.to(v.dtype)
-        acc += tl.dot(p, v)
-        # update m_i and l_i
-        l_i = l_i_new
-        m_i = m_i_new
-    # initialize pointers to output
+        off_v = (cur_batch_start + n_idx[:, None]) * stride_vbs + offs_d[None, :]
+        v = tl.load(v_base + off_v, mask=n_mask[:, None] & mask_d[None, :], other=0.0)
+        acc += tl.dot(p.to(v.dtype), v)
+
+        m_i = m_ij
+
+    # Normalize once, at the end.
+    acc = acc / l_i[:, None]
+
     off_o = (
-        (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs
+        (cur_batch_start + offs_m[:, None]) * stride_obs
         + cur_head * stride_oh
         + offs_d[None, :]
     )
-    out_ptrs = Out + off_o
     tl.store(
-        out_ptrs, acc, mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d[None, :])
+        Out + off_o,
+        acc.to(Out.dtype.element_ty),
+        mask=(offs_m[:, None] < cur_batch_seq_len) & mask_d[None, :],
     )
 
 
@@ -177,20 +152,30 @@ def context_attention_fwd(
     out: [b * s, head, head_dim]
     sm_scale: softmax scale, defaults to 1/sqrt(head_dim)
     """
-    if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
-        BLOCK = 128
-    else:
-        BLOCK = 64
-
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+    BLOCK_DMODEL = triton.next_power_of_2(Lk)
+
+    if _is_maca and not is_causal:
+        # C500X-tuned for non-causal (vision encoder) attention. Validated for
+        # head_dim <= 128 (BLOCK_DMODEL <= 128), where 128/32/8/2 fits exactly in
+        # the 64 KB shared-memory limit. Larger head_dim would not fit -> shrink.
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 32, 8, 2
+        if BLOCK_DMODEL > 128:
+            BLOCK_M, BLOCK_N, num_stages = 64, 32, 1
+    else:
+        if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
+            BLOCK_M = BLOCK_N = 128
+        else:
+            BLOCK_M = BLOCK_N = 64
+        num_warps = 4 if Lk <= 64 else 8
+        num_stages = 1
 
     if sm_scale is None:
-        sm_scale = 1.0 / (Lq**0.5)
+        sm_scale = 1.0 / (Lq ** 0.5)
     batch, head = b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1]
 
-    grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
-    num_warps = 4 if Lk <= 64 else 8
+    grid = (batch, head, triton.cdiv(max_input_len, BLOCK_M))
 
     _fwd_kernel[grid](
         q,
@@ -209,11 +194,12 @@ def context_attention_fwd(
         o.stride(0),
         o.stride(1),
         kv_group_num=kv_group_num,
-        BLOCK_M=BLOCK,
-        BLOCK_DMODEL=triton.next_power_of_2(Lk),
-        BLOCK_N=BLOCK,
+        BLOCK_M=BLOCK_M,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_N=BLOCK_N,
         IS_CAUSAL=is_causal,
         num_warps=num_warps,
-        num_stages=1,
+        num_stages=num_stages,
         Lk=Lk,
     )
+    return o

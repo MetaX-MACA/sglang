@@ -509,7 +509,11 @@ class KimiGPUProcessorWrapper:
 # Compatible with KimiVLForConditionalGeneration
 class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK25ForConditionalGeneration]
-    gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
+    # GPU nvJPEG decode (torchvision decode_jpeg device="cuda") segfaults on
+    # MetaX C500 (MACA's CUDA-compat reports <11.6; the nvjpeg path is
+    # unstable and a native crash can't be caught by the try/except fallback in
+    # common._load_image). Force CPU (PIL) image decode instead.
+    gpu_image_decode = False  # nvJPEG for JPEG, PIL fallback for others
     prefer_tokenized_input = True
     precompute_hash_before_cpu_transfer = True
     # The GPU wrapper expands placeholders from the request's own token IDs.
