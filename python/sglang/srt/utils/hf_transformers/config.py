@@ -14,10 +14,10 @@
 """Config loading utilities."""
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
-
+from transformers import PretrainedConfig
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
@@ -43,6 +43,8 @@ import filelock
 import hashlib
 import tempfile
 import os
+
+_class_config_cache: Dict[str, dict] = {}
 
 def _set_architectures(config, arch_name):
     config.update({"architectures": [arch_name]})
@@ -73,12 +75,30 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = AutoConfig.from_pretrained(
-            model,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        config_dict, _ = PretrainedConfig.get_config_dict(model, revision=revision, **kwargs)
+        has_remote_code = "auto_map" in config_dict and "AutoConfig" in config_dict["auto_map"]
+        if has_remote_code:
+            class_ref = config_dict["auto_map"]["AutoConfig"]
+            if class_ref in _class_config_cache:
+                # When an additional path for the DRAFT model needs to be specified, the TARGET and DRAFT models may 
+                # generate transformers modules with identical names, resulting in pickle errors
+                config = _class_config_cache[class_ref]
+            else:
+                config = AutoConfig.from_pretrained(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+                _class_config_cache[class_ref] = config
+        # Some models may not have "auto_map" in config_dict
+        else:
+            config = AutoConfig.from_pretrained(
+                model,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
 
         if (
             config.architectures is not None
@@ -88,15 +108,12 @@ class HfModelConfigParser(ModelConfigParserBase):
             # needs, so re-read them from config.json and restore. Fixed upstream
             # by https://github.com/huggingface/transformers/pull/46338; remove
             # this block once SGLang requires transformers >= 5.10.
-            from transformers import PretrainedConfig
-
-            raw_config, _ = PretrainedConfig.get_config_dict(model, revision=revision)
             for key in (
                 "qk_rope_head_dim",
                 "index_topk_freq",
             ):
-                if key in raw_config:
-                    setattr(config, key, raw_config[key])
+                if key in config_dict:
+                    setattr(config, key, config_dict[key])
             if hasattr(config, "qk_head_dim") and hasattr(config, "qk_nope_head_dim"):
                 config.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
 
