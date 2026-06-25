@@ -368,7 +368,11 @@ class KimiGPUProcessorWrapper:
 # Compatible with KimiVLForConditionalGeneration
 class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK25ForConditionalGeneration]
-    gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
+    # GPU nvJPEG decode (torchvision decode_jpeg device="cuda") segfaults on
+    # MetaX C500 (MACA's CUDA-compat reports <11.6; the nvjpeg path is
+    # unstable and a native crash can't be caught by the try/except fallback in
+    # common._load_image). Force CPU (PIL) image decode instead.
+    gpu_image_decode = False  # nvJPEG for JPEG, PIL fallback for others
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
