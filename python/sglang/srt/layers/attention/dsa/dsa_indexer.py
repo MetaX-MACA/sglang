@@ -963,8 +963,18 @@ class Indexer(MultiPlatformOp):
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
+                    # Match the CUDA deep_gemm path (clean_logits=False): the topk
+                    # transform masks invalid positions via ks/ke/lengths, so the
+                    # -inf pre-fill of the [tokens x seq_len_kv] logits buffer is
+                    # redundant and grows quadratically with context length.
                     logits = fp8_mqa_logits(
-                        q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
+                        q_fp8[:q_offset],
+                        kv,
+                        scale,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        clean_logits=False,
                     )
                 else:
                     if self.fp8_cache:
@@ -1032,6 +1042,7 @@ class Indexer(MultiPlatformOp):
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
+                    # clean_logits=False: topk transform handles masking (see above)
                     logits_chunk = fp8_mqa_logits(
                         q_fp8[start:end],
                         kv,
@@ -1039,6 +1050,7 @@ class Indexer(MultiPlatformOp):
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
+                        clean_logits=False,
                     )
                 else:
                     if self.fp8_cache:
