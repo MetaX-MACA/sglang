@@ -3494,6 +3494,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
             )
 
+        if self._should_reroute_padding_only_extend_to_idle(forward_batch):
+            forward_batch.forward_mode = ForwardMode.IDLE
+
         # Use precomputed SWA cache location
         if forward_batch.out_cache_loc_swa is not None:
             self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
