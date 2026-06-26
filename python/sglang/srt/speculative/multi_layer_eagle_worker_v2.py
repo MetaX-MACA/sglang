@@ -762,6 +762,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     ):
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
+        verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
         bs = len(batch.seq_lens)
