@@ -55,16 +55,44 @@ def _apply_deepseek_ocr_overrides(config, model):
     _set_architectures(config, "DeepseekOCRForCausalLM")
     config._name_or_path = model
 
-def get_hf_lock(model_name_or_path: str):
-    lock_dir = tempfile.gettempdir()
-    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
-    model_name = model_name_or_path.replace("/", "-")
-    hash_name = hashlib.sha256(model_name.encode()).hexdigest()
-    # add hash to avoid conflict with old users' lock files
-    lock_file_name = hash_name + model_name + ".lock"
-    # mode 0o666 is required for the filelock to be shared across users
-    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
-    return lock
+
+def _is_legacy_glm_moe_dsa_layer_types_error(error: Exception) -> bool:
+    error_msg = str(error)
+    return (
+        "validate_layer_type" in error_msg and "deepseek_sparse_attention" in error_msg
+    )
+
+
+def _load_glm_moe_dsa_config_without_legacy_layer_types(
+    model,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    from transformers import PretrainedConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    raw_config, unused_kwargs = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    if raw_config.get("model_type") != "glm_moe_dsa" or raw_config.get(
+        "architectures"
+    ) != ["GlmMoeDsaForCausalLM"]:
+        return None
+
+    layer_types = raw_config.get("layer_types")
+    if not isinstance(layer_types, list) or any(
+        layer_type != "deepseek_sparse_attention" for layer_type in layer_types
+    ):
+        return None
+
+    raw_config = dict(raw_config)
+    raw_config.pop("layer_types", None)
+    config = CONFIG_MAPPING[raw_config["model_type"]].from_dict(
+        raw_config, **unused_kwargs
+    )
+    config._name_or_path = model
+    return config
+
 
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
@@ -75,30 +103,23 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config_dict, _ = PretrainedConfig.get_config_dict(model, revision=revision, **kwargs)
-        has_remote_code = "auto_map" in config_dict and "AutoConfig" in config_dict["auto_map"]
-        if has_remote_code:
-            class_ref = config_dict["auto_map"]["AutoConfig"]
-            if class_ref in _class_config_cache:
-                # When an additional path for the DRAFT model needs to be specified, the TARGET and DRAFT models may 
-                # generate transformers modules with identical names, resulting in pickle errors
-                config = _class_config_cache[class_ref]
-            else:
-                config = AutoConfig.from_pretrained(
-                    model,
-                    trust_remote_code=trust_remote_code,
-                    revision=revision,
-                    **kwargs,
-                )
-                _class_config_cache[class_ref] = config
-        # Some models may not have "auto_map" in config_dict
-        else:
+        try:
             config = AutoConfig.from_pretrained(
                 model,
                 trust_remote_code=trust_remote_code,
                 revision=revision,
                 **kwargs,
             )
+        except Exception as e:
+            config = (
+                _load_glm_moe_dsa_config_without_legacy_layer_types(
+                    model, revision, **kwargs
+                )
+                if _is_legacy_glm_moe_dsa_layer_types_error(e)
+                else None
+            )
+            if config is None:
+                raise
 
         if (
             config.architectures is not None
