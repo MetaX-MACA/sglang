@@ -26,6 +26,14 @@ def make_name(name: str) -> str:
     return f"dpsk_v4_{name}"
 
 
+def get_smem_used():
+    try:
+        current_device = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(current_device)
+        return props.shared_memory_per_block // 2
+    except:
+        return None
+
 @cache_once
 def _jit_common_module() -> Module:
     return load_jit(
@@ -78,11 +86,15 @@ def _jit_topk_module() -> Module:
 @cache_once
 def _jit_topk1024_module() -> Module:
     args = make_cpp_args(is_arch_support_pdl())
+    extra_cuda_cflags = None
+    if (used_smem := get_smem_used()):
+        extra_cuda_cflags = [f"-DDYNAMIC_KSMEM={used_smem}"]
     return load_jit(
         make_name("topk1024"),
         *args,
         cuda_files=["deepseek_v4/topk_1024.cuh"],
         cuda_wrappers=[("topk_transform", f"TopK1024Kernel<{args}>::transform")],
+        extra_cuda_cflags=extra_cuda_cflags,
     )
 
 

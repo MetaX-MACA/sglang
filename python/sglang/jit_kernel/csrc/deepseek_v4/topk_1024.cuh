@@ -13,7 +13,12 @@ namespace {
 
 constexpr uint32_t kTopK = 1024;
 constexpr uint32_t kTopKBlockSize = 1024;
+
+#ifdef DYNAMIC_KSMEM
+constexpr uint32_t kSMEM = DYNAMIC_KSMEM;
+#else
 constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
+#endif
 
 struct TopK1024Params {
   const float* __restrict__ scores;
