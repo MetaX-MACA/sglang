@@ -45,7 +45,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-
+from mcoplib.custom_ops import fused_add_rms_norm_dynamic_per_token_quant_padding_output
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
@@ -309,6 +309,9 @@ class RMSNorm(MultiPlatformOp):
         weight_dtype: Optional = None,
         override_orig_dtype: Optional = None,
         x_pad_to_multiple: int = 0,
+        fused_quant: bool = False,
+        packed_quant: bool = False,
+        packed_size: int = 3840
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
@@ -344,6 +347,10 @@ class RMSNorm(MultiPlatformOp):
                 except ImportError:
                     self._fused_pad_kernel = None
             self._forward_method = self.forward_aiter
+        self.fused_quant = fused_quant
+        self.packed_quant = packed_quant
+        self.packed_size = packed_size
+        
 
     def forward_cuda(
         self,
@@ -357,13 +364,27 @@ class RMSNorm(MultiPlatformOp):
                     residual = residual + post_residual_addition
                 return x, residual
             return x
+        if self.fused_quant and self.packed_quant and residual is not None:
+            packed_output, residual, no_quant_output, int8_out, scales = \
+                fused_add_rms_norm_dynamic_per_token_quant_padding_output(
+                    x,
+                    residual,
+                    self.weight.data,
+                    self.packed_size,
+                    self.variance_epsilon,
+                )
+            return (packed_output, no_quant_output, (int8_out, scales)), residual
+        else:
+            if self.variance_size_override is not None:
+                    return self.forward_native(x, residual, post_residual_addition)
+
         # sgl_kernel rmsnorm requires 2D input; reshape higher-rank tensors
         needs_reshape = x.dim() != 2 and residual is None
         if needs_reshape:
             original_shape = x.shape
             x = x.contiguous().reshape(-1, original_shape[-1])
-        if self.variance_size_override is not None:
-            return self.forward_native(x, residual, post_residual_addition)
+        # if self.variance_size_override is not None:
+        #     return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
             if (
                 residual is not None
