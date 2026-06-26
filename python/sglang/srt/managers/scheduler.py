@@ -3438,10 +3438,12 @@ class Scheduler(
             running_batch = prefill_plan.running_batch
 
         need_mlp_sync = self.require_mlp_sync
+        from sglang.srt.configs.model_config import is_mimo
         if (
-            need_mlp_sync
-            and not self.spec_algorithm.is_none()
-            and not get_spec().speculative_skip_dp_mlp_sync
+            need_mlp_sync and \
+                ((not self.spec_algorithm.is_none() and not get_spec().speculative_skip_dp_mlp_sync) or \
+                  is_mimo(self.model_config.hf_config)
+                )
         ):
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
             # Before merging the new batch into running batch:

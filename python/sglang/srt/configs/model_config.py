@@ -101,6 +101,22 @@ class ModelImpl(str, Enum):
     TRANSFORMERS = "transformers"
     MINDSPORE = "mindspore"
 
+def is_mimo(config) -> bool:
+    architectures = (
+        config.get("architectures")
+        if isinstance(config, dict)
+        else getattr(config, "architectures", None)
+    )
+    return (
+        architectures is not None
+        and architectures[0]
+        in [
+            "MiMoForCausalLM",
+            "MiMoMTP",
+            "MiMoV2FlashForCausalLM",
+            "MiMoV2MTP",
+        ]
+    )
 
 def _hf_arch(config) -> Optional[str]:
     """First architecture from a HF config dict or PretrainedConfig (or None)."""
