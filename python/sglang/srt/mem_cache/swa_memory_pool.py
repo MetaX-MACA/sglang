@@ -107,6 +107,13 @@ class SWAKVPool(BaseSWAKVPool):
         k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
         return k_size + k_size_swa, v_size + v_size_swa
 
+    def get_v_head_dim(self):
+        if self.full_layer_nums > 0:
+            return self.full_kv_pool.get_value_buffer(0).shape[-1]
+        if self.swa_layer_nums > 0:
+            return self.swa_kv_pool.get_value_buffer(0).shape[-1]
+        raise RuntimeError("SWAKVPool has no attention layers to infer v_head_dim.")
+
     def get_contiguous_buf_infos(self):
         full_kv_data_ptrs, full_kv_data_lens, full_kv_item_lens = (
             self.full_kv_pool.get_contiguous_buf_infos()
