@@ -111,7 +111,7 @@ def assign_new_state_kernel(
 ):
     pid = tl.program_id(0)
 
-    seq_len: tl.tensor = tl.load(seq_lens_ptr + pid)
+    seq_len = tl.load(seq_lens_ptr + pid)
     old_extend_len = tl.load(old_extend_seq_lens_ptr + pid)
     old_start = tl.load(old_extend_start_loc_ptr + pid)
     new_extend_len = old_extend_len + 1
