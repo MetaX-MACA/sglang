@@ -383,6 +383,12 @@ class Envs:
     SGLANG_TCP_STORE_PORT = EnvInt(29600)
     SGLANG_DCP_WORLD_SIZE = EnvInt(1)
 
+    # Base port hint for ephemeral sockets (ZMQ, SHM broadcaster, etc.).
+    # When set, get_open_port() and shm_broadcast search upwards from this
+    # value instead of asking the OS for a random port.  Useful to keep all
+    # SGLang ports in a predictable range behind a firewall.
+    SGLANG_PORT = EnvInt(None)
+
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
 
