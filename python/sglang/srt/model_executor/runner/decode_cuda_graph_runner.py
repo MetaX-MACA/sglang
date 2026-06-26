@@ -175,6 +175,323 @@ def build_replay_fb_view(
     )
 
 
+def _allocate_decode_buffers(
+    *,
+    device: torch.device,
+    max_bs: int,
+    max_num_token: int,
+    hidden_size: int,
+    vocab_size: int,
+    dtype: torch.dtype,
+    dp_size: int,
+    pp_size: int,
+    is_encoder_decoder: bool,
+    require_mlp_tp_gather: bool,
+    seq_len_fill_value: int,
+    encoder_len_fill_value: int,
+    num_tokens_per_bs: int,
+    cache_loc_dtype: torch.dtype,
+    enable_mamba_track: bool,
+    ne_token_table: Optional[torch.Tensor] = None,
+    hc_hidden_size: Optional[int] = None,
+) -> SimpleNamespace:
+    """Allocate the FB-shared decode buffers as a namespace adopted by
+    ``build_decode_registry(source=...)``."""
+    with torch.device(device):
+        input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
+        input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
+        req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
+        seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
+        out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+        positions = torch.zeros((max_num_token,), dtype=torch.int64)
+        mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
+        num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+        custom_mask = torch.ones(
+            (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+            dtype=torch.bool,
+        )
+        next_token_logits_buffer = torch.zeros(
+            (max_num_token, vocab_size),
+            dtype=torch.float,
+        )
+        mamba_track_indices = (
+            torch.zeros((max_bs,), dtype=torch.int64) if enable_mamba_track else None
+        )
+        mamba_track_mask = (
+            torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
+        )
+
+        if pp_size > 1:
+            # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
+            is_mhc = hc_hidden_size is not None
+            hs = hc_hidden_size if is_mhc else hidden_size
+            pp_proxy_tensors = {
+                "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+            }
+            if not is_mhc:
+                pp_proxy_tensors["residual"] = torch.zeros(
+                    (max_bs, hidden_size), dtype=dtype
+                )
+        else:
+            pp_proxy_tensors = None
+
+        if is_encoder_decoder:
+            encoder_lens = torch.full(
+                (max_bs,), encoder_len_fill_value, dtype=torch.int32
+            )
+        else:
+            encoder_lens = None
+
+        if require_mlp_tp_gather:
+            global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
+            global_num_tokens_for_logprob_gpu = torch.zeros(
+                (dp_size,), dtype=torch.int32
+            )
+        else:
+            global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+            global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
+
+        ngram_embedding_info = (
+            NgramEmbeddingInfo(
+                token_table=ne_token_table,
+                column_starts=torch.zeros([max_bs], dtype=torch.int32),
+                req_lens=torch.ones([max_bs], dtype=torch.int32),
+                out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
+                out_req_lens=torch.ones([max_bs], dtype=torch.int32),
+            )
+            if ne_token_table is not None
+            else None
+        )
+
+        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+            rids_int = torch.zeros((max_bs,), dtype=torch.int64)
+            bootstrap_room_ids_int = torch.full((max_bs,), -1, dtype=torch.int64)
+        else:
+            rids_int = None
+            bootstrap_room_ids_int = None
+
+    seq_lens_cpu = torch.full(
+        (max_bs,),
+        seq_len_fill_value,
+        dtype=torch.int32,
+        device="cpu",
+    )
+
+    return SimpleNamespace(
+        input_ids=input_ids,
+        input_embeds=input_embeds,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        out_cache_loc=out_cache_loc,
+        positions=positions,
+        mrope_positions=mrope_positions,
+        num_token_non_padded=num_token_non_padded,
+        custom_mask=custom_mask,
+        next_token_logits_buffer=next_token_logits_buffer,
+        mamba_track_indices=mamba_track_indices,
+        mamba_track_mask=mamba_track_mask,
+        encoder_lens=encoder_lens,
+        global_num_tokens_gpu=global_num_tokens_gpu,
+        global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+        pp_proxy_tensors=pp_proxy_tensors,
+        ngram_embedding_info=ngram_embedding_info,
+        rids_int=rids_int,
+        bootstrap_room_ids_int=bootstrap_room_ids_int,
+    )
+
+
+# Detect whether the current forward pass is in capture mode
+is_capture_mode = False
+
+
+def get_is_capture_mode():
+    return is_capture_mode
+
+
+def compile_in_capture_mode(func):
+    if get_is_capture_mode():
+        return torch.compile(func)
+    return func
+
+
+@contextmanager
+def model_capture_mode():
+    global is_capture_mode
+    is_capture_mode = True
+
+    yield
+
+    is_capture_mode = False
+
+
+@contextmanager
+def freeze_gc(enable_cudagraph_gc: bool):
+    """
+    Optimize garbage collection during CUDA graph capture.
+    Clean up, then freeze all remaining objects from being included
+    in future collections if GC is disabled during capture.
+    """
+    gc.collect()
+    should_freeze = not enable_cudagraph_gc
+    if should_freeze:
+        gc.freeze()
+    try:
+        yield
+    finally:
+        if should_freeze:
+            gc.unfreeze()
+            gc.collect()
+
+
+def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
+    for sub in model._modules.values():
+        if isinstance(sub, MultiPlatformOp):
+            if reverse:
+                sub.leave_torch_compile()
+            else:
+                sub.enter_torch_compile(num_tokens=num_tokens)
+        if isinstance(sub, torch.nn.Module):
+            _to_torch(sub, reverse, num_tokens)
+
+
+@contextmanager
+def patch_model(
+    model: torch.nn.Module,
+    enable_compile: bool,
+    num_tokens: int,
+    tp_group: GroupCoordinator,
+):
+    """Patch the model to make it compatible with with torch.compile"""
+    backup_ca_comm = None
+
+    try:
+        if enable_compile:
+            _to_torch(model, reverse=False, num_tokens=num_tokens)
+            backup_ca_comm = tp_group.ca_comm
+            # Use custom-allreduce here.
+            # We found the custom allreduce is much faster than the built-in allreduce in torch,
+            # even with ENABLE_INTRA_NODE_COMM=1.
+            # tp_group.ca_comm = None
+            yield torch.compile(
+                torch.no_grad()(model.forward),
+                mode=os.environ.get(
+                    "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+                ),
+                dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
+            )
+        else:
+            yield model.forward
+    finally:
+        if enable_compile:
+            _to_torch(model, reverse=True, num_tokens=num_tokens)
+            tp_group.ca_comm = backup_ca_comm
+
+
+def set_torch_compile_config():
+    import torch._dynamo.config
+    import torch._inductor.config
+
+    torch._inductor.config.coordinate_descent_tuning = True
+    torch._inductor.config.triton.unique_kernel_names = True
+    torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
+
+    # FIXME: tmp workaround
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
+    if hasattr(torch._dynamo.config, "cache_size_limit"):
+        torch._dynamo.config.cache_size_limit = 1024
+
+    monkey_patch_torch_compile()
+
+
+def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
+    server_args = model_runner.server_args
+    capture_bs = server_args.cuda_graph_bs
+
+    if capture_bs is None:
+        if server_args.speculative_algorithm is None:
+            if server_args.disable_cuda_graph_padding:
+                capture_bs = list(range(1, 33)) + list(range(48, 161, 16))
+            else:
+                capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
+        else:
+            # Since speculative decoding requires more cuda graph memory, we
+            # capture less.
+            capture_bs = (
+                list(range(1, 9))
+                + list(range(10, 33, 2))
+                + list(range(40, 65, 8))
+                + list(range(80, 161, 16))
+            )
+
+        gpu_mem = get_device_memory_capacity()
+        if gpu_mem is not None:
+            if gpu_mem > 90 * 1024:  # H200, H20
+                capture_bs += list(range(160, 257, 8))
+            if gpu_mem > 160 * 1000:  # B200, MI300
+                capture_bs += list(range(256, 513, 16))
+
+    num_max_requests = model_runner.req_to_token_pool.size
+
+    mul_base = 1
+    if server_args.enable_two_batch_overlap:
+        mul_base *= 2
+        num_tokens_per_bs = 1  # tbo not test, set num_tokens_per_bs to 1
+
+    if require_gathered_buffer(server_args):
+        mul_base *= get_attention_tp_size()
+
+    if mul_base % get_attention_cp_size() != 0:
+        mul_base *= get_attention_cp_size()
+
+    # pad `num_max_requests` to avoid being filtered out
+    num_max_requests = (num_max_requests + mul_base - 1) // mul_base * mul_base
+    if max(capture_bs) > num_max_requests:
+        # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
+        # is very small. We add more values here to make sure we capture the maximum bs.
+        capture_bs += [num_max_requests]
+
+    sum_len_bs = []
+    if server_args.speculative_algorithm is None and get_moe_a2a_backend().is_none():
+        sum_len_bs = [bs for bs in capture_bs if (bs < 10 and bs % mul_base != 0)]
+        
+
+    # Model input token count = bs * num_tokens_per_bs; must be a multiple of attn_tp_size.        
+    capture_bs = sum_len_bs + [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
+
+    if server_args.cuda_graph_max_bs:
+        capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
+        if max(capture_bs) < server_args.cuda_graph_max_bs:
+            capture_bs += list(
+                range(max(capture_bs), server_args.cuda_graph_max_bs + 1, 16)
+            )
+    capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
+    capture_bs = list(sorted(set(capture_bs)))
+
+    assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
+    compile_bs = (
+        [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
+        if server_args.enable_torch_compile
+        else []
+    )
+    return capture_bs, compile_bs, sum_len_bs
+
+
+# Reuse this memory pool across all cuda graph runners.
+global_graph_memory_pool = None
+
+
+def get_global_graph_memory_pool():
+    return global_graph_memory_pool
+
+
+def set_global_graph_memory_pool(val):
+    global global_graph_memory_pool
+    global_graph_memory_pool = val
+
+
+# class CudaGraphRunner:
+#     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 

@@ -38,6 +38,13 @@ from sglang.srt.utils import (
     load_json_config,
 )
 
+import triton
+from sglang.srt.layers.moe.ep_moe.kernels import (
+    deepep_permute_triton_kernel_opt,
+    deepep_post_reorder_triton_kernel,
+    deepep_run_moe_deep_preprocess,
+)
+
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
@@ -101,6 +108,8 @@ class DeepEPNormalDispatchOutput(NamedTuple):
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     num_recv_tokens_per_expert: List[int]
+    reorder_topk_ids: Optional[torch.Tensor]
+    seg_indptr: Optional[torch.Tensor]
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -248,8 +257,9 @@ class DeepEPBuffer:
         buffer_kwargs = dict(
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
-            allow_mnnvl=use_mnnvl_fabric,
+            # allow_mnnvl=use_mnnvl_fabric,
         )
+        logger.error(f'## DeepEPBuffer {group.size()=} {num_nvl_bytes=} {num_rdma_bytes=} {num_qps_per_rank=} low_latency_mode={deepep_mode.enable_low_latency()}')
         # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
         # support, so cross-pod GB200/GB300 EP groups use
         # cuMemImportFromShareableHandle instead of the intra-node-only
@@ -260,11 +270,14 @@ class DeepEPBuffer:
         #   cu12x -> fzyzcjy/DeepEP, which has no use_fabric kwarg but already
         #            auto-enables fabric in C++ when supported, so we skip it:
         #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
-        is_cu12 = get_cuda_version()[0] == 12
-        if not is_cu12 and use_mnnvl_fabric:
-            buffer_kwargs["use_fabric"] = True
+        # is_cu12 = get_cuda_version()[0] == 12
+        # if not is_cu12 and is_flashinfer_available():
+        #     from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
 
-        cls._buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        #     if is_mnnvl_fabric_supported(torch.cuda.current_device()):
+        #         buffer_kwargs["use_fabric"] = True
+
+        # cls._buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return cls._buffer
 
     @classmethod
@@ -482,6 +495,59 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self.src2dst = None
         self.quant_config = {}
 
+    def _deepep_permute(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        fp8_dtype: Optional[torch.dtype] = None,
+        use_fp8_w8a8: bool = False,
+        use_block_quant: bool = False,
+    ):
+        """
+        Copy from Megatron-Core token_dispatcher MoEFlexTokenDispatcher
+        https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py
+        """
+
+        reorder_topk_ids, self.src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
+            topk_idx, self.num_experts
+        )
+        num_total_tokens = reorder_topk_ids.numel()
+        gateup_input = torch.empty(
+            (int(num_total_tokens), hidden_states.shape[1]),
+            device=hidden_states.device,
+            dtype=(
+                fp8_dtype
+                if (use_fp8_w8a8 and not use_block_quant)
+                else hidden_states.dtype
+            ),
+        )
+        # PreReorder
+        # deepep_permute_triton_kernel[(hidden_states.shape[0],)](
+        #     hidden_states,
+        #     gateup_input,
+        #     self.src2dst,
+        #     topk_idx,
+        #     None,
+        #     self.router_topk,
+        #     hidden_states.shape[1],
+        #     BLOCK_SIZE=512,
+        # )
+        # TOPK = triton.next_power_of_2(self.router_topk)
+        deepep_permute_triton_kernel_opt[(hidden_states.shape[0],)](
+            hidden_states,
+            gateup_input,
+            self.src2dst,
+            topk_idx,
+            None,
+            self.router_topk,
+            hidden_states.shape[1],
+            BLOCK_SIZE=512,
+            K=self.K,
+            num_warps = 8
+        )
+
+        return reorder_topk_ids, seg_indptr, gateup_input
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -515,6 +581,20 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             hidden_states, hidden_states_scale = hidden_states
         else:
             hidden_states_scale = None
+        
+        if hidden_states.shape[0] > 0:
+            reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
+                hidden_states, topk_ids, fp8_dtype=hidden_states.dtype
+            )
+        else:
+            reorder_topk_ids = torch.empty(
+                (0,), device=hidden_states.device, dtype=torch.int64
+            )
+            seg_indptr = torch.zeros(
+                (self.num_experts + 1,),
+                device=hidden_states.device,
+                dtype=torch.int64,
+            )
 
         return DeepEPNormalDispatchOutput(
             hidden_states,
@@ -596,7 +676,31 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
-            raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
+            # raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
+            if hidden_states.shape[0] > 0:
+                num_tokens = self.src2dst.shape[0] // self.router_topk
+                output = torch.empty(
+                    (num_tokens, hidden_states.shape[1]),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+                deepep_post_reorder_triton_kernel[(num_tokens,)](
+                    hidden_states,
+                    output,
+                    self.src2dst,
+                    topk_ids,
+                    topk_weights,
+                    self.router_topk,
+                    hidden_states.shape[1],
+                    BLOCK_SIZE=512,
+                )
+            else:
+                output = torch.zeros(
+                    (0, hidden_states.shape[1]),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+            # raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
 
         previous_event = Buffer.capture() if self.async_finish else None
         return output, previous_event
@@ -711,8 +815,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_weights: Optional[torch.Tensor]=None,        
     ):
         use_nvfp4 = use_fp8 = False
+        use_nvfp4 = use_fp8 = False
         input_global_scale = None
-        input_global_scale = self.quant_config.get("input_global_scale", None)
+        input_global_scale = None
+        # input_global_scale = self.quant_config.get("input_global_scale", None)
+
         bf16_dispatch = self.quant_config.get("bf16_dispatch", False)
         if input_global_scale is not None:
             use_nvfp4 = True
@@ -732,19 +839,19 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             if not need_bf16_dispatch:
                 use_fp8 = True
 
-        # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
-        # to return int32-packed UE8M0 scales that don't feed the flashinfer
-        # cutedsl kernel.
-        fp8_deepgemm_scale_opts = (
-            dict(
-                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-            )
-            if self.use_fp8
-            else dict()
-        )
+        # # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
+        # # to return int32-packed UE8M0 scales that don't feed the flashinfer
+        # # cutedsl kernel.
+        # fp8_deepgemm_scale_opts = (
+        #     dict(
+        #         round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        #         and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+        #         use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        #         and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+        #     )
+        #     if self.use_fp8
+        #     else dict()
+        # )
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
@@ -764,7 +871,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 ),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                **fp8_deepgemm_scale_opts,
+                # **fp8_deepgemm_scale_opts,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook

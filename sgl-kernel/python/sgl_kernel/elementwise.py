@@ -122,6 +122,19 @@ def _gemma_fused_add_rmsnorm_internal(
 #     else:
 #         return _flashinfer_norm.rmsnorm(input, weight, eps, out, enable_pdl)
 
+def rms_norm_dynamic_per_token_quant_custom(input: torch.Tensor,
+                                                   weight: torch.Tensor,
+                                                   var_epsilon: float,
+                                                   quant_dtype: torch.dtype,
+                                                   scale_ub: torch.Tensor = None,
+                                                   residual: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] :
+    out = torch.zeros_like(input, dtype=torch.int8)
+    out_bf16 = torch.zeros_like(input, dtype=torch.bfloat16)
+    scales = torch.empty((input.numel() // input.shape[-1], 1),
+                         device=input.device,
+                         dtype=torch.float32)
+    torch.ops.sgl_kernel.rms_norm_dynamic_per_token_quant_custom.default(out, out_bf16, input, weight, scales, var_epsilon, scale_ub, residual)
+    return out, out_bf16, scales
 
 def fused_add_rmsnorm(
     input: torch.Tensor,
