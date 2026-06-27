@@ -1943,7 +1943,9 @@ class DeepseekV2AttentionMLA(
             and not lora_active
         ):
             qkv_latent = dsv3_fused_a_gemm(
-                hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
+                hidden_states,
+                self.fused_qkv_a_proj_with_mqa.weight.T,
+                backend=self.fused_a_gemm_backend,
             )
         else:
             qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
