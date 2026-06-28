@@ -1,14 +1,16 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-from ..common.utils import get_cu_seqblocks, robust_allocator
+from ..common.utils import get_cu_seqblocks, _bitonic_merge, _check_dtypes
 
-
+# --------------------------------------------------------------------------- #
+# Step 1: score + (optional) index-head attention, with in-kernel top-k score  #
+# --------------------------------------------------------------------------- #
 @triton.heuristics(
     {
         "BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"]),
@@ -19,46 +21,26 @@ from ..common.utils import get_cu_seqblocks, robust_allocator
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=1, num_stages=1
+            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 16}, num_warps=4, num_stages=1
         ),
-        # Small block (64x64): low shared mem, can use higher num_stages
-        # triton.Config(
-        #     {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=2
-        # ),
-        # triton.Config(
-        #     {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3
-        # ),
-        # triton.Config(
-        #     {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=4
-        # ),
-        # # Medium block (64x128, 128x64): moderate shared mem, ns=2,3
-        # triton.Config(
-        #     {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
-        # ),
-        # triton.Config(
-        #     {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3
-        # ),
-        # triton.Config(
-        #     {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=2
-        # ),
-        # triton.Config(
-        #     {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=3
-        # ),
-        # # Large block (128x128): high shared mem, ns=2,3 only, nw=8
-        # triton.Config(
-        #     {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
-        # ),
-        # triton.Config(
-        #     {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3
-        # ),
+        triton.Config(
+            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 16}, num_warps=2, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 32}, num_warps=4, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 16}, num_warps=4, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 32}, num_warps=8, num_stages=1
+        ),
     ],
     key=[
         "qk_head_dim",
         "v_head_dim",
-        # "block_size",
-        # "use_gumbel_topk",
-        # "SCORE_TYPE",
-        # "DISABLE_INDEX_VALUE",
+        "block_size",
+        "use_gumbel_topk",
     ],
 )
 @triton.jit
@@ -118,8 +100,14 @@ def _flash_attn_fwd_with_block_score_kernel(
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
-    tl.static_assert(BLOCK_SIZE_K >= block_size)
-    BLOCKS_PER_K_BLOCK: tl.constexpr = BLOCK_SIZE_K // block_size
+    # BLOCK_SIZE_K is the K/V sub-tile; block_size is the topk block size (bsk).
+    # A selected block of `block_size` tokens is processed in sub-tiles of
+    # BLOCK_SIZE_K (block_size must be a multiple of BLOCK_SIZE_K). Smaller
+    # sub-tile -> smaller K/V shared-mem footprint -> higher occupancy on the
+    # 64KB-smem/SM device (see step3 kernel for the same trick). Each bsk-block
+    # writes exactly one score column, accumulated across its sub-tiles.
+    tl.static_assert(block_size % BLOCK_SIZE_K == 0)
+    SUB_TILES_PER_BLOCK: tl.constexpr = block_size // BLOCK_SIZE_K
     # get batch id and head id
     pid_q, pid_bh = tl.program_id(0), tl.program_id(1)
     pid_b = pid_bh // num_heads
@@ -150,7 +138,7 @@ def _flash_attn_fwd_with_block_score_kernel(
         shape=(q_len, block_num),
         strides=(stride_s_q, stride_s_k),
         offsets=(pid_q * BLOCK_SIZE_Q, 0),
-        block_shape=(BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK),
+        block_shape=(BLOCK_SIZE_Q, 1),
         order=(1, 0),
     )
     # load q
@@ -167,7 +155,6 @@ def _flash_attn_fwd_with_block_score_kernel(
     off_k = tl.arange(0, BLOCK_SIZE_K)
     off_kd = tl.arange(0, BLOCK_SIZE_KD)
     off_vd = tl.arange(0, BLOCK_SIZE_VD)
-    off_bpk = tl.arange(0, BLOCKS_PER_K_BLOCK)
     kd_mask = off_kd < qk_head_dim
     vd_mask = off_vd < v_head_dim
     if HAS_SINK:
@@ -180,87 +167,93 @@ def _flash_attn_fwd_with_block_score_kernel(
         m_i = tl.full((BLOCK_SIZE_Q,), float("-inf"), dtype=tl.float32)
         lse_i = tl.full((BLOCK_SIZE_Q,), float("-inf"), dtype=tl.float32)
     acc_o = tl.full((BLOCK_SIZE_Q, BLOCK_SIZE_VD), 0, dtype=tl.float32)
-    # attention
-    diag_start = (prefix_len + pid_q * BLOCK_SIZE_Q) // BLOCK_SIZE_K * BLOCK_SIZE_K
+    # attention. Outer loop steps by block_size (one bsk-block -> one score
+    # column); inner loop splits that block into SUB_TILES_PER_BLOCK sub-tiles
+    # of BLOCK_SIZE_K so the K/V shared-mem tile stays small (high occupancy).
+    # Online softmax (m/lse/acc_o) and the per-block score (max/lse) both
+    # accumulate across sub-tiles, so the split is exact.
     hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
-    for i in tl.range(0, hi, BLOCK_SIZE_K):
-        # paged load K via req_to_token: pos -> slot -> k_cache
-        pos = i + off_k
-        pos_mask = pos < seq_len
-        slots = tl.load(
-            req_to_token_ptr + sid * stride_r2t_b + pos,
-            mask=pos_mask,
-            other=0,
-        ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots  # safety against negative
-        # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
-        k = tl.load(
-            k_cache_ptr
-            + slots[None, :] * stride_k_s
-            + pid_kh * stride_k_h
-            + off_kd[:, None] * stride_k_d,
-            mask=kd_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        )
-        # compute qk
-        qk = tl.dot(q, k) * sm_scale_log2e
-        if i >= diag_start:
-            qk = tl.where(off_q[:, None] >= (i + off_k)[None, :], qk, float("-inf"))
-        # K boundary mask: positions beyond seq_len contribute -inf
-        qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-        # save score
-        score = tl.reshape(
-            qk, (BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK, block_size), can_reorder=False
-        )
-        sub_max = tl.max(score, axis=2)
-        if SCORE_TYPE == "max":
-            score = sub_max
-        else:  # "lse"
-            # fully-masked sub-blocks produce NaN via -inf - (-inf); clamp
-            # back to -inf so downstream bitonic sort sees a clean sentinel.
-            score = sub_max + tl.log2(
-                tl.sum(tl.exp2(score - sub_max[:, :, None]), axis=2)
+    for i in tl.range(0, hi, block_size):
+        # accumulate this bsk-block's score across its sub-tiles.
+        # max: running max of per-token qk. lse: logsumexp via running (max, sum).
+        blk_score_max = tl.full((BLOCK_SIZE_Q,), float("-inf"), dtype=tl.float32)
+        blk_lse_m = tl.full((BLOCK_SIZE_Q,), float("-inf"), dtype=tl.float32)
+        blk_lse_s = tl.zeros((BLOCK_SIZE_Q,), dtype=tl.float32)
+        for s in tl.static_range(0, SUB_TILES_PER_BLOCK):
+            ks = i + s * BLOCK_SIZE_K
+            # paged load K via req_to_token: pos -> slot -> k_cache
+            pos = ks + off_k
+            pos_mask = pos < seq_len
+            slots = tl.load(
+                req_to_token_ptr + sid * stride_r2t_b + pos,
+                mask=pos_mask,
+                other=0,
+            ).to(tl.int64)
+            slots = (slots + max_slots) % max_slots  # safety against negative
+            # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
+            k = tl.load(
+                k_cache_ptr
+                + slots[None, :] * stride_k_s
+                + pid_kh * stride_k_h
+                + off_kd[:, None] * stride_k_d,
+                mask=kd_mask[:, None] & pos_mask[None, :],
+                other=0.0,
             )
+            # compute qk
+            qk = tl.dot(q, k) * sm_scale_log2e
+            # causal mask: a query at off_q attends to keys at abs pos ks+off_k
+            qk = tl.where(off_q[:, None] >= (ks + off_k)[None, :], qk, float("-inf"))
+            # K boundary mask: positions beyond seq_len contribute -inf
+            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+            # accumulate per-block score (max or lse) across sub-tiles
+            sub_max = tl.max(qk, axis=1)  # (BLOCK_SIZE_Q,)
+            if SCORE_TYPE == "max":
+                blk_score_max = tl.maximum(blk_score_max, sub_max)
+            else:  # "lse": logsumexp merge of this sub-tile into the block
+                new_m = tl.maximum(blk_lse_m, sub_max)
+                blk_lse_s = blk_lse_s * tl.exp2(blk_lse_m - new_m) + tl.sum(
+                    tl.exp2(qk - new_m[:, None]), axis=1
+                )
+                blk_lse_m = new_m
+            if not DISABLE_INDEX_VALUE:
+                # compute m_ij and l_ij (online softmax over all sub-tiles)
+                m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+                p = tl.exp2(qk - m_ij[:, None])
+                l_ij = tl.sum(p, axis=1)
+                # scale acc_o
+                acc_o_scale = tl.exp2(m_i - m_ij)
+                acc_o = acc_o * acc_o_scale[:, None]
+                # paged load V (sub-tile, same slots)
+                v = tl.load(
+                    v_cache_ptr
+                    + slots[:, None] * stride_v_s
+                    + pid_kh * stride_v_h
+                    + off_vd[None, :] * stride_v_d,
+                    mask=pos_mask[:, None] & vd_mask[None, :],
+                    other=0.0,
+                )
+                p = p.to(v.dtype)
+                acc_o += tl.dot(p, v)
+                # update statistics
+                m_i = m_ij
+                lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+        # finalize and save this bsk-block's score (one column)
+        if SCORE_TYPE == "max":
+            score = blk_score_max
+        else:  # "lse"
+            score = blk_lse_m + tl.log2(blk_lse_s)
+            # fully-masked block (all -inf) -> NaN; clamp to -inf sentinel
             score = tl.where(score != score, float("-inf"), score)
         if use_gumbel_topk:
-            # generate non-conflicting offset for random generation
-            # noise_offset shape: (BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK)
-            # random seed include head id, batch id and gumbel seed
-            # (Head low 7 bits | Batch middle 12 bits | Other high bits)
             local_seed = (pid_h | (pid_b << 7) | (gumbel_seed << 19)).to(tl.int32)
-            # noise offset include q index and k block index
-            # [31-13: Q (19bits)] | [12-0: K_Block (13bits)]
-            noise_offset = (off_q << 13)[:, None] | (off_bpk + i // block_size)[None, :]
-            # gumbel noise (scaled to log2 scale to match sm_scale_log2e)
+            noise_offset = (off_q << 13) | (i // block_size)
             noise = tl.rand(local_seed, offset=noise_offset)
             noise = tl.clamp(noise, min=1e-9, max=1 - 1e-9)  # avoid log(0)
             noise = -tl.log(-tl.log(noise)) * 1.4426950409
-            score += noise
-        tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
-        if not DISABLE_INDEX_VALUE:
-            # compute m_ij and l_ij
-            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            p = tl.exp2(qk - m_ij[:, None])
-            l_ij = tl.sum(p, axis=1)
-            # scale acc_o
-            acc_o_scale = tl.exp2(m_i - m_ij)
-            acc_o = acc_o * acc_o_scale[:, None]
-            # paged load V
-            v = tl.load(
-                v_cache_ptr
-                + slots[:, None] * stride_v_s
-                + pid_kh * stride_v_h
-                + off_vd[None, :] * stride_v_d,
-                mask=pos_mask[:, None] & vd_mask[None, :],
-                other=0.0,
-            )
-            p = p.to(v.dtype)
-            acc_o += tl.dot(p, v)
-            # update statistics
-            m_i = m_ij
-            lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
-        # update ptrs
-        s_ptrs = tl.advance(s_ptrs, (0, BLOCKS_PER_K_BLOCK))
+            score = score + noise
+        tl.store(s_ptrs, tl.reshape(score, (BLOCK_SIZE_Q, 1)).to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
+        # advance score ptr to next bsk-block column
+        s_ptrs = tl.advance(s_ptrs, (0, 1))
     if not DISABLE_INDEX_VALUE:
         # final scale
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
@@ -276,75 +269,18 @@ def _flash_attn_fwd_with_block_score_kernel(
         tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit
-def _compare_and_swap(x, ids, flip, i: tl.constexpr, n_dims: tl.constexpr):
-    n_outer: tl.constexpr = x.numel >> n_dims
-    shape: tl.constexpr = [n_outer * 2**i, 2, 2 ** (n_dims - i - 1)]
-    y = tl.reshape(x, shape)
-    # slice left/right with 'stride' 2**(n_dims - i - 1)
-    mask = tl.arange(0, 2)[None, :, None]
-    left = tl.broadcast_to(tl.sum(y * (1 - mask), 1)[:, None, :], shape).to(y.dtype)
-    right = tl.broadcast_to(tl.sum(y * mask, 1)[:, None, :], shape).to(y.dtype)
-    left = tl.reshape(left, x.shape)
-    right = tl.reshape(right, x.shape)
-    # idx
-    y_idx = tl.reshape(ids, shape)
-    left_idx = tl.broadcast_to(tl.sum(y_idx * (1 - mask), 1)[:, None, :], shape)
-    right_idx = tl.broadcast_to(tl.sum(y_idx * mask, 1)[:, None, :], shape)
-    left_idx = tl.reshape(left_idx, x.shape).to(y_idx.dtype)
-    right_idx = tl.reshape(right_idx, x.shape).to(y_idx.dtype)
-    # actual compare-and-swap
-    idtype = tl.core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
-    ileft = left.to(idtype, bitcast=True)
-    iright = right.to(idtype, bitcast=True)
-    ix = x.to(idtype, bitcast=True)
-
-    cond = (left > right) != flip
-    ret = ix ^ tl.where(cond, ileft ^ iright, tl.zeros_like(ix))
-    new_ids = ids ^ tl.where(cond, left_idx ^ right_idx, tl.zeros_like(ids))
-    return ret.to(x.dtype, bitcast=True), new_ids
-
-
-@triton.jit
-def _bitonic_merge(
-    x, ids, stage: tl.constexpr, order: tl.constexpr, n_dims: tl.constexpr
-):
-    n_outer: tl.constexpr = x.numel >> n_dims
-    tl.static_assert(stage <= n_dims)
-    # flip denotes whether to re-arrange sub-sequences of elements in ascending or
-    # descending order.
-    # if flip = 00000000... then all elements will be re-arranged ascendingly at this stage
-    # if flip = 00110011... then all the elements will be re-arranged alternatingly (with
-    # a stride of 2) at this stage
-    if order == 2:
-        shape: tl.constexpr = [n_outer * 2 ** (n_dims - 1 - stage), 2, 2**stage]
-        flip = tl.reshape(
-            tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape
-        )
-    else:
-        flip = order
-    # perform `stage` rounds of `compare-and-swap`
-    for i in tl.static_range(stage):
-        x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
-    return x, ids
-
-
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
 @triton.autotune(
     configs=[
-        # Large configs for H200/B200 to support larger topk
-        # triton.Config({"BLOCK_SIZE_K": 2048}, num_warps=8, num_stages=2),
-        # triton.Config({"BLOCK_SIZE_K": 1024}, num_warps=8, num_stages=2),
-        # triton.Config({"BLOCK_SIZE_K": 512}, num_warps=8, num_stages=2),
-        # triton.Config({"BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
-        # triton.Config({"BLOCK_SIZE_K": 256}, num_warps=4, num_stages=2),
-        # triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
-        # triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=1, num_stages=1),
+        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_K": 64}, num_warps=2, num_stages=2),
     ],
     key=[
-        "BLOCK_SIZE_T"
-    ],  # use BLOCK_SIZE_T instead of topk to reduce autotune frequency
+        "topk"
+    ],  # topk gates BLOCK_SIZE_K validity (assert BLOCK_SIZE_K > topk)
 )
 @triton.jit
 def _topk_index_kernel(
@@ -411,13 +347,8 @@ def _topk_index_kernel(
         init_mask = i + off_k < init_blocks
         # load score
         score = tl.load(s_ptrs, mask=causal_mask, other=-1e30).to(tl.float32)
-        # handle NaN: NaN inputs cause bitonic sort to fail, resulting in invalid indices (-2)
-        # appearing in the topk list. We replace NaN with -inf to maintain sort order.
         score = tl.where(score != score, -1e30, score)
         s_ptrs = s_ptrs + stride_s_k * BLOCK_SIZE_K
-        # fill init and local part, make sure init part is always in topk
-        # and at the first position. Note: must use causal_mask to protect
-        # init_mask to avoid selecting blocks outside causal window
         if MASK_INIT:
             score = tl.where(causal_mask & init_mask, score - 1e29, score)
         else:
@@ -488,40 +419,35 @@ def flash_prefill_with_topk_index(
     init_blocks: int = 1,
     local_blocks: int = 2,
     sm_scale: Optional[float] = None,
-    use_tma: bool = False,
     score_type: str = "max",
     disable_index_value: bool = False,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
-):
-    assert score_type in (
-        "max",
-        "lse",
-    ), f"score_type must be 'max' or 'lse', got {score_type!r}"
-    # triton.set_allocator(robust_allocator)
+) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    assert score_type in ("max", "lse"), f"score_type must be 'max' or 'lse', got {score_type!r}"
     # dtype check
-    assert q.dtype == torch.bfloat16 or q.dtype == torch.float16
+    assert q.dtype in (torch.bfloat16, torch.float16)
     assert k_cache.dtype == q.dtype
     assert cu_seqlens.dtype == torch.int32
     # shape
     total_q, num_heads, qk_head_dim = q.shape
     max_slots, num_kv_heads, _ = k_cache.shape
     if disable_index_value:
-        # placeholder for BLOCK_SIZE_VD; V is never loaded
-        v_head_dim = qk_head_dim
+        v_head_dim = qk_head_dim  # placeholder for BLOCK_SIZE_VD; V is never loaded
     else:
         assert v_cache is not None and v_cache.dtype == q.dtype
         assert v_cache.shape[1] == k_cache.shape[1]
+        _check_dtypes(q, k_cache, v_cache)
         v_head_dim = v_cache.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
     batch_size = cu_seqlens.shape[0] - 1
     assert qk_head_dim <= 256 and v_head_dim <= 256, "head_dim must be less than 256"
     if sink is not None:
         assert sink.shape[0] == num_heads and sink.shape[1] == qk_head_dim
-    assert init_blocks + local_blocks <= topk, (
-        "init_blocks + local_blocks must be less than topk"
-    )
+    assert (
+        init_blocks + local_blocks <= topk
+    ), "init_blocks + local_blocks must be less than topk"
     if sm_scale is None:
         sm_scale = qk_head_dim**-0.5
     if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
