@@ -8,10 +8,9 @@ import triton.language as tl
 
 from sglang.srt.utils import is_hip
 
-from ..common.utils import get_cu_seqblocks, robust_allocator
+from ..common.utils import get_cu_seqblocks, robust_allocator, _check_dtypes
 
 _is_hip = is_hip()
-
 
 @triton.heuristics(
     {
@@ -29,16 +28,14 @@ _is_hip = is_hip()
     }
 )
 @triton.autotune(
-    # Configs that fail to compile on the target arch are skipped, so widening
-    # the num_warps x num_stages grid only adds candidates, never a bad kernel.
     configs=[
-        triton.Config({}, num_warps=1, num_stages=1),
-        # for nw in (2, 4, 8)
-        # for ns in (2, 3, 4)
+        triton.Config({}, num_warps=nw, num_stages=ns)
+        for nw in (2, 4, 8)
+        for ns in (1, 2)
     ],
     key=[
-        # "BLOCK_SIZE_Q",
-        # "BLOCK_SIZE_K",
+        "BLOCK_SIZE_Q",
+        "BLOCK_SIZE_K",
         "qk_head_dim",
         "v_head_dim",
         "gqa_group_size",
@@ -91,7 +88,8 @@ def _gqa_share_sparse_fwd_kernel(
     stride_r2t_b,
     # META parameters
     BLOCK_SIZE_Q: tl.constexpr,  # q block size
-    BLOCK_SIZE_K: tl.constexpr,  # k block size
+    block_size: tl.constexpr,  # topk block size (= bsk, one selected KV block)
+    BLOCK_SIZE_K: tl.constexpr,  # K/V tile size for the inner dot (<= block_size)
     BLOCK_SIZE_KD: tl.constexpr,
     BLOCK_SIZE_VD: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
@@ -99,8 +97,6 @@ def _gqa_share_sparse_fwd_kernel(
     BLOCK_SIZE_QH: tl.constexpr,
     # has sink
     HAS_SINK: tl.constexpr,
-    USE_TMA: tl.constexpr,
-    IS_FP8: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # get batch id and head id
@@ -146,8 +142,8 @@ def _gqa_share_sparse_fwd_kernel(
         # we assume that the topk_idx is right padded with -1
         off_t = tl.arange(0, BLOCK_SIZE_T)
         topk_idx = tl.load(t_ptr_j + off_t * stride_tk, mask=off_t < max_topk, other=-1)
-        valid_idx = tl.where(topk_idx >= 0, 1, 0)
-        real_topk = tl.sum(valid_idx, axis=0)
+        valid_idx = tl.where(topk_idx >= 0, off_t, -1)
+        real_topk = tl.sum((valid_idx != -1).to(tl.int32), axis=0)
         # init qkv pointer
         q_ptrs = tl.make_block_ptr(
             base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
@@ -181,68 +177,60 @@ def _gqa_share_sparse_fwd_kernel(
             lse_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
         acc_o = tl.full((BLOCK_SIZE_QH, BLOCK_SIZE_VD), 0, dtype=tl.float32)
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_KD)
-        # sparse attention
         for i in range(real_topk):
             # get current block start index (absolute K position)
-            c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
+            c = tl.load(t_ptr_j).to(tl.int32) * block_size
             t_ptr_j = t_ptr_j + stride_tk
-            # paged load K via req_to_token: pos -> slot -> k_cache
-            pos = c + off_n
-            pos_mask = pos < seq_len
-            slots = tl.load(
-                req_to_token_ptr + sid * stride_r2t_b + pos,
-                mask=pos_mask,
-                other=0,
-            ).to(tl.int64)
-            slots = (slots + max_slots) % max_slots  # safety against negative
-            # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
-            k = tl.load(
-                k_cache_ptr
-                + slots[None, :] * stride_ks
-                + pid_kh * stride_kh
-                + off_kd[:, None] * stride_kd,
-                mask=kd_mask[:, None] & pos_mask[None, :],
-                other=0.0,
-            )
-            if IS_FP8:
-                # fp8 main K cache is unit-scaled; widen to the Q compute dtype
-                # before the tl.dot (compiled out when the cache is bf16).
-                k = k.to(q.dtype)
-            # compute qk
-            qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
-            # causal mask
-            qk += tl.where(off_q_k[:, None, :] >= c, 0, float("-inf"))
-            qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
-            # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
-            #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]
-            qk += tl.dot(q, k) * sm_scale_log2e
-            # K boundary mask: positions beyond seq_len contribute -inf
-            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-            # compute m_ij and l_ij
-            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            p = tl.exp2(qk - m_ij[:, None])
-            l_ij = tl.sum(p, axis=1)
-            # scale acc_o
-            acc_o_scale = tl.exp2(m_i - m_ij)
-            acc_o = acc_o * acc_o_scale[:, None]
-            # paged load V
-            v = tl.load(
-                v_cache_ptr
-                + slots[:, None] * stride_vs
-                + pid_kh * stride_vh
-                + off_vd[None, :] * stride_vd,
-                mask=pos_mask[:, None] & vd_mask[None, :],
-                other=0.0,
-            )
-            if IS_FP8:
-                # Widen V so `p.to(v.dtype)` casts P to the compute dtype rather
-                # than to fp8 (which would wreck attention-weight precision).
-                v = v.to(q.dtype)
-            p = p.to(v.dtype)
-            acc_o += tl.dot(p, v)
-            # update statistics
-            m_i = m_ij
-            lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+            for s in tl.static_range(0, block_size, BLOCK_SIZE_K):
+                # paged load K via req_to_token: pos -> slot -> k_cache
+                pos = c + s + off_n
+                pos_mask = pos < seq_len
+                slots = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + pos,
+                    mask=pos_mask,
+                    other=0,
+                ).to(tl.int64)
+                slots = (slots + max_slots) % max_slots  # safety against negative
+                # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
+                k = tl.load(
+                    k_cache_ptr
+                    + slots[None, :] * stride_ks
+                    + pid_kh * stride_kh
+                    + off_kd[:, None] * stride_kd,
+                    mask=kd_mask[:, None] & pos_mask[None, :],
+                    other=0.0,
+                )
+                # compute qk
+                qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
+                # causal mask (key abs pos = c + s + off_n)
+                qk += tl.where(off_q_k[:, None, :] >= c + s, 0, float("-inf"))
+                qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
+                # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
+                #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]
+                qk += tl.dot(q, k) * sm_scale_log2e
+                # K boundary mask: positions beyond seq_len contribute -inf
+                qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+                # compute m_ij and l_ij
+                m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+                p = tl.exp2(qk - m_ij[:, None])
+                l_ij = tl.sum(p, axis=1)
+                # scale acc_o
+                acc_o_scale = tl.exp2(m_i - m_ij)
+                acc_o = acc_o * acc_o_scale[:, None]
+                # paged load V
+                v = tl.load(
+                    v_cache_ptr
+                    + slots[:, None] * stride_vs
+                    + pid_kh * stride_vh
+                    + off_vd[None, :] * stride_vd,
+                    mask=pos_mask[:, None] & vd_mask[None, :],
+                    other=0.0,
+                )
+                p = p.to(v.dtype)
+                acc_o += tl.dot(p, v)
+                # update statistics
+                m_i = m_ij
+                lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         # final scale
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         # save output
@@ -256,6 +244,7 @@ def _gqa_share_sparse_fwd_kernel(
             order=(2, 1, 0),
         )
         tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
+
 
 @torch.no_grad()
 def flash_prefill_with_gqa_share_sparse(
@@ -273,23 +262,10 @@ def flash_prefill_with_gqa_share_sparse(
     prefix_lens: torch.Tensor,
     max_seqlen_q: int,
     sm_scale: Optional[float] = None,
-    use_tma: bool = True,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
 ) -> torch.Tensor:
-    # triton.set_allocator(robust_allocator)
-    # dtype check. On HIP, the paged main K/V cache may be fp8 (unit-scaled)
-    # under --kv-cache-dtype fp8_*; the kernel widens it to the Q dtype on load.
-    # Keep CUDA's pre-existing sparse prefill dtype contract unchanged by
-    # accepting fp8 only on HIP.
-    assert q.dtype in (torch.bfloat16, torch.float16)
-    _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz)
-    is_fp8 = _is_hip and k_cache.dtype in _FP8_DTYPES
-    assert k_cache.dtype == q.dtype or is_fp8, (
-        f"sparse prefill expects K cache dtype == Q dtype ({q.dtype}) "
-        f"or fp8 on HIP, got {k_cache.dtype}"
-    )
-    assert v_cache.dtype == k_cache.dtype
+    _check_dtypes(q, k_cache, v_cache)
     assert block_size_q in {1, 2, 4, 8, 16, 32, 64}
     assert block_size_k in {16, 32, 64, 128}
     # shape
@@ -317,13 +293,12 @@ def flash_prefill_with_gqa_share_sparse(
         max_seqblock_q // 131072 + 1
     )  # calculate multiple queries in one kernel if seqlence length is too long
     BLOCK_SIZE_Q = triton.next_power_of_2(block_size_q)
-    BLOCK_SIZE_K = triton.next_power_of_2(block_size_k)
+    BLOCK_SIZE_K = min(16, triton.next_power_of_2(block_size_k))
     grid = (
         triton.cdiv(triton.cdiv(max_seqlen_q, block_size_q), num_q_loop),
         num_k_heads,
         batch_size,
     )
-
     _gqa_share_sparse_fwd_kernel[grid](
         q,
         k_cache,
@@ -364,8 +339,7 @@ def flash_prefill_with_gqa_share_sparse(
         o.stride(2),
         req_to_token.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
+        block_size=block_size_k,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
-        USE_TMA=use_tma,
-        IS_FP8=is_fp8,
     )
     return o
