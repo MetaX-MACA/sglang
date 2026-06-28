@@ -1279,10 +1279,14 @@ class NixlKVManager(CommonKVManager):
         notif: str,
         src_mem_kind: str = "VRAM",
         dst_mem_kind: str = "VRAM",
+        force_flat: bool = False,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
-        Used by both send_kvcache and maybe_send_extra."""
+        Used by both send_kvcache and maybe_send_extra.
 
+        ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
+        even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
+        index) whose per-layer list must not be half-split into K/V."""
         # Prepped path (KV only; state transfers use the non-prepped path below).
         if (
             src_data_ptrs is self.kv_args.kv_data_ptrs
