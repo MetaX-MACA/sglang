@@ -336,6 +336,16 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+def _shared_indexer_freqs_cis(rotary_emb: torch.nn.Module) -> torch.Tensor:
+    cached = getattr(rotary_emb, "_dsa_indexer_freqs_cis", None)
+    if cached is None:
+        c = rotary_emb.cos_sin_cache.to(torch.float32)
+        half = c.shape[-1] // 2
+        cached = torch.complex(c[:, :half].contiguous(), c[:, half:].contiguous())
+        rotary_emb._dsa_indexer_freqs_cis = cached
+    return cached
+
+
 class Indexer(MultiPlatformOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
@@ -431,6 +441,10 @@ class Indexer(MultiPlatformOp):
         if self.int8_cache:
             self.scale_fmt = None
         self.softmax_scale = self.head_dim**-0.5
+
+        self._indexer_freqs_cis: Optional[torch.Tensor] = None
+        if _use_dsa_indexer_fusion:
+            self._indexer_freqs_cis = _shared_indexer_freqs_cis(self.rotary_emb)
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
