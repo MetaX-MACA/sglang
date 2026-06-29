@@ -765,7 +765,7 @@ def invoke_fused_moe_kernel(
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
     else:
         swap_ab = False
-
+    group_size = 0
     padded_size = 0
     if use_fp8_w8a8:
         assert B_scale is not None
@@ -780,6 +780,7 @@ def invoke_fused_moe_kernel(
             # activation block-wise fp8 quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
+            group_size = block_n
             if _is_cuda:
                 A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
             else:
@@ -941,6 +942,43 @@ def invoke_fused_moe_kernel(
                                 topk_ids.numel(), # num_valid_tokens
                                 top_k,
                                 mul_routed_weight)
+    elif use_fp8_w8a8 and enable_mctlass_fused_moe_python_api:
+        C1 = C.view(-1, C.size(-1)).contiguous()
+        fp8_kwargs = {
+            "filter_expert": filter_expert,
+            "use_fp8": True,
+        }
+        if block_shape is not None:
+            A_scale = A_scale.T.contiguous()
+            B_scale = B_scale.transpose(1, 2).contiguous()
+            fp8_kwargs.update(
+                is_blockwise=True,
+                group_size=group_size,
+                is_scale_a_1d=True,
+                is_scale_b_1d=False,
+                scale_a_layout="m-major",
+                scale_b_layout="n-major",
+            )
+        gemm(
+            A.shape[0],
+            B.shape[1],
+            A.shape[1],
+            B.shape[0],
+            sorted_token_ids.shape[0],
+            top_k,
+            A,
+            B,
+            C1,
+            A_scale,
+            B_scale,
+            None,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            **fp8_kwargs,
+        )
     else:
         if a_use_tma or b_use_tma:
             _set_triton_tma_allocator()
