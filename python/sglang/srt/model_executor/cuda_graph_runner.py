@@ -578,7 +578,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
             capture_bs += list(
                 range(max(capture_bs), server_args.cuda_graph_max_bs + 1, 16)
             )
-    capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
+    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
 
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
