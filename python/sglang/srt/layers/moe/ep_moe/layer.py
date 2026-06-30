@@ -9,7 +9,7 @@ from mcoplib.op import  fused_silu_mul_dq_reorder_quant
 from sglang.srt.layers.moe.ep_moe.kernels import (
     grouped_gemm_triton,
     m_grouped_gemm_nt_masked,
-    silu_and_mul_masked_fwd,
+    silu_and_mul_masked,
     silu_and_mul_masked_fwd_no_pack,
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep import _DeepEPDispatcherImplLowLatency
@@ -227,6 +227,7 @@ class DeepEPMoE(FusedMoE):
             self.dispatcher.set_quant_config({"bf16_dispatch": True})
             
         self.activation = activation
+        self.swiglu_limit = kwargs.get('swiglu_limit')
         self.grouped_gemm_runner = None
         self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
         
@@ -507,6 +508,7 @@ class DeepEPMoE(FusedMoE):
             )
         return down_output
     
+    # Deprecated: will be removed in a future release
     def forward_deepgemm_masked_v1(
         self,
         dispatch_output: DeepEPLLDispatchOutput,
@@ -544,7 +546,7 @@ class DeepEPMoE(FusedMoE):
         )
 
         if self.fused_quant:
-            down_input = silu_and_mul_masked_fwd(gateup_output, masked_m)
+            down_input = silu_and_mul_masked(gateup_output, masked_m, self.swiglu_limit)
         else:
             silu_and_mul_masked_fwd_no_pack(gateup_output, down_input, masked_m)
 
