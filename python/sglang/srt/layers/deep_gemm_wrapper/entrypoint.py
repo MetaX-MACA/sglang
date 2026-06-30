@@ -99,23 +99,103 @@ def grouped_gemm_nt_f8f8bf16_masked(
         # ),
     )
 
+def append_scale_batch_cuda(input_tensor: torch.Tensor, scale_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    pack scale in float32 to input in int8
+
+    args:
+        input_tensor (torch.Tensor): BxMxK,int8
+        scale_tensor (torch.Tensor): BxMx1,float32
+
+    return:
+        torch.Tensor: BxMx(K+4), int8
+    """
+    assert input_tensor.dtype == torch.int8, "input_tensor must be int8"
+    assert scale_tensor.dtype == torch.float32, "scale_tensor must be float32"
+    assert input_tensor.shape[:2] == scale_tensor.shape[:2], "Shape mismatch on B and M"
+    assert scale_tensor.shape[2] == 1, "scale_tensor must be of shape BxMx1"
+
+    B, M, K = input_tensor.shape
+
+    # float32 -> 4*int8
+    # scale_flat = scale_tensor.contiguous().view(-1)  # (B*M,)
+    # scale_bytes = scale_flat.cpu().numpy().tobytes()  # 4×B×M bytes
+    # scale_bytes_tensor = torch.tensor(list(scale_bytes), dtype=torch.uint8, device=input_tensor.device)
+    # scale_bytes_tensor = scale_bytes_tensor.view(B, M, 4).to(torch.int8)
+    scale_bytes_tensor = scale_tensor.view(torch.int8)
+
+    # pack scale to input
+    output = torch.cat([input_tensor, scale_bytes_tensor], dim=-1)  # B×M×(K+4)
+    return output
+
 def grouped_gemm_nt_int8int8bf16_masked(
     lhs: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
-):
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 128,
+    clamp_limit: Optional[float] = None,
+):  
     if not isinstance(lhs, tuple):
         lhs = (lhs.view(torch.int8), None)
-    deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(
-        lhs,
-        rhs,
-        out,
-        masked_m,
-        expected_m,
-    )
+    if clamp_limit is not None:
+        import mctlassEx
+        lhs_data, lhs_scales = lhs
+        rhs_data, rhs_scales = rhs
 
+        @lru_cache(maxsize=1)
+        def get_mctlass_op():
+            """Get mctlassEx operation handle (singleton)"""
+            return mctlassEx.mctlassExHandleWrapper()
+
+        mctlass_op = get_mctlass_op()
+        stream = torch.cuda.current_stream().cuda_stream
+
+        mctlass_op.mctlass_masked_group_gemm(
+            lhs_data,
+            rhs_data,
+            out,
+            lhs_scales,
+            rhs_scales,
+            masked_m,
+            stream
+        )
+        return None
+
+    if overlap_args is None:
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(
+            lhs,
+            rhs,
+            out,
+            masked_m,
+            expected_m,
+        )
+        return None
+    else:
+        import mctlassEx
+        from mctlassEx import MaskedGroupedGEMM
+        assert isinstance(lhs, tuple), "lhs must be a tuple"
+        assert isinstance(rhs, tuple), "rhs must be a tuple"
+        num_groups, m, _ = lhs[0].shape
+        _, n, k = rhs[0].shape
+        MaskedGroupedGEMM()([m, n, k],
+                lhs[0],
+                rhs[0],
+                out,
+                masked_m,
+                A_packed = True,
+                B_packed = False,
+                scale_b = rhs[1],
+                signal = overlap_args.signal,
+                single_batch_overlap = True,
+                num_blocks=overlap_args.num_sms)
+        kernel_n = 128
+        kernel_m = 128
+        threshold = (n + kernel_n - 1) // kernel_n
+        # logger.info(f"kernel_m: {kernel_m}, threshold: {threshold}")
+        return kernel_m, threshold
 
 def _ensure_cuda(
     pair: Tuple[torch.Tensor, torch.Tensor],

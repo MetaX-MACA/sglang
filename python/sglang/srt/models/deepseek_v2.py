@@ -52,6 +52,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+    get_tensor_model_parallel_rank,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -162,6 +163,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter,
     _use_aiter_gfx95,
 )
+from sglang.srt.eplb.mock_balance_tensor import EP_BALANCED_TENSOR, AFD_BALANCED_TENSOR
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -169,6 +171,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
+    get_int_env_var,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -258,8 +261,12 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT") or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL")
-        self.act_fn = SiluAndMul(self.fused_quant)
+        
+        fused_quant = False
+        if quant_config is not None and quant_config.get_name() == "compressed_tensors":
+            fused_quant = True
+        self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT") or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL") or fused_quant
+        self.act_fn = SiluAndMul(fused_quant=self.fused_quant)
 
     def forward(
         self,
@@ -692,8 +699,21 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_flashinfer()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
-        self.use_single_stream_dispatch_overlap = get_bool_env_var('USE_SINGLE_STREAM_DISPATCH_OVERLAP')
 
+        self.balance_tensor = None
+        work_rank = get_tensor_model_parallel_rank()
+        if 'ENABLE_EP_MOCK_BALANCE' in os.environ:
+            self.balance_tensor = EP_BALANCED_TENSOR[work_rank].to(torch.cuda.current_device())
+        self.use_single_stream = False
+        if 'USE_SINGLE_STREAM' in os.environ:
+            self.use_single_stream = True
+        self.use_single_stream_dispatch_overlap = False
+        if 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
+            self.use_single_stream = True
+            self.use_single_stream_dispatch_overlap = True
+        if self.use_single_stream:
+            self.alt_stream = None
+        self.sbo_tokens_threshold = get_int_env_var("SBO_TOKENS_THRESHOLD", 32)
 
     def get_moe_weights(self):
         return [
@@ -1003,7 +1023,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
-        sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
+        sbo_enabled_flag = self._fuse_shared_experts_inside_sbo
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
         )
@@ -1025,15 +1045,18 @@ class DeepseekV2MoE(nn.Module):
                     device=hidden_states.device
                 )
 
+        num_tokens = hidden_states.shape[0]
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
+            if not sbo_enabled_flag and not self.use_single_stream_dispatch_overlap and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
+                    self.alt_stream = None
                     if enable_sglang_deepep_mode_shared_experts_multi_stream:
                         self.alt_stream.wait_stream(torch.cuda.current_stream())
                         with torch.cuda.stream(self.alt_stream):
-                            shared_output = self._forward_shared_experts(hidden_states)
+                            shared_output = self._forward_shared_experts(tensor_scale_tuple if self.use_fused_quant and tensor_scale_tuple is not None
+                            else hidden_states)
                             shared_output.record_stream(self.alt_stream)
                             shared_event = self.alt_stream.record_event()
                     else:
@@ -1057,12 +1080,15 @@ class DeepseekV2MoE(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
+        if self.balance_tensor is not None:
+            topk_output.topk_ids[:,0:8] = self.balance_tensor[:topk_output.topk_ids.shape[0]]
         if sbo_overlap_dispatch_flag or self.use_single_stream_dispatch_overlap:
             shared_output = None
 
             def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
                 nonlocal shared_output
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(tensor_scale_tuple if self.use_fused_quant and tensor_scale_tuple is not None
+                        else hidden_states)
                 for handle in deepep_dispatch_hook_handle:
                     handle.remove()
 
@@ -1095,12 +1121,14 @@ class DeepseekV2MoE(nn.Module):
                     _deepep_dispatch_hook
                 )
             )
-            post_dispatch_hook_handle = (
-                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
-            )
-            post_combine_hook_handle = (
-                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
-            )
+            if sbo_overlap_dispatch_flag and not self.is_nextn:
+                post_dispatch_hook_handle = (
+                    self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+                )
+                
+                post_combine_hook_handle = (
+                    self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+                )
 
         elif sbo_overlap_combine_flag:
             shared_output = None
@@ -1249,26 +1277,39 @@ class DeepseekV2MoE(nn.Module):
             return None
 
     def op_gate(self, state):
+        hidden_states = state.hidden_states_mlp_input
+        if isinstance(state.hidden_states_mlp_input,tuple):
+            hidden_states = state.hidden_states_mlp_input[1]
         if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+            state.forward_batch.forward_mode, hidden_states
         ):
             # router_logits: (num_tokens, n_experts)
-            state.router_logits = self.gate(state.hidden_states_mlp_input)
+            state.router_logits = self.gate(hidden_states)
         else:
             state.router_logits = None
 
     def op_shared_experts(self, state):
         hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
+        hidden_states = hidden_states_mlp_input
+        if isinstance(hidden_states_mlp_input,tuple):
+            hidden_states = hidden_states_mlp_input[1]
         if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, hidden_states_mlp_input
+            state.forward_batch.forward_mode, hidden_states
         ):
-            state.shared_output = self.shared_experts(hidden_states_mlp_input)
+            if isinstance(hidden_states_mlp_input,tuple):
+                state.shared_output = self.shared_experts(hidden_states_mlp_input[2])
+            else:
+                state.shared_output = self.shared_experts(hidden_states_mlp_input)
         else:
             state.shared_output = None
 
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
+        router_logits = state.pop("router_logits")
+        if isinstance(state.hidden_states_mlp_input,tuple):
+            hidden_states = state.hidden_states_mlp_input[1]
+        else:
+            hidden_states = state.hidden_states_mlp_input
 
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
@@ -1414,7 +1455,12 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_a_layernorm = RMSNorm(
+                self.q_lora_rank,
+                eps=config.rms_norm_eps,
+                fused_quant=get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
+                or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL", default="false"),
+            )
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
@@ -1444,6 +1490,7 @@ class DeepseekV2AttentionMLA(
 
         self.skip_topk = False
         self.next_skip_topk = False
+        self.use_index_cache = False
         if self.use_nsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
             self.indexer = Indexer(
@@ -1467,44 +1514,28 @@ class DeepseekV2AttentionMLA(
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
+            self.use_index_cache = False
             if is_nextn:
-                self.skip_topk = True
-                self.next_skip_topk = True
+                self.skip_topk = False
+                self.next_skip_topk = False
             else:
-                self.index_topk_freq = getattr(config, "index_topk_freq", 1)
-                self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
-                self.index_skip_topk_offset = getattr(
-                    config, "index_skip_topk_offset", None
-                )
-                if (
-                    self.index_topk_pattern is None
-                    and self.index_skip_topk_offset is not None
-                ):
-                    assert self.index_skip_topk_offset > 0, (
-                        "index_skip_topk_offset must be positive; offset <= 0 "
-                        "marks layer 0 as skip_topk with no prior topk to reuse"
-                    )
-                    self.skip_topk = (
-                        max(layer_id - self.index_skip_topk_offset + 1, 0)
-                        % self.index_topk_freq
-                        != 0
-                    )
-                    self.next_skip_topk = (
-                        max(layer_id - self.index_skip_topk_offset + 2, 0)
-                        % self.index_topk_freq
-                        != 0
-                    )
-                elif self.index_topk_pattern is None:
-                    self.skip_topk = max(layer_id - 1, 0) % self.index_topk_freq != 0
-                    self.next_skip_topk = layer_id % self.index_topk_freq != 0
+                self.use_index_cache = get_bool_env_var("USE_INDEX_CACHE", default="false")
+                if self.use_index_cache:
+                    self.index_topk_freq = getattr(config, "index_topk_freq",1)
                 else:
-                    self.skip_topk = self.index_topk_pattern[layer_id] == "S"
+                    self.index_topk_freq = 1
+                self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
+                if self.index_topk_pattern is None:
+                    self.skip_topk = layer_id % self.index_topk_freq != 0
+                    self.next_skip_topk = (layer_id+1 % self.index_topk_freq != 0)
+                else:
+                    self.skip_topk = self.index_topk_pattern[layer_id] == 'S'
                     if layer_id < len(self.index_topk_pattern) - 1:
-                        self.next_skip_topk = (
-                            self.index_topk_pattern[layer_id + 1] == "S"
-                        )
+                        self.next_skip_topk = self.index_topk_pattern[layer_id+1] == 'S'
                     else:
                         self.next_skip_topk = False
+            if False:
+                logger.info('layer_id {} DSA skip_topk {} next_skip_topk {} is_nextn {}'.format(layer_id, self.skip_topk, self.next_skip_topk, is_nextn))
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1952,9 +1983,21 @@ class DeepseekV2DecoderLayer(nn.Module):
         # )
         packed_quant = True if self.is_layer_sparse else False
         fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        fused_quant_pd = fused_quant or get_bool_env_var(
+            "FUSED_RMSNORM_QUANT_PREFILL", default="false"
+        )
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=fused_quant_pd,
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, fused_quant=fused_quant, packed_quant=packed_quant, packed_size=align_packed_tensor_size(config.hidden_size))
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=fused_quant,
+            packed_quant=packed_quant,
+            packed_size=align_packed_tensor_size(config.hidden_size),
+        )
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
@@ -2182,6 +2225,9 @@ class DeepseekV2Model(nn.Module):
             )
             else None
         )
+
+        if 'USE_SINGLE_STREAM' or 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
+            self.alt_stream = None
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -2483,6 +2529,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(q_lora_rank, is_deepseek_nsa(config))
+        
+        if SboFlags.fuse_shared_experts_inside_sbo():
+            self.execute_stream = torch.cuda.Stream()
+        else:
+            self.execute_stream = None
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -2563,11 +2614,16 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
-
-        with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden_states = self.model(
-                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
-            )
+        execute_stream = torch.cuda.current_stream()
+        if self.execute_stream and not torch.cuda.is_current_stream_capturing():
+            execute_stream = self.execute_stream
+        with torch.cuda.stream(execute_stream):
+            with get_attn_tp_context().maybe_input_scattered(forward_batch):
+                hidden_states = self.model(
+                    input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+                )
+        if self.execute_stream and not torch.cuda.is_current_stream_capturing():
+            execute_stream.synchronize()
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states

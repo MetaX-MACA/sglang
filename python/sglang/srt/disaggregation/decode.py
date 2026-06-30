@@ -73,7 +73,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.utils import get_num_new_pages, get_bool_env_var
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+ENABLE_KV_LAYOUT_FIX = get_bool_env_var("SGLANG_ENABLE_KV_LAYOUT_FIX", "false")
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
@@ -395,9 +396,17 @@ class DecodePreallocQueue:
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
+            if not self.is_mla_backend and ENABLE_KV_LAYOUT_FIX:
+                # Interleave target and draft K/V pointers to maintain [All K] + [All V] layout
+                half_t = len(kv_data_ptrs) // 2
+                half_d = len(draft_kv_data_ptrs) // 2
+                kv_data_ptrs = kv_data_ptrs[:half_t] + draft_kv_data_ptrs[:half_d] + kv_data_ptrs[half_t:] + draft_kv_data_ptrs[half_d:]
+                kv_data_lens = kv_data_lens[:half_t] + draft_kv_data_lens[:half_d] + kv_data_lens[half_t:] + draft_kv_data_lens[half_d:]
+                kv_item_lens = kv_item_lens[:half_t] + draft_kv_item_lens[:half_d] + kv_item_lens[half_t:] + draft_kv_item_lens[half_d:]
+            else:
+                kv_data_ptrs += draft_kv_data_ptrs
+                kv_data_lens += draft_kv_data_lens
+                kv_item_lens += draft_kv_item_lens
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

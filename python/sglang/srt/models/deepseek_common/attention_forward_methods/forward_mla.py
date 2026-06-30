@@ -13,7 +13,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
+from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp, is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -46,7 +46,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator,get_bool_env_var
 
 # from sgl_kernel import cutlass_scaled_batch_mm
 from mctlassEx import ScaledGEMM
@@ -90,7 +90,6 @@ if _is_cuda:
             )
         _bmm_fp8_op(A, B, out, A_scale, B_scale)
         return out
-
     def _scaled_gemm_int8_fake_impl(M: int, N: int, K: int, A: torch.Tensor, B:torch.Tensor, C:torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor, bias: torch.Tensor)->None:
         return
 
@@ -99,8 +98,6 @@ if _is_cuda:
         gemm_shapes = [M, N, K]
         _scaled_gemm_int8(gemm_shapes, A, B, C, scale_a, scale_b, bias)
         return 
-
-
 
 if _use_aiter:
     # aiter ROCm/aiter#2958 renamed the public `fused_qk_rmsnorm` in
@@ -170,7 +167,15 @@ class DeepseekMLAForwardMixin:
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
+        if isinstance(hidden_states, tuple):
+            q_len = hidden_states[0].shape[0]
+            q_input = torch.empty([q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim],
+                                dtype=torch.bfloat16, device=hidden_states[0].device)
+        else:
+            q_len = hidden_states.shape[0]
+            q_input = hidden_states.new_empty(
+                q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
+            )
         q_lora = None
         topk_indices = None
         if self.q_lora_rank is not None:
@@ -248,7 +253,8 @@ class DeepseekMLAForwardMixin:
                         )
                     else:
                         q = self.q_a_layernorm(q)
-                        k_nope = self.kv_a_layernorm(k_nope)
+                        if not envs.MX_FUSED_MLA_ABSORB_ROPE.get():
+                            k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
             if self.use_nsa:
@@ -319,109 +325,154 @@ class DeepseekMLAForwardMixin:
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+            if not envs.MX_FUSED_MLA_ABSORB_ROPE.get():
+                k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+        if self.q_lora_rank is not None and get_dcp_world_size() == 1 and envs.MX_FUSED_MLA_ABSORB_ROPE.get():
+        # if self.q_lora_rank is not None and self.use_nsa is False and get_dcp_world_size() == 1:
+            from sgl_kernel import fused_mla_absorb_rotary_emb
+            assert q.dtype != torch.float16, "fused_mla_absorb_rotary_emb not support float16 !"
+            k_input = torch.empty(q_len, 1, self.kv_lora_rank + self.qk_rope_head_dim, dtype=torch.bfloat16, device=q_input.device)
+            v_input = torch.empty(q_len, 1, self.kv_lora_rank, dtype=torch.bfloat16, device=q_input.device)
+            fused_mla_absorb_rotary_emb(
+                q,
+                self.w_kc,
+                latent_cache.contiguous(),
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.kv_a_layernorm.weight,
+                q_input,
+                k_input,
+                v_input,
+                q_len,
+                self.num_local_heads,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                self.qk_nope_head_dim,
+            )
+            if self.use_nsa:
+                # split fused outputs into nope / pe components for NSA
+                q_nope_out = q_input[:, :, :self.kv_lora_rank]   # [q_len, h, kv_lora_rank]
+                q_pe       = q_input[:, :, self.kv_lora_rank:]   # [q_len, h, qk_rope_head_dim]
+                k_nope     = k_input[:, :, :self.kv_lora_rank]   # [q_len, 1, kv_lora_rank]
+                k_pe       = k_input[:, :, self.kv_lora_rank:]   # [q_len, 1, qk_rope_head_dim]
+                topk_indices = None
 
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+                if q_lora is not None:
+                    if not self.skip_topk:
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
+                    else:
+                        topk_indices = prev_topk_indices
+                if self.use_index_cache:
+                    self.topk_indices = topk_indices
+                # logger.info(f"{topk_indices=}")
+        else:
+            q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        if self.use_deep_gemm_bmm:
-            q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
-                per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
-            )
-            q_nope_out = q_nope.new_empty(
-                (self.num_local_heads, aligned_m, self.kv_lora_rank)
-            )
-            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-                (q_nope_val, q_nope_scale),
-                (self.w_kc, self.w_scale_k),
-                q_nope_out,
-                masked_m,
-                expected_m,
-            )
-            q_nope_out = q_nope_out[:, :expected_m, :]
-        elif _is_hip:
-            # TODO(haishaw): add bmm_fp8 to ROCm
-            if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
-                x = q_nope.transpose(0, 1)
-                q_nope_out = torch.empty(
-                    x.shape[0],
-                    x.shape[1],
-                    self.w_kc.shape[2],
-                    device=x.device,
-                    dtype=torch.bfloat16,
+            if self.use_deep_gemm_bmm:
+                q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
+                    per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
                 )
-                batched_gemm_afp4wfp4_pre_quant(
-                    x,
-                    self.w_kc.transpose(-2, -1),
-                    self.w_scale_k.transpose(-2, -1),
-                    torch.bfloat16,
+                q_nope_out = q_nope.new_empty(
+                    (self.num_local_heads, aligned_m, self.kv_lora_rank)
+                )
+                deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                    (q_nope_val, q_nope_scale),
+                    (self.w_kc, self.w_scale_k),
                     q_nope_out,
+                    masked_m,
+                    expected_m,
                 )
-            else:
-                if (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn) or (
-                    get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz
-                ):
-                    # fp8 Triton kernel: always on gfx950,
-                    # cudagraph-only on gfx942 (hides launch overhead)
-                    q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-                        X=q_nope,
-                        WQ=self.w_kc.transpose(-1, -2),
-                        w_scale=self.w_scale,
-                        group_size=128,
-                        YQ=None,  # allocate (B, M, N)
-                        transpose_bm=False,  # (B, M, N)
-                        transpose_bm_in=True,  # (M, B, K)
+                q_nope_out = q_nope_out[:, :expected_m, :]
+            elif _is_hip:
+                # TODO(haishaw): add bmm_fp8 to ROCm
+                if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
+                    x = q_nope.transpose(0, 1)
+                    q_nope_out = torch.empty(
+                        x.shape[0],
+                        x.shape[1],
+                        self.w_kc.shape[2],
+                        device=x.device,
                         dtype=torch.bfloat16,
                     )
-
+                    batched_gemm_afp4wfp4_pre_quant(
+                        x,
+                        self.w_kc.transpose(-2, -1),
+                        self.w_scale_k.transpose(-2, -1),
+                        torch.bfloat16,
+                        q_nope_out,
+                    )
                 else:
+                    if (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn) or (
+                        get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz
+                    ):
+                        # fp8 Triton kernel: always on gfx950,
+                        # cudagraph-only on gfx942 (hides launch overhead)
+                        q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+                            X=q_nope,
+                            WQ=self.w_kc.transpose(-1, -2),
+                            w_scale=self.w_scale,
+                            group_size=128,
+                            YQ=None,  # allocate (B, M, N)
+                            transpose_bm=False,  # (B, M, N)
+                            transpose_bm_in=True,  # (M, B, K)
+                            dtype=torch.bfloat16,
+                        )
+
+                    else:
+                        q_nope_out = torch.bmm(
+                            q_nope.to(torch.bfloat16).transpose(0, 1),
+                            self.w_kc.to(torch.bfloat16) * self.w_scale,
+                        )
+
+            elif self.w_kc.dtype == torch.float8_e4m3fn:
+                if _is_cpu:
                     q_nope_out = torch.bmm(
                         q_nope.to(torch.bfloat16).transpose(0, 1),
                         self.w_kc.to(torch.bfloat16) * self.w_scale,
                     )
-
-        elif self.w_kc.dtype == torch.float8_e4m3fn:
-            if _is_cpu:
-                q_nope_out = torch.bmm(
-                    q_nope.to(torch.bfloat16).transpose(0, 1),
-                    self.w_kc.to(torch.bfloat16) * self.w_scale,
-                )
+                else:
+                    # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
+                    q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+                        q_nope.transpose(0, 1),
+                        (
+                            torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
+                            if _is_cublas_ge_129
+                            else zero_allocator.allocate(1)
+                        ),
+                    )
+                    q_nope_out = bmm_fp8(
+                        q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
+                    )
             else:
-                # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
-                q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                    q_nope.transpose(0, 1),
-                    (
-                        torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
-                        if _is_cublas_ge_129
-                        else zero_allocator.allocate(1)
-                    ),
+                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+
+            q_nope_out = q_nope_out.transpose(0, 1)
+            if is_kv_b_lora_active(self):
+                q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
+
+            skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
+            skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
+            if (
+                self.rotary_emb is not None
+                and (not self._fuse_rope_for_trtllm_mla(forward_batch))
+                and (not skip_rope_for_nsa_tilelang_fused)
+                and (not skip_rope_for_aiter_fused_mla)
+                and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
+            ):
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+            if nsa_use_prefill_cp(forward_batch):
+                # support allgather+rerrange
+                k_nope, k_pe = self.rebuild_cp_kv_cache(
+                    latent_cache, forward_batch, k_nope, k_pe
                 )
-                q_nope_out = bmm_fp8(
-                    q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
-                )
-        else:
-            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
-
-        q_nope_out = q_nope_out.transpose(0, 1)
-        if is_kv_b_lora_active(self):
-            q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
-
-        skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
-        skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
-        if (
-            self.rotary_emb is not None
-            and (not self._fuse_rope_for_trtllm_mla(forward_batch))
-            and (not skip_rope_for_nsa_tilelang_fused)
-            and (not skip_rope_for_aiter_fused_mla)
-            and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
-        ):
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-
-        if nsa_use_prefill_cp(forward_batch):
-            # support allgather+rerrange
-            k_nope, k_pe = self.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
-            )
 
         # TODO(augusto.yjh) all_gather q_pe and q_node_out, For tp8 [1, 8, 64] [1, 8, 512] , after all gather [1, 64, 64] [1, 64, 512], k_pe: [1, 1, 64], k_nope: [1, 1, 512], local heads to all heads
         if not self.is_nextn and get_dcp_world_size() > 1:

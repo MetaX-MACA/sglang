@@ -354,6 +354,8 @@ class Indexer(MultiPlatformOp):
             self.scale_fmt = None
         self.softmax_scale = self.head_dim**-0.5
 
+        self.int8_mqa_logits_backend = "tilelang" if envs.MX_ENABLE_TILELANG_INT8_MQA_LOGITS.get() else "triton"
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -394,7 +396,10 @@ class Indexer(MultiPlatformOp):
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
         if _is_cuda:
-            return torch.mm(x.float(), self.weights_proj.weight.t().float())
+            if envs.MX_ENABLE_NSA_INDEXER_GEMM_BF16.get():
+                return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
+            else:
+                return torch.mm(x.float(), self.weights_proj.weight.t().float())
 
         weights, _ = self.weights_proj(x)
         if _is_hip:
@@ -410,7 +415,7 @@ class Indexer(MultiPlatformOp):
         weights = weights * self.n_heads**-0.5
         return weights
 
-    @torch.compile(dynamic=True)
+    # @torch.compile(dynamic=True)
     def _get_logits_head_gate(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: Optional[torch.Tensor] = None
     ):
@@ -672,6 +677,7 @@ class Indexer(MultiPlatformOp):
                     schedule_metadata,
                     max_seq_len,
                     clean_logits=False,
+                    backend=self.int8_mqa_logits_backend,
                 )
             else:
                 assert q_fp8.dtype is torch.bfloat16
@@ -852,6 +858,7 @@ class Indexer(MultiPlatformOp):
                             ks,
                             ke,
                             clean_logits=False,
+                            backend=self.int8_mqa_logits_backend,
                         )
                     else:
                         assert q_fp8.dtype is torch.bfloat16
@@ -924,6 +931,7 @@ class Indexer(MultiPlatformOp):
                             ks[start:end],
                             ke[start:end],
                             clean_logits=False,
+                            backend=self.int8_mqa_logits_backend,
                         )
                     else:
                         assert q_fp8.dtype is torch.bfloat16
@@ -1357,7 +1365,12 @@ class Indexer(MultiPlatformOp):
         # elif not _is_npu:
         #     from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
-
+        if isinstance(x, tuple):
+            x = x[-1]
+            q_lora_shape0 = q_lora[0].shape[0]
+        else:
+            q_lora_shape0 = q_lora.shape[0]
+            
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 

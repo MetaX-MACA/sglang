@@ -429,6 +429,8 @@ class Envs:
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(False)
     SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
+    SGLANG_MX_FUSED_MLA_ABSORB_ROPE = EnvBool(False)
+    SGLANG_NSA_DISABLE_FUSED_KERNEL = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -665,9 +667,19 @@ class Envs:
     EXPORT_SERVER_ARGS_DIR = EnvStr("")
     SGLANG_QWEN3_ENABLE_ALT_STREAM = EnvBool(False)
     ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16 = EnvBool(True)
+
+    # Debug
+    # Skip prefill model execution and fill random KV cache so decode
+    # performance can be profiled without prefill compute cost.
+    SGLANG_DEBUG_DECODE_RANDOM_KV = EnvBool(False)
     
     # Metax
     MX_ENABLE_NSA_INT8 = EnvBool(True)
+    MX_NSA_INDEXER_CACHE_DTYPE = EnvStr("")
+    MX_ENABLE_TILELANG_INT8_MQA_LOGITS = EnvBool(False)
+    MX_FUSED_MLA_ABSORB_ROPE = EnvBool(False)
+    MX_ENABLE_FLASH_MLA_METADATA_CACHE = EnvBool(False)
+    MX_ENABLE_NSA_INDEXER_GEMM_BF16 = EnvBool(False)
 
 
 envs = Envs()

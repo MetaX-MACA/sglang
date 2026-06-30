@@ -129,6 +129,9 @@ class DeepseekModelNextN(nn.Module):
             else None
         )
 
+        if 'USE_SINGLE_STREAM' or 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
+            self.alt_stream = None
+
         layer_name = "decoder"
         if _is_npu and (
             get_global_server_args().speculative_draft_model_path

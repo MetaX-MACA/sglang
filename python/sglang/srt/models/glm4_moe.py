@@ -99,6 +99,7 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     make_layers,
+    align_packed_tensor_size,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -160,7 +161,10 @@ class Glm4MoeMLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        fused_quant = False
+        if quant_config is not None and quant_config.get_name() == "compressed_tensors":
+            fused_quant = True
+        self.act_fn = SiluAndMul(fused_quant=fused_quant)
 
     def forward(
         self,
@@ -170,7 +174,9 @@ class Glm4MoeMLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
-            return x
+            target = x[0] if isinstance(x, tuple) else x
+            if target.shape[0] == 0:
+                return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
@@ -440,6 +446,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.DeepSeekV3,
             prefix=add_prefix("experts", prefix),
         )
+        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
 
         self.topk = TopK(
             top_k=self.top_k + self.num_fused_shared_experts,
@@ -659,6 +666,20 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             )
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
         )
+        
+        tensor_scale_tuple = None
+        if isinstance(hidden_states, tuple):
+            packed_hidden = hidden_states[0]
+            tensor_scale_tuple = hidden_states[2]
+            hidden_states = hidden_states[1]
+        else:
+            packed_hidden = hidden_states
+            if self.use_fused_quant and packed_hidden.shape[0] == 0:
+                packed_hidden = torch.empty(
+                    (0, align_packed_tensor_size(packed_hidden.shape[-1])),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device
+                )
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
@@ -668,7 +689,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     hidden_states, self._forward_shared_experts
                 )
             else:
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(
+                    tensor_scale_tuple if self.use_fused_quant and tensor_scale_tuple is not None
+                            else hidden_states
+                    )
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -681,7 +705,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(
-            hidden_states=hidden_states,
+            hidden_states=packed_hidden,
             topk_output=topk_output,
         )
         if enable_npu_dual_stream:
@@ -701,7 +725,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         return final_hidden_states
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
-        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+        if isinstance(hidden_states,tuple) or ((hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0)):
             return self.shared_experts(hidden_states)
         else:
             return None
@@ -862,10 +886,17 @@ class Glm4MoeDecoderLayer(nn.Module):
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
-
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        packed_quant = True if self.is_layer_sparse else False
+        fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        fused_quant_pd = fused_quant or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL")
+        
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, fused_quant=fused_quant_pd)
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, 
+            eps=config.rms_norm_eps,
+            fused_quant=fused_quant,
+            packed_quant=packed_quant,
+            packed_size=align_packed_tensor_size(config.hidden_size),
         )
 
         self.layer_communicator = LayerCommunicator(

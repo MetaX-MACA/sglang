@@ -57,6 +57,7 @@ if _is_cuda:
         gelu_tanh_and_mul,
         silu_and_mul,
     )
+    from sgl_kernel import fused_silu_mul_dq_quant 
 elif _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
@@ -88,29 +89,36 @@ class SiluAndMul(MultiPlatformOp):
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
-    def forward_cuda(self, x: torch.Tensor, limit: Optional[float]=None) -> torch.Tensor:
+    def forward_cuda(self, x: torch.Tensor,limit: Optional[float]=None)  -> torch.Tensor:
         if self.fused_quant:
-            int8_out = torch.empty(
-                (x.shape[0], x.shape[1] // 2),
-                device=x.device, 
-                dtype=torch.int8,
-            )
-            int8_scale = torch.empty(
-                (x.shape[0], 1),
-                device=x.device, 
-                dtype=torch.float32
-            )
-            torch.ops.sgl_kernel.fused_silu_mul_dq_nomask_quant_nopack.default(
-                int8_out, int8_scale, x, limit, None
-            )
-            return int8_out, int8_scale
-
-        assert limit is None
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
-        return out
+            if limit is not None:
+                int8_out = torch.empty(
+                    (x.shape[0], x.shape[1] // 2),
+                    device=x.device, 
+                    dtype=torch.int8,
+                )
+                int8_scale = torch.empty(
+                    (x.shape[0], 1),
+                    device=x.device, 
+                    dtype=torch.float32
+                )
+                torch.ops.sgl_kernel.fused_silu_mul_dq_nomask_quant_nopack.default(
+                    int8_out, int8_scale, x, limit, None
+                )
+                return int8_out, int8_scale
+            else:
+                output,scale = fused_silu_mul_dq_quant(x)
+                return (output, scale)
+        else:
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            # Note: sglang 0.4.8 not support float16
+            if x.dtype == torch.float16:
+                torch.ops._C.silu_and_mul(out, x)
+            else:
+                silu_and_mul(x, out)
+            return out
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if _is_cpu_amx_available:

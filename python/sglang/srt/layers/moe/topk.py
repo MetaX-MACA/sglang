@@ -126,6 +126,7 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_disable_fused_kerenl = get_bool_env_var("SGLANG_NSA_DISABLE_FUSED_KERNEL")
 _is_musa = is_musa()
 
 if _is_cuda:
@@ -1419,13 +1420,11 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         else:
-            glm = (top_k == 9 and num_expert_group == 1 and topk_group == 1) and (router_logits.shape[1] == 160 or router_logits.shape[1] == 256)
-            mimo = (top_k == 8 and num_expert_group == 1 and topk_group == 1) and (router_logits.shape[1] == 256 or router_logits.shape[1] == 256)
-            support = (not glm) and (not mimo)
-            if (router_logits.shape[1] // num_expert_group <= 384) and support:
+            glm = (top_k == 8 and num_expert_group == 1 and topk_group == 1) and (router_logits.shape[1] == 160 or router_logits.shape[1] == 256)
+            if (router_logits.shape[1] // num_expert_group <= 384) and not _disable_fused_kerenl:
                 deepseek = (top_k == 8 and num_expert_group == 8 and topk_group == 4) or (top_k == 9 and num_expert_group == 8 and topk_group == 4)
                 kimi = (top_k == 8 and num_expert_group == 1 and topk_group == 1) or (top_k == 9 and num_expert_group == 1 and topk_group == 1)
-                if kimi or deepseek:
+                if kimi or deepseek or glm:
                     topk_ids = torch.empty((hidden_states.shape[0], top_k), dtype=torch.int, device=hidden_states.device)
                     topk_weights = torch.empty((hidden_states.shape[0], top_k), dtype=torch.float, device=hidden_states.device)
                     if correction_bias.dtype != router_logits.dtype:
@@ -1444,6 +1443,7 @@ def select_experts(
                         num_fused_shared_experts,
                         routed_scaling_factor,
                     )
+                    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
                 else:
                     topk_weights, topk_ids = moe_fused_gate(
                         router_logits.to(dtype=torch.float32),

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
@@ -8,7 +7,6 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlia
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
-logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
@@ -39,6 +37,7 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip, get_bool_env_var
+from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -50,7 +49,7 @@ _is_hip = is_hip()
 
 # if _is_hip:
 #     from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
-# 
+#
 #     try:
 #         from aiter import (  # noqa: F401
 #             flash_attn_varlen_func,
@@ -79,6 +78,9 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
         seqlens_32 = seqlens_32.reshape(-1)
     return seqlens_32.contiguous().view(-1, 1)
 
+def _create_flashmla_metadata():
+    import flash_mla
+    return flash_mla.get_mla_metadata()[0]
 
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
@@ -119,7 +121,7 @@ class NSAMetadata:
     nsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
     nsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
 
-   
+    flashmla_sched_metadata: Optional[FlashMLASchedMeta] = None
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
     # Precomputed once per forward batch and reused across layers.
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
@@ -661,6 +663,7 @@ class NativeSparseAttnBackend(
             seq_lens_sum=forward_batch.seq_lens_sum,
             page_table_1=page_table,
             page_table_1_flattened=page_table_1_flattened,
+            flashmla_sched_metadata=_create_flashmla_metadata(),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
@@ -783,6 +786,10 @@ class NativeSparseAttnBackend(
             ),
         }
 
+    def on_after_cuda_graph_warmup(self):
+        metadata = self.forward_metadata
+        metadata.flashmla_sched_metadata.tile_scheduler_metadata = None
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -902,6 +909,7 @@ class NativeSparseAttnBackend(
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             page_table_1=page_table_1,
+            flashmla_sched_metadata=_create_flashmla_metadata(),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
@@ -1712,11 +1720,13 @@ class NativeSparseAttnBackend(
         metadata: NSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+        from flash_mla import flash_mla_with_kvcache
         cache_seqlens = metadata.nsa_cache_seqlens_int32
-        sched_meta, _ = get_mla_metadata()
 
-
+        if metadata.flashmla_sched_metadata.tile_scheduler_metadata is None or not envs.MX_ENABLE_FLASH_MLA_METADATA_CACHE.get():
+            sched_meta = _create_flashmla_metadata()
+        else:
+            sched_meta = metadata.flashmla_sched_metadata
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
@@ -1784,6 +1794,12 @@ class NativeSparseAttnBackend(
                 ),
                 is_fp8_kvcache=self.nsa_kv_cache_store_fp8,
             )
+
+        if metadata.flashmla_sched_metadata.tile_scheduler_metadata is None:
+            metadata.flashmla_sched_metadata.tile_scheduler_metadata = sched_meta.tile_scheduler_metadata
+            metadata.flashmla_sched_metadata.num_splits = sched_meta.num_splits
+            metadata.flashmla_sched_metadata.config = sched_meta.config
+            metadata.flashmla_sched_metadata.have_initialized = sched_meta.have_initialized
 
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
