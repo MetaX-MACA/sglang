@@ -277,7 +277,7 @@ class DeepseekMHAForwardMixin:
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
-                if dcp_enabled():
+                if dcp_enabled() and not self.is_nextn:
                     kv_a, k_pe = all_gather_kv_cache_for_mha_extend(
                         get_token_to_kv_pool(),
                         self.attn_mha,
@@ -440,12 +440,13 @@ class DeepseekMHAForwardMixin:
             kv_a_normed, k_pe = self._get_mla_kv_buffer(
                 kv_indices, kv_a_dtype, forward_batch
             )
-            kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
-                kv_a_normed,
-                k_pe,
-                forward_batch.prefix_chunk_seq_lens_cpu[i],
-                forward_batch.prefix_chunk_starts_cpu[i],
-            )
+            if not self.is_nextn:
+                kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
+                    kv_a_normed,
+                    k_pe,
+                    forward_batch.prefix_chunk_seq_lens_cpu[i],
+                    forward_batch.prefix_chunk_starts_cpu[i],
+                )
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -510,7 +511,8 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
-            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
+            if not self.is_nextn:
+                kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )

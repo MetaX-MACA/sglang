@@ -82,7 +82,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import get_dcp_world_size, monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     join_process_groups,
@@ -2910,6 +2910,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and forward_batch.seq_lens.numel() == 0
             and forward_batch.req_pool_indices.numel() == 0
             and forward_batch.input_ids.numel() > 0
+            and get_dcp_world_size() == 1
         )
 
     def forward_split_prefill(

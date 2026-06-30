@@ -63,7 +63,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     prepare_abort,
 )
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import get_pp_group, get_world_group, get_dcp_world_size
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
@@ -2650,7 +2650,7 @@ class Scheduler(
         from sglang.srt.configs.model_config import is_mimo, is_deepseek_v4
         if (
             need_mlp_sync and \
-                ((not self.spec_algorithm.is_none() and not self.server_args.speculative_skip_dp_mlp_sync) or \
+                (((get_dcp_world_size() > 1 or not self.spec_algorithm.is_none()) and not self.server_args.speculative_skip_dp_mlp_sync) or \
                   is_mimo(self.model_config.hf_config) or is_deepseek_v4(self.model_config.hf_config)
                 )
         ):

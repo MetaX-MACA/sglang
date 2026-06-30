@@ -2311,7 +2311,9 @@ class MLATokenToKVPool(KVCache):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
-        if dcp_enabled():
+
+        # mtp kvcache not use dcp
+        if dcp_enabled() and self.layer_num > 1:
             valid_mask = (
                 loc % get_attention_dcp_world_size() == get_attention_dcp_rank()
             )
@@ -2378,6 +2380,7 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope,
                 cache_k_rope,
+                is_nextn=(self.layer_num==1),
             )
 
     def get_mla_kv_buffer(

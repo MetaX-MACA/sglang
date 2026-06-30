@@ -150,3 +150,92 @@ def create_flashmla_kv_indices_triton(
             data // PAGED_SIZE,
             mask=mask_out,
         )
+
+
+@triton.jit
+def create_dcp_flashmla_kv_indices_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr,
+    page_kernel_lens_ptr,
+    kv_indices_ptr,
+    req_to_token_ptr_stride: tl.constexpr,
+    kv_indices_ptr_stride: tl.constexpr,
+    dcp_world_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
+    PAGED_SIZE: tl.constexpr = 64,
+):
+    NUM_PAGE_PER_BLOCK: tl.constexpr = (
+        FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON // PAGED_SIZE
+    )
+    pid = tl.program_id(axis=0)
+
+    # find the req pool idx, this is for batch to token
+    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+
+    kv_start = 0
+    kv_end = tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
+
+    num_paged = tl.cdiv(kv_end - kv_start, PAGED_SIZE)
+    num_pages_loop = tl.cdiv(kv_end - kv_start, FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON)
+
+    for i in range(num_pages_loop):
+        # index into req_to_token_ptr needs to be int64
+        paged_offset = (
+            tl.arange(0, NUM_PAGE_PER_BLOCK).to(tl.int64) + i * NUM_PAGE_PER_BLOCK
+        ) * PAGED_SIZE * dcp_world_size
+        paged_offset_out = tl.arange(0, NUM_PAGE_PER_BLOCK) + i * NUM_PAGE_PER_BLOCK
+
+        mask = paged_offset < num_paged * PAGED_SIZE * dcp_world_size
+        mask_out = paged_offset_out < num_paged
+
+        data = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + kv_start + dcp_rank
+            + paged_offset,
+            mask=mask,
+        )
+        tl.store(
+            kv_indices_ptr + pid * kv_indices_ptr_stride + paged_offset_out,
+            data // PAGED_SIZE // dcp_world_size,
+            mask=mask_out,
+        )
+
+@triton.jit
+def filter_flashmla_dcp_kv_indices_triton(
+    paged_kernel_lens_split_str,  # [max_batch, max_context_len]
+    block_kv_indices_str,
+    filter_block_kv_indices_str,
+    kv_indices_ptr_stride: tl.constexpr,
+    filter_block_kv_indices_stride: tl.constexpr,
+    dcp_world_size: tl.constexpr,
+    PAGED_SIZE: tl.constexpr = 64,
+):
+    NUM_PAGE_PER_BLOCK: tl.constexpr = (
+        FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON // PAGED_SIZE
+    )
+    pid = tl.program_id(axis=0)
+
+    # load cur seq len and get page num need
+    req_len = tl.load(paged_kernel_lens_split_str + pid).to(tl.int32)
+    num_paged = tl.cdiv(req_len, PAGED_SIZE).to(tl.int32)
+    num_pages_loop = tl.cdiv(req_len, FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON)
+
+    for i in range(num_pages_loop):
+        paged_offset = (
+            tl.arange(0, NUM_PAGE_PER_BLOCK).to(tl.int32) + i * NUM_PAGE_PER_BLOCK
+        )
+        mask = paged_offset < num_paged
+        data = tl.load(
+            block_kv_indices_str
+            + pid * kv_indices_ptr_stride
+            + paged_offset * dcp_world_size,
+            mask=mask,
+        )
+        tl.store(
+            filter_block_kv_indices_str
+            + pid * filter_block_kv_indices_stride + paged_offset,
+            data // dcp_world_size,
+            mask=mask,
+        )
+
