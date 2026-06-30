@@ -437,6 +437,9 @@ class ModelRunnerKVCacheMixin:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
 
+        if self.is_draft_worker:
+            self.max_total_num_tokens *= get_attention_dcp_world_size()
+
         # Initialize token_to_kv_pool
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
@@ -922,11 +925,11 @@ class ModelRunnerKVCacheMixin:
                             )
                         )
                     elif self.page_size == 1:
-                        if dcp_enabled():
+                        if dcp_enabled() and not self.is_draft_worker:
                             self.max_total_num_tokens *= get_attention_dcp_world_size()
                             self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,
-                                1,
+                                self.page_size,
                                 dtype=self.kv_cache_dtype,
                                 device=self.device,
                                 kvcache=self.token_to_kv_pool,
@@ -943,7 +946,7 @@ class ModelRunnerKVCacheMixin:
                                 need_sort=need_sort,
                             )
                     else:
-                        if dcp_enabled():
+                        if dcp_enabled() and not self.is_draft_worker:
                             self.max_total_num_tokens *= get_attention_dcp_world_size()
                             self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,

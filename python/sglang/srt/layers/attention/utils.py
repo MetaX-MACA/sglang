@@ -22,6 +22,9 @@ from sglang.srt.layers.attention.triton_ops.kv_indices import (
     create_flashmla_kv_indices_triton as create_flashmla_kv_indices_triton,
 )
 from sglang.srt.layers.attention.triton_ops.kv_indices import (
+    create_dcp_flashmla_kv_indices_triton as create_dcp_flashmla_kv_indices_triton,
+)
+from sglang.srt.layers.attention.triton_ops.kv_indices import (
     get_num_kv_index_blocks_flashmla as get_num_kv_index_blocks_flashmla,
 )
 from sglang.srt.layers.attention.triton_ops.kv_indices import (
@@ -1372,3 +1375,5 @@ def assert_buffer_fits(used: int, capacity: int, what: str, **context) -> None:
     assert used <= capacity, f"{what}: used {used} > capacity {capacity}" + (
         f" ({', '.join(f'{k}={v}' for k, v in context.items())})" if context else ""
     )
+
+

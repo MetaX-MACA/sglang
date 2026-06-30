@@ -96,6 +96,7 @@ def set_mla_kv_buffer_triton(
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
+    is_nextn: bool = False,
 ):
     """Dispatch MLA paged-KV scatter writes to the fastest available path.
 
@@ -161,8 +162,8 @@ def set_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
-        DCP_RANK=get_attention_dcp_rank(),
-        DCP_WORLD_SIZE=get_attention_dcp_world_size(),
+        DCP_RANK=get_attention_dcp_rank() if not is_nextn else 0,
+        DCP_WORLD_SIZE=get_attention_dcp_world_size() if not is_nextn else 1,
         **pdl_kwargs,
     )
 
