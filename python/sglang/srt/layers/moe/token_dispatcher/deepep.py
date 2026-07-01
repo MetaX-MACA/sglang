@@ -510,7 +510,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         """
 
         reorder_topk_ids, self.src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
-            topk_idx, self.num_experts
+            topk_idx, self.num_local_experts
         )
         num_total_tokens = reorder_topk_ids.numel()
         gateup_input = torch.empty(
@@ -592,7 +592,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 (0,), device=hidden_states.device, dtype=torch.int64
             )
             seg_indptr = torch.zeros(
-                (self.num_experts + 1,),
+                (self.num_local_experts + 1,),
                 device=hidden_states.device,
                 dtype=torch.int64,
             )
