@@ -92,6 +92,7 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.utils.maca import is_maca_available
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -131,8 +132,13 @@ def is_cuda():
 
 
 @lru_cache(maxsize=1)
+def is_maca() -> bool:
+    return is_maca_available(torch, os.environ)
+
+
+@lru_cache(maxsize=1)
 def is_cuda_alike():
-    return is_cuda() or is_hip()
+    return is_cuda() or is_hip() or is_maca()
 
 
 @lru_cache(maxsize=1)
