@@ -3,6 +3,7 @@
 import importlib.metadata
 import os
 import resource
+import shutil
 import subprocess
 import sys
 from abc import abstractmethod
@@ -15,6 +16,13 @@ from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu
 
 def is_cuda_v2():
     return torch.version.cuda is not None
+
+
+def is_maca_v2():
+    maca_envs = ("MACA_PATH", "MACA_HOME", "CUCC_PATH", "MCCL_HOME", "MCCL_PATH")
+    if any(os.environ.get(name) for name in maca_envs):
+        return True
+    return shutil.which("cucc") is not None or shutil.which("mx-smi") is not None
 
 
 # List of packages to check versions
@@ -57,7 +65,7 @@ class BaseEnv:
     """Base class for environment check"""
 
     def __init__(self):
-        self.package_list = PACKAGE_LIST
+        self.package_list = list(PACKAGE_LIST)
 
     @abstractmethod
     def get_info(self) -> dict:
@@ -220,6 +228,107 @@ class GPUEnv(BaseEnv):
             }
         except subprocess.SubprocessError:
             return {}
+
+
+class MACAEnv(BaseEnv):
+    """Environment checker for MetaX MACA GPU."""
+
+    def get_info(self):
+        maca_info = {"MACA available": torch.cuda.is_available()}
+
+        if torch.cuda.is_available():
+            maca_info.update(self.get_device_info())
+
+        maca_info.update(self._get_maca_version_info())
+        return maca_info
+
+    def _get_maca_version_info(self):
+        maca_info = {
+            "MACA_PATH": self._get_first_existing_env("MACA_PATH", "MACA_HOME"),
+            "CUCC_PATH": os.environ.get("CUCC_PATH", "Not Set"),
+            "MCCL_HOME": self._get_first_existing_env("MCCL_HOME", "MCCL_PATH"),
+        }
+        maca_info.update(self._get_cucc_info())
+        maca_info.update(self._get_mx_smi_info())
+        return maca_info
+
+    @staticmethod
+    def _get_first_existing_env(*names: str) -> str:
+        for name in names:
+            value = os.environ.get(name)
+            if value:
+                return value
+        return "Not Set"
+
+    def _get_cucc_info(self):
+        candidates = []
+        cucc_path = os.environ.get("CUCC_PATH")
+        if cucc_path:
+            candidates.append(os.path.join(cucc_path, "bin", "cucc"))
+
+        maca_path = self._get_first_existing_env("MACA_PATH", "MACA_HOME")
+        if maca_path != "Not Set":
+            candidates.append(
+                os.path.join(maca_path, "tools", "cu-bridge", "bin", "cucc")
+            )
+
+        path_cucc = shutil.which("cucc")
+        if path_cucc:
+            candidates.append(path_cucc)
+
+        for cucc in candidates:
+            try:
+                cucc_output = (
+                    subprocess.check_output(
+                        [cucc, "--version"],
+                        stderr=subprocess.STDOUT,
+                        timeout=10,
+                    )
+                    .decode("utf-8", errors="replace")
+                    .strip()
+                )
+                return {"CUCC": cucc_output.splitlines()[0] if cucc_output else cucc}
+            except (OSError, subprocess.SubprocessError):
+                continue
+
+        return {"CUCC": "Not Available"}
+
+    def _get_mx_smi_info(self):
+        mx_smi = shutil.which("mx-smi")
+        if not mx_smi:
+            return {"MX-SMI": "Not Available"}
+
+        try:
+            output = subprocess.check_output(
+                [mx_smi, "--show-version"],
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=10,
+            ).strip()
+            return {"MX-SMI": output.splitlines()[0] if output else "Available"}
+        except (OSError, subprocess.SubprocessError):
+            return {"MX-SMI": "Not Available"}
+
+    def get_topology(self):
+        mx_smi = shutil.which("mx-smi")
+        if not mx_smi:
+            return {}
+
+        for args in (["topo", "-m"], ["--show-topo"]):
+            try:
+                result = subprocess.run(
+                    [mx_smi, *args],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=True,
+                    timeout=10,
+                )
+                return {"MACA Topology": "\n" + result.stdout}
+            except (OSError, subprocess.SubprocessError):
+                continue
+
+        return {}
 
 
 class HIPEnv(BaseEnv):
@@ -579,7 +688,9 @@ class MPSEnv(BaseEnv):
 
 
 if __name__ == "__main__":
-    if is_cuda_v2():
+    if is_maca_v2():
+        env = MACAEnv()
+    elif is_cuda_v2():
         env = GPUEnv()
     elif is_hip():
         env = HIPEnv()
