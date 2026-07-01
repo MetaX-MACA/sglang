@@ -137,6 +137,7 @@ def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
 if _is_cuda:
     from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.utils.custom_op import register_custom_op
+    from fast_hadamard_transform import hadamard_transform
 
     @register_custom_op(mutates_args=["topk_result"])
     @register_split_op()
@@ -197,11 +198,18 @@ if _is_cuda:
         softmax_scale: float,
         q_scale: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.empty(
-            (x.shape[0], weight.shape[0], q_scale.shape[-1]),
-            dtype=torch.float32,
-            device=x.device,
-        )
+        if q_scale is not None:
+            return torch.empty(
+                (x.shape[0], weight.shape[0], q_scale.shape[-1]),
+                dtype=torch.float32,
+                device=x.device,
+            )
+        else :
+            return torch.empty(
+                (x.shape[0], weight.shape[0], 1),
+                dtype=torch.float32,
+                device=x.device,
+            )
 
     @register_custom_op(fake_impl=_logits_head_gate_pcg_fake_impl)
     def logits_head_gate_pcg(
@@ -213,13 +221,30 @@ if _is_cuda:
     ) -> torch.Tensor:
         out = torch.mm(x, weight.t(), out_dtype=torch.float32)
         weights = out * n_heads_inv_sqrt
-        weights = weights.unsqueeze(-1) * q_scale * softmax_scale
+
+        if q_scale is None:
+            # bf16 cache
+            weights = weights.unsqueeze(-1) * softmax_scale
+        else:
+            # int8 cache
+            weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
 
     @register_custom_op(mutates_args=["topk_indices"])
     @register_split_op()
     def broadcast_indexer_topk_from_rank0_(topk_indices: torch.Tensor) -> None:
         _broadcast_indexer_topk_from_rank0_impl(topk_indices)
+
+    def _hadamard_transform_fake_impl(
+        x: torch.Tensor,
+        scale: float = 1.0,
+    ) -> torch.Tensor:
+        return torch.empty_like(x)
+    
+    
+    @register_custom_op(fake_impl=_hadamard_transform_fake_impl)
+    def _hadamard_transform(x: torch.Tensor, scale: float = 1.0)->torch.Tensor:
+        return hadamard_transform(x, scale)
 
 
 def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
@@ -333,7 +358,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert (
         hidden_size & (hidden_size - 1)
     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
-    return hadamard_transform(x, scale=hidden_size**-0.5)
+    return _hadamard_transform(x, scale=hidden_size**-0.5)
 
 
 def _shared_indexer_freqs_cis(rotary_emb: torch.nn.Module) -> torch.Tensor:
@@ -935,7 +960,7 @@ class Indexer(MultiPlatformOp):
                 max_seq_len,
             )
         else:
-            k_fp8 = forward_batch.token_to_kv_pool.get_index_batched_k_buffer(
+            k_fp8 = get_token_to_kv_pool().get_index_batched_k_buffer(
                 layer_id,
                 metadata.get_indexer_seq_len(),
                 block_tables,
