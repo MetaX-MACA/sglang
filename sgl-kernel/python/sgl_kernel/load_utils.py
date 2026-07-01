@@ -96,19 +96,19 @@ def _load_architecture_specific_ops():
 
             logger.debug(f"[sgl_kernel] Loading module from {ops_path}...")
             spec.loader.exec_module(common_ops)
-            logger.debug(f"[sgl_kernel] ✓ Successfully loaded {variant_name}")
-            logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
+            logger.debug(f"[sgl_kernel] Successfully loaded {variant_name}")
+            logger.debug(f"[sgl_kernel] Module file: {common_ops.__file__}")
             return common_ops
 
         except Exception as e:
             previous_import_errors.append(e)
             logger.debug(
-                f"[sgl_kernel] ✗ Failed to load from {ops_path}: {type(e).__name__}: {e}"
+                f"[sgl_kernel] Failed to load from {ops_path}: {type(e).__name__}: {e}"
             )
             # Continue to fallback
     else:
         logger.debug(
-            f"[sgl_kernel] ✗ Architecture-specific library not found matching pattern: {ops_pattern}"
+            f"[sgl_kernel] Architecture-specific library not found matching pattern: {ops_pattern}"
         )
 
     # Try alternative directory (in case installation structure differs)
@@ -133,18 +133,18 @@ def _load_architecture_specific_ops():
 
             logger.debug(f"[sgl_kernel] Loading fallback module from {alt_path}...")
             spec.loader.exec_module(common_ops)
-            logger.debug(f"[sgl_kernel] ✓ Successfully loaded fallback library")
-            logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
+            logger.debug(f"[sgl_kernel] Successfully loaded fallback library")
+            logger.debug(f"[sgl_kernel] Module file: {common_ops.__file__}")
             return common_ops
 
         except Exception as e:
             previous_import_errors.append(e)
             logger.debug(
-                f"[sgl_kernel] ✗ Failed to load fallback from {alt_path}: {type(e).__name__}: {e}"
+                f"[sgl_kernel] Failed to load fallback from {alt_path}: {type(e).__name__}: {e}"
             )
     else:
         logger.debug(
-            f"[sgl_kernel] ✗ Fallback library not found matching pattern: {alt_pattern}"
+            f"[sgl_kernel] Fallback library not found matching pattern: {alt_pattern}"
         )
 
     # Final attempt: try standard Python import (for backward compatibility)
@@ -154,8 +154,8 @@ def _load_architecture_specific_ops():
     try:
         import common_ops
 
-        logger.debug(f"[sgl_kernel] ✓ Successfully imported via standard Python import")
-        logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
+        logger.debug(f"[sgl_kernel] Successfully imported via standard Python import")
+        logger.debug(f"[sgl_kernel] Module file: {common_ops.__file__}")
         return common_ops
     except ImportError as e:
         previous_import_errors.append(e)
@@ -202,38 +202,66 @@ def _find_cuda_home():
     """Find the CUDA install path."""
     # Guess #1
     cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    maca_home = os.environ.get("MACA_PATH")
     if cuda_home is None:
-        # Guess #2
-        nvcc_path = shutil.which("nvcc")
-        if nvcc_path is not None:
-            cuda_home = os.path.dirname(os.path.dirname(nvcc_path))
+        if maca_home is not None:
+            cuda_home = str(Path(maca_home) / "tools" / "cu-bridge")
         else:
-            # Guess #3
-            cuda_home = "/usr/local/cuda"
+        # Guess #2
+            nvcc_path = shutil.which("nvcc")
+            if nvcc_path is not None:
+                cuda_home = os.path.dirname(os.path.dirname(nvcc_path))
+            else:
+                # Guess #3
+                cuda_home = "/usr/local/cuda"
     return cuda_home
+
+
+def _candidate_runtime_library_dirs(cuda_home: Path):
+    maca_home = os.environ.get("MACA_PATH")
+    cuda_home = Path(cuda_home)
+    candidate_dirs = [
+        cuda_home / "lib",
+        cuda_home / "lib64",
+    ]
+    if maca_home:
+        maca_path = Path(maca_home)
+        candidate_dirs.extend(
+            [
+                maca_path / "lib",
+                maca_path / "mxgpu_llvm" / "lib",
+                maca_path / "tools" / "cu-bridge" / "lib",
+                maca_path / "tools" / "cu-bridge" / "lib64",
+            ]
+        )
+    candidate_dirs.extend(
+        [
+            Path("/usr/lib/x86_64-linux-gnu"),
+            Path("/usr/lib/aarch64-linux-gnu"),
+            Path("/usr/lib64"),
+            Path("/usr/lib"),
+        ]
+    )
+    return list(dict.fromkeys(candidate_dirs))
 
 
 def _preload_cuda_library():
     """Preload the CUDA runtime library to help avoid 'libcudart.so not found' issues."""
     cuda_home = Path(_find_cuda_home())
 
-    candidate_dirs = [
-        cuda_home / "lib",
-        cuda_home / "lib64",
-        Path("/usr/lib/x86_64-linux-gnu"),
-        Path("/usr/lib/aarch64-linux-gnu"),
-        Path("/usr/lib64"),
-        Path("/usr/lib"),
-    ]
+    candidate_dirs = _candidate_runtime_library_dirs(cuda_home)
 
     # Determine CUDA major version to try the matching library first.
     # On CUDA 13 systems (e.g., DGX Spark), only libcudart.so.13 exists.
     cuda_major = torch.version.cuda.split(".")[0] if torch.version.cuda else "12"
     lib_versions = list(dict.fromkeys([cuda_major, "13", "12"]))
 
+    library_names = [f"libcudart.so.{lib_version}" for lib_version in lib_versions]
+    library_names.extend(["libcudart.so", "libmcruntime.so"])
+
     for base in candidate_dirs:
-        for lib_version in lib_versions:
-            candidate = base / f"libcudart.so.{lib_version}"
+        for library_name in library_names:
+            candidate = base / library_name
             if candidate.exists():
                 try:
                     cuda_runtime_lib = candidate.resolve()
