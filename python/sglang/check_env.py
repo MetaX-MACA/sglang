@@ -187,7 +187,7 @@ class GPUEnv(BaseEnv):
                     )
                 ].strip()
             }
-        except subprocess.SubprocessError:
+        except (OSError, subprocess.SubprocessError):
             return {"NVCC": "Not Available"}
 
     def _get_cuda_driver_version(self):
@@ -248,6 +248,9 @@ class HIPEnv(BaseEnv):
     def _get_hipcc_info(self):
         from torch.utils.cpp_extension import ROCM_HOME
 
+        if not ROCM_HOME:
+            return {"HIPCC": "Not Available"}
+
         try:
             hipcc = os.path.join(ROCM_HOME, "bin/hipcc")
             hipcc_output = (
@@ -260,7 +263,7 @@ class HIPEnv(BaseEnv):
                     hipcc_output.rfind("HIP version") : hipcc_output.rfind("AMD clang")
                 ].strip()
             }
-        except subprocess.SubprocessError:
+        except (OSError, subprocess.SubprocessError):
             return {"HIPCC": "Not Available"}
 
     def _get_rocm_driver_version(self):
