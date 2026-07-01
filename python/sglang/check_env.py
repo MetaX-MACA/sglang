@@ -218,7 +218,7 @@ class GPUEnv(BaseEnv):
                     "\n" + result.stdout if result.returncode == 0 else None
                 )
             }
-        except subprocess.SubprocessError:
+        except (OSError, subprocess.SubprocessError):
             return {}
 
 
@@ -293,7 +293,7 @@ class HIPEnv(BaseEnv):
             return {
                 "AMD Topology": "\n" + result.stdout if result.returncode == 0 else None
             }
-        except subprocess.SubprocessError:
+        except (OSError, subprocess.SubprocessError):
             return {}
 
 
@@ -408,7 +408,7 @@ class NPUEnv(BaseEnv):
                     "\n" + result.stdout if result.returncode == 0 else None
                 )
             }
-        except subprocess.SubprocessError:
+        except (OSError, subprocess.SubprocessError):
             return {}
 
 
@@ -498,7 +498,7 @@ class MUSAEnv(BaseEnv):
                     "\n" + result.stdout if result.returncode == 0 else None
                 )
             }
-        except subprocess.SubprocessError:
+        except (OSError, subprocess.SubprocessError):
             return {}
 
 
