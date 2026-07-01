@@ -80,7 +80,7 @@ class BaseEnv:
             try:
                 version = importlib.metadata.version(package_name)
                 versions[package_name] = version
-            except ModuleNotFoundError:
+            except importlib.metadata.PackageNotFoundError:
                 versions[package_name] = "Module Not Found"
         return versions
 
