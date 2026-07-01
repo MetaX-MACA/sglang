@@ -578,6 +578,16 @@ class MPSEnv(BaseEnv):
         return {}
 
 
+class CPUEnv(BaseEnv):
+    """Environment checker when no supported accelerator backend is available."""
+
+    def get_info(self):
+        return {"Accelerator": "Not Available"}
+
+    def get_topology(self):
+        return {}
+
+
 if __name__ == "__main__":
     if is_cuda_v2():
         env = GPUEnv()
@@ -589,4 +599,6 @@ if __name__ == "__main__":
         env = MUSAEnv()
     elif is_mps():
         env = MPSEnv()
+    else:
+        env = CPUEnv()
     env.check_env()
