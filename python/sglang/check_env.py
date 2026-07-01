@@ -52,6 +52,8 @@ PACKAGE_LIST = [
     "torchcodec",
 ]
 
+CHECK_ENV_COMMAND_TIMEOUT = 10
+
 
 class BaseEnv:
     """Base class for environment check"""
@@ -212,6 +214,7 @@ class GPUEnv(BaseEnv):
                 stderr=subprocess.PIPE,
                 text=True,
                 check=True,
+                timeout=CHECK_ENV_COMMAND_TIMEOUT,
             )
             return {
                 "NVIDIA Topology": (
@@ -289,6 +292,7 @@ class HIPEnv(BaseEnv):
                 stderr=subprocess.PIPE,
                 text=True,
                 check=True,
+                timeout=CHECK_ENV_COMMAND_TIMEOUT,
             )
             return {
                 "AMD Topology": "\n" + result.stdout if result.returncode == 0 else None
@@ -402,6 +406,7 @@ class NPUEnv(BaseEnv):
                 stderr=subprocess.PIPE,
                 text=True,
                 check=True,
+                timeout=CHECK_ENV_COMMAND_TIMEOUT,
             )
             return {
                 "Ascend Topology": (
@@ -492,6 +497,7 @@ class MUSAEnv(BaseEnv):
                 stderr=subprocess.PIPE,
                 text=True,
                 check=True,
+                timeout=CHECK_ENV_COMMAND_TIMEOUT,
             )
             return {
                 "MTHREADS Topology": (
