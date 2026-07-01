@@ -45,7 +45,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.common import get_device_module, is_xpu, require_attn_tp_gather
 
 logger = logging.getLogger(__name__)
 
@@ -570,6 +570,8 @@ class SchedulerPPMixin:
         self.require_attn_tp_allgather = (
             not get_parallel().enable_dsa_prefill_context_parallel
         )
+        self.require_attn_tp_gather = require_attn_tp_gather(self.server_args)
+        self.p2p_allgather = self.require_attn_tp_allgather and not self.require_attn_tp_gather
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
@@ -1064,7 +1066,7 @@ class SchedulerPPMixin:
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
                 all_gather_group=(
-                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                    self.attn_tp_group if self.p2p_allgather else None
                 ),
                 async_send=async_send,
             )
@@ -1111,7 +1113,7 @@ class SchedulerPPMixin:
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
                     all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
+                        self.attn_tp_group if self.p2p_allgather else None
                     ),
                 )
             )
