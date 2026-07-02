@@ -1085,7 +1085,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
 
         vision_config = getattr(config, "vision_config", None)
         audio_config = getattr(config, "audio_config", None)
-        self._is_multimodal = vision_config is not None and audio_config is not None
+        self._is_multimodal = not(not vision_config or not audio_config)
         # Always build vision/audio encoders so P can fall back to local
         # encoding when the EPD encoder is unreachable.
         if self._is_multimodal:
