@@ -42,7 +42,10 @@ from .common import (
 )
 from .gguf_native import build_gguf_config, has_native_gguf_support
 from .mistral_utils import is_mistral_model, load_mistral_config
-
+import filelock
+import hashlib
+import tempfile
+import os
 
 def _set_architectures(config, arch_name):
     config.update({"architectures": [arch_name]})
@@ -53,6 +56,16 @@ def _apply_deepseek_ocr_overrides(config, model):
     _set_architectures(config, "DeepseekOCRForCausalLM")
     config._name_or_path = model
 
+def get_hf_lock(model_name_or_path: str):
+    lock_dir = tempfile.gettempdir()
+    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
+    model_name = model_name_or_path.replace("/", "-")
+    hash_name = hashlib.sha256(model_name.encode()).hexdigest()
+    # add hash to avoid conflict with old users' lock files
+    lock_file_name = hash_name + model_name + ".lock"
+    # mode 0o666 is required for the filelock to be shared across users
+    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
+    return lock
 
 _LONGCAT_ARCHS = {
     "LongcatCausalLM",
@@ -258,10 +271,11 @@ def get_config(
         # `model` is post-rewrite (gguf parent / runai uri / remote pull).
         model_config_parser = "mistral" if is_mistral_model(model) else "hf"
 
-    parser = get_model_config_parser(model_config_parser)
-    config = parser.parse(
-        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
+    with get_hf_lock(model):
+        parser = get_model_config_parser(model_config_parser)
+        config = parser.parse(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
 
     if model_override_args:
         # A plain update() setattrs a dict-valued override straight onto the

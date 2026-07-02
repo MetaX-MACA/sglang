@@ -1019,6 +1019,7 @@ class BenchmarkMetrics:
     std_ttft_ms: float
     p90_ttft_ms: float
     p95_ttft_ms: float
+    p50_ttft_ms: float
     p99_ttft_ms: float
 
     # TPOT - Time per Output Token, excluding the first token (ms)
@@ -1243,6 +1244,7 @@ def calculate_metrics(
         * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
         std_ttft_ms=np.std(ttfts or 0) * 1000,
+        p50_ttft_ms=np.percentile(ttfts or 0, 50) * 1000,
         p90_ttft_ms=np.percentile(ttfts or 0, 90) * 1000,
         p95_ttft_ms=np.percentile(ttfts or 0, 95) * 1000,
         p99_ttft_ms=np.percentile(ttfts or 0, 99) * 1000,
@@ -1710,6 +1712,7 @@ async def benchmark(
         print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
         print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
         print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
+        print("{:<40} {:<10.2f}".format("P50 TTFT (ms):", metrics.p50_ttft_ms))
         print("{:<40} {:<10.2f}".format("P90 TTFT (ms):", metrics.p90_ttft_ms))
         print("{:<40} {:<10.2f}".format("P95 TTFT (ms):", metrics.p95_ttft_ms))
         print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
@@ -1826,6 +1829,7 @@ async def benchmark(
             "mean_ttft_ms": metrics.mean_ttft_ms,
             "median_ttft_ms": metrics.median_ttft_ms,
             "std_ttft_ms": metrics.std_ttft_ms,
+            "p50_ttft_ms": metrics.p50_ttft_ms,
             "p90_ttft_ms": metrics.p90_ttft_ms,
             "p95_ttft_ms": metrics.p95_ttft_ms,
             "p99_ttft_ms": metrics.p99_ttft_ms,
