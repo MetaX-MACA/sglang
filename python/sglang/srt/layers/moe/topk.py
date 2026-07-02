@@ -131,7 +131,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
 if _is_cuda:
-    from sgl_kernel import moe_fused_gate
+    from sgl_kernel import moe_fused_gate, fused_moe_gate_opt
 
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
@@ -1700,18 +1700,50 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         else:
-            topk_weights, topk_ids = biased_grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                num_fused_shared_experts=num_fused_shared_experts,
-                routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-            )
+            glm = (top_k == 9 and num_expert_group == 1 and topk_group == 1) and (router_logits.shape[1] == 160 or router_logits.shape[1] == 256)
+            if (router_logits.shape[1] // num_expert_group <= 384) and not glm:
+                deepseek = (top_k == 8 and num_expert_group == 8 and topk_group == 4) or (top_k == 9 and num_expert_group == 8 and topk_group == 4)
+                kimi = (top_k == 8 and num_expert_group == 1 and topk_group == 1) or (top_k == 9 and num_expert_group == 1 and topk_group == 1)
+                if kimi or deepseek:
+                    topk_ids = torch.empty((hidden_states.shape[0], top_k), dtype=torch.int, device=hidden_states.device)
+                    topk_weights = torch.empty((hidden_states.shape[0], top_k), dtype=torch.float, device=hidden_states.device)
+                    bias_bf16 = correction_bias.to(torch.bfloat16)
+                    fused_moe_gate_opt(
+                        router_logits,
+                        bias_bf16,
+                        topk_weights,
+                        topk_ids,
+                        top_k,
+                        renormalize,
+                        num_expert_group,
+                        topk_group,
+                        num_fused_shared_experts,
+                        routed_scaling_factor,
+                    )
+                else:
+                    topk_weights, topk_ids = moe_fused_gate(
+                        router_logits.to(dtype=torch.float32),
+                        correction_bias,
+                        num_expert_group,
+                        topk_group,
+                        top_k,
+                        num_fused_shared_experts,
+                        routed_scaling_factor,
+                        apply_routed_scaling_factor_on_output,
+                    )
+            else:
+                topk_weights, topk_ids = biased_grouped_topk(
+                        hidden_states=hidden_states,
+                        gating_output=router_logits,
+                        correction_bias=correction_bias,
+                        topk=num_routed_topk if _use_aiter else top_k,
+                        renormalize=renormalize,
+                        num_expert_group=num_expert_group,
+                        topk_group=topk_group,
+                        num_fused_shared_experts=num_fused_shared_experts,
+                        routed_scaling_factor=routed_scaling_factor,
+                        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                    )
     elif torch_native and custom_routing_function is None:
         assert (
             num_token_non_padded is None

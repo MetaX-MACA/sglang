@@ -410,7 +410,7 @@ def get_maca_version():
 
 
 # This is to make sure that the package supports editable installs
-version = "0.4.3"
+version = "0.4.4"
 maca_ai_version = get_maca_version()
 version += "+maca"+maca_ai_version
 version += "."+get_torch_version()

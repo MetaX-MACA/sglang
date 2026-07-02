@@ -37,8 +37,8 @@ __device__ inline bool cmp_eq(const T& a, const T& b) {
 }
 
 // Fixed constants common to both dynamic and static template versions:
-static constexpr int WARP_SIZE = 32;
-static constexpr int WARPS_PER_CTA = 6;
+static constexpr int WARP_SIZE = 64;
+static constexpr int WARPS_PER_CTA = 4;
 static constexpr int MAX_VPT = 32;  // maximum VPT we support, > params.VPT = num_expert / num_expert_group
 
 // Create an alias for Array using AlignedArray
