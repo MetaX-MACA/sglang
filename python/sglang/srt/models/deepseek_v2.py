@@ -1305,7 +1305,6 @@ class DeepseekV2MoE(nn.Module):
 
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
-        router_logits = state.pop("router_logits")
         if isinstance(state.hidden_states_mlp_input,tuple):
             hidden_states = state.hidden_states_mlp_input[1]
         else:
