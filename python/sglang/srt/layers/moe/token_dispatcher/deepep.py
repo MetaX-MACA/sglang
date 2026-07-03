@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
+    get_moe_runner_backend,
     is_tbo_enabled,
 )
 from sglang.srt.utils import (
@@ -660,6 +661,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
+            topk_weights,
         )
         return (
             hidden_states,
@@ -706,8 +708,29 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
+        topk_weights: Optional[torch.Tensor]=None,        
     ):
+        use_nvfp4 = use_fp8 = False
+        input_global_scale = None
         input_global_scale = self.quant_config.get("input_global_scale", None)
+        bf16_dispatch = self.quant_config.get("bf16_dispatch", False)
+        if input_global_scale is not None:
+            use_nvfp4 = True
+        else:
+            backend = get_moe_runner_backend()
+            # BF16 dispatch is needed when:
+            #   - quant_config requests BF16 dispatch explicitly
+            #   - flashinfer_cutedsl: kernel quantizes to NVFP4 internally
+            #   - NPU with SGLANG_DEEPEP_BF16_DISPATCH: INT8 input + BF16 weight GMM not supported
+            #   - deep_gemm with SGLANG_DEEPEP_BF16_DISPATCH: user requests BF16 dispatch
+            need_bf16_dispatch = (
+                bf16_dispatch
+                or backend.is_flashinfer_cutedsl()
+                or (_is_npu and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
+                or (backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
+            )
+            if not need_bf16_dispatch:
+                use_fp8 = True
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
         # to return int32-packed UE8M0 scales that don't feed the flashinfer
@@ -729,8 +752,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             buffer.low_latency_dispatch(
                 hidden_states,
                 topk_ids,
-                self.num_max_dispatch_tokens_per_rank,
-                self.num_experts,
+                **(dict(topk_weights=topk_weights) if use_fp8 else dict()),
+                num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+                num_experts=self.num_experts,
                 use_fp8=self.use_fp8,
                 **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
                 **(
