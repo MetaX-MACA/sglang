@@ -155,7 +155,6 @@ class DSAMetadata:
     dsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
     dsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
 
-    flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
     # Precomputed once per forward batch and reused across layers.
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
@@ -869,14 +868,6 @@ class DeepseekSparseAttnBackend(
             seq_lens_sum=forward_batch.seq_lens_sum,
             page_table_1=page_table,
             page_table_1_flattened=page_table_1_flattened,
-            flashmla_metadata=(
-                self._compute_flashmla_metadata(
-                    cache_seqlens=dsa_cache_seqlens_int32,
-                    seq_len_q=1,
-                )
-                if use_flashmla_kv
-                else None
-            ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
@@ -998,16 +989,6 @@ class DeepseekSparseAttnBackend(
                 dtype=torch.int32,
                 device=self.device,
             ),
-            "flashmla_metadata": (
-                self._compute_flashmla_metadata(
-                    cache_seqlens=torch.ones(
-                        max_num_tokens, dtype=torch.int32, device=self.device
-                    ),
-                    seq_len_q=1,
-                )
-                if self.dsa_decode_impl == "flashmla_kv"
-                else None
-            ),
         }
 
     def _build_forward_metadata_cuda_graph(
@@ -1047,18 +1028,6 @@ class DeepseekSparseAttnBackend(
 
             seqlens_expanded = cache_seqlens_int32
             dsa_extend_seq_lens_list = [1] * bs
-            if self.dsa_decode_impl == "flashmla_kv":
-                flashmla_metadata = self.decode_cuda_graph_metadata[
-                    "flashmla_metadata"
-                ].slice(slice(0, bs + 1))
-                flashmla_metadata.copy_(
-                    self._compute_flashmla_metadata(
-                        cache_seqlens=dsa_cache_seqlens_int32,
-                        seq_len_q=1,
-                    )
-                )
-            else:
-                flashmla_metadata = None
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
@@ -1104,19 +1073,6 @@ class DeepseekSparseAttnBackend(
             )
             dsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
-            if self.dsa_decode_impl == "flashmla_kv":
-                flashmla_metadata = self.decode_cuda_graph_metadata[
-                    "flashmla_metadata"
-                ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
-
-                flashmla_metadata.copy_(
-                    self._compute_flashmla_metadata(
-                        cache_seqlens=dsa_cache_seqlens_int32,
-                        seq_len_q=1,
-                    )
-                )
-            else:
-                flashmla_metadata = None
 
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
@@ -1144,7 +1100,6 @@ class DeepseekSparseAttnBackend(
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             page_table_1=page_table_1,
-            flashmla_metadata=flashmla_metadata,
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
@@ -1332,16 +1287,6 @@ class DeepseekSparseAttnBackend(
         else:
             assert metadata.real_page_table is metadata.page_table_1
 
-        if self.dsa_decode_impl == "flashmla_kv":
-            flashmla_metadata = metadata.flashmla_metadata.slice(
-                slice(0, seqlens_expanded_size + 1)
-            )
-            flashmla_metadata.copy_(
-                self._compute_flashmla_metadata(
-                    cache_seqlens=dsa_cache_seqlens,
-                    seq_len_q=1,
-                )
-            )
 
         self.forward_metadata = metadata
 
@@ -1382,18 +1327,6 @@ class DeepseekSparseAttnBackend(
                 else:
                     raise ValueError(f"Unsupported forward_mode: {forward_mode}")
 
-                # Prepare FlashMLA tensors if needed
-                flashmla_num_splits_src = None
-                flashmla_num_splits_dst = None
-                flashmla_metadata_src = None
-                flashmla_metadata_dst = None
-                if precomputed.flashmla_metadata is not None:
-                    flashmla_num_splits_src = precomputed.flashmla_metadata.num_splits
-                    flashmla_num_splits_dst = metadata.flashmla_metadata.num_splits
-                    flashmla_metadata_src = (
-                        precomputed.flashmla_metadata.flashmla_metadata
-                    )
-                    flashmla_metadata_dst = metadata.flashmla_metadata.flashmla_metadata
 
                 # Call fused kernel
                 fused_metadata_copy_cuda(
@@ -1405,8 +1338,6 @@ class DeepseekSparseAttnBackend(
                     precomputed.seqlens_expanded,
                     precomputed.dsa_cu_seqlens_k,
                     precomputed.real_page_table,
-                    flashmla_num_splits_src,
-                    flashmla_metadata_src,
                     # Destination tensors
                     metadata.cache_seqlens_int32,
                     metadata.cu_seqlens_k,
@@ -1419,8 +1350,6 @@ class DeepseekSparseAttnBackend(
                         if precomputed.real_page_table is not None
                         else None
                     ),
-                    flashmla_num_splits_dst,
-                    flashmla_metadata_dst,
                     # Parameters
                     mode_int,
                     bs,
@@ -1477,11 +1406,6 @@ class DeepseekSparseAttnBackend(
                     precomputed.real_page_table
                 )
 
-            # Copy FlashMLA metadata in fallback path
-            if precomputed.flashmla_metadata is not None:
-                size = precomputed.seqlens_expanded_size
-                flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
-                flashmla_metadata.copy_(precomputed.flashmla_metadata)
 
         # Refresh DeepGEMM paged MQA schedule metadata for the actual seqlens of
         # this replay (the captured graph holds stale data otherwise, which can
@@ -1990,13 +1914,18 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        from flash_mla import flash_mla_with_kvcache
+        from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32
-        assert metadata.flashmla_metadata is not None
+        sched_meta, _ = get_mla_metadata()
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        if self.dsa_kv_cache_store_fp8:
+            # The xcore1600 FlashMLA FP8 KV sparse-decode path expects only the
+            # absorbed NoPE query part (512 dims for DeepSeek V3.2), not q_nope
+            # concatenated with the 64-dim RoPE query.
+            q_all = q_all[..., : self.kv_lora_rank]
         num_q_heads = q_all.shape[2]
         target_q_heads = self.flashmla_kv_num_q_heads
         if target_q_heads != num_q_heads:
@@ -2025,12 +1954,12 @@ class DeepseekSparseAttnBackend(
         if flashmla_opt:
             decode_mask = (indices != -1).all(dim=-1, keepdim=True)
             o, _ = flash_mla_with_kvcache(
-                q=q_all,
+                q=q_input,
                 k_cache=kv_cache,
                 cache_seqlens=cache_seqlens,
                 head_dim_v=v_head_dim,
-                tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-                num_splits=metadata.flashmla_metadata.num_splits,
+                tile_scheduler_metadata=sched_meta,
+                num_splits=None,
                 softmax_scale=sm_scale,
                 indices=indices,
                 indices_all_valid_per_q=decode_mask,
@@ -2038,23 +1967,23 @@ class DeepseekSparseAttnBackend(
                 block_table=torch.empty(
                     (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
                 ),
-                is_fp8_kvcache=False,
+                is_fp8_kvcache=self.dsa_kv_cache_store_fp8,
             )
         else:
             o, _ = flash_mla_with_kvcache(
-                q=q_all,
+                q=q_input,
                 k_cache=kv_cache,
                 cache_seqlens=cache_seqlens,
                 head_dim_v=v_head_dim,
-                tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-                num_splits=metadata.flashmla_metadata.num_splits,
+                tile_scheduler_metadata=sched_meta,
+                num_splits=None,
                 softmax_scale=sm_scale,
                 indices=indices,
                 # doc says it is not used, but if pass in None then error
                 block_table=torch.empty(
                     (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
                 ),
-                is_fp8_kvcache=False,
+                is_fp8_kvcache=self.dsa_kv_cache_store_fp8,
             )
             
         if target_q_heads != num_q_heads:
@@ -2558,26 +2487,6 @@ class DeepseekSparseAttnBackend(
             force_unfused_topk=force_unfused,
         )
 
-    def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
-        from flash_mla import get_mla_metadata
-
-        num_heads_q = self.flashmla_kv_num_q_heads
-
-        flashmla_metadata, num_splits = get_mla_metadata(
-            cache_seqlens=cache_seqlens,
-            # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
-            #      but the name looks like need seq_len_q?
-            num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
-            num_heads_k=1,
-            num_heads_q=num_heads_q,
-            is_fp8_kvcache=False,
-            topk=self.dsa_index_topk,
-        )
-
-        return DSAFlashMLAMetadata(
-            flashmla_metadata=flashmla_metadata,
-            num_splits=num_splits,
-        )
 
 
 class DeepseekSparseAttnMultiStepBackend:
@@ -2652,41 +2561,6 @@ class DeepseekSparseAttnMultiStepBackend:
                     for i in range(3):
                         self.attn_backends[i].set_dsa_prefill_impl(forward_batch=None)
 
-                    # Prepare FlashMLA tensors if needed
-                    flashmla_num_splits_src = None
-                    flashmla_metadata_src = None
-                    flashmla_num_splits_dst0 = None
-                    flashmla_num_splits_dst1 = None
-                    flashmla_num_splits_dst2 = None
-                    flashmla_metadata_dst0 = None
-                    flashmla_metadata_dst1 = None
-                    flashmla_metadata_dst2 = None
-
-                    if precomputed.flashmla_metadata is not None:
-                        flashmla_num_splits_src = (
-                            precomputed.flashmla_metadata.num_splits
-                        )
-                        flashmla_metadata_src = (
-                            precomputed.flashmla_metadata.flashmla_metadata
-                        )
-                        flashmla_num_splits_dst0 = (
-                            metadata0.flashmla_metadata.num_splits
-                        )
-                        flashmla_num_splits_dst1 = (
-                            metadata1.flashmla_metadata.num_splits
-                        )
-                        flashmla_num_splits_dst2 = (
-                            metadata2.flashmla_metadata.num_splits
-                        )
-                        flashmla_metadata_dst0 = (
-                            metadata0.flashmla_metadata.flashmla_metadata
-                        )
-                        flashmla_metadata_dst1 = (
-                            metadata1.flashmla_metadata.flashmla_metadata
-                        )
-                        flashmla_metadata_dst2 = (
-                            metadata2.flashmla_metadata.flashmla_metadata
-                        )
 
                     # Call the multi-backend fused kernel for first 3 backends
                     fused_metadata_copy_multi_cuda(
@@ -2697,8 +2571,6 @@ class DeepseekSparseAttnMultiStepBackend:
                         precomputed.dsa_cache_seqlens,
                         precomputed.dsa_cu_seqlens_k,
                         precomputed.real_page_table,
-                        flashmla_num_splits_src,
-                        flashmla_metadata_src,
                         # Destination tensors for backend 0
                         metadata0.cache_seqlens_int32,
                         metadata0.cu_seqlens_k,
@@ -2710,8 +2582,6 @@ class DeepseekSparseAttnMultiStepBackend:
                             if precomputed.real_page_table is not None
                             else None
                         ),
-                        flashmla_num_splits_dst0,
-                        flashmla_metadata_dst0,
                         # Destination tensors for backend 1
                         metadata1.cache_seqlens_int32,
                         metadata1.cu_seqlens_k,
@@ -2723,8 +2593,6 @@ class DeepseekSparseAttnMultiStepBackend:
                             if precomputed.real_page_table is not None
                             else None
                         ),
-                        flashmla_num_splits_dst1,
-                        flashmla_metadata_dst1,
                         # Destination tensors for backend 2
                         metadata2.cache_seqlens_int32,
                         metadata2.cu_seqlens_k,
@@ -2736,8 +2604,6 @@ class DeepseekSparseAttnMultiStepBackend:
                             if precomputed.real_page_table is not None
                             else None
                         ),
-                        flashmla_num_splits_dst2,
-                        flashmla_metadata_dst2,
                         # Parameters
                         bs,
                         precomputed.max_len,
@@ -2802,5 +2668,4 @@ class DeepseekSparseAttnMultiStepBackend:
 DeepseekSparseAttnBackend = DeepseekSparseAttnBackend
 DeepseekSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
 DSAMetadata = DSAMetadata
-DSAFlashMLAMetadata = DSAFlashMLAMetadata
 DSAIndexerMetadata = DSAIndexerMetadata
