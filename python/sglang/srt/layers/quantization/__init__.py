@@ -26,8 +26,7 @@ from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-# from sglang.srt.layers.quantization.fp8 import Fp8Config
-Fp8Config=None
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import (
@@ -72,7 +71,7 @@ if TYPE_CHECKING:
 
 # Base quantization methods
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
-    # "fp8": Fp8Config,
+    "fp8": Fp8Config,
     # "mxfp8": Fp8Config,
     "blockwise_int8": BlockInt8Config,
     "modelopt": ModelOptFp8Config,  # Auto-detect, defaults to FP8

@@ -5,6 +5,7 @@ import triton
 
 from sglang.srt.utils import ceil_div, is_cuda, is_musa
 
+from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()

@@ -397,6 +397,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
             )
+        else:
+            hidden_states_scale = hidden_states_scale
 
         num_groups, m, k = hidden_states.shape
         n = w13_weight.size(1)
@@ -453,10 +455,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # GroupGemm-1
         n = w2_weight.shape[1]
 
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
-            down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
-                down_input_scale
-            )
+        # if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        #     down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+        #         down_input_scale
+        #     )
 
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
