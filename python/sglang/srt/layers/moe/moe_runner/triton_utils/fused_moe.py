@@ -40,7 +40,7 @@ from .fused_moe_triton_kernels import (
 )
 from .moe_align_block_size import moe_align_block_size
 from sgl_kernel import cutlass_moe_mm_gemm_kernel_m_w8a8
-from moe_fused_w4a16 import mctlass_moe_w4a16_gemm_kernel_mnk
+from mcoplib.sgl_moe_fused_w4a16 import mctlass_moe_w4a16_gemm_kernel_mnk
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput

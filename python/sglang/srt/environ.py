@@ -788,7 +788,7 @@ class Envs:
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
-    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
+    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)    # need confirm
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
@@ -826,7 +826,7 @@ class Envs:
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
-    SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)                  # jit compile faile, close temporarily
 
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
@@ -836,16 +836,16 @@ class Envs:
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
     # GEMM / kernel fusion
-    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
-    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
+    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(False)        # need confirm, close temporarily
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
     SGLANG_OPT_USE_JIT_NORM = EnvBool(True)
-    SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
+    SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(False)     # need confirm, close temporarily
 
     # CUDA graph
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
@@ -867,6 +867,9 @@ class Envs:
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
+
+    # Cache type
+    SGLANG_DSV4_INDEX_CACHE_TYPE = EnvStr("int8")
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)

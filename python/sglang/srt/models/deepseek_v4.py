@@ -1108,7 +1108,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
+            prefix=add_prefix("attn", prefix),
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
@@ -1123,7 +1123,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mlp = deepseek_v2.DeepseekV2MoE(
             config=config,
             quant_config=moe_quant_config_override or quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("ffn", prefix),
             layer_id=self.layer_id,
             alt_stream=moe_alt_stream,
             is_nextn=is_nextn,
@@ -1549,7 +1549,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_ffn_fn,
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
-                norm=self.post_attention_layernorm,
+                # norm=self.post_attention_layernorm,   # cause precision problem, shutdown
                 forward_batch=forward_batch,
             )
             if not norm_fused:
@@ -2328,8 +2328,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                             elif fuse_wqa_wkv and (
                                 name.endswith(".wq_a.weight")
                                 or name.endswith(".wq_a.weight_scale_inv")
+                                or name.endswith(".wq_a.weight_scale")
                                 or name.endswith(".wkv.weight")
                                 or name.endswith(".wkv.weight_scale_inv")
+                                or name.endswith(".wkv.weight_scale")
                             ):
                                 is_q = ".wq_a." in name
                                 param_name = name.replace(

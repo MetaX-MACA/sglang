@@ -532,7 +532,7 @@ class CompressorBackendMixin:
                 head_dim=compressor.head_dim,
                 norm=compressor.norm,
                 freqs_cis_cache=compressor.freqs_cis,
-                kv_cache=kv_cache.view(dtype=torch.uint8),
+                kv_cache=kv_cache.view(dtype=torch.uint8) if token_to_kv_pool.dtype in (torch.float8_e5m2, torch.float8_e4m3fn) else kv_cache,
                 is_indexer=compressor.is_in_indexer,
                 rotate=compressor.rotate,
                 compress_ratio=compressor.ratio,
