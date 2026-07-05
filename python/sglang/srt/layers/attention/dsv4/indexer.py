@@ -707,9 +707,17 @@ class C4Indexer(nn.Module):
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
             )
-        return fused_q_indexer_rope_hadamard_quant(
-            q, weight, self.weight_scale, self.freqs_cis, positions
-        )
+        if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":
+            return fused_q_indexer_rope_hadamard_quant(
+                q, weight, self.weight_scale, self.freqs_cis, positions
+            )
+        elif envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "int8":
+            return fused_q_indexer_rope_hadamard_quant(
+                q, weight, self.weight_scale, self.freqs_cis, positions, torch.int8
+            )
+        else:
+            assert envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "bf16"
+            raise NotImplementedError("index cache with bfloat16 is not implement yet")
 
     def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:
         out, _ = self.weights_proj(x)
