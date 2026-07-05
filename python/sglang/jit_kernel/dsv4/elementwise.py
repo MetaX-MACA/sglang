@@ -47,12 +47,13 @@ def _jit_main_q_norm_rope_module(
 @cache_once
 def _jit_main_k_norm_rope_flashmla_module(
     dtype: torch.dtype,
+    cache_dtype: torch.dtype,
     head_dim: int,
     rope_dim: int,
     page_size: int,
 ):
     """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache."""
-    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    args = make_cpp_args(dtype, cache_dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
     return load_jit(
         make_name("main_k_norm_rope_flashmla"),
         *args,
@@ -64,9 +65,9 @@ def _jit_main_k_norm_rope_flashmla_module(
 
 
 @cache_once
-def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
+def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype, output_dtype: torch.dtype = torch.float8_e4m3fn,):
     """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant"""
-    args = make_cpp_args(dtype, is_arch_support_pdl())
+    args = make_cpp_args(dtype, is_arch_support_pdl(), output_dtype)
     return load_jit(
         make_name("main_q_indexer_rope_hadamard_quant"),
         *args,
@@ -139,16 +140,17 @@ def fused_q_indexer_rope_hadamard_quant(
     weight_scale: float,
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
+    output_dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
+    q_output = torch.empty(q_input.shape, dtype=output_dtype, device=q_input.device)
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
     if _is_hip:
         torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant(
             q_input,
-            q_fp8,
+            q_output,
             weight,
             weights_out,
             float(weight_scale),
@@ -156,17 +158,17 @@ def fused_q_indexer_rope_hadamard_quant(
             positions,
         )
     else:
-        module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
+        module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype, q_output.dtype)
         module.forward(
             q_input,
-            q_fp8,
+            q_output,
             weight,
             weights_out,
             float(weight_scale),
             freqs_real,
             positions,
         )
-    return q_fp8, weights_out
+    return q_output, weights_out
 
 
 def fused_q_indexer_rope_hadamard_fp4_quant(
@@ -216,6 +218,6 @@ def fused_k_norm_rope_flashmla(
     head_dim = kv.shape[-1]
     rope_dim = freqs_real.shape[-1]
     module = _jit_main_k_norm_rope_flashmla_module(
-        kv.dtype, head_dim, rope_dim, page_size
+        kv.dtype, kvcache.dtype, head_dim, rope_dim, page_size
     )
     module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)

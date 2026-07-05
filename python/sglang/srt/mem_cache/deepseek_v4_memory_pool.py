@@ -138,13 +138,25 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        return fused_store_cache(
-            input=cache_k,
-            cache=self.kv_buffer[layer_id],
-            indices=loc,
-            page_size=self.page_size,
-            type="flashmla",
-        )
+        if self.dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+            return fused_store_cache(       # only support fp8 now
+                input=cache_k,
+                cache=self.kv_buffer[layer_id],
+                indices=loc,
+                page_size=self.page_size,
+                type="flashmla",
+            )
+        else:
+            if cache_k.dtype != self.store_dtype: # state data have different dtype with store_dtype
+                cache_k = cache_k.to(self.store_dtype)
+            dsv4_index_buf_accessor.SetK.execute(
+                pool=self,
+                buf=self.kv_buffer[layer_id],
+                loc=loc,
+                nope_fp8_rope_bf16_pack=cache_k,
+            )
+
+
 
     def get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
@@ -247,7 +259,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
 
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128
-    index_k_with_scale_buffer_dtype = torch.uint8
+    index_k_with_scale_buffer_dtype = torch.uint8 if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8" else torch.int8
 
     def __init__(
         self,
@@ -343,7 +355,7 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        return fused_store_cache(
+        return fused_store_cache(   # quant to fp8 or int8 and store
             input=cache_k,
             cache=self.index_k_with_scale_buffer[layer_id - self.start_layer],
             indices=loc,

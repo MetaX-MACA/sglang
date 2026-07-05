@@ -20,13 +20,18 @@ if TYPE_CHECKING:
 @cache_once
 def _jit_compress_norm_rope_module(
     dtype: torch.dtype,
+    cache_dtype: torch.dtype,
     head_dim: int,
     rope_dim: int,
     page_size: int,
     bf16_store: bool = False,
 ) -> Module:
+    if bf16_store:
+        cache_d = torch.bfloat16
+    else:
+        cache_d = cache_dtype
     args = make_cpp_args(
-        dtype, head_dim, rope_dim, page_size, is_arch_support_pdl(), bf16_store
+        dtype, cache_d, head_dim, rope_dim, page_size, is_arch_support_pdl()
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:
@@ -364,7 +369,7 @@ def compress_norm_rope_store(
         assert kv.shape[-1] == 128
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_compress_norm_rope_module(
-        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
+        kv.dtype, kvcache.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
     )
     fn = module.forward_fp4 if use_fp4 else module.forward
     fn(

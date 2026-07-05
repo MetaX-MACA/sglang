@@ -14,7 +14,6 @@ from sglang.jit_kernel.dsv4.compress_old import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
@@ -218,19 +217,26 @@ class CompressorBackendMixin:
                 cache_k=new_compressed_kv,
             )
         elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+            assert envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() in ["fp8", "int8"]
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
                 loc=out_loc,
                 cache_k=new_compressed_kv,
             )
         else:
-            new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
+            if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":
+                from sglang.srt.layers.attention.dsa.triton_kernel import act_quant as quant_fn
+            elif envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "int8":
+                from sglang.srt.layers.attention.dsa.triton_kernel import act_quant_int8  as quant_fn
+            else:
+                raise NotImplementedError("index cache with bfloat16 is not implement yet")
+            new_compressed_kv, new_compressed_kv_scale = quant_fn(
                 new_compressed_kv
             )
             token_to_kv_pool.set_index_k_scale_buffer(
                 layer_id=layer_id,
                 loc=out_loc,
-                index_k=new_compressed_kv_fp8,
+                index_k=new_compressed_kv,
                 index_k_scale=new_compressed_kv_scale,
             )
 
