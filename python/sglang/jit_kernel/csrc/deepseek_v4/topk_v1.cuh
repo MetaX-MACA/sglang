@@ -17,7 +17,7 @@ namespace {
 
 constexpr uint32_t kTopK = SGL_TOPK;
 constexpr uint32_t kTopKBlockSize = SGL_TOPK;
-constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
+constexpr uint32_t kSMEM = 12 * 1024 * sizeof(uint32_t);  // 48KB (bytes)
 
 struct TopKParams {
   const float* __restrict__ scores;
@@ -228,7 +228,7 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
 }
 
 template <bool kUsePDL>
-__global__ void topk_1024_transform(const  TopK1024Params params) {
+__global__ void topk_transform_kernel(const  TopKParams params) {
   const auto &[
     scores, seq_lens, page_table, page_indices, raw_indices, // pointers
     score_stride, page_table_stride, page_bits // sizes

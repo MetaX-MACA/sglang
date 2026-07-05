@@ -120,10 +120,10 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120:
-        return None
-    import sgl_kernel.flash_mla as flash_mla
-
+    # if _is_sm120:
+    #     return None
+    # import sgl_kernel.flash_mla as flash_mla
+    import flash_mla
     return flash_mla.get_mla_metadata()[0]
 
 
@@ -1431,7 +1431,8 @@ class DeepseekV4AttnBackend(
                     extra_topk_length=extra_topk_lengths,
                 )[0]
             else:
-                import sgl_kernel.flash_mla as flash_mla
+                # import sgl_kernel.flash_mla as flash_mla
+                import flash_mla
 
                 o = flash_mla.flash_mla_with_kvcache(
                     q=q,
@@ -1441,7 +1442,7 @@ class DeepseekV4AttnBackend(
                     cache_seqlens=None,
                     tile_scheduler_metadata=flashmla_metadata,
                     softmax_scale=self.softmax_scale,
-                    is_fp8_kvcache=True,
+                    is_fp8_kvcache=True if self.token_to_kv_pool.dtype in (torch.float8_e5m2, torch.float8_e4m3fn) else False, 
                     indices=swa_page_indices,
                     topk_length=swa_topk_lengths,
                     attn_sink=attn_sink,

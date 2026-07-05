@@ -46,9 +46,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 from sglang.srt.environ import envs
 
 if _is_cuda:
-    from moe_fused_w4a16 import (
-        mctlass_fused_moe_kernel_w4a16
-    )
+    from mcoplib.sgl_moe_fused_w4a16 import mctlass_fused_moe_kernel_w4a16
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:

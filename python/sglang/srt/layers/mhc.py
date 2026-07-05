@@ -399,7 +399,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
             if ENABLE_PDL:
                 T.pdl_sync()
 
-            for pz in T.Pipelined(split_size // hidden_block, num_stages=2):
+            for pz in T.Pipelined(split_size // hidden_block, num_stages=1):
                 x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
                 fn_smem = T.alloc_shared((32, hidden_block), T.float32)
 
@@ -426,7 +426,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
                     out_frag,
                     transpose_A=False,
                     transpose_B=True,
-                    wg_wait=0,
+                    # wg_wait=0,
                     clear_accum=False,
                 )
 
@@ -492,6 +492,19 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     num_block_k = (hc_hidden_size + block_k - 1) // block_k
     n_sms = torch.cuda.get_device_properties(0).multi_processor_count
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
+
+
+@functools.cache
+def compute_num_split(num_tokrns: int, hc_hidden_size: int) -> int:
+    """
+    reference from vllm, maybe not the best
+    """
+    n_split = 16 if num_tokrns >= 512 else 64
+    # deep_gemm.tf32_hc_prenorm_gemm requirement
+    assert 0 == (hc_hidden_size % 8)
+    assert 0 == (hc_hidden_size % n_split)
+    assert 0 == ((hc_hidden_size / n_split) % 8)
+    return n_split
 
 
 def get_mhc_pre_token_count_representatives(
@@ -832,7 +845,7 @@ def _mhc_pre_impl(
     )
 
     if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        n_splits = compute_num_split(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
             n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
@@ -841,7 +854,8 @@ def _mhc_pre_impl(
             n_splits, num_tokens, dtype=torch.float32, device=residual.device
         )
 
-        from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+        # from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm   # todo dive to detail
+        from deep_gemm import tf32_hc_prenorm_gemm
 
         tf32_hc_prenorm_gemm(
             residual_flat.view(num_tokens, hc_hidden_size),
@@ -1395,7 +1409,7 @@ def mhc_fused_post_pre(
         tile_n = 2 if num_tokens < 8 else 3
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
     else:
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        n_splits = compute_num_split(num_tokens, hc_hidden_size)
 
     gemm_out_mul = torch.empty(
         n_splits,
