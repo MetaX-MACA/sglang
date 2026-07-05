@@ -79,6 +79,7 @@ from sglang.srt.utils import (
     export_json_on_rank0,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.configs.model_config import is_deepseek_v4
 
 _is_npu = is_npu()
 _is_musa = is_musa()
@@ -304,7 +305,7 @@ class EAGLEWorker(TpModelWorker):
             )
 
         # Capture extend
-        if self.draft_extend_attn_backend and not _is_npu:
+        if self.draft_extend_attn_backend and not _is_npu and not is_deepseek_v4(self.model_config.hf_config):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
