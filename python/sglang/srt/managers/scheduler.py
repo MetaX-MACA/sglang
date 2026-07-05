@@ -2647,11 +2647,11 @@ class Scheduler(
             new_batch = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
-        from sglang.srt.configs.model_config import is_mimo
+        from sglang.srt.configs.model_config import is_mimo, is_deepseek_v4
         if (
             need_mlp_sync and \
                 ((not self.spec_algorithm.is_none() and not self.server_args.speculative_skip_dp_mlp_sync) or \
-                  is_mimo(self.model_config.hf_config)
+                  is_mimo(self.model_config.hf_config) or is_deepseek_v4(self.model_config.hf_config)
                 )
         ):
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
