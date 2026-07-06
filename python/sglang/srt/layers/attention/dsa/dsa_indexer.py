@@ -5,8 +5,6 @@ import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
-import os
-
 import torch
 from einops import rearrange
 
@@ -17,6 +15,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
+    get_nsa_index_cache_dtype,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_in_seq_split,
 )
@@ -151,10 +150,20 @@ if _is_cuda:
         assert (
             _is_cuda
         ), "Internal error: piecewise CUDA graph is only supported on CUDA"
-        from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+        
 
         forward_batch = get_tc_piecewise_forward_context().forward_batch
         indexer = get_tc_piecewise_forward_context().dsa_indexers[layer_id]
+        
+        if indexer.int8_cache:
+            from sglang.srt.layers.attention.dsa.triton_kernel import (
+                act_quant_int8 as act_quant,
+            )
+        elif indexer.fp8_cache:
+            from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+        else:
+            act_quant = None
+
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
         assert metadata is not None, (
             "DSA piecewise CUDA graph requires indexer metadata from the DSA "
@@ -366,7 +375,9 @@ class Indexer(MultiPlatformOp):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.int8_cache = True if os.getenv("MX_ENABLE_NSA_INT8") else False
+        self.index_cache_dtype = get_nsa_index_cache_dtype()
+        self.fp8_cache = self.index_cache_dtype == "fp8"
+        self.int8_cache = self.index_cache_dtype == "int8"
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
             self.cp_rank = get_parallel().attn_cp_rank
@@ -468,10 +479,10 @@ class Indexer(MultiPlatformOp):
         weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         if q_scale is None:  # bf16
-            assert self.int8_cache is False
+            assert not (self.int8_cache or self.fp8_cache)
             weights = weights.unsqueeze(-1) * self.softmax_scale
         else:
-            assert self.int8_cache
+            assert self.int8_cache or self.fp8_cache
             weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
 
@@ -663,6 +674,7 @@ class Indexer(MultiPlatformOp):
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
         use_dg_native = (
             _is_cuda
+            and self.fp8_cache
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
             and ctx_2d is not None
@@ -684,8 +696,8 @@ class Indexer(MultiPlatformOp):
         assert len(kv_cache_fp8.shape) == 2
         block_kv = page_size
         num_heads_kv = 1
-        if self.int8_cache or q_fp8.dtype in FLOAT8_TYPES:
-            head_dim_with_sf = 132 # fp8(128) + scale(4)
+        if self.int8_cache or self.fp8_cache:
+            head_dim_with_sf = 132  # 8-bit K(128) + fp32 scale(4)
         else:
             head_dim_with_sf = 128  # bf16(128)
         kv_cache_fp8 = kv_cache_fp8.view(
@@ -695,6 +707,9 @@ class Indexer(MultiPlatformOp):
         weights = weights.squeeze(2)
 
         if _is_hip:
+            assert (
+                self.fp8_cache
+            ), "HIP paged MQA logits currently require fp8 index cache"
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
             q_fp8 = q_fp8.unsqueeze(1)
@@ -730,7 +745,8 @@ class Indexer(MultiPlatformOp):
             )
         else:
             q_fp8 = q_fp8.unsqueeze(1)
-            if q_fp8.dtype in FLOAT8_TYPES:
+            if self.fp8_cache:
+                assert q_fp8.dtype in FLOAT8_TYPES
                 logits = deep_gemm.fp8_paged_mqa_logits(
                     q_fp8[:q_offset],
                     kv_cache_fp8,
@@ -741,8 +757,8 @@ class Indexer(MultiPlatformOp):
                     max_seq_len,
                     clean_logits=False,
                 )
-            elif q_fp8.dtype is torch.int8:
-                assert self.int8_cache
+            elif self.int8_cache:
+                assert q_fp8.dtype is torch.int8
                 logits = deep_gemm.int8_paged_mqa_logits(
                     q_fp8[:q_offset],
                     kv_cache_fp8,
@@ -896,8 +912,8 @@ class Indexer(MultiPlatformOp):
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
-        if q_fp8.dtype in FLOAT8_TYPES or q_fp8.dtype is torch.int8:
-            k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+        if self.int8_cache or self.fp8_cache:
+            k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
                 layer_id,
                 metadata.get_indexer_seq_len(),
                 block_tables,
@@ -915,12 +931,14 @@ class Indexer(MultiPlatformOp):
             k_scale = None
         if self.int8_cache:
             k_fp8 = k_fp8.view(torch.int8)
-        elif _is_fp8_fnuz:
-            k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
-        elif q_fp8.dtype is torch.bfloat16:
-            kv_fp8 = k_fp8.view(torch.bfloat16)
+        elif self.fp8_cache:
+            k_fp8 = (
+                k_fp8.view(torch.float8_e4m3fnuz)
+                if _is_fp8_fnuz
+                else k_fp8.view(torch.float8_e4m3fn)
+            )
         else:
-            k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+            k_fp8 = k_fp8.view(torch.bfloat16)
 
         if k_scale is not None:
             k_scale = k_scale.view(torch.float32).squeeze(-1)
@@ -941,6 +959,7 @@ class Indexer(MultiPlatformOp):
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
                 if _is_hip:
+                    assert self.fp8_cache, "HIP MQA logits currently require fp8 index cache"
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -948,7 +967,8 @@ class Indexer(MultiPlatformOp):
                         q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
                     )
                 else:
-                    if q_fp8.dtype in FLOAT8_TYPES:
+                    if self.fp8_cache:
+                        assert q_fp8.dtype in FLOAT8_TYPES
                         logits = deep_gemm.fp8_mqa_logits(
                             q_fp8[:q_offset],
                             kv_fp8,
@@ -958,8 +978,8 @@ class Indexer(MultiPlatformOp):
                             clean_logits=False,
                         )
 
-                    elif q_fp8.dtype is torch.int8:
-                        assert self.int8_cache
+                    elif self.int8_cache:
+                        assert q_fp8.dtype is torch.int8
                         logits = deep_gemm.int8_mqa_logits(
                             q_fp8[:q_offset],
                             kv_fp8,
@@ -1008,6 +1028,7 @@ class Indexer(MultiPlatformOp):
 
             with self._with_real_sm_count():
                 if _is_hip:
+                    assert self.fp8_cache, "HIP MQA logits currently require fp8 index cache"
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -1020,7 +1041,8 @@ class Indexer(MultiPlatformOp):
                         ke[start:end],
                     )
                 else:
-                    if q_fp8.dtype in FLOAT8_TYPES:
+                    if self.fp8_cache:
+                        assert q_fp8.dtype in FLOAT8_TYPES
                         logits_chunk = deep_gemm.fp8_mqa_logits(
                             q_fp8[start:end],
                             kv_fp8,
@@ -1029,8 +1051,8 @@ class Indexer(MultiPlatformOp):
                             ke[start:end],
                             clean_logits=False,
                         )
-                    elif q_fp8.dtype is torch.int8:
-                        assert self.int8_cache
+                    elif self.int8_cache:
+                        assert q_fp8.dtype is torch.int8
                         logits_chunk = deep_gemm.int8_mqa_logits(
                             q_fp8[start:end],
                             kv_fp8,
@@ -1136,6 +1158,9 @@ class Indexer(MultiPlatformOp):
         ), "DSA context parallel (_get_topk_ragged_with_cp) not supported under piecewise CUDA graph"
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
+        assert (
+            self.fp8_cache
+        ), "DSA prefill CP path currently supports fp8 index cache only"
 
         page_size = get_token_to_kv_pool().page_size
         assert page_size == 64, "only support page size 64"
@@ -1285,6 +1310,7 @@ class Indexer(MultiPlatformOp):
         ), "DSA forward_indexer (non-CUDA loop path) not supported under piecewise CUDA graph"
         # if not _is_npu:
         #     from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
+        assert self.fp8_cache, "forward_indexer currently supports fp8 index cache only"
 
         page_size = get_token_to_kv_pool().page_size
         assert page_size == 64, "only support page size 64"
@@ -1405,7 +1431,7 @@ class Indexer(MultiPlatformOp):
         # layout (page_size>=16). Otherwise we fall back to the legacy row-major
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
-        if _use_aiter:
+        if _use_aiter and self.fp8_cache:
             page_size = get_token_to_kv_pool().page_size
             buf = get_token_to_kv_pool().get_index_k_with_scale_buffer(
                 layer_id=layer_id
@@ -1468,7 +1494,11 @@ class Indexer(MultiPlatformOp):
         #     from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
         if self.int8_cache:
-            from sglang.srt.layers.attention.dsa.triton_kernel import act_quant_int8 as act_quant
+            from sglang.srt.layers.attention.dsa.triton_kernel import (
+                act_quant_int8 as act_quant,
+            )
+        elif self.fp8_cache:
+            from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
         else:
             act_quant = None
 

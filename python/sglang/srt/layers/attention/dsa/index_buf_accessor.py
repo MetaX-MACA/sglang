@@ -32,10 +32,11 @@ s: scale, 1 item per token, fp32
 class GetK:
     @classmethod
     def execute(cls, *args, **kwargs):
-        if os.getenv("MX_ENABLE_NSA_INT8"):
-            return cls.triton(*args, **kwargs)
+        buf = args[1]
+        if buf.dtype == torch.bfloat16:
+            return cls.torch_fast(*args, **kwargs) 
         else:
-            return cls.torch_fast(*args, **kwargs)
+            return cls.triton(*args, **kwargs)
 
     @classmethod
     def slow(
@@ -423,9 +424,9 @@ class SetKAndS:
     def triton(cls, pool, buf, loc, index_k, index_k_scale):
         loc = loc.to(torch.int64)
 
-        if os.getenv("MX_ENABLE_NSA_INT8"):
-            assert index_k_scale is not None
-            _set_k_and_s_triton(
+        if buf.dtype == torch.bfloat16:
+            assert index_k_scale is None
+            _set_k_triton(
                 buf=buf,
                 loc=loc,
                 index_k=index_k,
@@ -433,8 +434,8 @@ class SetKAndS:
                 page_size=pool.page_size,
             )
         else:
-            assert index_k_scale is None
-            _set_k_triton(
+            assert index_k_scale is not None
+            _set_k_and_s_triton(
                 buf=buf,
                 loc=loc,
                 index_k=index_k,

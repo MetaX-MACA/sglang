@@ -29,8 +29,6 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
-import os
-
 import numpy as np
 import torch
 import triton
@@ -44,7 +42,10 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
-from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.attention.dsa.utils import (
+    aiter_can_use_preshuffle_paged_mqa,
+    get_nsa_index_cache_dtype,
+)
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
@@ -2497,8 +2498,12 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
-    int8_cache = True if os.getenv("MX_ENABLE_NSA_INT8") else False
-    index_k_with_scale_buffer_dtype = torch.uint8 if os.getenv("MX_ENABLE_NSA_INT8") else torch.bfloat16
+    index_cache_dtype = get_nsa_index_cache_dtype()
+    fp8_cache = index_cache_dtype == "fp8"
+    int8_cache = index_cache_dtype == "int8"
+    index_k_with_scale_buffer_dtype = (
+        torch.bfloat16 if index_cache_dtype == "bf16" else torch.uint8
+    )
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
     def __init__(
@@ -2559,14 +2564,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
             if self.custom_mem_pool
             else nullcontext()
         ):
-            if self.int8_cache:
+            if self.int8_cache or self.fp8_cache:
                 self.index_k_with_scale_buffer = [
                     torch.zeros(
                         # Layout:
                         #     ref: test_attention.py :: kv_cache_cast_to_fp8
                         #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
                         #     data: for page i,
-                        #         * buf[i, :page_size * head_dim] for fp8 data
+                        #         * buf[i, :page_size * head_dim] for int8/fp8 data
                         #         * buf[i, page_size * head_dim:].view(float32) for scale
                         (
                             (index_buf_size + page_size + 1) // self.page_size,

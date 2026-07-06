@@ -2974,18 +2974,22 @@ class DSAIndexerPoolHost(HostKVCache):
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
-        self.indexer_dtype = DSATokenToKVPool.index_k_with_scale_buffer_dtype
-        self.indexer_size_per_token = (
-            self.index_head_dim
-            + self.index_head_dim // self.indexer_quant_block_size * 4
-        )
+        self.indexer_dtype = device_pool.index_k_with_scale_buffer_dtype
+        if device_pool.index_cache_dtype == "bf16":
+            self.indexer_size_per_token = self.index_head_dim
+        else:
+            self.indexer_size_per_token = (
+                self.index_head_dim
+                + self.index_head_dim // self.indexer_quant_block_size * 4
+            )
         self.size = anchor_host.size
         self.page_num = anchor_host.page_num
 
-        self.indexer_page_stride_size = (
-            self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
+        self.indexer_page_stride_size = self.indexer_size_per_token * self.page_size
+        self.indexer_page_stride_bytes = (
+            self.indexer_page_stride_size * self.indexer_dtype.itemsize
         )
-        self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
+        self.indexer_layout_dim = self.indexer_page_stride_bytes * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
         self.size_per_token = (
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
@@ -3106,7 +3110,7 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
-        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        use_kernel = io_backend == "kernel" and self.indexer_page_stride_bytes % 8 == 0
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
@@ -3114,7 +3118,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     dst=device_pool.index_k_with_scale_buffer[layer_id],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
-                    item_size=self.indexer_page_stride_size,
+                    item_size=self.indexer_page_stride_bytes,
                 )
             elif self.layout == "page_first":
                 transfer_kv_per_layer_mla_pf_lf(
@@ -3123,7 +3127,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     layer_id=layer_id,
-                    item_size=self.indexer_page_stride_size,
+                    item_size=self.indexer_page_stride_bytes,
                     src_layout_dim=self.indexer_layout_dim,
                 )
             else:
@@ -3157,7 +3161,7 @@ class DSAIndexerPoolHost(HostKVCache):
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
-        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        use_kernel = io_backend == "kernel" and self.indexer_page_stride_bytes % 8 == 0
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_all_layer_mla(
@@ -3165,7 +3169,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     dst_layers=self.index_k_data_ptrs,
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,
-                    item_size=self.indexer_page_stride_size,
+                    item_size=self.indexer_page_stride_bytes,
                     num_layers=self.layer_num,
                 )
             elif self.layout == "page_first":
@@ -3177,7 +3181,7 @@ class DSAIndexerPoolHost(HostKVCache):
                         staging=self.staging_buffer,
                         dst=self.index_k_with_scale_buffer,
                         page_size=1,
-                        element_size=self.indexer_page_stride_size,
+                        element_size=self.indexer_page_stride_bytes,
                     )
                 else:
                     transfer_kv_all_layer_mla_lf_pf(
@@ -3185,7 +3189,7 @@ class DSAIndexerPoolHost(HostKVCache):
                         dst=self.index_k_with_scale_buffer,
                         src_indices=device_page_indices,
                         dst_indices=host_page_indices,
-                        item_size=self.indexer_page_stride_size,
+                        item_size=self.indexer_page_stride_bytes,
                         dst_layout_dim=self.indexer_layout_dim,
                         num_layers=self.layer_num,
                     )
@@ -3263,7 +3267,7 @@ class DSAIndexerPoolHost(HostKVCache):
         ptr_list = []
         indices = indices.tolist()
         page_stride_bytes = (
-            self.layer_num * self.indexer_page_stride_size * self.indexer_dtype.itemsize
+            self.layer_num * self.indexer_page_stride_bytes
         )
         base_ptr = self.index_k_with_scale_buffer.data_ptr()
         for i in range(0, len(indices), self.page_size):
