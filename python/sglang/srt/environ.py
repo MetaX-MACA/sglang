@@ -680,6 +680,7 @@ class Envs:
     MX_FUSED_MLA_ABSORB_ROPE = EnvBool(False)
     MX_ENABLE_FLASH_MLA_METADATA_CACHE = EnvBool(False)
     MX_ENABLE_NSA_INDEXER_GEMM_BF16 = EnvBool(False)
+    MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE = EnvInt(512)
 
 
 envs = Envs()
