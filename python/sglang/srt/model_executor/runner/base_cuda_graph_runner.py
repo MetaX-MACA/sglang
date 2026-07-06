@@ -114,7 +114,7 @@ def get_batch_sizes_to_capture(
         capture_bs += [num_max_requests]
 
     sum_len_bs = []
-    if server_args.speculative_algorithm is None and get_moe_a2a_backend().is_none():
+    if (server_args.speculative_algorithm is None and get_moe_a2a_backend().is_none() and get_parallel().attn_cp_size <= 1):
         sum_len_bs = [bs for bs in capture_bs if bs < 10 and bs % mul_base != 0]
 
     # Model input token count = bs * num_tokens_per_bs; must be a multiple of attn_tp_size.
