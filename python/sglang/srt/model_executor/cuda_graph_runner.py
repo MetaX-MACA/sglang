@@ -85,7 +85,6 @@ from sglang.srt.utils import (
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
-    enable_specific_device_opt,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -565,7 +564,11 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
         capture_bs += [num_max_requests]
 
     sum_len_bs = []
-    if not server_args.enable_two_batch_overlap and (server_args.speculative_algorithm is None or enable_specific_device_opt()):
+    if (not server_args.enable_two_batch_overlap 
+        and server_args.speculative_algorithm is None 
+        and get_moe_a2a_backend().is_none() 
+        and get_attention_cp_size() <= 1
+    ):
         sum_len_bs = [bs for bs in capture_bs if (bs < 10 and bs % mul_base != 0)]
         
 
