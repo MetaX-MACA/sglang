@@ -585,6 +585,8 @@ class Envs:
     SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA"
     )
+    # GLM/DSA/NSA indexer cache dtype: int8, fp8, or bf16.
+    MX_NSA_INDEXER_CACHE_DTYPE = EnvStr("int8")
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )

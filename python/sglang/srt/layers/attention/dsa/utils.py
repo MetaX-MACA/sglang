@@ -14,6 +14,21 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
+def get_nsa_index_cache_dtype() -> str:
+    dtype = envs.MX_NSA_INDEXER_CACHE_DTYPE.get().strip().lower()
+    aliases = {
+        "bfloat16": "bf16",
+        "float8": "fp8",
+        "fp8_e4m3": "fp8",
+        "fp8_e4m3fn": "fp8",
+    }
+    dtype = aliases.get(dtype, dtype)
+    if dtype not in ("int8", "fp8", "bf16"):
+        raise ValueError(
+            "MX_NSA_INDEXER_CACHE_DTYPE must be one of int8, fp8, or bf16; "
+            f"got {envs.MX_NSA_INDEXER_CACHE_DTYPE.get()!r}"
+        )
+    return dtype
 
 @lru_cache(maxsize=1)
 def aiter_can_use_preshuffle_paged_mqa() -> bool:

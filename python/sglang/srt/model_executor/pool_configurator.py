@@ -17,7 +17,6 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-import os
 import torch
 
 from sglang.srt.configs.model_config import (
@@ -26,6 +25,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import get_nsa_index_cache_dtype
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
@@ -193,13 +193,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                if os.getenv("MX_ENABLE_NSA_INT8"):
+                if get_nsa_index_cache_dtype() == "bf16":
+                    indexer_size_per_token = index_head_dim
+                else:
                     indexer_size_per_token = (
                         index_head_dim
                         + index_head_dim // DSATokenToKVPool.quant_block_size * 4
                     )
-                else:
-                    indexer_size_per_token = index_head_dim # dtype bf16
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )

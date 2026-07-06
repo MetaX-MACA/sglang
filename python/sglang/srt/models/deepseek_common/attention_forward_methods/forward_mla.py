@@ -266,7 +266,13 @@ class DeepseekMLAForwardMixin:
                 # unavailable (e.g. the TBO op path drops topk_indices),
                 # reintroducing the >index_topk garbling. The is_nextn clause is
                 # the sole intentional fallback (layer 78 has its own weights).
-                if not self.skip_topk or (self.is_nextn and prev_topk_indices is None):
+                if (
+                    not forward_batch.forward_mode.is_idle()
+                    and (
+                        not self.skip_topk
+                        or (self.is_nextn and prev_topk_indices is None)
+                    )
+                ):
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -274,7 +280,7 @@ class DeepseekMLAForwardMixin:
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
                     )
-                else:
+                elif not forward_batch.forward_mode.is_idle():
                     # skip_topk reuses prev layer's indices; mirror into this
                     # layer's slot so the captured buffer matches what's used.
                     topk_indices = maybe_capture_indexer_topk(
@@ -288,8 +294,12 @@ class DeepseekMLAForwardMixin:
                     # See the skip_topk note above: shared layers have no
                     # indexer weights, so this gate must not fall back to
                     # computing when prev_topk_indices is None.
-                    if not self.skip_topk or (
-                        self.is_nextn and prev_topk_indices is None
+                    if (
+                        not forward_batch.forward_mode.is_idle()
+                        and (
+                            not self.skip_topk
+                            or (self.is_nextn and prev_topk_indices is None)
+                        )
                     ):
                         topk_indices = self.indexer(
                             x=hidden_states,
@@ -298,7 +308,7 @@ class DeepseekMLAForwardMixin:
                             forward_batch=forward_batch,
                             layer_id=self.layer_id,
                         )
-                    else:
+                    elif not forward_batch.forward_mode.is_idle():
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
                         )
