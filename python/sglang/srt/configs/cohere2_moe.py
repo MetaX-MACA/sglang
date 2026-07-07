@@ -4,12 +4,12 @@
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-try:
-    from huggingface_hub.dataclasses import strict
-except ImportError:  # older huggingface_hub
+# try:
+#     from huggingface_hub.dataclasses import strict
+# except ImportError:  # older huggingface_hub
 
-    def strict(cls):  # type: ignore[misc]
-        return cls
+def strict(cls):  # type: ignore[misc]
+    return cls
 
 
 @strict
