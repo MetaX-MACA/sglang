@@ -1489,7 +1489,6 @@ class DeepseekV2AttentionMLA(
 
         self.skip_topk = False
         self.next_skip_topk = False
-        self.use_index_cache = False
         if self.use_nsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
             self.indexer = Indexer(
@@ -1513,28 +1512,44 @@ class DeepseekV2AttentionMLA(
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
-            self.use_index_cache = False
             if is_nextn:
-                self.skip_topk = False
-                self.next_skip_topk = False
+                self.skip_topk = True
+                self.next_skip_topk = True
             else:
-                self.use_index_cache = get_bool_env_var("USE_INDEX_CACHE", default="false")
-                if self.use_index_cache:
-                    self.index_topk_freq = getattr(config, "index_topk_freq",1)
-                else:
-                    self.index_topk_freq = 1
+                self.index_topk_freq = getattr(config, "index_topk_freq", 1)
                 self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
-                if self.index_topk_pattern is None:
-                    self.skip_topk = layer_id % self.index_topk_freq != 0
-                    self.next_skip_topk = (layer_id+1 % self.index_topk_freq != 0)
+                self.index_skip_topk_offset = getattr(
+                    config, "index_skip_topk_offset", None
+                )
+                if (
+                    self.index_topk_pattern is None
+                    and self.index_skip_topk_offset is not None
+                ):
+                    assert self.index_skip_topk_offset > 0, (
+                        "index_skip_topk_offset must be positive; offset <= 0 "
+                        "marks layer 0 as skip_topk with no prior topk to reuse"
+                    )
+                    self.skip_topk = (
+                        max(layer_id - self.index_skip_topk_offset + 1, 0)
+                        % self.index_topk_freq
+                        != 0
+                    )
+                    self.next_skip_topk = (
+                        max(layer_id - self.index_skip_topk_offset + 2, 0)
+                        % self.index_topk_freq
+                        != 0
+                    )
+                elif self.index_topk_pattern is None:
+                    self.skip_topk = max(layer_id - 1, 0) % self.index_topk_freq != 0
+                    self.next_skip_topk = layer_id % self.index_topk_freq != 0
                 else:
-                    self.skip_topk = self.index_topk_pattern[layer_id] == 'S'
+                    self.skip_topk = self.index_topk_pattern[layer_id] == "S"
                     if layer_id < len(self.index_topk_pattern) - 1:
-                        self.next_skip_topk = self.index_topk_pattern[layer_id+1] == 'S'
+                        self.next_skip_topk = (
+                            self.index_topk_pattern[layer_id + 1] == "S"
+                        )
                     else:
                         self.next_skip_topk = False
-            if False:
-                logger.info('layer_id {} DSA skip_topk {} next_skip_topk {} is_nextn {}'.format(layer_id, self.skip_topk, self.next_skip_topk, is_nextn))
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
