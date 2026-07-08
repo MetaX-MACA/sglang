@@ -148,7 +148,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_forward_mode = self.forward_mode
         self.capture_hidden_mode = CaptureHiddenMode.FULL
 
-        self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
+        self.capture_bs, _ , self.sum_len_bs  = get_batch_sizes_to_capture(model_runner)
         self.padded_static_len = -1
 
         # For Attention Backend

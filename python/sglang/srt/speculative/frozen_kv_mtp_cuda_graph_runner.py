@@ -110,7 +110,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
         self.num_tokens_per_bs = self.topk
-        self.capture_bs, _ = get_batch_sizes_to_capture(
+        self.capture_bs, _ , self.sum_len_bs  = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
         )
         self.max_bs = max(self.capture_bs)

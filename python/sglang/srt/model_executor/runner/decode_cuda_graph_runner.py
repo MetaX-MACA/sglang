@@ -93,6 +93,7 @@ from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_strea
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    get_device_memory_capacity,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -247,7 +248,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.num_tokens_per_bs = self.dllm_config.block_size
 
         # --- bucket sizes ---------------------------------------------
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
+        self.capture_bs, self.compile_bs, self.sum_len_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
         )
         if KTRANSFORMERS_AVAILABLE:
@@ -609,6 +610,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
+        dp_padding_mode = DpPaddingMode.SUM_LEN if bs in self.sum_len_bs else DpPaddingMode.get_default_mode_in_cuda_graph()
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -628,7 +630,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             positions=positions,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            dp_padding_mode=dp_padding_mode,
             global_dp_buffer_len=global_dp_buffer_len,
             global_num_tokens_cpu=global_num_tokens_cpu,
             mrope_positions=mrope_positions,
@@ -663,7 +665,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.server_args.enable_torch_compile
         ):
             self.enable_torch_compile = False
-            _, self.compile_bs = get_batch_sizes_to_capture(
+            _, self.compile_bs , self.sum_len_bs = get_batch_sizes_to_capture(
                 self.model_runner, self.num_tokens_per_bs
             )
         profile_context = empty_context()
