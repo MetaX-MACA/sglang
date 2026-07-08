@@ -2576,7 +2576,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             capture_name = f"{role} decode"
             num_tokens_per_bs = 1
-        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
+        capture_bs, _ , self.sum_len_bs = get_batch_sizes_to_capture(self, num_tokens_per_bs)
         decode_backend = self.server_args.cuda_graph_config.decode.backend
         logger.info(
             f"Capture {capture_name} {graph_backend[self.device]} begin. "

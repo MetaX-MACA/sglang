@@ -2594,6 +2594,9 @@ class ServerArgs:
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
+        
+        # Handle cuda grap max bs config
+        self._recompute_cuda_graph_decode_max_bs()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -2707,7 +2710,49 @@ class ServerArgs:
                     "Granian does not support SSL certificate hot-reloading. "
                     "Use Uvicorn (the default) or handle certificate rotation externally."
                 )
+                
+    def _recompute_cuda_graph_decode_max_bs(self):
+        decode_cuda_graph_config = self.cuda_graph_config.decode
+        if decode_cuda_graph_config.max_bs is None:
+            return
 
+        original_max_bs = decode_cuda_graph_config.max_bs
+        adjusted_max_bs = original_max_bs
+        if self.enable_dp_attention:
+            adjusted_max_bs = adjusted_max_bs // self.dp_size
+            if self.max_running_requests is not None:
+                adjusted_max_bs = min(
+                    adjusted_max_bs, self.max_running_requests // self.dp_size
+                )
+        elif self.max_running_requests is not None:
+            adjusted_max_bs = min(adjusted_max_bs, self.max_running_requests)
+
+        if adjusted_max_bs == original_max_bs:
+            return
+
+        decode_cuda_graph_config.max_bs = adjusted_max_bs
+        if (Phase.DECODE, "bs") not in getattr(
+            self, "_cuda_graph_config_locked", set()
+        ):
+            if self.device == "cpu":
+                self.torch_compile_max_bs = adjusted_max_bs
+                decode_cuda_graph_config.bs = self._generate_cpu_graph_batch_sizes()
+            else:
+                decode_cuda_graph_config.bs = (
+                    self._generate_decode_cuda_graph_batch_sizes(adjusted_max_bs)
+                )
+        elif decode_cuda_graph_config.bs is not None:
+            decode_cuda_graph_config.bs = [
+                bs for bs in decode_cuda_graph_config.bs if bs <= adjusted_max_bs
+            ]
+            if adjusted_max_bs not in decode_cuda_graph_config.bs:
+                decode_cuda_graph_config.bs.append(adjusted_max_bs)
+
+        logger.warning(
+            "Cuda graph decode max bs is adjusted to %s.",
+            decode_cuda_graph_config.max_bs,
+        )
+            
     def _handle_multimodal(self):
         """Validate mm_process_config structure before model loading."""
         if self.mm_process_config is not None:
@@ -3187,7 +3232,7 @@ class ServerArgs:
                     self.chunked_prefill_size = 8200
                 if decode_cuda_graph_config.max_bs is None:
                     if self.tp_size < 4:
-                        decode_cuda_graph_config.max_bs = 256
+                        decode_cuda_graph_config.max_bs = 128
                     else:
                         decode_cuda_graph_config.max_bs = 512
             elif gpu_mem < 160 * 1024:
@@ -3216,13 +3261,7 @@ class ServerArgs:
 
         # Set cuda graph batch sizes
         if self.device != "cpu":
-            if decode_cuda_graph_config.bs is None:
-                decode_cuda_graph_config.bs = (
-                    self._generate_decode_cuda_graph_batch_sizes(
-                        decode_cuda_graph_config.max_bs
-                    )
-                )
-            else:
+            if decode_cuda_graph_config.bs is not None:
                 decode_cuda_graph_config.max_bs = max(decode_cuda_graph_config.bs)
         else:
             # Reuse decode_cuda_graph_config.bs for cpu graph and use torch_compile_max_bs for cpu graph batch size limit,

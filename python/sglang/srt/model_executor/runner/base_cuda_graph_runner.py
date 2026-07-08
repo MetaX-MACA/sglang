@@ -22,6 +22,7 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import require_gathered_buffer
@@ -57,15 +58,41 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 def get_batch_sizes_to_capture(
     model_runner: ModelRunner, num_tokens_per_bs: int = 1
-) -> Tuple[List[int], List[int]]:
-    """Build the (capture_bs, compile_bs) lists for the decode runner.
+) -> Tuple[List[int], List[int], List[int]]:
+    """Build the (capture_bs, compile_bs, sum_len_bs) lists for the decode runner.
 
     Filters cuda_graph_config[decode].bs by attention-tp/cp alignment
-    constraints and clamps to req_to_token_pool.size.
+    constraints and clamps to req_to_token_pool.size. sum_len_bs keeps the
+    small-batch DP-attention graphs that should be captured with SUM_LEN
+    padding instead of the default CUDA-graph padding mode.
     """
 
     server_args = model_runner.server_args
     capture_bs = list(server_args.cuda_graph_config.decode.bs)
+
+    if capture_bs is None:
+        if server_args.speculative_algorithm is None:
+            if server_args.disable_cuda_graph_padding:
+                capture_bs = list(range(1, 33)) + list(range(48, 161, 16))
+            else:
+                capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
+        else:
+            # Since speculative decoding requires more cuda graph memory, we
+            # capture less.
+            capture_bs = (
+                list(range(1, 9))
+                + list(range(10, 33, 2))
+                + list(range(40, 65, 8))
+                + list(range(80, 161, 16))
+            )
+
+        gpu_mem = get_device_memory_capacity()
+        if gpu_mem is not None:
+            if gpu_mem > 90 * 1024:  # H200, H20
+                capture_bs += list(range(160, 257, 8))
+            if gpu_mem > 160 * 1000:  # B200, MI300
+                capture_bs += list(range(256, 513, 16))
+
     num_max_requests = model_runner.req_to_token_pool.size
 
     mul_base = 1
@@ -86,8 +113,25 @@ def get_batch_sizes_to_capture(
         # is very small. We add more values here to make sure we capture the maximum bs.
         capture_bs += [num_max_requests]
 
+    sum_len_bs = []
+    if server_args.speculative_algorithm is None and get_moe_a2a_backend().is_none():
+        sum_len_bs = [bs for bs in capture_bs if bs < 10 and bs % mul_base != 0]
+
     # Model input token count = bs * num_tokens_per_bs; must be a multiple of attn_tp_size.
-    capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
+    capture_bs = sum_len_bs + [
+        bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0
+    ]
+
+    decode_max_bs = server_args.cuda_graph_config.decode.max_bs
+    if decode_max_bs:
+        capture_bs = [bs for bs in capture_bs if bs <= decode_max_bs]
+        if not capture_bs:
+            capture_bs = [decode_max_bs]
+        elif max(capture_bs) < decode_max_bs:
+            capture_bs += list(range(max(capture_bs) + 16, decode_max_bs + 1, 16))
+            if max(capture_bs) < decode_max_bs:
+                capture_bs.append(decode_max_bs)
+
     capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
     capture_bs = list(sorted(set(capture_bs)))
 
@@ -97,7 +141,7 @@ def get_batch_sizes_to_capture(
         if server_args.enable_torch_compile
         else []
     )
-    return capture_bs, compile_bs
+    return capture_bs, compile_bs, sum_len_bs
 
 
 class BaseCudaGraphRunner(BaseRunner):
