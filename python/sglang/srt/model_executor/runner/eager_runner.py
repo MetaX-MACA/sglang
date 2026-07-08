@@ -43,7 +43,13 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import ceil_align, require_mlp_sync
-
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+    create_chunked_prefix_cache_kv_indices,
+)
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
@@ -221,6 +227,23 @@ class EagerRunner(BaseRunner):
         if not enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
         if forward_batch.needs_forward_metadata_init():
+            if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
+                # prepare kv cache buffer for dcp to gather kv cache
+                forward_batch.attn_dcp_metadata = (
+                    model_runner.model.prepare_context_parallel_metadata_for_dcp(
+                        forward_batch.seq_lens,
+                        forward_batch.extend_prefix_lens,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.extend_seq_lens,
+                        forward_batch.req_pool_indices,
+                        get_req_to_token_pool().req_to_token,
+                        forward_batch.seq_lens_sum,
+                        get_token_to_kv_pool().get_key_buffer(0).shape,
+                        model_runner.kv_cache_dtype,
+                        self.device,
+                        create_chunked_prefix_cache_kv_indices,
+                    )
+                )
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
@@ -253,6 +276,24 @@ class EagerRunner(BaseRunner):
 
         if not model_runner.server_args.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+
+        if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
+                # prepare kv cache buffer for dcp to gather kv cache
+                forward_batch.attn_dcp_metadata = (
+                    model_runner.model.prepare_context_parallel_metadata_for_dcp(
+                        forward_batch.seq_lens,
+                        forward_batch.extend_prefix_lens,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.extend_seq_lens,
+                        forward_batch.req_pool_indices,
+                        get_req_to_token_pool().req_to_token,
+                        forward_batch.seq_lens_sum,
+                        get_token_to_kv_pool().get_key_buffer(0).shape,
+                        model_runner.kv_cache_dtype,
+                        self.device,
+                        create_chunked_prefix_cache_kv_indices,
+                    )
+                )
 
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_forward_batch"):
