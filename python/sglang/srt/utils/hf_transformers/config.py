@@ -56,6 +56,18 @@ def _apply_deepseek_ocr_overrides(config, model):
     config._name_or_path = model
 
 
+def get_hf_lock(model_name_or_path: str):
+    lock_dir = tempfile.gettempdir()
+    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
+    model_name = model_name_or_path.replace("/", "-")
+    hash_name = hashlib.sha256(model_name.encode()).hexdigest()
+    # add hash to avoid conflict with old users' lock files
+    lock_file_name = hash_name + model_name + ".lock"
+    # mode 0o666 is required for the filelock to be shared across users
+    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
+    return lock
+
+
 def _is_legacy_glm_moe_dsa_layer_types_error(error: Exception) -> bool:
     error_msg = str(error)
     return (
