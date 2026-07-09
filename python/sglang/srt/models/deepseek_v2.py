@@ -1040,7 +1040,7 @@ class DeepseekV2MoE(nn.Module):
             packed_hidden = hidden_states
             if self.use_fused_quant and packed_hidden.shape[0] == 0:
                 packed_hidden = torch.empty(
-                    (0, align_packed_tensor_size(packed_hidden.shape[-1], 512),envs.MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE.get()),
+                    (0, align_packed_tensor_size(packed_hidden.shape[-1],envs.MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE.get())),
                     dtype=hidden_states.dtype, 
                     device=hidden_states.device
                 )

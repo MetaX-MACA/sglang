@@ -1443,7 +1443,7 @@ def select_experts(
                         num_fused_shared_experts,
                         routed_scaling_factor,
                     )
-                    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+
                 else:
                     topk_weights, topk_ids = moe_fused_gate(
                         router_logits.to(dtype=torch.float32),
