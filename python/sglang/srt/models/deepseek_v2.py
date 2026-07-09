@@ -40,6 +40,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
+    dsa_layer_skips_topk,
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
     get_nsa_index_topk,
@@ -2210,6 +2211,8 @@ class DeepseekV2Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
+        self.use_nsa = is_deepseek_nsa(config)
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
@@ -2355,6 +2358,17 @@ class DeepseekV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+            topk_indices = pp_proxy_tensors.tensors.get("topk_indices")
+            assert not (
+                not forward_batch.forward_mode.is_idle()
+                and hidden_states.shape[0] != 0
+                and self.use_nsa
+                and dsa_layer_skips_topk(self.config, self.start_layer)
+                and topk_indices is None
+            ), (
+                f"PP stage starting at layer {self.start_layer} requires DSA "
+                "topk_indices from the previous stage."
+            )
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -2405,7 +2419,8 @@ class DeepseekV2Model(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
-        topk_indices = None
+        if self.pp_group.is_first_rank:
+            topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -2449,12 +2464,30 @@ class DeepseekV2Model(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy_tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            if (
+                self.use_nsa
+                and self.end_layer < self.config.num_hidden_layers
+                and dsa_layer_skips_topk(self.config, self.end_layer)
+            ):
+                if (
+                    not forward_batch.forward_mode.is_idle()
+                    and hidden_states.shape[0] != 0
+                ):
+                    assert topk_indices is not None, (
+                        f"PP stage ending at layer {self.end_layer} must forward "
+                        "DSA topk_indices because the next stage starts on a "
+                        "skip-topk layer."
+                    )
+                if topk_indices is None:
+                    topk_indices = hidden_states.new_empty(
+                        (0, get_nsa_index_topk(self.config)), dtype=torch.int32
+                    )
+                proxy_tensors["topk_indices"] = topk_indices
+            return PPProxyTensors(proxy_tensors)
         else:
             if not forward_batch.forward_mode.is_idle():
                 if residual is None:

@@ -60,7 +60,9 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
+    dsa_layer_skips_topk,
     get_num_indexer_layers,
+    is_deepseek_nsa,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
@@ -827,6 +829,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
+
+    def get_pp_proxy_topk_size(self) -> Optional[int]:
+        hf_config = self.model_config.hf_text_config
+        if (
+            self.pp_size <= 1
+            or self.pp_rank == 0
+            or not is_deepseek_nsa(hf_config)
+            or not dsa_layer_skips_topk(hf_config, self.start_layer)
+        ):
+            return None
+        return getattr(hf_config, "index_topk", None)
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
@@ -2689,6 +2702,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            pp_proxy_topk_size=self.get_pp_proxy_topk_size(),
         )
         buffers.num_token_non_padded[...] = num_tokens
 
