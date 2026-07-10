@@ -1,4 +1,15 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
+"""Standalone prefill sparse-attention kernels (bf16 / fp16 only).
+
+Step 1 (lightning indexer): ``flash_prefill_with_topk_index`` — score every KV
+block with the index head and select the top-k blocks (in-kernel bitonic top-k).
+Optionally also produces the index-head attention output.
+
+Step 3 (main sparse attention): ``flash_prefill_with_gqa_share_sparse`` —
+attend only to the selected top-k blocks with the main head.
+
+No fp8, no sglang, no project utils. Paged KV via ``req_to_token`` / ``slot_ids``.
+"""
 
 from typing import Optional, Tuple
 
@@ -20,6 +31,14 @@ from ..common.utils import get_cu_seqblocks, _bitonic_merge, _check_dtypes
 )
 @triton.autotune(
     configs=[
+        # BLOCK_SIZE_K is now the K/V sub-tile (block_size=bsk is processed in
+        # SUB_TILES_PER_BLOCK = block_size//BLOCK_SIZE_K sub-tiles). Small
+        # sub-tile -> small smem -> high occupancy on 64KB-smem/SM. 16 is the
+        # bf16 mma K-dim floor; 32 is the larger alternative. num_stages=1
+        # fits <=64KB; larger stages are pruned where they exceed the limit.
+        # Note: BSQ=32 raises occupancy (18% vs 6%) but step1 is compute-bound
+        # (~16 TFLOPS), so halving the Q tile costs more arithmetic intensity
+        # than occupancy gains —实测 BSQ32 慢一倍, 故不纳入。BSQ64 BSK32 最优。
         triton.Config(
             {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 16}, num_warps=4, num_stages=1
         ),
@@ -347,8 +366,13 @@ def _topk_index_kernel(
         init_mask = i + off_k < init_blocks
         # load score
         score = tl.load(s_ptrs, mask=causal_mask, other=-1e30).to(tl.float32)
+        # handle NaN: NaN inputs cause bitonic sort to fail, resulting in invalid indices (-2)
+        # appearing in the topk list. We replace NaN with -inf to maintain sort order.
         score = tl.where(score != score, -1e30, score)
         s_ptrs = s_ptrs + stride_s_k * BLOCK_SIZE_K
+        # fill init and local part, make sure init part is always in topk
+        # and at the first position. Note: must use causal_mask to protect
+        # init_mask to avoid selecting blocks outside causal window
         if MASK_INIT:
             score = tl.where(causal_mask & init_mask, score - 1e29, score)
         else:
@@ -425,6 +449,12 @@ def flash_prefill_with_topk_index(
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    """Step 1: score KV blocks with the index head and select top-k blocks.
+
+    Returns ``(o, topk_idx)``. ``o`` is the index-head attention output
+    ([total_q, num_heads, v_head_dim]) or ``None`` when ``disable_index_value``.
+    ``topk_idx`` is [num_heads, all_seqblock_q, topk], 0-based block ids, -1 padded.
+    """
     assert score_type in ("max", "lse"), f"score_type must be 'max' or 'lse', got {score_type!r}"
     # dtype check
     assert q.dtype in (torch.bfloat16, torch.float16)
