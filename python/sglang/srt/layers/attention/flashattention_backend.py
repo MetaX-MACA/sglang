@@ -1126,7 +1126,7 @@ class FlashAttentionBackend(AttentionBackend):
                         forward_batch.forward_mode.is_target_verify()
                         and self.topk <= 1
                     )
-                    or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                    or forward_batch.forward_mode.is_draft_extend_v2()
                 )
             ):
                 page_table, cache_seqlens = (
