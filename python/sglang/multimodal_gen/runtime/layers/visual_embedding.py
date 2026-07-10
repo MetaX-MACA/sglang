@@ -25,6 +25,18 @@ from diffusers.models.embeddings import (
 from sglang.jit_kernel.timestep_embedding import (
     timestep_embedding as timestep_embedding_cuda,
 )
+
+from diffusers.models.embeddings import (
+    get_timestep_embedding as _get_timestep_embedding,
+)
+
+try:
+    from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
+except Exception as _e:
+    # Fallback to diffusers implementation so downstream code can still run
+    # even if `sgl_kernel` is not installed/available.
+    timestep_embedding_cuda = _get_timestep_embedding
+
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP

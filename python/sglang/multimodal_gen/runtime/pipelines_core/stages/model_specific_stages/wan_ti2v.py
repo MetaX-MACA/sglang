@@ -87,7 +87,7 @@ def prepare_wan_ti2v_latents(
         * (batch.height // spatial_scale)
         * (batch.width // spatial_scale)
         // (patch_size[1] * patch_size[2])
-    )
+    ) 
     seq_len = int(math.ceil(seq_len / get_sp_world_size())) * get_sp_world_size()
     return seq_len, z, reserved_frames_masks
 

@@ -474,31 +474,34 @@ class ZImageTransformerBlock(nn.Module):
                 num_replicated_suffix=num_replicated_suffix,
                 skip_sequence_parallel_override=skip_sequence_parallel_override,
             )
-            if (
+            _use_fused = (
                 _is_cuda
                 and attn_out.is_cuda
                 and attn_out.shape[-1] % 256 == 0
                 and attn_out.shape[-1] <= 8192
                 and self.attention_norm2.variance_epsilon
                 == self.ffn_norm1.variance_epsilon
-            ):
-                from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
-                    fused_norm_tanh_mul_add_norm_scale,
-                )
-
-                x, ffn_in = fused_norm_tanh_mul_add_norm_scale(
-                    attn_out.contiguous(),
-                    self.attention_norm2.weight.data.contiguous(),
-                    None,
-                    gate_msa.contiguous(),
-                    x.contiguous(),
-                    self.ffn_norm1.weight.data.contiguous(),
-                    None,
-                    scale_mlp.contiguous(),
-                    "rms",
-                    self.attention_norm2.variance_epsilon,
-                )
-            else:
+            )
+            if _use_fused:
+                try:
+                    from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+                        fused_norm_tanh_mul_add_norm_scale,
+                    )
+                    x, ffn_in = fused_norm_tanh_mul_add_norm_scale(
+                        attn_out.contiguous(),
+                        self.attention_norm2.weight.data.contiguous(),
+                        None,
+                        gate_msa.contiguous(),
+                        x.contiguous(),
+                        self.ffn_norm1.weight.data.contiguous(),
+                        None,
+                        scale_mlp.contiguous(),
+                        "rms",
+                        self.attention_norm2.variance_epsilon,
+                    )
+                except ImportError:
+                    _use_fused = False
+            if not _use_fused:
                 x = apply_rmsnorm_tanh_mul_add(
                     attn_out, gate_msa, x, self.attention_norm2
                 )

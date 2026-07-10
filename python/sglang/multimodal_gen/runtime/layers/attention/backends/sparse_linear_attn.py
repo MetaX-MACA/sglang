@@ -86,8 +86,10 @@ def compress_kernel(
         X + x_offset + offs_l[:, None] * D + offs_d[None, :], mask=offs_l[:, None] < L
     )
 
-    nx = min(BLOCK_L, L - idx_l * BLOCK_L)
-    x_mean = tl.sum(x, axis=0, dtype=tl.float32) / nx
+    x_fp32 = x.to(tl.float32)
+    nx = tl.minimum(BLOCK_L, L - idx_l * BLOCK_L)
+    x_mean = tl.sum(x_fp32, axis=0) / nx
+
     tl.store(XM + xm_offset + idx_l * D + offs_d, x_mean.to(XM.dtype.element_ty))
 
 
@@ -373,7 +375,7 @@ class _attention(torch.autograd.Function):
             BLOCK_M,
             BLOCK_N,
             num_warps=4 if q.shape[-1] == 64 else 8,
-            num_stages=3,
+            num_stages=1,
         )
 
         ctx.save_for_backward(q, k, v, k_block_id, lut, lse, o_s)

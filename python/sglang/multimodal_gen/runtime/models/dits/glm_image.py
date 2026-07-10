@@ -924,6 +924,10 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         hidden_states = self.image_projector(hidden_states)
         encoder_hidden_states = self.glyph_projector(encoder_hidden_states)
+        prior_device = self.prior_token_embedding.weight.device
+        prior_token_id = prior_token_id.to(device=prior_device, dtype=torch.long)
+        prior_token_drop = prior_token_drop.to(device=prior_device, dtype=torch.bool)
+
         prior_embedding = self.prior_token_embedding(prior_token_id)
         prior_embedding[prior_token_drop] *= 0.0
         prior_hidden_states = self.prior_projector(prior_embedding)

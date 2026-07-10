@@ -50,6 +50,7 @@ def cuda_platform_plugin() -> str | None:
 
         if cuda_is_jetson():
             is_cuda = True
+    is_cuda = True
     if is_cuda:
         logger.debug("CUDA is available")
 

@@ -246,7 +246,7 @@ class CLIPAttention(nn.Module):
                     key_states,
                     value_states,
                     attn_mask=None,
-                    is_causal=True,
+                    is_causal=False,
                     scale=self.scale,
                 )
             else:
