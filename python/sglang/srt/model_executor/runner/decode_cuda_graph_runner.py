@@ -30,6 +30,7 @@ import inspect
 import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
+from contextlib import contextmanager
 
 import torch
 import tqdm

@@ -277,7 +277,7 @@ class DeepEPBuffer:
         #     if is_mnnvl_fabric_supported(torch.cuda.current_device()):
         #         buffer_kwargs["use_fabric"] = True
 
-        # cls._buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        cls._buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return cls._buffer
 
     @classmethod
@@ -494,6 +494,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self.async_finish = async_finish
         self.src2dst = None
         self.quant_config = {}
+        self.K = triton.next_power_of_2(self.router_topk)
 
     def _deepep_permute(
         self,
@@ -602,6 +603,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             topk_ids,
             topk_weights,
             num_recv_tokens_per_expert,
+            reorder_topk_ids,
+            seg_indptr
         )
 
     def _dispatch_core(
