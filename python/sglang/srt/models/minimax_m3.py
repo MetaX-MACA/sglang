@@ -475,8 +475,8 @@ class MiniMaxM3MoE(nn.Module):
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.bf16_router_gemm:
             return torch.mm(
-                hidden_states, self.gate.weight.t(), out_dtype=torch.float32
-            )
+                hidden_states, self.gate.weight.t()
+            ).to(torch.float32)
         router_logits, _ = self.gate(hidden_states.to(torch.float32))
         return router_logits
 
