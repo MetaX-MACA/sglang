@@ -962,15 +962,23 @@ class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin)
         self.quant_config = quant_config
         self.text_config = config.text_config
 
-        # Vision Tower
-        self.vision_tower = SiglipVisionModel(
-            config=config.vision_config,
-            quant_config=quant_config,
-            prefix=add_prefix("vision_tower", prefix),
+        # Diffusion pipelines use Gemma3 as a text encoder only. Avoid constructing
+        # the vision tower unless image understanding is explicitly enabled; otherwise
+        # FSDP may try to shard unused SigLIP Conv2d weights.
+        self.enable_image_understanding = getattr(
+            config, "enable_image_understanding", True
         )
 
-        # Projector
-        self.multi_modal_projector = Gemma3MultiModalProjector(config)
+        if self.enable_image_understanding:
+            # Vision Tower
+            self.vision_tower = SiglipVisionModel(
+                config=config.vision_config,
+                quant_config=quant_config,
+                prefix=add_prefix("vision_tower", prefix),
+            )
+
+            # Projector
+            self.multi_modal_projector = Gemma3MultiModalProjector(config)
 
         # Text Model
         self.language_model = Gemma3TextModel(config)
@@ -1015,6 +1023,11 @@ class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin)
         inputs_embeds = self.language_model.get_input_embeddings(llm_input_ids)
 
         if pixel_values is not None:
+            if not self.enable_image_understanding:
+                raise ValueError(
+                    "pixel_values were provided, but Gemma3 vision tower is disabled. "
+                    "Set enable_image_understanding=True for multimodal Gemma3 usage."
+                )
             if pixel_values.dim() == 5:
                 pixel_values = pixel_values.reshape(
                     -1,

@@ -59,7 +59,7 @@ if TYPE_CHECKING:
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
-    SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
+    SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = False
     SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -263,8 +263,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
         "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
     ),
-    "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
-        "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
+    "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_bool(
+        "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "false"
     ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
