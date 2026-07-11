@@ -552,7 +552,8 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.input_layernorm(x)
-        x = self.self_attn(positions, x, forward_batch)
+        if not forward_batch.forward_mode.is_idle():
+            x = self.self_attn(positions, x, forward_batch)
         x = self._hc_post_block(x, residual, post, comb)
 
         residual = x
@@ -629,7 +630,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     num_stages=self.num_stages,
                     num_target_layers=self.num_target_features,
                     quant_config=quant_config,
-                    prefix=add_prefix(f"stages.{stage_id}", prefix),
+                    prefix=add_prefix(f"mtp.{stage_id}", prefix),
                     alt_streams=self.alt_streams,
                 )
                 for stage_id in range(self.num_stages)
