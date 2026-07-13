@@ -1028,6 +1028,8 @@ class Envs:
     SGLANG_QWEN3_ENABLE_ALT_STREAM = EnvBool(False)
     ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16 = EnvBool(True)
 
+    SGLANG_ENABLE_SHARED_EXPERTS_MULTI_STREAM = EnvBool(False)
+
     # ===================================================================
     # KV-Canary / Token-Oracle (testing-only)
     # ===================================================================
