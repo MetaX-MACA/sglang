@@ -289,7 +289,7 @@ class Envs:
     SGLANG_DSPARK_KERNEL_PADDED_TO_BUCKET = EnvStr("triton")
     SGLANG_DSPARK_KERNEL_ACCEPT_GREEDY = EnvStr("triton")
     SGLANG_DSPARK_KERNEL_ACCEPT_SAMPLING = EnvStr("triton")
-    SGLANG_DSPARK_KERNEL_SOFTMAX_TEMP = EnvStr("flashinfer")
+    SGLANG_DSPARK_KERNEL_SOFTMAX_TEMP = EnvStr("triton")        # cur version  flashinfer not support yet 
     SGLANG_DSPARK_KERNEL_COMMIT_INJECT_LAYOUT = EnvStr("triton")
     SGLANG_DSPARK_KERNEL_QO_INDPTR = EnvStr("triton")
     SGLANG_DSPARK_KERNEL_PAGE_TABLE_POSITIONS = EnvStr("triton")
