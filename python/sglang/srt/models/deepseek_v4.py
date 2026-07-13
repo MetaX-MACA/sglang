@@ -178,6 +178,7 @@ from sglang.srt.utils import (
     is_gfx1250_supported,
     log_info_on_rank0,
     make_layers,
+    get_int_env_var,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -3614,7 +3615,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        load_model_worker_num = get_int_env_var("SGLANG_LOAD_MODEL_WORKERS", 0)
+        max_workers = load_model_worker_num if load_model_worker_num > 0 else None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             weight_names = []
             for name, loaded_weight in weights:
