@@ -14,10 +14,10 @@
 """Config loading utilities."""
 
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional
 
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
-from transformers import PretrainedConfig
+
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
@@ -43,8 +43,6 @@ import filelock
 import hashlib
 import tempfile
 import os
-
-_class_config_cache: Dict[str, dict] = {}
 
 def _set_architectures(config, arch_name):
     config.update({"architectures": [arch_name]})
@@ -115,23 +113,12 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        try:
-            config = AutoConfig.from_pretrained(
-                model,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                **kwargs,
-            )
-        except Exception as e:
-            config = (
-                _load_glm_moe_dsa_config_without_legacy_layer_types(
-                    model, revision, **kwargs
-                )
-                if _is_legacy_glm_moe_dsa_layer_types_error(e)
-                else None
-            )
-            if config is None:
-                raise
+        config = AutoConfig.from_pretrained(
+            model,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
 
         if (
             config.architectures is not None
@@ -141,12 +128,15 @@ class HfModelConfigParser(ModelConfigParserBase):
             # needs, so re-read them from config.json and restore. Fixed upstream
             # by https://github.com/huggingface/transformers/pull/46338; remove
             # this block once SGLang requires transformers >= 5.10.
+            from transformers import PretrainedConfig
+
+            raw_config, _ = PretrainedConfig.get_config_dict(model, revision=revision)
             for key in (
                 "qk_rope_head_dim",
                 "index_topk_freq",
             ):
-                if key in config_dict:
-                    setattr(config, key, config_dict[key])
+                if key in raw_config:
+                    setattr(config, key, raw_config[key])
             if hasattr(config, "qk_head_dim") and hasattr(config, "qk_nope_head_dim"):
                 config.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
 
