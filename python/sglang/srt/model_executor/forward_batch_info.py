@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.utils.dcp_utils import dcp_enabled
 from sglang.srt.layers.utils.dcp_utils import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
@@ -789,6 +790,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            ret.extend_seq_lens = ret.extend_prefix_lens = None
             return ret
 
         # Override the positions with diffusion LLM or spec_info
@@ -1154,7 +1156,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.is_extend_in_batch, global_num_tokens
         )
         
-        if dp_padding_mode.is_max_len() and self.is_extend_in_batch and is_idle_in_batch:
+        if dp_padding_mode.is_max_len() and self.is_extend_in_batch and is_idle_in_batch and dcp_enabled():
             dp_padding_mode = DpPaddingMode.SUM_LEN
 
         self.dp_padding_mode = dp_padding_mode
