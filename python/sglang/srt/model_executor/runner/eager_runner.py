@@ -278,7 +278,11 @@ class EagerRunner(BaseRunner):
         if not model_runner.server_args.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
-        if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
+        if (hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp") 
+            and forward_batch.extend_prefix_lens_cpu
+            and any(forward_batch.extend_prefix_lens_cpu)
+            and not self.model_runner.is_draft_worker
+            and not forward_batch.forward_mode.is_target_verify()):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (
                     model_runner.model.prepare_context_parallel_metadata_for_dcp(
