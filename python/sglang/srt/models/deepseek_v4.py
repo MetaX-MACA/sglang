@@ -69,6 +69,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -2296,9 +2297,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
             weights = list(weights)
             exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
+            exists_wo_a_inv_scale = any(n.endswith(".wo_a.weight_scale_inv") for n, t in weights)
             if exists_wo_a_scale:
                 logger.info("Execute dequant fp8 wo_a")
                 weights = _dequant_fp8_wo_a(weights)
+            elif exists_wo_a_inv_scale:
+                logger.info("Execute block dequant fp8 wo a")
+                block_size = getattr(self.quant_config, "weight_block_size", None) or [128, 128]
+                weights = _block_dequant_fp8_wo_a(weights, block_size)
             else:
                 logger.info("Skip dequant fp8 wo_a")
 
@@ -2672,5 +2678,25 @@ def _dequant_fp8_wo_a(
         weight = weights_dict.pop(name)
         scale = weights_dict.pop(scale_name)
         yield name, _dequant_fp8(weight, scale)
+
+    yield from weights_dict.items()
+
+
+def _block_dequant_fp8_wo_a(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    block_size: List[int],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    weights_dict = dict(weights)
+
+    for name in list(weights_dict.keys()):
+        if name not in weights_dict:
+            continue
+        if not name.endswith(".wo_a.weight"):
+            continue
+        scale_name = name.replace(".wo_a.weight", ".wo_a.weight_scale_inv")
+        assert scale_name in weights_dict
+        weight = weights_dict.pop(name)
+        scale = weights_dict.pop(scale_name)
+        yield name, block_quant_dequant(weight, scale, block_size, torch.bfloat16)
 
     yield from weights_dict.items()
