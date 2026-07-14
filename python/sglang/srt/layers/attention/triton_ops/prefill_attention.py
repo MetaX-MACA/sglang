@@ -176,7 +176,7 @@ def context_attention_fwd(
     kv_group_num = q.shape[1] // k.shape[1]
 
     grid = (batch, head, triton.cdiv(max_input_len, BLOCK_M))
-
+    num_stages = 1
     _fwd_kernel[grid](
         q,
         k,
