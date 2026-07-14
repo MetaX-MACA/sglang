@@ -913,7 +913,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params = set()
 
-        weights = _dequant_fp8_wo_a_streaming(weights)
+        block_size = getattr(self.quant_config, "weight_block_size", None) or [
+            128,
+            128,
+        ]
+        weights = _dequant_fp8_wo_a_streaming(weights, block_size=block_size)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE

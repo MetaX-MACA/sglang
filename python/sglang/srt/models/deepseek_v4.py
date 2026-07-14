@@ -96,6 +96,7 @@ from sglang.srt.layers.moe.utils import (
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    block_quant_dequant,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -3963,20 +3964,45 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
 
 def _dequant_fp8_wo_a_streaming(
     weights: Iterable[Tuple[str, torch.Tensor]],
+    block_size: Optional[List[int]] = None,
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     pending: dict[str, dict[str, torch.Tensor]] = {}
     saw_wo_a_scale = False
+    saw_wo_a_inv_scale = False
     emitted = False
+
+    def dequantize(
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        is_block_scale: bool,
+    ) -> torch.Tensor:
+        if is_block_scale:
+            return block_quant_dequant(
+                weight,
+                scale,
+                block_size or [128, 128],
+                torch.bfloat16,
+            )
+        return _dequant_fp8(weight, scale)
 
     for name, tensor in weights:
         if name.endswith(".wo_a.weight"):
             prefix = name[: -len(".weight")]
             bucket = pending.setdefault(prefix, {})
             scale = bucket.pop("scale", None)
-            if scale is not None:
+            inv_scale = bucket.pop("weight_scale_inv", None)
+            assert scale is None or inv_scale is None, (
+                f"Both {prefix}.scale and {prefix}.weight_scale_inv were provided"
+            )
+            if scale is not None or inv_scale is not None:
                 pending.pop(prefix, None)
                 emitted = True
-                yield name, _dequant_fp8(tensor, scale)
+                yield name, dequantize(
+                    tensor,
+                    inv_scale if inv_scale is not None else scale,
+                    is_block_scale=inv_scale is not None,
+                )
             else:
                 bucket["weight"] = _clone_if_runai_streamed_tensor(tensor)
             continue
@@ -3994,16 +4020,38 @@ def _dequant_fp8_wo_a_streaming(
                 bucket["scale"] = _clone_if_runai_streamed_tensor(tensor)
             continue
 
+        if name.endswith(".wo_a.weight_scale_inv"):
+            saw_wo_a_inv_scale = True
+            prefix = name[: -len(".weight_scale_inv")]
+            bucket = pending.setdefault(prefix, {})
+            weight = bucket.pop("weight", None)
+            if weight is not None:
+                pending.pop(prefix, None)
+                emitted = True
+                yield prefix + ".weight", dequantize(
+                    weight,
+                    tensor,
+                    is_block_scale=True,
+                )
+            else:
+                bucket["weight_scale_inv"] = _clone_if_runai_streamed_tensor(tensor)
+            continue
+
         yield name, tensor
 
     if emitted:
         logger.info("Finished streaming dequant fp8 wo_a")
     for prefix, bucket in pending.items():
         if "weight" in bucket:
-            assert not saw_wo_a_scale, f"{prefix}.scale is missing"
+            if saw_wo_a_scale:
+                raise AssertionError(f"{prefix}.scale is missing")
+            if saw_wo_a_inv_scale:
+                raise AssertionError(f"{prefix}.weight_scale_inv is missing")
             yield prefix + ".weight", bucket["weight"]
         if "scale" in bucket:
             yield prefix + ".scale", bucket["scale"]
+        if "weight_scale_inv" in bucket:
+            yield prefix + ".weight_scale_inv", bucket["weight_scale_inv"]
 
 
 def _dequant_fp8_wo_a(
@@ -4034,7 +4082,12 @@ def _prepare_deepseek_v4_weights(
     if quant_config is not None and quant_config.get_name() == "expert_pack":
         logger.info("Keep Expert Pack GGUF weights on the streaming load path")
         return weights
-    return _dequant_fp8_wo_a_streaming(weights)
+
+    block_size = getattr(self.quant_config, "weight_block_size", None) or [
+        128,
+        128,
+    ]
+    return _dequant_fp8_wo_a_streaming(weights, block_size=block_size)
 
 
 def _fuse_deepseek_v4_wqkv_a_pair(
