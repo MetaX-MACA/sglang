@@ -279,7 +279,7 @@ class EagerRunner(BaseRunner):
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
         if (hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp") 
-            and forward_batch.extend_prefix_lens_cpu
+            and forward_batch.extend_prefix_lens_cpu is not None
             and any(forward_batch.extend_prefix_lens_cpu)
             and not self.model_runner.is_draft_worker
             and not forward_batch.forward_mode.is_target_verify()):
