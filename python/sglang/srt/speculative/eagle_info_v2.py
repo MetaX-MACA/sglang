@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     is_dp_attention_enabled,
@@ -233,7 +234,7 @@ class EagleDraftInputV2Mixin:
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
         batch.spec_info = self
-        batch.input_ids = predict.to(torch.int64)
+        batch.input_ids = predict.to(torch.int64) if envs.SGLANG_ENABLE_SPEC_V2_INPUT_INT64.get() else predict
         batch.seq_lens = batch.seq_lens + num_draft_tokens
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
         batch.seq_lens_sum += extend_num_tokens
