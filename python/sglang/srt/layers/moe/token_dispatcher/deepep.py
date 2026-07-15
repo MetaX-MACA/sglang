@@ -92,6 +92,22 @@ def check_deepep_package() -> str:
             ) from exc
 
 
+
+def check_deepep_package() -> str:
+    import importlib.metadata
+
+    try:
+        importlib.metadata.distribution("mxmesh")
+        return "mxmesh"
+    except importlib.metadata.PackageNotFoundError:
+        try:
+            importlib.metadata.distribution("deep_ep")
+            return "deep_ep"
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise FileNotFoundError(
+                "Initializing DeepEP requires either the deep_ep or mxmesh package"
+            ) from exc
+
 def _deepep_precompile_tp_barrier() -> None:
     # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
     # so if different ranks compile at different speeds, it may quickly trigger a timeout.
