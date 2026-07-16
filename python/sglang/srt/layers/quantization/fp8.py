@@ -1480,14 +1480,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
                 layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
+                # fp4 masked_grouped_gemm need for perf
                 layer.w13_weight_scale_inv.data = (
                     layer.w13_weight_scale_inv.data.to(torch.float8_e8m0fnu)
                     .view(torch.uint8)
+                    .transpose(-1, -2)
                     .contiguous()
                 )
                 layer.w2_weight_scale_inv.data = (
                     layer.w2_weight_scale_inv.data.to(torch.float8_e8m0fnu)
                     .view(torch.uint8)
+                    .transpose(-1, -2)
                     .contiguous()
                 )
 

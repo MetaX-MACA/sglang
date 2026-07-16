@@ -630,7 +630,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # GroupGemm-0
         num_groups, m, k = hidden_states.shape
         n = w13_weight.size(1)
-        gateup_output = torch.zeros(
+        gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
 
@@ -646,34 +646,27 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if hidden_states_scale is not None:
             dispose_tensor(hidden_states_scale)
 
+        swiglu_limit_arg = None
         if self.swiglu_limit is not None:
             # DeepSeek V4: clamped swiglu requires JIT EP activation; the
             # FAST_ACT fused-quant path doesn't carry a swiglu_limit arg.
             assert (
                 envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
             ), "DeepSeek V4 requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
-
-            gateup_output = einops.rearrange(
-                gateup_output, "grp tok hidden -> (grp tok) hidden"
-            )
-            gateup_output = _apply_swiglu_limit(
-                gateup_output, swiglu_limit=self.swiglu_limit
-            )
-            gateup_output = einops.rearrange(
-                gateup_output, "(grp tok) hidden -> grp tok hidden", grp=num_groups
-            )
+            swiglu_limit_arg = self.swiglu_limit
 
         # Act
         down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant_bf16(
             gateup_output,
             masked_m,
+            swiglu_limit_arg,
         )
         del gateup_output
 
         # GroupGemm-1
         n = w2_weight.shape[1]
 
-        down_output = torch.zeros(
+        down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
 
@@ -1295,8 +1288,9 @@ def _varlen_deep_gemm_silu_mul_quant(
 def _varlen_deep_gemm_silu_mul_quant_bf16(
     gateup_output: torch.Tensor,
     masked_m: Optional[torch.Tensor],
+    swiglu_limit: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_fwd
+    from mcoplib.op import silu_mul_mask
 
     assert masked_m is not None
     hidden_states_device = gateup_output.device
@@ -1307,7 +1301,7 @@ def _varlen_deep_gemm_silu_mul_quant_bf16(
         dtype=torch.bfloat16,
     )
 
-    silu_and_mul_masked_fwd(gateup_output, down_input, masked_m)
+    silu_mul_mask(down_input, gateup_output, masked_m, swiglu_limit)
 
     return down_input, None
 
