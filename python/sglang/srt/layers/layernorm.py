@@ -20,7 +20,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.layers.dp_attention import _DpGatheredBufferWrapper
 from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
@@ -365,9 +364,8 @@ class RMSNorm(MultiPlatformOp):
                     residual = residual + post_residual_addition
                 return x, residual
             return x
-        
-        is_extend = getattr(_DpGatheredBufferWrapper, '_is_extend_in_batch', False)
-        if self.fused_quant and self.packed_quant and residual is not None and not is_extend:
+
+        if self.fused_quant and self.packed_quant and residual is not None:
             packed_output, residual, no_quant_output, int8_out, scales = \
                 fused_add_rms_norm_dynamic_per_token_quant_padding_output(
                     x,

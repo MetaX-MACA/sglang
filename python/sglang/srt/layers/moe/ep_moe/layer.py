@@ -177,8 +177,7 @@ class DeepEPMoE(FusedMoE):
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM :
             if (isinstance(quant_config, Fp8Config) or \
                 isinstance(quant_config, CompressedTensorsConfig) or \
-                isinstance(quant_config, W8A8Int8Config)) and \
-                self.dispatcher._inners[0].deepep_mode.name == 'LOW_LATENCY':
+                isinstance(quant_config, W8A8Int8Config)):
                     self.deprecate_flag = True
             else:
                 self.deprecate_flag = False
