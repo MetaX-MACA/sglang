@@ -179,6 +179,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
         hc_hidden_size: Optional[int] = None,
+        pp_proxy_topk_size: Optional[int] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -221,6 +222,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 if not is_mhc:
                     pp_proxy_tensors["residual"] = torch.zeros(
                         (max_bs, hidden_size), dtype=dtype
+                    )
+                if pp_proxy_topk_size is not None:
+                    pp_proxy_tensors["topk_indices"] = torch.zeros(
+                        (max_num_token, pp_proxy_topk_size), dtype=torch.int32
                     )
             else:
                 pp_proxy_tensors = None
@@ -769,6 +774,7 @@ class CudaGraphRunner:
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
+            pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
         )
         self.buffers.share_buffers()
 
