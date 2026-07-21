@@ -18,6 +18,7 @@ dependencies = ["aiohttp", "IPython", "numpy", "requests", "setproctitle", "tqdm
 
 [project.optional-dependencies]
 runtime_common = [
+  "openai",
   "aiohttp",
   "anthropic>=0.20.0",
   "apache-tvm-ffi",
