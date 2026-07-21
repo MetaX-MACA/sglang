@@ -71,6 +71,7 @@ from sglang.srt.state_capturer.indexer_topk import (
 )
 from sglang.srt.utils import BumpAllocator
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils import BumpAllocator,get_bool_env_var
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -329,6 +330,15 @@ class DeepseekMLAForwardMixin:
         if q_replicate_active:
             # force standard absorb so the full-head w_kc bmm runs
             fuse_bmm_attention = False
+        if isinstance(hidden_states, tuple):
+            q_len = hidden_states[0].shape[0]
+            q_input = torch.empty([q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim],
+                                dtype=torch.bfloat16, device=hidden_states[0].device)
+        else:
+            q_len = hidden_states.shape[0]
+            q_input = hidden_states.new_empty(
+                q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
+            )
         q_lora = None
         topk_indices = None
         q_nope = None
@@ -479,7 +489,8 @@ class DeepseekMLAForwardMixin:
                 )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+            if not envs.MX_FUSED_MLA_ABSORB_ROPE.get():
+                k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
         if q_nope is None:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)

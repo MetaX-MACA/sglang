@@ -370,6 +370,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 f"DSA paged MQA backend {self.paged_mqa_logits_backend.value!r} "
                 f"requires an fp8 indexer cache, got {self.index_cache_dtype!r}."
             )
+        self.int8_mqa_logits_backend = (
+            "tilelang"
+            if envs.MX_ENABLE_TILELANG_INT8_MQA_LOGITS.get()
+            else "triton"
+        )
 
     def _get_index_cache_quantizer(self):
         if self.int8_cache:
@@ -381,6 +386,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
             return act_quant
         return None
+
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -410,7 +416,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
         if _is_cuda:
-            return torch.mm(x.float(), self.weights_proj.weight.t().float())
+            if envs.MX_ENABLE_DSA_INDEXER_GEMM_BF16.get():
+                return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
+            else:
+                return torch.mm(x.float(), self.weights_proj.weight.t().float())
 
         weights, _ = self.weights_proj(x)
         if _is_hip:
@@ -426,7 +435,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights = weights * self.n_heads**-0.5
         return weights
 
-    @torch.compile(dynamic=True)
+    # @torch.compile(dynamic=True)
     def _get_logits_head_gate(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: Optional[torch.Tensor] = None
     ):
@@ -1031,6 +1040,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
             )
         elif use_dg_native:
+            kernel_kwargs = (
+                {"backend": self.int8_mqa_logits_backend}
+                if self.int8_cache
+                else {}
+            )
             logits = deepgemm_paged_mqa_logits_native(
                 paged_mqa_logits_fn,
                 q_fp8,
@@ -1043,11 +1057,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_offset=q_offset,
                 B=B,
                 next_n=next_n,
+                **kernel_kwargs,
             )
         else:
             # DeepGEMM's paged kernels require q=[batch, next_n, heads, dim].
             # This split path represents every flattened query token as a
             # one-token batch and keeps its matching expanded context length.
+            kernel_kwargs = (
+                {"backend": self.int8_mqa_logits_backend}
+                if self.int8_cache
+                else {}
+            )
             logits = deepgemm_paged_mqa_logits_split(
                 paged_mqa_logits_fn,
                 q_fp8,
@@ -1058,6 +1078,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 schedule_metadata,
                 max_seq_len,
                 q_offset=q_offset,
+                **kernel_kwargs,
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
@@ -1286,6 +1307,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                             ks,
                             ke,
                             clean_logits=False,
+                            backend=self.int8_mqa_logits_backend,
                         )
                     else:
                         assert q_fp8.dtype is torch.bfloat16
@@ -1367,6 +1389,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                             ks[start:end],
                             ke[start:end],
                             clean_logits=False,
+                            backend=self.int8_mqa_logits_backend,
                         )
                     else:
                         assert q_fp8.dtype is torch.bfloat16
@@ -1806,6 +1829,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         act_quant = self._get_index_cache_quantizer()
 
+        if isinstance(x, tuple):
+            x = x[-1]
+            q_lora_shape0 = q_lora[0].shape[0]
+        else:
+            q_lora_shape0 = q_lora.shape[0]
+
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
@@ -1831,8 +1860,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         enable_dual_stream = (
             self.alt_stream is not None
             and get_is_capture_mode()
-            and q_lora.shape[0] > 0
-            and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+            and q_lora_shape0 > 0
+            and q_lora_shape0 <= DUAL_STREAM_TOKEN_THRESHOLD
         )
 
         # Determine if should skip topk based on sequence length

@@ -1176,6 +1176,14 @@ class Envs:
     SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
     SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
 
+
+    # Metax
+    SGLANG_DSA_DISABLE_FUSED_KERNEL = EnvBool(False)
+    MX_ENABLE_TILELANG_INT8_MQA_LOGITS = EnvBool(False)
+    MX_FUSED_MLA_ABSORB_ROPE = EnvBool(False)
+    MX_ENABLE_FLASH_MLA_METADATA_CACHE = EnvBool(False)
+    MX_ENABLE_DSA_INDEXER_GEMM_BF16 = EnvBool(False)
+
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =

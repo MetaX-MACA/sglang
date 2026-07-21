@@ -240,9 +240,14 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             )
 
         if isinstance(x, tuple):
-            x_q = x[1]
-            x_scale = x[2]
-            out_dtype=x[0]
+            if len(x) < 3:
+                out_dtype = torch.bfloat16
+                x_q     = x[0]
+                x_scale = x[1]
+            else:
+                out_dtype = x[0]
+                x_q     = x[1]
+                x_scale = x[2]
         else:
             x_q, x_scale = per_token_quant_int8(x)
             out_dtype=x.dtype

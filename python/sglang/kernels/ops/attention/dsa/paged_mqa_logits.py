@@ -38,7 +38,7 @@ def _restore_row_stride(logits: torch.Tensor) -> torch.Tensor:
 
 
 def deepgemm_paged_mqa_logits_native(
-    fp8_paged_mqa_logits_fn: Callable[..., torch.Tensor],
+    paged_mqa_logits_fn: Callable[..., torch.Tensor],
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -50,10 +50,11 @@ def deepgemm_paged_mqa_logits_native(
     q_offset: int,
     B: int,
     next_n: int,
+    **kernel_kwargs,
 ) -> torch.Tensor:
     # block_tables[::next_n] de-expands the caller's repeat_interleave without a
     # copy (DeepGEMM only checks `stride(1) == 1`).
-    logits = fp8_paged_mqa_logits_fn(
+    logits = paged_mqa_logits_fn(
         q_fp8[:q_offset].view(B, next_n, q_fp8.shape[1], q_fp8.shape[2]),
         kv_cache_fp8,
         weights[:q_offset],
@@ -62,12 +63,13 @@ def deepgemm_paged_mqa_logits_native(
         schedule_metadata,
         max_seq_len,
         clean_logits=False,
+        **kernel_kwargs,
     )
     return _restore_row_stride(logits)
 
 
 def deepgemm_paged_mqa_logits_split(
-    fp8_paged_mqa_logits_fn: Callable[..., torch.Tensor],
+    paged_mqa_logits_fn: Callable[..., torch.Tensor],
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -77,9 +79,10 @@ def deepgemm_paged_mqa_logits_split(
     max_seq_len: int,
     *,
     q_offset: int,
+    **kernel_kwargs,
 ) -> torch.Tensor:
     q_fp8 = q_fp8.unsqueeze(1)
-    logits = fp8_paged_mqa_logits_fn(
+    logits = paged_mqa_logits_fn(
         q_fp8[:q_offset],
         kv_cache_fp8,
         weights[:q_offset],
@@ -88,6 +91,7 @@ def deepgemm_paged_mqa_logits_split(
         schedule_metadata,
         max_seq_len,
         clean_logits=False,
+        **kernel_kwargs,
     )
     return _restore_row_stride(logits)
 

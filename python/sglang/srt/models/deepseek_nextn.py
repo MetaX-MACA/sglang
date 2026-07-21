@@ -160,6 +160,9 @@ class DeepseekModelNextN(nn.Module):
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
+        
+        if 'USE_SINGLE_STREAM' or 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
+            self.alt_stream = None
 
         layer_name = "decoder"
         if _is_npu and (

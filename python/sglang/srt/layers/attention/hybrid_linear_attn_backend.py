@@ -1278,6 +1278,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         below reads the metadata it just planned.
         """
         del req_pool_indices
+        # Guard against idle/dummy batches where forward_metadata wasn't set.
+        if self.linear_attn_backend.forward_metadata is None:
+            return
+        
         request_number = last_correct_step_indices.shape[0]
 
         # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
