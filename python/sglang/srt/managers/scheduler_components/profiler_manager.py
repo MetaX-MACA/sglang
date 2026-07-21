@@ -427,7 +427,7 @@ class SchedulerProfilerManager:
                 self._start_profile()
 
     def _profile(self, recv_req: ProfileReq):
-        if recv_req.type == ProfileReqType.START_PROFILE:
+        if recv_req.req_type == ProfileReqType.START_PROFILE:
             self.profile_funcs = None
             self.tp_ranks = None
             self.export_trace = True

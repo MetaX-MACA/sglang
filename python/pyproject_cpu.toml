@@ -17,6 +17,7 @@ classifiers = [
 
 # Please keep dependency lists in this file sorted alphabetically by package name.
 dependencies = [
+  "openai",
   "aiohttp",
   "anthropic>=0.20.0",
   "blobfile==3.0.0",
