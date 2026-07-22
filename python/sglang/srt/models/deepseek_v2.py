@@ -1623,7 +1623,12 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_a_layernorm = RMSNorm(
+                self.q_lora_rank,
+                eps=config.rms_norm_eps,
+                fused_quant=get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
+                or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL", default="false"),
+            )
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
@@ -2147,9 +2152,21 @@ class DeepseekV2DecoderLayer(nn.Module):
         # )
         packed_quant = True if self.is_layer_sparse else False
         fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        fused_quant_pd = fused_quant or get_bool_env_var(
+            "FUSED_RMSNORM_QUANT_PREFILL", default="false"
+        )
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=fused_quant_pd,
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, fused_quant=fused_quant, packed_quant=packed_quant, packed_size=align_packed_tensor_size(config.hidden_size))
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=fused_quant,
+            packed_quant=packed_quant,
+            packed_size=align_packed_tensor_size(config.hidden_size),
+        )
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
@@ -2393,6 +2410,9 @@ class DeepseekV2Model(nn.Module):
             )
             else None
         )
+
+        if 'USE_SINGLE_STREAM' or 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
+            self.alt_stream = None
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,

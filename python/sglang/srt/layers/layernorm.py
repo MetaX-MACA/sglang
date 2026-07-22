@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from mcoplib.custom_ops import fused_add_rms_norm_dynamic_per_token_quant_padding_output
+from sgl_kernel import rms_norm_dynamic_per_token_quant_custom
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
@@ -365,16 +366,30 @@ class RMSNorm(MultiPlatformOp):
                 return x, residual
             return x
 
-        if self.fused_quant and self.packed_quant and residual is not None:
-            packed_output, residual, no_quant_output, int8_out, scales = \
-                fused_add_rms_norm_dynamic_per_token_quant_padding_output(
-                    x,
-                    residual,
-                    self.weight.data,
-                    self.packed_size,
-                    self.variance_epsilon,
-                )
-            return (packed_output, no_quant_output, (int8_out, scales)), residual
+        if self.fused_quant: 
+            if self.packed_quant and residual is not None:
+                packed_output, residual, no_quant_output, int8_out, scales = \
+                    fused_add_rms_norm_dynamic_per_token_quant_padding_output(
+                        x,
+                        residual,
+                        self.weight.data,
+                        self.packed_size,
+                        self.variance_epsilon,
+                    )
+                return (packed_output, no_quant_output, (int8_out, scales)), residual
+            
+            if not x.is_contiguous():
+                x = x.contiguous()
+            output, output_bf16, scale = rms_norm_dynamic_per_token_quant_custom(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+                quant_dtype=torch.int8,
+                residual=residual,
+            )
+            if residual is not None:
+                return (output, scale, output_bf16), residual
+            return output, scale, output_bf16
         else:
             if self.variance_size_override is not None:
                     return self.forward_native(x, residual, post_residual_addition)
