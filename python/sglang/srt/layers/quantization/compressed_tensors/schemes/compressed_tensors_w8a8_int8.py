@@ -172,14 +172,15 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     ) -> torch.Tensor:
         # TODO: add cutlass_scaled_mm_azp support
         if isinstance(x, tuple):
-            if len(x) < 3:
-                out_dtype = torch.bfloat16
-                x_q     = x[0]
-                x_scale = x[1]
-            else:
+            if isinstance(x[0], torch.dtype):
+                # custom quantization
                 out_dtype = x[0]
                 x_q     = x[1]
                 x_scale = x[2]
+            else:
+                out_dtype = torch.bfloat16
+                x_q     = x[0]
+                x_scale = x[1]
         else:
             x_q, x_scale = per_token_quant_int8(x)
             out_dtype=x.dtype
