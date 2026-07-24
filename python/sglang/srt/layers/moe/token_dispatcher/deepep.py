@@ -75,16 +75,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 
-
-def _is_mnnvl_fabric_supported() -> bool:
-    if not is_flashinfer_available():
-        return False
-
-    from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
-
-    return is_mnnvl_fabric_supported(torch.cuda.current_device())
-
-
 def _deepep_precompile_tp_barrier() -> None:
     # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
     # so if different ranks compile at different speeds, it may quickly trigger a timeout.
@@ -253,7 +243,6 @@ class DeepEPBuffer:
                     f"Consider using --deepep-config to change the behavior."
                 )
 
-        use_mnnvl_fabric = _is_mnnvl_fabric_supported()
         buffer_kwargs = dict(
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
