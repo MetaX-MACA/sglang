@@ -1202,7 +1202,6 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and not self.use_single_stream_dispatch_overlap and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
-                    self.alt_stream = None
                     if sglang_enable_shared_experts_multi_stream:
                         self.alt_stream.wait_stream(torch.cuda.current_stream())
                         with torch.cuda.stream(self.alt_stream):
