@@ -2034,6 +2034,14 @@ class DeepseekV4AttnBackend(
             extra_indices = match_num_queries(extra_indices, value=-1)
             extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
 
+            raw_q = forward_batch.batch_size
+            if extra_indices is not None and extra_indices.shape[0] > raw_q:
+                extra_indices = extra_indices.clone()
+                extra_indices[raw_q:].fill_(-1)
+            if extra_topk_lengths is not None and extra_topk_lengths.shape[0] > raw_q:
+                extra_topk_lengths = extra_topk_lengths.clone()
+                extra_topk_lengths[raw_q:].fill_(1)
+
             if q.ndim == 3:
                 q = q.unsqueeze(1)
             if swa_page_indices.ndim == 2:
