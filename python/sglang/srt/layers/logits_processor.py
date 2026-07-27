@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from sglang.srt.distributed import get_lm_head_tp_group, get_tensor_model_parallel_world_size
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -223,8 +224,29 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
-        cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
-        dp_rank = get_parallel().attn_dp_rank
+        if get_lm_head_tp_group().world_size > 1:
+            slice_start = ((get_lm_head_tp_group().rank // get_lm_head_tp_group().world_size) *
+                           get_lm_head_tp_group().world_size)
+            slice_end = slice_start + get_lm_head_tp_group().world_size
+            cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu[slice_start:slice_end], dim=0)
+            dp_rank = get_lm_head_tp_group().rank_in_group
+            self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[slice_start:slice_end][dp_rank]
+            if self.global_num_tokens_for_logprob_cpu is not None:
+                # create a smaller buffer to reduce peak memory usage
+                self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu[slice_start:slice_end])
+            else:
+                self.global_dp_buffer_len = self.global_dp_buffer_len // (
+                        get_tensor_model_parallel_world_size() // get_lm_head_tp_group().world_size)
+        else:
+            cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
+            dp_rank = get_parallel().attn_dp_rank
+            self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+            if self.global_num_tokens_for_logprob_cpu is not None:
+                # create a smaller buffer to reduce peak memory usage
+                self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
+            else:
+                self.global_dp_buffer_len = self.global_dp_buffer_len
+
         if dp_rank == 0:
             dp_local_start_pos = torch.zeros_like(
                 self.global_num_tokens_for_logprob_gpu[0]
@@ -233,17 +255,10 @@ class LogitsMetadata:
             dp_local_start_pos = cumtokens[dp_rank - 1]
 
         self.dp_local_start_pos = dp_local_start_pos
-        self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
 
         hidden_size = get_dp_hidden_size()
         dtype = get_dp_dtype()
         device = get_dp_device()
-
-        if self.global_num_tokens_for_logprob_cpu is not None:
-            # create a smaller buffer to reduce peak memory usage
-            self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
-        else:
-            self.global_dp_buffer_len = self.global_dp_buffer_len
 
         self.gathered_buffer = torch.empty(
             (
@@ -267,9 +282,19 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
-        self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
-        if self.use_attn_tp_group:
+        server_args = get_global_server_args()
+        self.use_lm_head_tp_group = server_args.lm_head_tp_size > 1
+        self.use_attn_tp_group = server_args.enable_dp_lm_head and not self.use_lm_head_tp_group
+        self.use_fp32_lm_head = server_args.enable_fp32_lm_head
+        if self.use_lm_head_tp_group:
+            self.lm_head_tp_size = server_args.lm_head_tp_size
+            self.do_tensor_parallel_all_gather = (
+                not skip_all_gather and self.lm_head_tp_size > 1
+            )
+            self.do_tensor_parallel_all_gather_dp_attn = (
+                    self.do_tensor_parallel_all_gather and get_parallel().attn_dp_size != 1
+            )
+        elif self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
                 not skip_all_gather and self.attn_tp_size > 1
@@ -580,7 +605,20 @@ class LogitsProcessor(nn.Module):
 
         if logits_metadata.forward_mode.is_idle():
             if self.empty_hiddens == None:
-                self.empty_hiddens = torch.empty(0, hidden_states.shape[1], device=hidden_states.device)
+                if self.use_lm_head_tp_group and self.lm_head_tp_size > 1:
+                    self.empty_hiddens = torch.zeros(
+                        1,
+                        hidden_states.shape[1],
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    )
+                else:
+                    self.empty_hiddens = torch.empty(
+                        0,
+                        hidden_states.shape[1],
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    )
 
             pruned_states = self.empty_hiddens
             
@@ -863,7 +901,9 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         if self.do_tensor_parallel_all_gather:
-            if self.use_attn_tp_group:
+            if self.use_lm_head_tp_group:
+                logits = get_lm_head_tp_group().all_gather(logits, -1)
+            elif self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
                 logits = self._logits_gatherer(logits)
@@ -936,7 +976,8 @@ class LogitsProcessor(nn.Module):
             logits_metadata.compute_dp_attention_metadata()
             local_hidden_states = hidden_states
             hidden_states = logits_metadata.gathered_buffer
-            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata,
+                                use_custom_lmhead_tp=self.use_lm_head_tp_group)
             return hidden_states, local_hidden_states
         return hidden_states, hidden_states
 
