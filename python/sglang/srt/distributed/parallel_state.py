@@ -1603,6 +1603,7 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_LM_HEAD_TP: Optional[GroupCoordinator] = None
 
 _DCP: Optional[GroupCoordinator] = None
 
@@ -1648,6 +1649,12 @@ def get_attn_cp_group() -> GroupCoordinator:
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
+
+def get_lm_head_tp_group() -> GroupCoordinator:
+    assert _LM_HEAD_TP is not None, "lm head tensor model parallel group is not initialized"
+    return _LM_HEAD_TP
+
 
 def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
     return _DCP
@@ -1918,6 +1925,7 @@ def initialize_model_parallel(
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
+    lm_head_tensor_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
@@ -1939,6 +1947,9 @@ def initialize_model_parallel(
             parallelism.
         moe_data_model_parallel_size: number of GPUs used for moe data
             parallelism.
+        lm_head_tensor_parallel_size: number of GPUs used for LM-head vocab
+            parallelism. It is independent from attention tensor parallelism.
+
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2089,6 +2100,47 @@ def initialize_model_parallel(
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
+            recovered_rank=recovered_rank,
+        )
+
+    global _LM_HEAD_TP
+    assert _LM_HEAD_TP is None, "lm head tensor model parallel group is already initialized"
+    if lm_head_tensor_parallel_size <= 1:
+        _LM_HEAD_TP = init_model_parallel_group(
+            [[rank] for rank in range(world_size)],
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            use_message_queue_broadcaster=False,
+            group_name="lm_head_tp",
+            recovered_rank=recovered_rank,
+        )
+    elif lm_head_tensor_parallel_size == tensor_model_parallel_size:
+        _LM_HEAD_TP = _TP
+    else:
+        assert (
+                tensor_model_parallel_size % lm_head_tensor_parallel_size == 0
+        ), "tensor_model_parallel_size must be divisible by lm_head_tensor_parallel_size"
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            base = tp_group_idx * tensor_model_parallel_size
+            for lm_head_tp_group_idx in range(
+                    tensor_model_parallel_size // lm_head_tensor_parallel_size
+            ):
+                st = base + lm_head_tp_group_idx * lm_head_tensor_parallel_size
+                en = st + lm_head_tensor_parallel_size
+                group_ranks.append(list(range(st, en)))
+        _LM_HEAD_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_mscclpp_allreduce=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_allreduce=False,
+            use_message_queue_broadcaster=False,
+            group_name="lm_head_tp",
             recovered_rank=recovered_rank,
         )
 
@@ -2449,28 +2501,42 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    global _LM_HEAD_TP
     global _TP
+    global _PP
+    global _MOE_EP
+    global _MOE_TP
+    global _ATTN_CP
+    global _MOE_DP
+    global _ATTN_TP
+    global _PDMUX_PREFILL_TP_GROUP
+    global _DCP
+
+    if (
+        _LM_HEAD_TP
+        and _LM_HEAD_TP is not _TP
+        and _LM_HEAD_TP is not _ATTN_TP
+        and _LM_HEAD_TP is not _ATTN_CP
+    ):
+        _LM_HEAD_TP.destroy()
+    _LM_HEAD_TP = None
+
     if _TP:
         _TP.destroy()
     _TP = None
 
-    global _PP
     if _PP:
         _PP.destroy()
     _PP = None
 
-    global _MOE_EP
     if _MOE_EP:
         _MOE_EP.destroy()
     _MOE_EP = None
 
-    global _MOE_TP
     if _MOE_TP:
         _MOE_TP.destroy()
     _MOE_TP = None
 
-    global _ATTN_CP
-    global _MOE_DP
     # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
     # Only destroy if not aliasing another group.
     if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
@@ -2480,17 +2546,14 @@ def destroy_model_parallel():
         _ATTN_CP.destroy()
     _ATTN_CP = None
 
-    global _ATTN_TP
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
 
-    global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
         _PDMUX_PREFILL_TP_GROUP.destroy()
     _PDMUX_PREFILL_TP_GROUP = None
 
-    global _DCP
     if _DCP:
         _DCP.destroy()
     _DCP = None
