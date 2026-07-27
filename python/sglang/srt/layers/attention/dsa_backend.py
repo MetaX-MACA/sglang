@@ -1022,6 +1022,10 @@ class DeepseekSparseAttnBackend(
             ),
         }
 
+    def on_after_cuda_graph_warmup(self):
+        metadata = self.forward_metadata
+        metadata.flashmla_sched_metadata.tile_scheduler_metadata = None
+
     def _build_forward_metadata_cuda_graph(
         self,
         bs: int,
@@ -2602,10 +2606,6 @@ class DeepseekSparseAttnMultiStepBackend:
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
-
-    def on_after_cuda_graph_warmup(self):
-        metadata = self.forward_metadata
-        metadata.flashmla_sched_metadata.tile_scheduler_metadata = None
         
     def init_forward_metadata_out_graph(
         self,
