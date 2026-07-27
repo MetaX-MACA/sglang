@@ -912,6 +912,13 @@ class ServerArgs:
             aliases=["--moe-data-parallel-size"],
         ),
     ] = 1
+    lm_head_tp_size: A[
+        int,
+        Arg(
+            help="The lm head tensor parallelism size.",
+            aliases=["--lm-head-tp-size"],
+        ),
+    ] = 1
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -5349,6 +5356,21 @@ class ServerArgs:
         init_cp_strategy(self)
 
     def _handle_data_parallelism(self):
+        assert self.lm_head_tp_size >= 1, "lm_head_tp_size must be >= 1"
+        if self.lm_head_tp_size > 1:
+            assert (
+                self.tp_size % self.lm_head_tp_size == 0
+            ), "tp_size must be divisible by lm_head_tp_size"
+            if self.enable_dp_attention:
+                assert (
+                    self.dp_size % self.lm_head_tp_size == 0
+                    or self.lm_head_tp_size % self.dp_size == 0
+                    or self.tp_size == self.dp_size
+                ), (
+                    "lm_head_tp_size with DP attention expects an aligned layout. "
+                    "For EP32/DP32, use tp_size=dp_size and lm_head_tp_size=8."
+                )
+
         if self.dp_size == 1:
             self.enable_dp_attention = False
             self.enable_dp_lm_head = False
