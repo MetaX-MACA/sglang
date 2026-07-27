@@ -671,7 +671,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.ep_moe.kernels import (
-            silu_and_mul_masked_fwd,
+            silu_and_mul_masked,
         )
         from sglang.srt.layers.quantization.int8_kernel import (
             per_token_quant_int8,
@@ -705,7 +705,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         
         # Act
-        down_input = silu_and_mul_masked_fwd(gateup_output, masked_m)
+        down_input = silu_and_mul_masked(gateup_output, masked_m, self.swiglu_limit)
         del gateup_output
 
         # GroupGemm-2
