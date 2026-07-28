@@ -9,6 +9,16 @@ from sglang_router.router_args import RouterArgs
 
 logger = logging.getLogger("router")
 
+def _configure_logging(log_level: Optional[str]) -> None:
+    level_name = (log_level or "info").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
 try:
     from sglang_router.router import Router
 except ImportError:
@@ -36,6 +46,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             router_args = RouterArgs.from_cli_args(args)
         else:
             router_args = args
+
+        _configure_logging(router_args.log_level)
 
         if router_args.mini_lb:
             mini_lb = MiniLoadBalancer(router_args)
