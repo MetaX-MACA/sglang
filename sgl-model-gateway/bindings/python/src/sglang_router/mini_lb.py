@@ -3,28 +3,52 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
 import asyncio
+import dataclasses
 import ipaddress
 import logging
+import os
 import random
+import time
 import urllib
 import warnings
 from http import HTTPStatus
 from itertools import chain
-from typing import Optional
+from typing import List, Optional
 
 import aiohttp
 import orjson
+import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from sglang.srt.utils.common import get_bool_env_var
 from sglang_router.router_args import RouterArgs
 
+try:
+    from sglang.srt.observability.trace import (
+        process_tracing_init,
+        trace_get_remote_propagate_context,
+        trace_req_finish,
+        trace_req_start,
+        trace_set_thread_info,
+        trace_slice_end,
+        trace_slice_start,
+    )
+
+    trace_package_imported = True
+except ImportError:
+    trace_package_imported = False
+
 logger = logging.getLogger(__name__)
+
+_DEBUG_SHORTEST_QUEUE = get_bool_env_var("SGLANG_DEBUG_SHORTEST_QUEUE")
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
 )  # 64KB, to prevent aiohttp's "Chunk too big" error
 
+def _format_counts(counts: List[int]) -> str:
+    return "[" + ",".join(str(count) for count in counts) + "]"
 
 def maybe_wrap_ipv6_address(address: str) -> str:
     try:
@@ -33,6 +57,66 @@ def maybe_wrap_ipv6_address(address: str) -> str:
     except ValueError:
         return address
 
+class MinCount:
+    def __init__(self, num: int):
+        assert num > 0
+        self.mutex = asyncio.Lock()
+        self.counts = [0] * num
+        self.estimated_end_times = [1.0] * num
+
+    async def inc_min(self):
+        async with self.mutex:
+            min_val, min_weight = self.counts[0], self.estimated_end_times[0]
+            min_val_idx = 0
+            for i, (v, w) in enumerate(zip(self.counts, self.estimated_end_times)):
+                if v == 0:
+                    min_val_idx = i
+                    break
+                if v < min_val or (v == min_val and w < min_weight):
+                    min_val_idx, min_val, min_weight = i, v, w
+            self.counts[min_val_idx] += 1
+            self.estimated_end_times[min_val_idx] = time.perf_counter()
+        return min_val_idx
+
+    async def dec(self, index: int):
+        async with self.mutex:
+            assert self.counts[index] > 0
+            self.counts[index] -= 1
+
+
+def get_server_dp_size(url: str) -> int:
+    error_count = 0
+    while True:
+        try:
+            if error_count == 1:
+                logger.info(f"Retrying to get dp size from {url}")
+            response = requests.get(f"{url}/get_server_info", timeout=(1, 10))
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout):
+            error_count += 1
+            time.sleep(1)
+    response.raise_for_status()
+    info = response.json()
+    return info["dp_size"]
+
+
+def pack_room_id(p_id: int, d_id: int) -> int:
+    """Encode (p_id, d_id) using the same 10+10+43 layout as sglang backend."""
+    _prefill_width = 10
+    _decode_width = 10
+    _random_width = 43
+    if not (0 <= p_id < (1 << _prefill_width) and 0 <= d_id < (1 << _decode_width)):
+        raise ValueError("p_id and d_id must each be in [0, 1023].")
+    random_part = random.randrange(1 << _random_width)
+    return (random_part << (_prefill_width + _decode_width)) | (p_id << _decode_width) | d_id
+
+
+def unpack_room_id(room_id: int):
+    _prefill_width = 10
+    _decode_width = 10
+    p_id = (room_id >> _decode_width) & ((1 << _prefill_width) - 1)
+    d_id = room_id & ((1 << _decode_width) - 1)
+    return p_id, d_id
 
 class MiniLoadBalancer:
     def __init__(
@@ -44,12 +128,33 @@ class MiniLoadBalancer:
         self.host = router_args.host
         self.port = router_args.port
         self.timeout = router_args.request_timeout_secs
+        self.shortest_queue = router_args.enable_shortest_queue
         self.prefill_urls = [url[0] for url in router_args.prefill_urls]
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
         self.test_external_dp_routing = router_args.test_external_dp_routing
-        self.prefill_dp_size = None
-        self.decode_dp_size = None
+        self.otlp_traces_endpoint = router_args.otlp_traces_endpoint
+        self.enable_trace = router_args.enable_trace
+        if self.enable_trace and not trace_package_imported:
+            logger.warning(
+                "Tracing is not supported in this environment. Please install sglang."
+            )
+            self.enable_trace = False
+
+        if self.shortest_queue:
+            prefill_dp_sizes = [get_server_dp_size(url) for url in self.prefill_urls]
+            decode_dp_sizes = [get_server_dp_size(url) for url in self.decode_urls]
+            logger.info(f"Prefill dp sizes: {prefill_dp_sizes}, decode dp sizes: {decode_dp_sizes}")
+            assert len(set(prefill_dp_sizes)) == 1, (
+                f"All prefill servers must have the same dp size, got {prefill_dp_sizes}"
+            )
+            assert len(set(decode_dp_sizes)) == 1, (
+                f"All decode servers must have the same dp size, got {decode_dp_sizes}"
+            )
+            self.prefill_dp_size = prefill_dp_sizes[0]
+            self.decode_dp_size = decode_dp_sizes[0]
+            self.prefill_min_count = MinCount(sum(prefill_dp_sizes))
+            self.decode_min_count = MinCount(sum(decode_dp_sizes))
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
@@ -72,6 +177,9 @@ class MiniLoadBalancer:
     def start(self):
         global lb
         lb = self
+        if self.enable_trace:
+            process_tracing_init(self.otlp_traces_endpoint, "sglang")
+            trace_set_thread_info("Mini lb")
         uvicorn.run(app, host=self.host, port=self.port)
 
     async def _ensure_dp_sizes(self):
@@ -110,9 +218,65 @@ class MiniLoadBalancer:
             self.prefill_bootstrap_ports[pidx],
             self.decode_urls[didx],
         )
+    
+    async def select_pair_shortest(self):
+        assert len(self.prefill_urls) > 0, "No prefill servers available"
+        assert len(self.decode_urls) > 0, "No decode servers available"
+        p_id = await self.prefill_min_count.inc_min()
+        d_id = await self.decode_min_count.inc_min()
+        room_id = pack_room_id(p_id, d_id)
+        if _DEBUG_SHORTEST_QUEUE:
+            async with self.prefill_min_count.mutex:
+                async with self.decode_min_count.mutex:
+                    logger.info(
+                        f"inc: {room_id=}, {p_id=}, {d_id=}, "
+                        f"prefill={self.prefill_min_count.counts}, decode={self.decode_min_count.counts}"
+                    )
+        return (
+            self.prefill_urls[p_id // self.prefill_dp_size],
+            self.prefill_bootstrap_ports[p_id // self.prefill_dp_size],
+            self.decode_urls[d_id // self.decode_dp_size],
+            room_id,
+        )
+
+    async def completed(self, room_id):
+        if not self.shortest_queue or room_id is None:
+            return
+        p_id, d_id = unpack_room_id(room_id)
+        await self.prefill_min_count.dec(p_id)
+        await self.decode_min_count.dec(d_id)
+        if _DEBUG_SHORTEST_QUEUE:
+            async with self.prefill_min_count.mutex:
+                async with self.decode_min_count.mutex:
+                    logger.info(
+                        f"dec: {room_id=}, {p_id=}, {d_id=}, "
+                        f"prefill={self.prefill_min_count.counts}, decode={self.decode_min_count.counts}"
+                    )
+
+    async def prefill_completed(self, room_id):
+        if not self.shortest_queue or room_id is None:
+            return
+        p_id, _ = unpack_room_id(room_id)
+        await self.prefill_min_count.dec(p_id)
+        if _DEBUG_SHORTEST_QUEUE:
+            async with self.prefill_min_count.mutex:
+                logger.info(
+                    f"dec prefill: {room_id=}, {p_id=}, prefill={_format_counts(self.prefill_min_count.counts)}"
+                )
+
+    async def decode_completed(self, room_id):
+        if not self.shortest_queue or room_id is None:
+            return
+        _, d_id = unpack_room_id(room_id)
+        await self.decode_min_count.dec(d_id)
+        if _DEBUG_SHORTEST_QUEUE:
+            async with self.decode_min_count.mutex:
+                logger.info(
+                    f"dec decode: {room_id=}, {d_id=}, decode={_format_counts(self.decode_min_count.counts)}"
+                )
 
     async def generate(
-        self, modified_request, prefill_server, decode_server, endpoint
+        self, modified_request, prefill_server, decode_server, endpoint, server_room_id=None
     ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
@@ -165,13 +329,14 @@ class MiniLoadBalancer:
                         status_code=500,
                     )
 
+            await self.completed(server_room_id)
             return ORJSONResponse(
                 content=ret_json,
                 status_code=decode_response.status,
             )
 
     async def generate_stream(
-        self, modified_request, prefill_server, decode_server, endpoint="generate"
+        self, modified_request, prefill_server, decode_server, endpoint="generate", server_room_id=None
     ):
 
         if self.test_external_dp_routing:
@@ -180,55 +345,101 @@ class MiniLoadBalancer:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         async def stream_results():
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(
-                    total=self.timeout
-                )  # Add timeout for request reliability
-            ) as session:
-                # Create the tasks for both prefill and decode requests
-                tasks = [
-                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
-                ]
+            prefill_released = False
+            bootstrap_room_list = []
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(
+                        total=self.timeout
+                    )  # Add timeout for request reliability
+                ) as session:
+                    # Create the tasks for both prefill and decode requests
+                    headers = {}
+                    if self.enable_trace:
+                        bootstrap_room_list = (
+                            modified_request["bootstrap_room"]
+                            if isinstance(modified_request["bootstrap_room"], list)
+                            else [modified_request["bootstrap_room"]]
+                        )
+                        trace_context = trace_get_remote_propagate_context(
+                            bootstrap_room_list
+                        )
+                        headers = {"trace_context": trace_context}
 
-                # Wait for both responses to complete. Since this is streaming, they return immediately.
-                prefill_response, decode_response = await asyncio.gather(*tasks)
+                    tasks = [
+                        session.post(
+                            f"{prefill_server}/{endpoint}",
+                            json=modified_request,
+                            headers=headers,
+                        ),
+                        session.post(
+                            f"{decode_server}/{endpoint}",
+                            json=modified_request,
+                            headers=headers,
+                        ),
+                    ]
 
-                if modified_request.get("return_logprob", False):
-                    prefill_chunks = []
-                    async for chunk in prefill_response.content:
-                        prefill_chunks.append(chunk)
+                    for bootstrap_room in bootstrap_room_list:
+                        trace_slice_end(
+                            "mini_lb_launch", bootstrap_room, auto_next_anon=True
+                        )
+                    # Wait for both responses to complete. Since this is streaming, they return immediately.
+                    prefill_response, decode_response = await asyncio.gather(*tasks)
 
-                    first_prefill_chunk = (
-                        prefill_chunks[0].decode("utf-8")[5:].strip("\n")
-                    )
-                    first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
+                    if modified_request.get("return_logprob", False):
+                        prefill_chunks = []
+                        async for chunk in prefill_response.content:
+                            prefill_chunks.append(chunk)
 
-                    async for chunk in decode_response.content:
-                        # Note: This is inefficient
-                        # merge prefill input_token_logprobs, output_token_logprobs to decode
-                        decoded_chunk = chunk.decode("utf-8")
-                        if (
-                            decoded_chunk
-                            and decoded_chunk.startswith("data:")
-                            and "[DONE]" not in decoded_chunk
+                        first_prefill_chunk = (
+                            prefill_chunks[0].decode("utf-8")[5:].strip("\n")
+                        )
+                        first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
+
+                        async for chunk in decode_response.content:
+                            # Note: This is inefficient
+                            # merge prefill input_token_logprobs, output_token_logprobs to decode
+                            decoded_chunk = chunk.decode("utf-8")
+                            if (
+                                decoded_chunk
+                                and decoded_chunk.startswith("data:")
+                                and "[DONE]" not in decoded_chunk
+                            ):
+                                ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
+                                ret_json["meta_info"]["input_token_logprobs"] = (
+                                    first_prefill_chunk_json["meta_info"][
+                                        "input_token_logprobs"
+                                    ]
+                                    + ret_json["meta_info"]["input_token_logprobs"]
+                                )
+
+                                yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
+                            else:
+                                yield chunk
+                    else:
+                        first = True
+                        async for chunk in decode_response.content.iter_chunked(
+                            AIOHTTP_STREAM_READ_CHUNK_SIZE
                         ):
-                            ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
-                            ret_json["meta_info"]["input_token_logprobs"] = (
-                                first_prefill_chunk_json["meta_info"][
-                                    "input_token_logprobs"
-                                ]
-                                + ret_json["meta_info"]["input_token_logprobs"]
-                            )
-
-                            yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
-                        else:
+                            if first:
+                                first = False
+                                await lb.prefill_completed(server_room_id)
+                                prefill_released = True
                             yield chunk
+
+                    for bootstrap_room in bootstrap_room_list:
+                        trace_slice_end(
+                            "wait_PD_finish",
+                            bootstrap_room,
+                            thread_finish_flag=True,
+                        )
+                        trace_req_finish(bootstrap_room)
+
+            finally:
+                if prefill_released:
+                    await lb.decode_completed(server_room_id)
                 else:
-                    async for chunk in decode_response.content.iter_chunked(
-                        AIOHTTP_STREAM_READ_CHUNK_SIZE
-                    ):
-                        yield chunk
+                    await lb.completed(server_room_id)
 
         return StreamingResponse(
             stream_results(),
@@ -361,7 +572,11 @@ async def get_model_info():
 
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+    server_room_id = None
+    if lb.shortest_queue:
+        prefill_server, bootstrap_port, decode_server, server_room_id = await lb.select_pair_shortest()
+    else:
+        prefill_server, bootstrap_port, decode_server = lb.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
@@ -384,22 +599,26 @@ async def handle_generate_request(request_data: dict):
             {
                 "bootstrap_host": hostname,
                 "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
+                "bootstrap_room": server_room_id if server_room_id is not None else _generate_bootstrap_room(),
             }
         )
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
-            modified_request, prefill_server, decode_server, "generate"
+            modified_request, prefill_server, decode_server, "generate", server_room_id=server_room_id
         )
     else:
         return await lb.generate(
-            modified_request, prefill_server, decode_server, "generate"
+            modified_request, prefill_server, decode_server, "generate", server_room_id=server_room_id
         )
 
 
 async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+    server_room_id = None
+    if lb.shortest_queue:
+        prefill_server, bootstrap_port, decode_server, server_room_id = await lb.select_pair_shortest()
+    else:
+        prefill_server, bootstrap_port, decode_server = lb.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
@@ -409,7 +628,7 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
         {
             "bootstrap_host": hostname,
             "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(),
+            "bootstrap_room": server_room_id if server_room_id is not None else _generate_bootstrap_room(),
         }
     )
 
@@ -419,6 +638,7 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
             prefill_server,
             decode_server,
             endpoint=endpoint_name,
+            server_room_id=server_room_id,
         )
     else:
         return await lb.generate(
@@ -426,6 +646,7 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
             prefill_server,
             decode_server,
             endpoint=endpoint_name,
+            server_room_id=server_room_id,
         )
 
 
@@ -440,7 +661,11 @@ async def handle_completion_request(request_data: dict):
 
 
 def _generate_bootstrap_room():
-    return random.randint(0, 2**63 - 1)
+    bootstrap_room = random.randint(0, 2**63 - 1)
+    if lb.enable_trace:
+        trace_req_start(bootstrap_room, bootstrap_room, role="router")
+        trace_slice_start("mini_lb_launch", bootstrap_room)
+    return bootstrap_room
 
 
 # We may utilize `GenerateReqInput`'s logic later

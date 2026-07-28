@@ -47,6 +47,7 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.common import unpack_room_id
 
 logger = logging.getLogger(__name__)
 
@@ -1411,7 +1412,15 @@ class CommonKVReceiver(BaseKVReceiver):
                 and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
             )
 
-        self.prefill_dp_rank = prefill_dp_rank
+        if prefill_dp_rank is not None:
+            logger.debug(f"Targeting DP rank: {prefill_dp_rank}")
+            self.prefill_dp_rank = prefill_dp_rank
+        elif mgr.server_args.load_balance_method == "shortest_queue":
+            prefill_room_id, _ = unpack_room_id(self.bootstrap_room)
+            self.prefill_dp_rank = prefill_room_id % self.prefill_info.dp_size
+        else:
+            self.prefill_dp_rank = self.bootstrap_room % self.prefill_info.dp_size
+
         self._setup_bootstrap_infos()
         if self.conclude_state == KVPoll.Failed:
             return

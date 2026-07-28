@@ -115,7 +115,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
-ENABLE_KV_LAYOUT_FIX = get_bool_env_var("SGLANG_ENABLE_KV_LAYOUT_FIX", "false")
+ENABLE_KV_LAYOUT_FIX = get_bool_env_var("MX_SGLANG_ENABLE_KV_LAYOUT_FIX", "false")
 
 
 def _bootstrap_addr(req: Req) -> str:

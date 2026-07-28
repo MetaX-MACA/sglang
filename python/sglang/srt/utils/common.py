@@ -4855,3 +4855,42 @@ def init_cublas():
 def align_packed_tensor_size(k, align_size: int=256):
     valid_size = k // 2 + 2
     return math.ceil(valid_size / align_size) * align_size
+
+# == PD disaggregation room_id helpers ==
+_room_id_prefill_width = 10
+_room_id_decode_width = 10
+_room_id_random_width = 63 - _room_id_prefill_width - _room_id_decode_width
+
+
+def pack_room_id(prefill_id: int, decode_id: int) -> int:
+    """Encode (prefill_id, decode_id) into a 63-bit integer.
+
+    Layout (high �?low):
+      [62:20]  43-bit random part for uniqueness
+      [19:10]  10-bit prefill_id
+      [ 9: 0]  10-bit decode_id
+    """
+    if not (
+        0 <= prefill_id < (1 << _room_id_prefill_width)
+        and 0 <= decode_id < (1 << _room_id_decode_width)
+    ):
+        raise ValueError(
+            "prefill_id and decode_id must each be in [0, 1023]."
+        )
+    random_part = random.randrange(1 << _room_id_random_width)
+    return (
+        (random_part << (_room_id_prefill_width + _room_id_decode_width))
+        | (prefill_id << _room_id_decode_width)
+        | decode_id
+    )
+
+
+def unpack_room_id(value: int):
+    """Decode a room_id produced by :func:`pack_room_id`.
+
+    Returns:
+        (prefill_id, decode_id)
+    """
+    prefill_id = (value >> _room_id_decode_width) & ((1 << _room_id_prefill_width) - 1)
+    decode_id = value & ((1 << _room_id_decode_width) - 1)
+    return prefill_id, decode_id

@@ -66,6 +66,7 @@ from sglang.srt.utils.common import (
     configure_logger,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
+    unpack_room_id,
 )
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -86,6 +87,9 @@ class LoadBalanceMethod(Enum):
     """Load balance method."""
 
     ROUND_ROBIN = auto()
+    DECODE_ROUND_ROBIN = auto()
+    SHORTEST_QUEUE = auto()
+    MINIMUM_TOKENS = auto()
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
@@ -163,6 +167,9 @@ class DataParallelController:
         self.round_robin_counter = 0
         dispatch_lookup = {
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
+            LoadBalanceMethod.DECODE_ROUND_ROBIN: self.decode_round_robin_scheduler,
+            LoadBalanceMethod.SHORTEST_QUEUE: self.shortest_queue_scheduler,
+            LoadBalanceMethod.MINIMUM_TOKENS: self.minimum_tokens_scheduler,
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
@@ -776,6 +783,55 @@ class DataParallelController:
             f"Cannot route request: all {len(active)} active DP workers "
             "are unavailable."
         )
+
+    def decode_round_robin_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        if self.server_args.disaggregation_mode == "decode":
+            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                self.workers
+            )
+            return
+        self.round_robin_scheduler(req)
+    
+    def shortest_queue_scheduler(self, req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        if self.server_args.disaggregation_mode == "null":
+            # Non-PD mode: use dp_budget for load-based dispatch
+            target_worker = self.dp_budget.dispatch()
+            if target_worker is None:
+                self.round_robin_scheduler(req)
+            else:
+                self.workers[target_worker].send_pyobj(req)
+        elif self.server_args.disaggregation_mode == "decode":
+            assert (
+                req.bootstrap_room is not None
+            ), "req.bootstrap_room should not be None when shortest_queue is enabled in decode mode"
+            room_id_prefill, room_id_decode = unpack_room_id(req.bootstrap_room)
+            self.workers[room_id_decode % len(self.workers)].send_pyobj(req)
+        elif self.server_args.disaggregation_mode == "prefill":
+            assert (
+                req.bootstrap_room is not None
+            ), "req.bootstrap_room should not be None when shortest_queue is enabled in prefill mode"
+            room_id_prefill, room_id_decode = unpack_room_id(req.bootstrap_room)
+            self.workers[room_id_prefill % len(self.workers)].send_pyobj(req)
+        else:
+            raise NotImplementedError(
+                f"shortest_queue does not support disaggregation_mode={self.server_args.disaggregation_mode!r}"
+            )
+
+    def minimum_tokens_scheduler(self, req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        logger.warning(
+            "The 'minimum_tokens' load balancing method is deprecated for now and will introduced later."
+            "Fall back to 'round_robin_scheduler'"
+        )
+        self.round_robin_scheduler(req)
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
