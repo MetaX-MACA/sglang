@@ -43,6 +43,7 @@ class RouterArgs:
 
     # PD-specific configuration
     mini_lb: bool = False
+    enable_shortest_queue: bool = False
     test_external_dp_routing: bool = False
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
@@ -59,7 +60,7 @@ class RouterArgs:
     cache_threshold: float = 0.3
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
-    eviction_interval_secs: int = 60
+    eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
@@ -372,6 +373,11 @@ class RouterArgs:
             f"--{prefix}mini-lb",
             action="store_true",
             help="Enable MiniLB",
+        )
+        pd_group.add_argument(
+            f"--{prefix}enable-shortest-queue",
+            action="store_true",
+            help="Enable shortest queue scheduling in MiniLB (PD mode)",
         )
         pd_group.add_argument(
             f"--{prefix}test-external-dp-routing",
