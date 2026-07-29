@@ -490,10 +490,10 @@ class Indexer(MultiPlatformOp):
     def _weights_proj_bf16_in_fp32_out(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
     ) -> torch.Tensor:
-        # aiter (ROCm gfx95): extract the passthrough bf16 tensor from the
-        # 3-tuple (fp8, scale, bf16) produced by fused_rms_fp8_group_quant,
-        # avoiding an expensive FP8-to-bf16 dequantization.
-        if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
+        # A fused RMSNorm + FP8 producer may preserve its BF16 result as the
+        # third tuple item. Reuse it for the BF16/FP32 gate projection instead
+        # of immediately dequantizing the FP8 side channel.
+        if isinstance(x, tuple) and len(x) == 3:
             x = x[2]
         if _is_cuda:
             if envs.MX_ENABLE_DSA_INDEXER_GEMM_BF16.get():
@@ -1562,9 +1562,9 @@ class Indexer(MultiPlatformOp):
             
         if isinstance(x, tuple):
             x = x[-1]
-            q_lora_shape0 = q_lora[0].shape[0]
-        else:
-            q_lora_shape0 = q_lora.shape[0]
+
+        q_lora_meta = q_lora[0] if isinstance(q_lora, tuple) else q_lora
+        q_lora_shape0 = q_lora_meta.shape[0]
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -1683,17 +1683,11 @@ class Indexer(MultiPlatformOp):
                 # so delay store_k_cache after weights proj.
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
 
-            # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
-            # fused_rms_fp8_group_quant is passed directly to _get_logits_head_gate,
-            # which extracts the bf16 tensor via _weights_proj_bf16_in_fp32_out,
-            # completely skipping the FP8 dequantization path below.
-            if (
-                _use_aiter
-                and _is_gfx95_supported
-                and isinstance(x, tuple)
-                and len(x) == 3
-            ):
-                x_for_gate = x
+            # A fused RMSNorm + FP8 producer carries BF16 as item 3 for this
+            # gate path. Extract it before the piecewise/LoRA branches, which
+            # require a tensor rather than the quantization tuple.
+            if isinstance(x, tuple) and len(x) == 3:
+                x_for_gate = x[2]
             elif isinstance(x, tuple):
                 assert len(x) in (
                     2,

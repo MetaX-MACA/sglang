@@ -1630,6 +1630,7 @@ class DeepseekV2AttentionMLA(
                 eps=config.rms_norm_eps,
                 fused_quant=get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
                 or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL", default="false"),
+                return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
             )
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
@@ -2161,6 +2162,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_quant=fused_quant_pd,
+            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
