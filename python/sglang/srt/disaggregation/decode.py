@@ -95,7 +95,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
-ENABLE_KV_LAYOUT_FIX = get_bool_env_var("SGLANG_ENABLE_KV_LAYOUT_FIX", "false")
+ENABLE_KV_LAYOUT_FIX = get_bool_env_var("MX_SGLANG_ENABLE_KV_LAYOUT_FIX", "false")
 
 
 def _bootstrap_addr(req: Req) -> str:
@@ -426,8 +426,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
-            if not self.is_mla_backend and ENABLE_KV_LAYOUT_FIX:
-                # Interleave target and draft K/V pointers to maintain [All K] + [All V] layout
+            if not self.is_mla_backend:
+                # Always keep [All K] + [All V] layout when a draft pool exists, so the
+                # V-pointer offset (dst_num_total_layers + start_layer) in
+                # get_mha_kv_ptrs_with_pp is correct for both PP and MTP. (Previously gated
+                # behind ENABLE_KV_LAYOUT_FIX, which left the default [K_main,V_main,K_draft,
+                # V_draft] layout that breaks V transfer when MTP is on.)
                 half_t = len(kv_data_ptrs) // 2
                 half_d = len(draft_kv_data_ptrs) // 2
                 kv_data_ptrs = kv_data_ptrs[:half_t] + draft_kv_data_ptrs[:half_d] + kv_data_ptrs[half_t:] + draft_kv_data_ptrs[half_d:]
