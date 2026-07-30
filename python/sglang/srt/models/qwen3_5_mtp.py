@@ -167,7 +167,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         hidden_states = forward_batch.spec_info.hidden_states
 
-        if not forward_batch.forward_mode.is_idle():
+        # Guard against empty (0-token) batches
+        if not forward_batch.forward_mode.is_idle() and input_embeds.shape[0] > 0:
             input_embeds = self.pre_fc_norm_embedding(input_embeds)
             hidden_states = self.pre_fc_norm_hidden(hidden_states)
         hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)

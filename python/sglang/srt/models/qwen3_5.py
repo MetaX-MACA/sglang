@@ -619,7 +619,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle():
+        original_forward_mode = getattr(
+            forward_batch, "_original_forward_mode", forward_batch.forward_mode
+        )
+        if not original_forward_mode.is_idle():
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -888,7 +891,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle():
+        original_forward_mode = getattr(
+            forward_batch, "_original_forward_mode", forward_batch.forward_mode
+        )
+        if not original_forward_mode.is_idle():
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
