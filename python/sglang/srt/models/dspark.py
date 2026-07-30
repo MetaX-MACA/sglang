@@ -10,7 +10,9 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dspark_components.dspark_utils import (
+    make_qwen3_5_dspark_dflash_backbone_config,
     parse_dspark_draft_config,
+    qwen3_5_family_draft_config_enabled,
 )
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -361,8 +363,20 @@ _DSPARK_SKIPPED_WEIGHT_PREFIXES = (
 class DSparkDraftMixin:
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        dspark_config = parse_dspark_draft_config(draft_hf_config=config)
+        if not qwen3_5_family_draft_config_enabled():
+            super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+            dspark_config = parse_dspark_draft_config(draft_hf_config=config)
+        else:
+            dspark_config = parse_dspark_draft_config(draft_hf_config=config)
+            super().__init__(
+                config=make_qwen3_5_dspark_dflash_backbone_config(
+                    draft_hf_config=config,
+                    dspark_config=dspark_config,
+                ),
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+            self.config = config
         if not dspark_config.require_markov():
             raise ValueError(
                 "DSpark draft requires markov_rank > 0, "

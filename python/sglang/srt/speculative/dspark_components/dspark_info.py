@@ -21,6 +21,14 @@ class TargetVerifyResult(msgspec.Struct, frozen=True):
     can_run_cuda_graph: bool
 
 
+class CompactVerifyOutput(msgspec.Struct, frozen=True):
+    runtime_layout: object
+    semantic_layout: object
+    ragged_window: RaggedVerifyWindow
+    compact_logits: torch.Tensor
+    compact_hidden: torch.Tensor
+
+
 class DraftBlockResult(msgspec.Struct, frozen=True):
     draft_tokens: torch.Tensor
     corrected_logits: Optional[torch.Tensor]

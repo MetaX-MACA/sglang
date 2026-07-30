@@ -3,8 +3,10 @@ from typing import Optional
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.speculative.dspark_components.dspark_info import CompactVerifyOutput
 from sglang.srt.speculative.dspark_components.kernels.commit_inject_layout import (
     BuildCommitInjectLayout,
+    build_compact_commit_cache_locs_triton,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
@@ -154,4 +156,44 @@ class TargetHiddenKvInjector:
             cache_loc_2d=verify_cache_loc_2d,
             positions=positions_2d.reshape(-1),
             commit_lens=commit_lens,
+        )
+
+    def inject_qwen3_5_ragged_compact(
+        self,
+        *,
+        compact_output: CompactVerifyOutput,
+        commit_lens: torch.Tensor,
+        bs: int,
+    ) -> None:
+        hidden = compact_output.compact_hidden
+        if hidden.numel() == 0:
+            return
+        runtime_layout = compact_output.runtime_layout
+        if hidden.shape[0] != runtime_layout.graph_num_tokens:
+            raise ValueError(
+                "DSpark compact hidden rows must match the runtime graph tier: "
+                f"hidden_rows={hidden.shape[0]}, "
+                f"graph_num_tokens={runtime_layout.graph_num_tokens}."
+            )
+
+        if self.model_runner.mambaish_config is None:
+            raise RuntimeError(
+                "Qwen3.5/Qwen3.6 compact DSpark hidden commit requires a "
+                "recurrent target model."
+            )
+
+        # Generic KV pools reserve slot 0 for padded writes. Masking uncommitted
+        # compact rows to that slot lets the existing model writer consume M rows
+        # directly without exposing a new memory-pool API.
+        cache_loc = build_compact_commit_cache_locs_triton(
+            verify_cache_loc=compact_output.ragged_window.verify_cache_loc,
+            runtime_qo_indptr=runtime_layout.qo_indptr_device,
+            commit_lens=commit_lens,
+            bs=bs,
+            graph_num_tokens=runtime_layout.graph_num_tokens,
+        )
+        self.inject_target_hidden(
+            target_hidden=hidden,
+            cache_loc=cache_loc,
+            positions=compact_output.ragged_window.positions,
         )
