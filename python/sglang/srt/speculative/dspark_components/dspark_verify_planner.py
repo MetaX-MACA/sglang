@@ -37,6 +37,9 @@ from sglang.srt.speculative.dspark_components.dspark_sps_table import (
 from sglang.srt.speculative.dspark_components.dspark_sts_table import (
     load_sts_calibration_from_path,
 )
+from sglang.srt.speculative.dspark_components.dspark_utils import (
+    is_qwen3_5_family_dspark_enabled,
+)
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     graph_tier_fill_budget,
     local_verify_tier_num_tokens,
@@ -131,6 +134,7 @@ class DSparkVerifyPlanner:
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
         self._is_verify_all = True
+        self._qwen3_5_family_enabled = is_qwen3_5_family_dspark_enabled(model_runner)
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
             if self._confidence_head is None:
                 raise ValueError(
@@ -175,6 +179,12 @@ class DSparkVerifyPlanner:
                 if self.server_args.disable_overlap_schedule
                 else CONFIDENCE_RELAY_RING_LAG
             )
+            physical_tokens_for_budget = (
+                self._physical_tokens_for_budget
+                if self._qwen3_5_family_enabled
+                and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+                else None
+            )
             self._budget_planner = HostConfidenceBudgetPlanner(
                 sps_table=sps_table,
                 cfg=self._schedule_cfg,
@@ -182,6 +192,7 @@ class DSparkVerifyPlanner:
                 relay_lag_steps=relay_lag_steps,
                 online_profiler=online_profiler,
                 log_table_swaps=tp_rank == 0,
+                physical_tokens_for_budget=physical_tokens_for_budget,
             )
             self._dynamic_graph_tier = not is_dp_attention_enabled() and not (
                 online_profiler is not None and self.server_args.tp_size > 1
@@ -242,6 +253,22 @@ class DSparkVerifyPlanner:
                 f"verify_lens_cpu host reads on the critical path. Set "
                 f"SGLANG_PREP_IN_CUDA_GRAPH=1 or run SGLANG_RAGGED_VERIFY_MODE=static."
             )
+
+    def _physical_tokens_for_budget(
+        self, num_requests: int, semantic_tokens: int
+    ) -> Optional[int]:
+        decode_graph_runner = self.model_runner.decode_cuda_graph_runner
+        ragged_graph_grid = (
+            decode_graph_runner.ragged_graph_grid
+            if decode_graph_runner is not None
+            else None
+        )
+        if ragged_graph_grid is None:
+            return None
+        return ragged_graph_grid.physical_tokens(
+            runtime_bs=num_requests,
+            semantic_tokens=semantic_tokens,
+        )
 
     @property
     def carries_confidence(self) -> bool:
@@ -428,17 +455,18 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
+        scheduled_budget = self._budget_aligned_to_graph_tier(
+            req_pool_indices=req_pool_indices,
+            budget=budget,
+            global_num_reqs=global_num_reqs,
+            dp_tier_num_tokens=dp_tier_num_tokens,
+        )
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
             device=device,
             confidence=confidence,
-            budget=self._budget_aligned_to_graph_tier(
-                req_pool_indices=req_pool_indices,
-                budget=budget,
-                global_num_reqs=global_num_reqs,
-                dp_tier_num_tokens=dp_tier_num_tokens,
-            ),
+            budget=scheduled_budget,
         )
         if verify_lens is None:
             assert dp_tier_num_tokens is None, (
@@ -466,7 +494,9 @@ class DSparkVerifyPlanner:
         elif self._dynamic_graph_tier and budget is not None:
             tier_num_tokens = local_verify_tier_num_tokens(
                 bs=tier_num_reqs,
-                verify_token_budget=budget,
+                verify_token_budget=(
+                    scheduled_budget if self._qwen3_5_family_enabled else budget
+                ),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 min_verify_len=self._schedule_cfg.min_verify_len,
             )
@@ -488,9 +518,33 @@ class DSparkVerifyPlanner:
         )
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
         if graph_num_tokens_floor > 0 and capture_num_tokens is not None:
-            graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
+            decode_graph_runner = self.model_runner.decode_cuda_graph_runner
+            graph_spec = (
+                decode_graph_runner.select_ragged_verify_graph(
+                    runtime_bs=tier_num_reqs,
+                    semantic_tokens=graph_num_tokens_floor,
+                )
+                if decode_graph_runner.ragged_graph_grid is not None
+                else None
+            )
+            graph_num_tokens = (
+                graph_spec.num_tokens
+                if graph_spec is not None
+                else round_up_grid(graph_num_tokens_floor, capture_num_tokens)
+            )
             return RaggedVerifyLayout.from_verify_lens_device(
-                verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+                verify_lens=verify_lens,
+                graph_num_tokens=graph_num_tokens,
+                total_verify_tokens=(
+                    local_verify_tier_num_tokens(
+                        bs=bs,
+                        verify_token_budget=scheduled_budget,
+                        verify_num_draft_tokens=self.verify_num_draft_tokens,
+                        min_verify_len=self._schedule_cfg.min_verify_len,
+                    )
+                    if self._qwen3_5_family_enabled and scheduled_budget is not None
+                    else None
+                ),
             )
         verify_lens_cpu = verify_lens.to("cpu").tolist()
         grid = verify_layout_grid(
@@ -550,7 +604,20 @@ class DSparkVerifyPlanner:
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
         if graph_num_tokens_floor <= 0 or capture_num_tokens is None:
             return budget
-        graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
+        decode_graph_runner = self.model_runner.decode_cuda_graph_runner
+        graph_spec = (
+            decode_graph_runner.select_ragged_verify_graph(
+                runtime_bs=tier_num_reqs,
+                semantic_tokens=graph_num_tokens_floor,
+            )
+            if decode_graph_runner.ragged_graph_grid is not None
+            else None
+        )
+        graph_num_tokens = (
+            graph_spec.num_tokens
+            if graph_spec is not None
+            else round_up_grid(graph_num_tokens_floor, capture_num_tokens)
+        )
         return graph_tier_fill_budget(
             graph_num_tokens=graph_num_tokens,
             bs=int(req_pool_indices.shape[0]),

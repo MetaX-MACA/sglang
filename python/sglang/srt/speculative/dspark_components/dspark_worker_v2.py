@@ -35,6 +35,7 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_accept import (
+    accept_compact_greedy,
     accept_draft_tokens,
 )
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
@@ -74,7 +75,10 @@ from sglang.srt.speculative.dspark_components.dspark_target_verify import (
 )
 from sglang.srt.speculative.dspark_components.dspark_utils import (
     dspark_gamma_from_num_draft_tokens,
+    is_qwen3_5_family_dspark_enabled,
+    is_qwen3_5_family_target,
     parse_dspark_draft_config,
+    qwen3_5_family_draft_config_context,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     alloc_verify_window,
@@ -104,7 +108,6 @@ _STS_COLLECT_FLUSH_EVERY: int = 256
 
 
 class DSparkWorkerV2(BaseSpecWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -129,6 +132,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
         self.device = target_worker.device
+        self._qwen3_5_family_enabled = is_qwen3_5_family_dspark_enabled(
+            self.model_runner
+        )
+        if (
+            is_qwen3_5_family_target(self.model_runner)
+            and not self._qwen3_5_family_enabled
+        ):
+            raise RuntimeError(
+                "Qwen3.5/Qwen3.6 DSpark support is experimental. Set "
+                "SGLANG_ENABLE_DSPARK_QWEN3_5_FAMILY=1 to enable it."
+            )
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
         self._draft_dp_context_enabled = (
@@ -142,7 +156,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "MoE-under-DP all-reduce."
             )
 
-        with self._draft_context():
+        with (
+            self._draft_context(),
+            qwen3_5_family_draft_config_context(self._qwen3_5_family_enabled),
+        ):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -161,7 +178,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_sampler = None
 
         dspark_config = parse_dspark_draft_config(
-            draft_hf_config=self.draft_model_runner.model_config.hf_config
+            draft_hf_config=self.draft_model_runner.model_config.hf_config,
+            enable_qwen3_5_family_aliases=self._qwen3_5_family_enabled,
         )
         if not dspark_config.require_markov():
             raise ValueError(
@@ -275,7 +293,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self._verify_epilogue = None
         if (
-            self._verify_planner.is_compact_mode
+            not self._qwen3_5_family_enabled
+            and self._verify_planner.is_compact_mode
             and not server_args.disable_cuda_graph
             and is_cuda()
         ):
@@ -295,13 +314,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.model_runner.capture_tail_hooks.append(
                 self._verify_epilogue.capture_hook
             )
-
         self._verify_executor = TargetVerifyExecutor(
             target_worker=self.target_worker,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             model_runner=self.model_runner,
             kv_injector=self._kv_injector,
             verify_epilogue=self._verify_epilogue,
+            qwen3_5_family_enabled=self._qwen3_5_family_enabled,
         )
 
         self._sts_recorder: Optional[StsDataRecorder] = None
@@ -499,7 +518,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def dump_sps_records(self) -> Optional[dict]:
         if self._sps_recorder is None:
             return None
-        return {
+        dumped = {
             "mode": self._verify_planner.mode_value,
             "verify_num_draft_tokens": int(self.verify_num_draft_tokens),
             "simulate_acc_len": (
@@ -507,11 +526,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             ),
             "records": self._sps_recorder.dump_records(),
         }
+        if self._qwen3_5_family_enabled:
+            dumped["qwen3_5_family_enabled"] = True
+        return dumped
 
     def dump_info_records(self) -> Optional[dict]:
         dumped = self._info_dumper.dump()
         if dumped is None:
             return None
+        if self._qwen3_5_family_enabled:
+            dumped["qwen3_5_family_enabled"] = True
         dumped["simulate_acc_len"] = (
             self._simulate_acc_len if self._simulate_acc_len > 0 else None
         )
@@ -740,6 +764,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         sampling_info = batch.sampling_info
+        if (
+            self._qwen3_5_family_enabled
+            and self._simulate_acc_len > 0
+            and sampling_info is not None
+            and not sampling_info.is_all_greedy
+        ):
+            raise ValueError(
+                "SGLANG_SIMULATE_ACC_LEN for DSpark is a greedy-only smoke-test "
+                "mode. Set request temperature=0 (or top_k=1) when using it; "
+                "sampling requests would require target sampling from the simulated "
+                "bonus position and are intentionally rejected to avoid misleading "
+                "outputs."
+            )
         with self._draft_context(), self._info_dumper.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
@@ -811,25 +848,53 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ),
             )
 
+        compact_native_accept = (
+            self._qwen3_5_family_enabled
+            and run_compact
+            and (sampling_info is None or sampling_info.is_all_greedy)
+            and verify_logits_adjustments_are_noop(sampling_info)
+            and self._simulate_acc_len <= 0
+            and (self._block_accept_recorder is None or proposal.folded)
+        )
         fold_eligible = (
-            self._verify_executor.verify_epilogue is not None
+            not self._qwen3_5_family_enabled
+            and self._verify_executor.verify_epilogue is not None
             and proposal.folded
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
         )
+        compact_output = None
+        hidden_strided = None
         with self._info_dumper.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
-                target_verify, hidden_strided = self._verify_executor.run_compact(
-                    batch=batch,
-                    layout=layout,
-                    draft_block_ids=draft_block_ids,
-                    draft_tokens=draft_tokens,
-                    bs=bs,
-                    device=device,
-                    sampling_info=sampling_info,
-                    inject_gate=fold_eligible,
-                )
-            else:
+                if self._qwen3_5_family_enabled:
+                    compact_result = self._verify_executor.run_qwen3_5_compact(
+                        batch=batch,
+                        layout=layout,
+                        draft_block_ids=draft_block_ids,
+                        draft_tokens=draft_tokens,
+                        bs=bs,
+                        device=device,
+                        sampling_info=sampling_info,
+                        materialize_logits=not compact_native_accept,
+                    )
+                    if compact_result is None:
+                        run_compact = False
+                        layout = None
+                    else:
+                        target_verify, compact_output = compact_result
+                else:
+                    target_verify, hidden_strided = self._verify_executor.run_compact(
+                        batch=batch,
+                        layout=layout,
+                        draft_block_ids=draft_block_ids,
+                        draft_tokens=draft_tokens,
+                        bs=bs,
+                        device=device,
+                        sampling_info=sampling_info,
+                        inject_gate=fold_eligible,
+                    )
+            if not run_compact:
                 target_verify = self._verify_executor.run_non_compact(
                     batch=batch,
                     draft_input=draft_input,
@@ -837,10 +902,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_window=verify_window,
                     sampling_info=sampling_info,
                 )
-                hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
-
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
         if folded_accept:
@@ -851,6 +914,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             commit_lens = accept.commit_lens
             new_seq_lens = accept.new_seq_lens
             out_tokens = accept.out_tokens
+            observed_correct_len = correct_len
+        elif compact_native_accept and run_compact:
+            if compact_output is None:
+                raise RuntimeError("DSpark compact accept output is missing.")
+            correct_len, bonus, cap_trim_lens = accept_compact_greedy(
+                candidates=verify_ids_2d,
+                compact_target_logits=compact_output.compact_logits,
+                runtime_layout=compact_output.runtime_layout,
+                semantic_layout=compact_output.semantic_layout,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+            )
+            observed_correct_len = correct_len
         else:
             correct_len, bonus, cap_trim_lens = accept_draft_tokens(
                 candidates=verify_ids_2d,
@@ -862,7 +937,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 cutoff_layout=layout,
             )
-            if self._simulate_acc_len > 0:
+            observed_correct_len = correct_len
+
+        if not folded_accept:
+            if self._simulate_acc_len > 0 and self._qwen3_5_family_enabled:
+                correct_len, bonus, cap_trim_lens = self._apply_simulated_accept(
+                    logits_output=logits_output,
+                    bs=bs,
+                    correct_len=correct_len,
+                    cap_trim_lens=cap_trim_lens,
+                )
+            elif self._simulate_acc_len > 0:
                 correct_len = self._simulated_correct_len(
                     bs=bs, dtype=correct_len.dtype, device=correct_len.device
                 )
@@ -882,6 +967,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 gamma=self.gamma,
             )
+        if self._qwen3_5_family_enabled:
+            self._verify_executor.commit_recurrent_states(
+                batch=batch,
+                seq_lens_pre_verify=prefix_lens,
+                seq_lens_post_verify=new_seq_lens,
+                commit_lens=commit_lens,
+            )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(
@@ -898,6 +990,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 batch=batch,
                 layout=layout,
                 hidden_strided=hidden_strided,
+                compact_output=compact_output,
                 verify_window=verify_window,
                 logits_output=logits_output,
                 commit_lens=commit_lens,
@@ -908,6 +1001,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if not proposal.folded:
             self._maybe_record_sts_collect(
+                num_correct_drafts=observed_correct_len,
                 verify_ids_2d=verify_ids_2d,
                 target_logits=logits_output.next_token_logits,
                 bs=bs,
@@ -1047,9 +1141,30 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._simulated_correct_drafts_buf = buf
         return buf[:bs]
 
+    def _apply_simulated_accept(
+        self,
+        *,
+        logits_output,
+        bs: int,
+        correct_len: torch.Tensor,
+        cap_trim_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        simulated_correct_len = self._simulated_correct_len(
+            bs=bs, dtype=correct_len.dtype, device=correct_len.device
+        )
+        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+            bs, self.verify_num_draft_tokens
+        )
+        bonus = target_predict[
+            torch.arange(bs, device=target_predict.device),
+            simulated_correct_len.to(torch.long),
+        ].to(torch.int64)
+        return simulated_correct_len, bonus, torch.zeros_like(cap_trim_lens)
+
     def _maybe_record_sts_collect(
         self,
         *,
+        num_correct_drafts: torch.Tensor,
         verify_ids_2d: torch.Tensor,
         target_logits: torch.Tensor,
         bs: int,
@@ -1068,13 +1183,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 gamma=self.gamma,
                 flush_every=_STS_COLLECT_FLUSH_EVERY,
             )
-        target_predict = torch.argmax(target_logits, dim=-1).view(
-            bs, self.verify_num_draft_tokens
-        )
-        num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
-            candidates=verify_ids_2d,
-            target_predict=target_predict,
-        )
+        if not self._qwen3_5_family_enabled:
+            target_predict = torch.argmax(target_logits, dim=-1).view(
+                bs, self.verify_num_draft_tokens
+            )
+            num_correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
+                candidates=verify_ids_2d,
+                target_predict=target_predict,
+            )
         self._sts_recorder.record(
             confidence_raw=confidence_raw,
             num_correct_drafts=num_correct_drafts,

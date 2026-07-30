@@ -1,20 +1,69 @@
 from __future__ import annotations
 
+import copy
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, List, Optional
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DSPARK_GAMMA = 7
 SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
+_QWEN3_5_FAMILY_TEXT_MODEL_TYPES = frozenset({"qwen3_5_text", "qwen3_5_moe_text"})
+_QWEN3_5_FAMILY_TARGET_ARCHITECTURES = frozenset(
+    {
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }
+)
+_QWEN3_5_FAMILY_DRAFT_CONFIG_CONTEXT = ContextVar(
+    "qwen3_5_family_dspark_draft_config", default=False
+)
+
+
+def is_qwen3_5_family_target(model_runner) -> bool:
+    text_config = model_runner.model_config.hf_text_config
+    architectures = model_runner.model_config.hf_config.architectures or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    return (
+        text_config is not None
+        and text_config.model_type in _QWEN3_5_FAMILY_TEXT_MODEL_TYPES
+        and any(
+            architecture in _QWEN3_5_FAMILY_TARGET_ARCHITECTURES
+            for architecture in architectures
+        )
+    )
+
+
+def is_qwen3_5_family_dspark_enabled(model_runner) -> bool:
+    return (
+        envs.SGLANG_ENABLE_DSPARK_QWEN3_5_FAMILY.get()
+        and model_runner.spec_algorithm.is_dspark()
+        and is_qwen3_5_family_target(model_runner)
+    )
+
+
+@contextmanager
+def qwen3_5_family_draft_config_context(enabled: bool):
+    token = _QWEN3_5_FAMILY_DRAFT_CONFIG_CONTEXT.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _QWEN3_5_FAMILY_DRAFT_CONFIG_CONTEXT.reset(token)
+
+
+def qwen3_5_family_draft_config_enabled() -> bool:
+    return _QWEN3_5_FAMILY_DRAFT_CONFIG_CONTEXT.get()
 
 
 class DSparkLengthContract(msgspec.Struct, frozen=True):
-
     gamma: int
 
     @property
@@ -96,7 +145,9 @@ def _get_dspark_config(config: Any) -> dict:
         return {}
 
 
-def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
+def parse_dspark_draft_config(
+    *, draft_hf_config: Any, enable_qwen3_5_family_aliases: Optional[bool] = None
+) -> DSparkDraftConfig:
     base = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
 
     dspark_cfg = _get_dspark_config(draft_hf_config)
@@ -195,9 +246,35 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     else:
         target_layer_ids = base.target_layer_ids
 
+    enable_qwen3_5_family_aliases = (
+        _QWEN3_5_FAMILY_DRAFT_CONFIG_CONTEXT.get()
+        if enable_qwen3_5_family_aliases is None
+        else bool(enable_qwen3_5_family_aliases)
+    )
+    raw_target_num_layers = (
+        _cfg_get(draft_hf_config, "target_num_hidden_layers", None)
+        if enable_qwen3_5_family_aliases
+        else None
+    )
+    if raw_target_num_layers is not None:
+        try:
+            num_target_layers = int(raw_target_num_layers)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                "DSpark target_num_hidden_layers must be an integer, "
+                f"got {raw_target_num_layers!r}."
+            ) from e
+    else:
+        num_target_layers = base.num_target_layers
+    if num_target_layers is not None and int(num_target_layers) <= 0:
+        raise ValueError(
+            "DSpark target_num_hidden_layers must be positive, "
+            f"got {num_target_layers}."
+        )
+
     return DSparkDraftConfig(
         num_hidden_layers=base.num_hidden_layers,
-        num_target_layers=base.num_target_layers,
+        num_target_layers=num_target_layers,
         gamma=gamma,
         target_layer_ids=target_layer_ids,
         mask_token=base.mask_token,
@@ -205,3 +282,70 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
     )
+
+
+def make_qwen3_5_dspark_dflash_backbone_config(
+    *,
+    draft_hf_config: Any,
+    dspark_config: DSparkDraftConfig,
+    enable_qwen3_5_family_aliases: Optional[bool] = None,
+) -> Any:
+    """Adapt Qwen3.5-family DSpark aliases before DFlash backbone initialization."""
+    enable_qwen3_5_family_aliases = (
+        _QWEN3_5_FAMILY_DRAFT_CONFIG_CONTEXT.get()
+        if enable_qwen3_5_family_aliases is None
+        else bool(enable_qwen3_5_family_aliases)
+    )
+    if not enable_qwen3_5_family_aliases:
+        return draft_hf_config
+    if dspark_config.num_target_layers is None:
+        return draft_hf_config
+
+    try:
+        num_target_layers = int(dspark_config.num_target_layers)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            "DSpark num_target_layers must be an integer before DFlash backbone "
+            f"initialization, got {dspark_config.num_target_layers!r}."
+        ) from e
+    if num_target_layers <= 0:
+        raise ValueError(
+            "DSpark num_target_layers must be positive before DFlash backbone "
+            f"initialization, got {num_target_layers}."
+        )
+
+    raw_target_num_layers = _cfg_get(draft_hf_config, "target_num_hidden_layers", None)
+    if (
+        raw_target_num_layers is None
+        and _cfg_get(draft_hf_config, "num_target_layers", None) is not None
+    ):
+        return draft_hf_config
+
+    if raw_target_num_layers is not None:
+        try:
+            target_num_layers = int(raw_target_num_layers)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                "DSpark target_num_hidden_layers must be an integer before DFlash "
+                f"backbone initialization, got {raw_target_num_layers!r}."
+            ) from e
+        if target_num_layers <= 0:
+            raise ValueError(
+                "DSpark target_num_hidden_layers must be positive before DFlash "
+                f"backbone initialization, got {target_num_layers}."
+            )
+        if target_num_layers != num_target_layers:
+            raise ValueError(
+                "DSpark parsed num_target_layers does not match "
+                "target_num_hidden_layers before DFlash backbone initialization: "
+                f"parsed={num_target_layers}, target_num_hidden_layers="
+                f"{target_num_layers}."
+            )
+
+    if isinstance(draft_hf_config, dict):
+        backbone_config = dict(draft_hf_config)
+        backbone_config["num_target_layers"] = num_target_layers
+    else:
+        backbone_config = copy.copy(draft_hf_config)
+        backbone_config.num_target_layers = num_target_layers
+    return backbone_config

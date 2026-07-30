@@ -29,7 +29,18 @@ if not is_cpu():
 if is_cuda() or is_hip():
     from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
 
+if is_cuda():
+    from sglang.srt.layers.attention.linear.kernels.dspark_ragged_gdn import (
+        dspark_ragged_causal_conv1d_update,
+        dspark_ragged_gdn_supported,
+    )
+
+from sglang.srt.speculative.dspark_components.dspark_utils import (
+    is_qwen3_5_family_dspark_enabled,
+)
+
 MAX_FUSED_QKV_SPLIT_DIM = 8192
+
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -64,6 +75,7 @@ class GDNKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
     ):
         triton_kernel = TritonGDNKernel()
+        self.ragged_verify_kernel = triton_kernel
 
         cutedsl_kernel = None
         if decode_backend.is_triton():
@@ -265,6 +277,35 @@ class GDNKernelDispatcher:
             **kwargs,
         )
 
+    def ragged_target_verify(
+        self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.ragged_verify_kernel.target_verify(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            **kwargs,
+        )
+
 
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
@@ -284,6 +325,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        if is_cuda() and is_qwen3_5_family_dspark_enabled(model_runner):
+            (
+                self.supports_ragged_verify_graph,
+                _,
+            ) = dspark_ragged_gdn_supported()
+        else:
+            self.supports_ragged_verify_graph = False
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
@@ -426,25 +474,49 @@ class GDNAttnBackend(MambaAttnBackendBase):
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
         if is_target_verify:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
-            )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            ragged_layout = forward_metadata.ragged_verify_layout
+            if ragged_layout is not None:
+                batch_size = ragged_layout.bs
+                query_start_loc_for_verify = query_start_loc
+            else:
+                batch_size = seq_len // draft_token_num
+                query_start_loc_for_verify = query_start_loc
+            if ragged_layout is not None:
+                mixed_qkv = dspark_ragged_causal_conv1d_update(
+                    mixed_qkv,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    query_start_loc=query_start_loc_for_verify,
+                    cache_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[
+                        :batch_size
+                    ],
+                    activation=layer.activation,
+                )
+                seq_len = mixed_qkv.shape[0]
+            else:
+                mixed_qkv_reshaped = mixed_qkv.view(
+                    batch_size, draft_token_num, -1
+                ).transpose(1, 2)
+                mixed_qkv_processed = causal_conv1d_update(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[
+                        :batch_size
+                    ],
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
+                mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:
@@ -490,7 +562,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
-            core_attn_out = self.kernel_dispatcher.target_verify(
+            target_verify_fn = (
+                self.kernel_dispatcher.ragged_target_verify
+                if ragged_layout is not None
+                else self.kernel_dispatcher.target_verify
+            )
+            core_attn_out = target_verify_fn(
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
                 q=query,
@@ -500,7 +577,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 b=b,
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
+                query_start_loc=query_start_loc_for_verify,
                 intermediate_states_buffer=intermediate_state_cache,
                 intermediate_state_indices=intermediate_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
