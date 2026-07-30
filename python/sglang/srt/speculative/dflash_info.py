@@ -55,6 +55,8 @@ class DFlashVerifyInput(SpecInput):
         self,
         batch: ScheduleBatch,
         target_worker: TpModelWorker,
+        *,
+        init_eager_on_graph_miss: bool = True,
     ) -> tuple[ForwardBatch, bool]:
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
@@ -83,7 +85,7 @@ class DFlashVerifyInput(SpecInput):
             target_worker.model_runner.decode_cuda_graph_runner.load_batch(
                 verify_forward_batch
             )
-        elif not batch.forward_mode.is_idle():
+        elif init_eager_on_graph_miss and not batch.forward_mode.is_idle():
             target_worker.model_runner.attn_backend.init_forward_metadata(
                 verify_forward_batch
             )
@@ -117,6 +119,8 @@ class DFlashVerifyInput(SpecInput):
             qo_indptr = layout.qo_indptr_device
             verify_lens = layout.verify_lens
             kv_indices_extra = layout.total_verify_tokens
+            if kv_indices_extra is None and layout.graph_num_slots is not None:
+                kv_indices_extra = layout.graph_num_tokens
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
         paged_kernel_lens = paged_kernel_lens + verify_lens

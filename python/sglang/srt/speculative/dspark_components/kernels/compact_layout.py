@@ -10,6 +10,33 @@ from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 _KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_COMPACT_LAYOUT.get()
 
 _SEARCH_NBITS = 11
+COMPACT_ROW_SEARCH_NBITS = _SEARCH_NBITS
+
+
+@triton.jit
+def compact_row_from_qo_indptr(
+    row,
+    qo_indptr_ptr,
+    num_slots,
+    mask,
+    NBITS: tl.constexpr,
+):
+    lo = (row * 0).to(tl.int32)
+    hi = lo + num_slots
+    for _ in range(NBITS):
+        mid = (lo + hi) // 2
+        active = lo < hi
+        end = tl.load(
+            qo_indptr_ptr + tl.minimum(mid + 1, num_slots),
+            mask=mask,
+            other=0,
+        ).to(tl.int64)
+        go_right = end <= row
+        lo = tl.where(active & go_right, mid + 1, lo)
+        hi = tl.where(active & (~go_right), mid, hi)
+    req = lo
+    row_start = tl.load(qo_indptr_ptr + req, mask=mask, other=0).to(tl.int64)
+    return req, row - row_start
 
 
 class CompactRowIndex:

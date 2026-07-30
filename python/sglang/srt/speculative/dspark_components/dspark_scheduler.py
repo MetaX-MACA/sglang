@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import msgspec
 import torch
@@ -57,6 +57,7 @@ class VerifyBudgetDecision(msgspec.Struct):
     budget: int
     predicted_step_seconds: Optional[float] = None
     predicted_theta: Optional[float] = None
+    physical_batch_tokens: Optional[int] = None
 
 
 def compute_verify_token_budget(
@@ -64,6 +65,7 @@ def compute_verify_token_budget(
     history_survival_probs: torch.Tensor,
     sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
     cfg: DSparkScheduleConfig,
+    physical_tokens_for_budget: Optional[Callable[[int, int], Optional[int]]] = None,
 ) -> VerifyBudgetDecision:
     num_requests = history_survival_probs.shape[0]
     max_len = cfg.resolved_max_verify_len()
@@ -76,19 +78,62 @@ def compute_verify_token_budget(
     tau_star = num_requests + torch.cat(
         [torch.zeros(1, dtype=torch.float64), prefix_sum]
     )
+    if physical_tokens_for_budget is None:
+        semantic_batch_tokens = num_requests + torch.arange(
+            tau_star.numel(), dtype=torch.int64
+        )
+    else:
+        floor_batch_tokens = num_requests * max(cfg.min_verify_len, 1)
+        semantic_batch_tokens = floor_batch_tokens + torch.arange(
+            tau_star.numel(), dtype=torch.int64
+        )
+    physical_batch_tokens = semantic_batch_tokens
+    if physical_tokens_for_budget is not None:
+        mapped = [
+            physical_tokens_for_budget(num_requests, int(semantic_tokens))
+            for semantic_tokens in semantic_batch_tokens
+        ]
+        if any(value is not None for value in mapped):
+            unavailable = (
+                max(
+                    int(sps_table.max_batch_tokens)
+                    if isinstance(sps_table, SpsCostTable)
+                    else int(sps_table.m_probes[-1]),
+                    int(semantic_batch_tokens[-1]),
+                )
+                + 1
+            )
+            physical_batch_tokens = torch.tensor(
+                [unavailable if value is None else value for value in mapped],
+                dtype=torch.int64,
+            )
+            available_mask = torch.tensor(
+                [value is not None for value in mapped], dtype=torch.bool
+            )
+        else:
+            physical_batch_tokens = torch.full_like(
+                semantic_batch_tokens, num_requests * max_len
+            )
+            available_mask = torch.ones_like(semantic_batch_tokens, dtype=torch.bool)
+    else:
+        available_mask = torch.ones_like(semantic_batch_tokens, dtype=torch.bool)
+
     if isinstance(sps_table, SpsAdditiveCostTable):
         step_time = _additive_step_time_tensor(
             table=sps_table,
             num_requests=int(num_requests),
-            num_budgets=int(tau_star.numel()),
+            batch_tokens=physical_batch_tokens,
         )
         theta = tau_star / step_time
+        theta = torch.where(available_mask, theta, torch.full_like(theta, -torch.inf))
         idx = int(torch.argmax(theta))
         predicted_step_seconds = float(step_time[idx])
     else:
-        batch_tokens = num_requests + torch.arange(tau_star.numel(), dtype=torch.int64)
-        sps = _lookup_sps_tensor(sps_table=sps_table, batch_tokens=batch_tokens)
+        sps = _lookup_sps_tensor(
+            sps_table=sps_table, batch_tokens=physical_batch_tokens
+        )
         theta = tau_star * sps
+        theta = torch.where(available_mask, theta, torch.full_like(theta, -torch.inf))
         idx = int(torch.argmax(theta))
         sps_at_idx = float(sps[idx])
         predicted_step_seconds = 1.0 / sps_at_idx if sps_at_idx > 0 else None
@@ -96,6 +141,11 @@ def compute_verify_token_budget(
         budget=idx,
         predicted_step_seconds=predicted_step_seconds,
         predicted_theta=float(theta[idx]),
+        physical_batch_tokens=(
+            int(physical_batch_tokens[idx])
+            if physical_tokens_for_budget is not None
+            else None
+        ),
     )
 
 
@@ -110,14 +160,22 @@ def _lookup_sps_tensor(
 
 
 def _additive_step_time_tensor(
-    *, table: SpsAdditiveCostTable, num_requests: int, num_budgets: int
+    *,
+    table: SpsAdditiveCostTable,
+    num_requests: int,
+    batch_tokens: Optional[torch.Tensor] = None,
+    num_budgets: Optional[int] = None,
 ) -> torch.Tensor:
+    if batch_tokens is None:
+        if num_budgets is None:
+            raise ValueError("batch_tokens or num_budgets must be provided")
+        batch_tokens = num_requests + torch.arange(num_budgets, dtype=torch.int64)
     floor = table.bias_seconds + _interp_clamped(
         table.bs_probes, table.alpha_seconds, float(num_requests)
     )
     m_probes = torch.tensor(table.m_probes, dtype=torch.float64)
     theta_vals = torch.tensor(table.theta_seconds, dtype=torch.float64)
-    m = (num_requests + torch.arange(num_budgets, dtype=torch.float64)).clamp_(
+    m = batch_tokens.to(torch.float64).clamp_(
         min=float(table.m_probes[0]), max=float(table.m_probes[-1])
     )
     hi = torch.bucketize(m, m_probes, right=True).clamp_(1, m_probes.numel() - 1)
@@ -129,7 +187,6 @@ def _additive_step_time_tensor(
 
 
 class HostConfidenceBudgetPlanner:
-
     def __init__(
         self,
         *,
@@ -139,6 +196,9 @@ class HostConfidenceBudgetPlanner:
         relay_lag_steps: int = 1,
         online_profiler: Optional[OnlineSpsProfiler] = None,
         log_table_swaps: bool = False,
+        physical_tokens_for_budget: Optional[
+            Callable[[int, int], Optional[int]]
+        ] = None,
     ) -> None:
         cfg.validate()
         self.sps_table = sps_table
@@ -146,6 +206,7 @@ class HostConfidenceBudgetPlanner:
         self._online_profiler = online_profiler
         self._log_table_swaps = log_table_swaps
         self._model_runner = model_runner
+        self._physical_tokens_for_budget = physical_tokens_for_budget
         self.forced_budget_frac: Optional[float] = None
         self.last_decision: Optional[VerifyBudgetDecision] = None
         self.lag_steps = max(
@@ -176,19 +237,52 @@ class HostConfidenceBudgetPlanner:
         )
         forced_frac = self.forced_budget_frac
         if forced_frac is not None:
-            full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
+            if self._physical_tokens_for_budget is None:
+                full_budget = int(
+                    survival[:, : self.cfg.resolved_max_verify_len()].numel()
+                )
+                forced_budget = max(0, int(float(forced_frac) * full_budget))
+                self.last_decision = VerifyBudgetDecision(budget=forced_budget)
+                return forced_budget
+            num_requests = int(survival.shape[0])
+            floor_per_request = max(self.cfg.min_verify_len, 1)
+            full_budget = num_requests * (
+                self.cfg.resolved_max_verify_len() - floor_per_request
+            )
             forced_budget = max(0, int(float(forced_frac) * full_budget))
-            self.last_decision = VerifyBudgetDecision(budget=forced_budget)
+            semantic_tokens = num_requests * floor_per_request + forced_budget
+            physical_tokens = (
+                self._physical_tokens_for_budget(num_requests, semantic_tokens)
+                if self._physical_tokens_for_budget is not None
+                else semantic_tokens
+            )
+            if physical_tokens is None:
+                physical_tokens = num_requests * self.cfg.resolved_max_verify_len()
+            self.last_decision = VerifyBudgetDecision(
+                budget=forced_budget,
+                physical_batch_tokens=physical_tokens,
+            )
+            if self._online_profiler is not None:
+                self._observe_online_step(
+                    batch_tokens=(
+                        semantic_tokens if physical_tokens is None else physical_tokens
+                    )
+                )
             return forced_budget
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
             sps_table=self.sps_table,
             cfg=self.cfg,
+            physical_tokens_for_budget=self._physical_tokens_for_budget,
         )
         self.last_decision = decision
         if self._online_profiler is not None:
             self._observe_online_step(
-                batch_tokens=int(survival.shape[0]) + decision.budget
+                batch_tokens=(
+                    int(survival.shape[0]) + decision.budget
+                    if decision.physical_batch_tokens is None
+                    else decision.physical_batch_tokens
+                )
             )
         return decision.budget
 

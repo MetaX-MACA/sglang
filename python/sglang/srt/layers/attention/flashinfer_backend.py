@@ -11,7 +11,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 from functools import partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
@@ -37,6 +37,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.speculative.dspark_components.dspark_utils import (
+    is_qwen3_5_family_dspark_enabled,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
@@ -342,6 +345,13 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             self.num_wrappers = 1
             self.dispatch_reason = None
+
+        self.qwen3_5_dspark_enabled = is_qwen3_5_family_dspark_enabled(model_runner)
+        self.supports_ragged_verify_graph = (
+            self.qwen3_5_dspark_enabled
+            and self.dispatch_reason is None
+            and not self.enable_mis
+        )
 
         # Qwen2/Qwen3 models require higher flashinfer workspace size
         if (
@@ -650,14 +660,36 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        if (
-            getattr(spec_info, "ragged_verify_layout", None) is not None
-            and forward_mode.is_target_verify()
-        ):
-            raise NotImplementedError(
-                "FlashInfer does not support DSV4 ragged verify in cuda graph; "
-                "disable SGLANG_RAGGED_VERIFY_MODE for this configuration."
-            )
+        ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+        if ragged_layout is not None and forward_mode.is_target_verify():
+            if not self.qwen3_5_dspark_enabled:
+                raise NotImplementedError(
+                    "FlashInfer does not support DSV4 ragged verify in cuda graph; "
+                    "disable SGLANG_RAGGED_VERIFY_MODE for this configuration."
+                )
+            if getattr(spec_info, "topk", 1) > 1:
+                raise NotImplementedError(
+                    "FlashInfer DSpark compact target verify does not support "
+                    "topk > 1; disable compact mode or use topk=1."
+                )
+            if getattr(spec_info, "custom_mask", None) is not None:
+                raise NotImplementedError(
+                    "FlashInfer DSpark compact target verify does not support "
+                    "custom attention masks; disable compact mode for this "
+                    "configuration."
+                )
+            if (
+                ragged_layout.bs != bs
+                or ragged_layout.total_verify_tokens != ragged_layout.graph_num_tokens
+            ):
+                spec_info = replace(
+                    spec_info,
+                    ragged_verify_layout=ragged_layout.padded_to_bucket(
+                        padded_bs=bs
+                    ),
+                )
+
+        metadata_key = self._cuda_graph_metadata_key(bs, forward_mode, spec_info)
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
@@ -669,7 +701,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                decode_wrappers=self.decode_cuda_graph_metadata[bs],
+                decode_wrappers=self.decode_cuda_graph_metadata[metadata_key],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
                 fixed_split_size=None,
@@ -682,7 +714,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[metadata_key],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -694,7 +726,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[metadata_key],
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
@@ -706,7 +738,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.draft_extend_cuda_graph_metadata[bs],
+                prefill_wrappers=self.draft_extend_cuda_graph_metadata[metadata_key],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -717,7 +749,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if in_capture and forward_mode.is_decode_or_idle():
             # fast_decode_plan needs _cached_module from the initial begin_forward
             # above, so install it only after that first plan has run.
-            for w in self.decode_cuda_graph_metadata[bs]:
+            for w in self.decode_cuda_graph_metadata[metadata_key]:
                 w.begin_forward = partial(fast_decode_plan, w)
 
         if (
@@ -731,7 +763,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # Like decode: swap in fast_prefill_plan for replay, after the real
             # plan() above set up _cached_module (host metadata supplied per-replay
             # in call_begin_forward).
-            for w in self.draft_extend_cuda_graph_metadata[bs]:
+            for w in self.draft_extend_cuda_graph_metadata[metadata_key]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
         # Refill the SWA write-target buffer from the live out_cache_loc before
@@ -774,6 +806,30 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
             )
         elif forward_batch.forward_mode.is_target_verify():
+            spec_info = forward_batch.spec_info
+            ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+            if ragged_layout is not None and self.qwen3_5_dspark_enabled:
+                if getattr(spec_info, "topk", 1) > 1:
+                    raise NotImplementedError(
+                        "FlashInfer DSpark compact target verify does not support "
+                        "topk > 1; disable compact mode or use topk=1."
+                    )
+                if getattr(spec_info, "custom_mask", None) is not None:
+                    raise NotImplementedError(
+                        "FlashInfer DSpark compact target verify does not support "
+                        "custom attention masks; disable compact mode for this "
+                        "configuration."
+                    )
+                if (
+                    ragged_layout.total_verify_tokens
+                    != ragged_layout.graph_num_tokens
+                ):
+                    spec_info = replace(
+                        spec_info,
+                        ragged_verify_layout=ragged_layout.padded_to_bucket(
+                            padded_bs=forward_batch.batch_size
+                        ),
+                    )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -783,7 +839,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 prefill_wrappers=self.prefill_wrappers_verify,
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
-                spec_info=forward_batch.spec_info,
+                spec_info=spec_info,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify,
@@ -929,6 +985,34 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         return wrappers
 
+    @staticmethod
+    def _cuda_graph_metadata_key(
+        bs: int,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ):
+        """Keep separate FlashInfer wrappers for DSpark ragged ``(S, M)`` graphs.
+
+        FlashInfer CUDA Graph prefill wrappers fix both the request count and
+        the maximum total query rows on their first plan. Standard SGLang graph
+        paths use one wrapper per batch size. DSpark compact captures several
+        physical token tiers M for the same request-slot tier S, so keying only
+        by S would let the final capture overwrite wrappers for the other M
+        tiers.
+        """
+        if forward_mode.is_target_verify():
+            ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
+            if (
+                ragged_layout is not None
+                and ragged_layout.graph_num_slots is not None
+            ):
+                return (
+                    "dspark_ragged",
+                    bs,
+                    int(ragged_layout.graph_num_tokens),
+                )
+        return bs
+
     def _prepare_cuda_graph_metadata(
         self,
         bs: int,
@@ -936,9 +1020,10 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ) -> None:
+        metadata_key = self._cuda_graph_metadata_key(bs, forward_mode, spec_info)
         if forward_mode.is_decode_or_idle():
             decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
-            self.decode_cuda_graph_metadata[bs] = decode_wrappers
+            self.decode_cuda_graph_metadata[metadata_key] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
         elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
             use_custom_mask = (
@@ -947,14 +1032,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 and getattr(spec_info, "custom_mask", None) is not None
             )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.prefill_cuda_graph_metadata[metadata_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )
         elif forward_mode.is_draft_extend_v2():
             # Draft-extend: causal paged prefill over the full sequence (no mask).
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask=False)
-            self.draft_extend_cuda_graph_metadata[bs] = prefill_wrappers
+            self.draft_extend_cuda_graph_metadata[metadata_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")

@@ -92,10 +92,13 @@ from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.speculative.dspark_components.dspark_utils import (
+    is_qwen3_5_family_dspark_enabled,
+    is_qwen3_5_family_target,
+)
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
-    get_device_memory_capacity,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -517,17 +520,54 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
-        self.ragged_verify_mode = (
+        ragged_verify_requested = (
             ragged_verify_full_mode_enabled(self.model_runner.spec_algorithm)
             and (self.capture_forward_mode == ForwardMode.TARGET_VERIFY)
             and not self.model_runner.is_draft_worker
         )
+        qwen3_5_family_target = (
+            self.model_runner.spec_algorithm.is_dspark()
+            and is_qwen3_5_family_target(self.model_runner)
+        )
+        self.ragged_verify_mode = (
+            ragged_verify_requested and self.attn_backend.supports_ragged_verify_graph
+            if qwen3_5_family_target
+            else ragged_verify_requested
+        )
+        self.qwen3_5_ragged_graph_grid_enabled = (
+            self.ragged_verify_mode
+            and is_qwen3_5_family_dspark_enabled(self.model_runner)
+        )
+        if (
+            qwen3_5_family_target
+            and ragged_verify_requested
+            and not self.ragged_verify_mode
+            and get_tensor_model_parallel_rank() == 0
+        ):
+            logger.warning(
+                "DSPARK_RAGGED_FALLBACK destination=static "
+                "reason=attention_backend_capability"
+            )
+        self.ragged_graph_grid = None
+        if self.qwen3_5_ragged_graph_grid_enabled:
+            from sglang.srt.speculative.ragged_verify import RaggedVerifyGraphGrid
+
+            self.ragged_graph_grid = RaggedVerifyGraphGrid.from_capture_bs(
+                capture_bs=self.capture_bs,
+                max_verify_len=self.num_tokens_per_bs,
+                tier_config=(
+                    (str(self.num_tokens_per_bs),)
+                    if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get()
+                    else envs.SGLANG_DSPARK_COMPACT_GRAPH_VERIFY_TIERS.get()
+                ),
+            )
         self.capture_num_tokens: Optional[list[int]] = (
             self._build_ragged_verify_token_buckets()
             if self.ragged_verify_mode
             else None
         )
         self._ragged_graph_size = 0
+        self._ragged_graph_slots = 0
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap or model_runner.server_args.enable_lora
         ):
@@ -542,8 +582,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
-        self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.max_bs = (
+            max(spec.num_slots for spec in self.ragged_graph_grid.specs)
+            if self.qwen3_5_ragged_graph_grid_enabled
+            else max(self.capture_bs)
+        )
+        self.max_num_token = (
+            max(spec.num_tokens for spec in self.ragged_graph_grid.specs)
+            if self.qwen3_5_ragged_graph_grid_enabled
+            else self.max_bs * self.num_tokens_per_bs
+        )
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
@@ -635,13 +683,46 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         try:
             with model_capture_mode():
                 self.capture()
-        except RuntimeError as e:
-            raise Exception(
-                f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
-            )
+        except Exception as capture_error:
+            if not self.qwen3_5_ragged_graph_grid_enabled:
+                if not isinstance(capture_error, RuntimeError):
+                    raise
+                raise Exception(
+                    f"Capture cuda graph failed: {capture_error}\n"
+                    f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                )
+
+            if get_tensor_model_parallel_rank() == 0:
+                logger.warning(
+                    "DSPARK_RAGGED_FALLBACK destination=static "
+                    "reason=capture_failed error=%s: %s",
+                    type(capture_error).__name__,
+                    capture_error,
+                )
+            self.backend.cleanup()
+            self.ragged_verify_mode = False
+            self.qwen3_5_ragged_graph_grid_enabled = False
+            self.ragged_graph_grid = None
+            self.capture_num_tokens = None
+            self._ragged_graph_size = 0
+            self._ragged_graph_slots = 0
+            try:
+                with model_capture_mode():
+                    self.capture()
+            except Exception as static_capture_error:
+                raise Exception(
+                    "Capture cuda graph failed for both DSpark compact ragged "
+                    f"and static verify. Compact failure: {capture_error}; "
+                    f"static failure: {static_capture_error}\n"
+                    f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                ) from static_capture_error
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
-        buckets = sorted({bs * self.num_tokens_per_bs for bs in self.capture_bs})
+        buckets = (
+            sorted({spec.num_tokens for spec in self.ragged_graph_grid.specs})
+            if self.qwen3_5_ragged_graph_grid_enabled
+            else sorted({bs * self.num_tokens_per_bs for bs in self.capture_bs})
+        )
         assert buckets and buckets[0] > 0, f"{buckets=}"
         return buckets
 
@@ -675,6 +756,38 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             variant_label=variant_label,
         )
 
+    def _make_ragged_graph_key(self, spec, stream_idx=None):
+        return self._make_graph_key(
+            spec.num_tokens,
+            stream_idx,
+            f"dspark-ragged-s{spec.num_slots}",
+        )
+
+    def select_ragged_verify_graph(self, *, runtime_bs: int, semantic_tokens: int):
+        if self.ragged_graph_grid is None:
+            return None
+        return self.ragged_graph_grid.select(
+            runtime_bs=runtime_bs, semantic_tokens=semantic_tokens
+        )
+
+    def _ragged_graph_spec(self, ragged_layout, *, runtime_bs: int):
+        if self.ragged_graph_grid is None:
+            return None
+        graph_num_slots = ragged_layout.graph_num_slots
+        if graph_num_slots is not None:
+            return self.ragged_graph_grid.get(
+                num_tokens=ragged_layout.graph_num_tokens,
+                num_slots=graph_num_slots,
+            )
+        semantic_tokens = (
+            ragged_layout.total_verify_tokens
+            if ragged_layout.total_verify_tokens is not None
+            else ragged_layout.graph_num_tokens
+        )
+        return self.select_ragged_verify_graph(
+            runtime_bs=runtime_bs, semantic_tokens=semantic_tokens
+        )
+
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
 
@@ -698,23 +811,40 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return num_tokens // self.num_tokens_per_bs
         return min(num_tokens, self.max_bs)
 
-    def _capture_ragged_verify_layout(self, num_tokens: int):
+    def _capture_ragged_verify_layout(
+        self, num_tokens: int, num_slots: Optional[int] = None
+    ):
         if not self.ragged_verify_mode:
             return None
         if self.model_runner.is_draft_worker:
             return None
-        if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
+        if (
+            not self.qwen3_5_ragged_graph_grid_enabled
+            and envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get()
+        ):
             return None
         from sglang.srt.speculative.ragged_verify import (
             RaggedVerifyLayout,
             build_capture_verify_lens,
         )
 
+        capture_slots = (
+            num_slots
+            if self.qwen3_5_ragged_graph_grid_enabled
+            else self._ragged_capture_slots(num_tokens)
+        )
         verify_lens_cpu = build_capture_verify_lens(
             num_tokens=num_tokens,
-            num_slots=self._ragged_capture_slots(num_tokens),
+            num_slots=capture_slots,
             num_draft_tokens=self.num_tokens_per_bs,
         )
+        if self.qwen3_5_ragged_graph_grid_enabled:
+            return RaggedVerifyLayout.from_verify_lens(
+                verify_lens_cpu=verify_lens_cpu,
+                device=self.device,
+                grid=(num_tokens,),
+                graph_num_slots=capture_slots,
+            )
         return RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=verify_lens_cpu,
             device=self.device,
@@ -810,10 +940,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not self.attn_backend.supports_ragged_verify_graph:
             return False
 
-        admission_tokens = ragged_layout.graph_num_tokens
-        is_tokens_supported = admission_tokens <= self.capture_num_tokens[
-            -1
-        ] and forward_batch.batch_size <= self._ragged_capture_slots(admission_tokens)
+        if self.qwen3_5_ragged_graph_grid_enabled:
+            graph_spec = self._ragged_graph_spec(
+                ragged_layout, runtime_bs=forward_batch.batch_size
+            )
+            is_tokens_supported = graph_spec is not None
+        else:
+            admission_tokens = ragged_layout.graph_num_tokens
+            is_tokens_supported = admission_tokens <= self.capture_num_tokens[
+                -1
+            ] and forward_batch.batch_size <= self._ragged_capture_slots(
+                admission_tokens
+            )
 
         is_dp_supported = (
             forward_batch.can_run_dp_cuda_graph if self.require_mlp_sync else True
@@ -974,7 +1112,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             global_dp_buffer_len = None
 
-        spec_info = self.get_spec_info(num_tokens)
+        spec_info = (
+            self.get_spec_info(num_tokens, num_slots=bs)
+            if self.qwen3_5_ragged_graph_grid_enabled
+            else self.get_spec_info(num_tokens)
+        )
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
@@ -1098,6 +1240,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._post_process_after_profile(prof)
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
+        if self.qwen3_5_ragged_graph_grid_enabled:
+            self._capture_one_ragged_stream(stream_idx)
+            return
+
         avail_mem = get_available_gpu_memory(
             self.model_runner.device,
             self.model_runner.gpu_id,
@@ -1135,15 +1281,62 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ) as forward:
                     self.capture_one_shape(bs, forward, stream_idx, variant_label)
 
+    def _capture_one_ragged_stream(
+        self, stream_idx: Optional[int] = None
+    ) -> None:
+        capture_specs = list(reversed(self.ragged_graph_grid.specs))
+        capture_range = (
+            tqdm.tqdm(capture_specs)
+            if get_tensor_model_parallel_rank() == 0
+            else capture_specs
+        )
+        for spec in capture_range:
+            if get_tensor_model_parallel_rank() == 0:
+                avail_mem = get_available_gpu_memory(
+                    self.model_runner.device,
+                    self.model_runner.gpu_id,
+                    empty_cache=False,
+                )
+                capture_range.set_description(
+                    "Capturing DSpark ragged graphs "
+                    f"(M={spec.num_tokens} S={spec.num_slots} "
+                    f"avail_mem={avail_mem:.2f} GB)"
+                )
+            with torch_compile_decoration.patch_model(
+                self.model_runner.model,
+                spec.num_slots in self.compile_bs,
+                num_tokens=spec.num_tokens,
+                tp_group=self.model_runner.tp_group,
+            ) as forward:
+                self.capture_one_shape(
+                    spec.num_slots,
+                    forward,
+                    stream_idx,
+                    ragged_graph_spec=spec,
+                )
+
     def capture_one_shape(
         self,
         size: int,
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        ragged_graph_spec=None,
     ):
-        num_tokens = size * self.num_tokens_per_bs
-        bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
+        if ragged_graph_spec is not None:
+            if variant_label is not None:
+                raise ValueError(
+                    "DSpark ragged graph keys cannot be combined with LoRA variants"
+                )
+            num_tokens = ragged_graph_spec.num_tokens
+            bs = ragged_graph_spec.num_slots
+        else:
+            num_tokens = size * self.num_tokens_per_bs
+            bs = (
+                self._ragged_capture_slots(num_tokens)
+                if self.ragged_verify_mode
+                else size
+            )
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if self.model_runner.server_args.debug_cuda_graph:
@@ -1215,10 +1408,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 else contextlib.nullcontext()
             )
             with canary_ctx:
-                shape_key = self._make_graph_key(
-                    self._capture_graph_size(bs=bs, num_tokens=num_tokens),
-                    stream_idx,
-                    variant_label,
+                shape_key = (
+                    self._make_ragged_graph_key(ragged_graph_spec, stream_idx)
+                    if ragged_graph_spec is not None
+                    else self._make_graph_key(
+                        self._capture_graph_size(bs=bs, num_tokens=num_tokens),
+                        stream_idx,
+                        variant_label,
+                    )
                 )
                 self.backend.capture_one(
                     shape_key,
@@ -1282,17 +1479,36 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not forward_batch.needs_forward_metadata_init() and not must_refresh_metadata:
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
-            graph_size_key = (
-                self._ragged_graph_size
-                if is_ragged
-                else self._capture_graph_size(
-                    bs=self.bs, num_tokens=self.bs * self.num_tokens_per_bs
-                )
-            )
             if is_ragged:
+                graph_spec = (
+                    self._ragged_graph_spec(
+                        ragged_layout, runtime_bs=forward_batch.batch_size
+                    )
+                    if self.qwen3_5_ragged_graph_grid_enabled
+                    else None
+                )
+                if self.qwen3_5_ragged_graph_grid_enabled:
+                    assert graph_spec is not None, (
+                        "preplanned ragged layout does not match a captured graph: "
+                        f"M={ragged_layout.graph_num_tokens}, "
+                        f"S={ragged_layout.graph_num_slots}"
+                    )
+                    graph_size_key = graph_spec.num_tokens
+                else:
+                    graph_size_key = self._ragged_graph_size
                 assert self.raw_num_token == ragged_layout.graph_num_tokens, (
                     f"stale ragged raw_num_token {self.raw_num_token} != "
                     f"{ragged_layout.graph_num_tokens}"
+                )
+                if graph_spec is not None:
+                    assert self._ragged_graph_slots == graph_spec.num_slots, (
+                        f"stale ragged graph slots {self._ragged_graph_slots} != "
+                        f"{graph_spec.num_slots}"
+                    )
+            else:
+                graph_spec = None
+                graph_size_key = self._capture_graph_size(
+                    bs=self.bs, num_tokens=self.bs * self.num_tokens_per_bs
                 )
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
@@ -1307,10 +1523,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
-            variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-            self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label
+            self._replay_graph_key = (
+                self._make_ragged_graph_key(graph_spec, stream_idx)
+                if graph_spec is not None
+                else self._make_graph_key(
+                    graph_size_key,
+                    stream_idx,
+                    self._resolve_lora_variant(forward_batch),
+                )
             )
             return
 
@@ -1321,18 +1542,31 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if is_ragged:
             raw_num_token = ragged_layout.graph_num_tokens
-            graph_size_key = self._ragged_graph_num_tokens(raw_num_token)
-            assert graph_size_key == ragged_layout.graph_num_tokens, (
-                f"ragged verify tier mismatch: runner tier {graph_size_key} != "
-                f"layout graph_num_tokens {ragged_layout.graph_num_tokens}"
-            )
-            bs = self._ragged_capture_slots(graph_size_key)
-            assert bs >= raw_bs, (
-                f"ragged capture slots {bs} (tier {graph_size_key}) < raw_bs "
-                f"{raw_bs}; the planner must reject this batch before replay"
-            )
-            padded_num_tokens = graph_size_key
+            if self.qwen3_5_ragged_graph_grid_enabled:
+                graph_spec = self._ragged_graph_spec(ragged_layout, runtime_bs=raw_bs)
+                assert graph_spec is not None, (
+                    "ragged verify layout does not match a captured graph: "
+                    f"M={ragged_layout.graph_num_tokens}, "
+                    f"S={ragged_layout.graph_num_slots}, raw_bs={raw_bs}"
+                )
+                graph_size_key = graph_spec.num_tokens
+                bs = graph_spec.num_slots
+                padded_num_tokens = graph_spec.num_tokens
+            else:
+                graph_spec = None
+                graph_size_key = self._ragged_graph_num_tokens(raw_num_token)
+                assert graph_size_key == ragged_layout.graph_num_tokens, (
+                    f"ragged verify tier mismatch: runner tier {graph_size_key} != "
+                    f"layout graph_num_tokens {ragged_layout.graph_num_tokens}"
+                )
+                bs = self._ragged_capture_slots(graph_size_key)
+                assert bs >= raw_bs, (
+                    f"ragged capture slots {bs} (tier {graph_size_key}) < raw_bs "
+                    f"{raw_bs}; the planner must reject this batch before replay"
+                )
+                padded_num_tokens = graph_size_key
         else:
+            graph_spec = None
             raw_num_token = raw_bs * self.num_tokens_per_bs
             if (
                 self.require_mlp_tp_gather
@@ -1407,14 +1641,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.bs = bs
         if is_ragged:
             self._ragged_graph_size = graph_size_key
+            self._ragged_graph_slots = (
+                graph_spec.num_slots
+                if graph_spec is not None
+                else self._ragged_capture_slots(graph_size_key)
+            )
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
-        variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label
+        self._replay_graph_key = (
+            self._make_ragged_graph_key(graph_spec, stream_idx)
+            if graph_spec is not None
+            else self._make_graph_key(
+                graph_size_key,
+                stream_idx,
+                self._resolve_lora_variant(forward_batch),
+            )
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
@@ -1454,7 +1698,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.forward_mode.name,
                     forward_batch.batch_size,
                     (
-                        f" slots={self._ragged_capture_slots(self._replay_graph_key.size)}"
+                        f" slots={self._ragged_graph_slots}"
+                        if self.qwen3_5_ragged_graph_grid_enabled
+                        else f" slots={self._ragged_capture_slots(self._replay_graph_key.size)}"
                         if self.ragged_verify_mode
                         else ""
                     ),
@@ -1499,7 +1745,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
-    def get_spec_info(self, num_tokens: int):
+    def get_spec_info(self, num_tokens: int, num_slots: Optional[int] = None):
         spec_info = None
         if (
             self.model_runner.spec_algorithm.is_eagle()
@@ -1562,7 +1808,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if self.model_runner.is_draft_worker
                     else CaptureHiddenMode.FULL
                 ),
-                ragged_verify_layout=self._capture_ragged_verify_layout(num_tokens),
+                ragged_verify_layout=(
+                    None
+                    if self.qwen3_5_ragged_graph_grid_enabled and num_slots is None
+                    else self._capture_ragged_verify_layout(num_tokens, num_slots)
+                ),
             )
 
         elif self.model_runner.spec_algorithm.is_ngram():

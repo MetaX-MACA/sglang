@@ -1013,6 +1013,37 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # passes its own positions (uniform num_draft_tokens per request).
         if seq_positions is None:
             seq_positions = batch.spec_info.positions
+
+        ragged_layout = getattr(batch.spec_info, "ragged_verify_layout", None)
+        if (
+            ragged_layout is not None
+            and ragged_layout.graph_num_slots is not None
+        ):
+            seq_positions = seq_positions.flatten()
+            if all(mm_input is None for mm_input in mm_inputs):
+                adjusted_positions = seq_positions
+            else:
+                mrope_deltas = [
+                    (
+                        torch.zeros(1, dtype=torch.int64)
+                        if mm_inputs[i] is None
+                        else mm_inputs[i].mrope_position_delta.squeeze(0)
+                    )
+                    for i in range(batch_size)
+                ]
+                mrope_delta_tensor = (
+                    torch.stack(mrope_deltas, dim=0)
+                    .to(device=device)
+                    .reshape(batch_size)
+                )
+                token_deltas = torch.repeat_interleave(
+                    mrope_delta_tensor,
+                    ragged_layout.verify_lens[:batch_size].to(torch.int64),
+                )
+                adjusted_positions = seq_positions + token_deltas
+            self.mrope_positions = adjusted_positions.unsqueeze(0).repeat(3, 1)
+            return
+
         seq_positions = seq_positions.view(batch_size, -1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):

@@ -18,11 +18,14 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
 @dataclass(kw_only=True)
@@ -53,6 +56,7 @@ class ForwardMetadata:
 
     is_target_verify: bool = False
     draft_token_num: int = 1
+    ragged_verify_layout: Optional["RaggedVerifyLayout"] = None
 
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
@@ -193,6 +197,7 @@ class Mamba2Metadata(ForwardMetadata):
             num_prefill_tokens=0,
             is_target_verify=is_target_verify,
             draft_token_num=draft_token_num,
+            ragged_verify_layout=forward_metadata.ragged_verify_layout,
         )
 
     @classmethod
@@ -288,6 +293,7 @@ class Mamba2Metadata(ForwardMetadata):
             num_decodes=num_decodes,
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             draft_token_num=draft_token_num,
+            ragged_verify_layout=forward_metadata.ragged_verify_layout,
             mixed_metadata=cls.MixedMetadata(
                 has_initial_states=has_initial_states,
                 prep_initial_states=prep_initial_states,
