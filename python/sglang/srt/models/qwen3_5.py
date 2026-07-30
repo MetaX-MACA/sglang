@@ -1623,6 +1623,24 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         return loaded_params
 
 
+def _set_qwen3_5_dspark_layers_to_capture(
+    module: nn.Module, layer_ids: Optional[list[int]]
+) -> None:
+    if not envs.SGLANG_ENABLE_DSPARK_QWEN3_5_FAMILY.get():
+        raise RuntimeError(
+            "Qwen3.5/Qwen3.6 DSpark support is experimental. Set "
+            "SGLANG_ENABLE_DSPARK_QWEN3_5_FAMILY=1 to enable it."
+        )
+    if not module.pp_group.is_last_rank:
+        return
+    if layer_ids is None:
+        raise ValueError(
+            "DSPARK requires explicit Qwen3.5/Qwen3.6 layer_ids for aux hidden capture."
+        )
+    module.capture_aux_hidden_states = True
+    module.model.set_dflash_layers_to_capture([layer_id + 1 for layer_id in layer_ids])
+
+
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
@@ -1668,6 +1686,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
+
+    def set_dspark_layers_to_capture(self, layer_ids: Optional[list[int]]):
+        _set_qwen3_5_dspark_layers_to_capture(self, layer_ids)
 
     def set_embed_and_head(self, embed, head):
         if self.pp_group.is_first_rank and embed is not None:
@@ -1827,6 +1848,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
+
+    def set_dspark_layers_to_capture(self, layer_ids: Optional[list[int]]):
+        _set_qwen3_5_dspark_layers_to_capture(self, layer_ids)
 
     def set_embed_and_head(self, embed, head):
         if self.pp_group.is_first_rank and embed is not None:

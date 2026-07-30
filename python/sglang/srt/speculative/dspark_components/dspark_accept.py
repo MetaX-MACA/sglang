@@ -6,7 +6,11 @@ import torch
 
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dspark_components.dspark_info import DraftBlockResult
-from sglang.srt.speculative.dspark_components.kernels.accept_greedy import AcceptGreedy
+from sglang.srt.speculative.dspark_components.kernels.accept_greedy import (
+    AcceptGreedy,
+    accept_greedy_from_predictions_triton,
+    compact_predictions_to_strided_triton,
+)
 from sglang.srt.speculative.dspark_components.kernels.accept_sampling import (
     AcceptSampling,
 )
@@ -81,3 +85,44 @@ def accept_draft_tokens(
         sampling_trim=sampling_trim,
     )
     return selected.correct_len, selected.bonus, selected.cap_trim_lens
+
+
+def accept_compact_greedy(
+    *,
+    candidates: torch.Tensor,
+    compact_target_logits: torch.Tensor,
+    runtime_layout: RaggedVerifyLayout,
+    semantic_layout: RaggedVerifyLayout,
+    verify_num_draft_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bs = int(candidates.shape[0])
+    if int(semantic_layout.verify_lens.numel()) != bs:
+        raise ValueError(
+            "DSpark compact accept semantic layout must match candidates: "
+            f"semantic_bs={int(semantic_layout.verify_lens.numel())}, bs={bs}."
+        )
+    if compact_target_logits.ndim != 2:
+        raise ValueError(
+            "DSpark compact accept requires [tokens, vocab] target logits, got "
+            f"shape={tuple(compact_target_logits.shape)}."
+        )
+    if compact_target_logits.shape[0] != runtime_layout.graph_num_tokens:
+        raise ValueError(
+            "DSpark compact target logits do not match the runtime graph tier: "
+            f"rows={compact_target_logits.shape[0]}, "
+            f"graph_num_tokens={runtime_layout.graph_num_tokens}."
+        )
+
+    compact_predict = torch.argmax(compact_target_logits, dim=-1)
+    target_predict = compact_predictions_to_strided_triton(
+        compact_predict=compact_predict,
+        runtime_qo_indptr=runtime_layout.qo_indptr_device,
+        semantic_verify_lens=semantic_layout.verify_lens,
+        bs=bs,
+        stride=verify_num_draft_tokens,
+    )
+    return accept_greedy_from_predictions_triton(
+        candidates=candidates,
+        target_predict=target_predict,
+        cutoff_verify_lens=semantic_layout.verify_lens,
+    )

@@ -157,3 +157,43 @@ def scatter_compact_to_strided_triton(
         stride=stride,
         fill_value=fill_value,
     )
+
+
+def scatter_runtime_compact_to_strided_triton(
+    *,
+    compact: torch.Tensor,
+    runtime_layout: RaggedVerifyLayout,
+    semantic_layout: RaggedVerifyLayout,
+    fill_value: float,
+    verify_num_draft_tokens: int,
+) -> torch.Tensor:
+    bs = semantic_layout.bs
+    stride = verify_num_draft_tokens
+    if runtime_layout.runtime_num_slots < bs:
+        raise ValueError(
+            "DSpark runtime compact layout has fewer slots than semantic rows: "
+            f"runtime_slots={runtime_layout.runtime_num_slots}, bs={bs}."
+        )
+    if compact.ndim != 2 or compact.shape[0] != runtime_layout.graph_num_tokens:
+        raise ValueError(
+            "DSpark runtime compact tensor must match the graph token tier: "
+            f"shape={tuple(compact.shape)}, "
+            f"graph_num_tokens={runtime_layout.graph_num_tokens}."
+        )
+
+    dim = compact.shape[1]
+    out = torch.empty((bs * stride, dim), dtype=compact.dtype, device=compact.device)
+    fill = float(fill_value) if out.dtype.is_floating_point else int(fill_value)
+    block_d = 1024
+    grid = (bs * stride, triton.cdiv(dim, block_d))
+    _scatter_compact_to_strided_kernel[grid](
+        compact.contiguous(),
+        semantic_layout.verify_lens,
+        runtime_layout.qo_indptr_device,
+        out,
+        stride,
+        dim,
+        fill,
+        BLOCK_D=block_d,
+    )
+    return out

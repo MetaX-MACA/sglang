@@ -6,6 +6,10 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.speculative.dspark_components.kernels.compact_layout import (
+    COMPACT_ROW_SEARCH_NBITS,
+    compact_row_from_qo_indptr,
+)
 
 _KERNEL_IMPL = envs.SGLANG_DSPARK_KERNEL_COMMIT_INJECT_LAYOUT.get()
 
@@ -172,3 +176,83 @@ def build_commit_inject_layout_triton(
         BLOCK=BLOCK,
     )
     return CommitInjectLayoutResult(swa_loc=swa_loc, positions=positions)
+
+
+@triton.jit
+def _compact_commit_locs_kernel(
+    verify_cache_loc_ptr,
+    runtime_qo_indptr_ptr,
+    commit_lens_ptr,
+    out_ptr,
+    real_bs,
+    num_slots,
+    n,
+    BLOCK: tl.constexpr,
+    NBITS: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    row = offs.to(tl.int64)
+
+    req, within = compact_row_from_qo_indptr(
+        row, runtime_qo_indptr_ptr, num_slots, mask, NBITS
+    )
+    safe_req = tl.minimum(req, real_bs - 1)
+    commit_len = tl.load(commit_lens_ptr + safe_req, mask=mask, other=0).to(tl.int64)
+    committed = mask & (req < real_bs) & (within < commit_len)
+    full_loc = tl.load(verify_cache_loc_ptr + offs, mask=committed, other=0).to(
+        tl.int64
+    )
+    out = tl.where(committed, full_loc, 0)
+    tl.store(out_ptr + offs, out, mask=mask)
+
+
+def build_compact_commit_cache_locs_triton(
+    *,
+    verify_cache_loc: torch.Tensor,
+    runtime_qo_indptr: torch.Tensor,
+    commit_lens: torch.Tensor,
+    bs: int,
+    graph_num_tokens: int,
+) -> torch.Tensor:
+    if bs < 1:
+        raise ValueError(f"DSpark compact hidden commit requires bs >= 1, got {bs}.")
+    if int(commit_lens.numel()) != bs:
+        raise ValueError(
+            "DSpark compact hidden commit lengths must match the real batch: "
+            f"commit_lens={int(commit_lens.numel())}, bs={bs}."
+        )
+    if int(verify_cache_loc.numel()) != graph_num_tokens:
+        raise ValueError(
+            "DSpark compact hidden cache locations must match the graph tier: "
+            f"cache_locs={int(verify_cache_loc.numel())}, "
+            f"graph_num_tokens={graph_num_tokens}."
+        )
+    num_slots = int(runtime_qo_indptr.numel()) - 1
+    if num_slots < bs:
+        raise ValueError(
+            "DSpark compact hidden runtime slots cannot be smaller than the real "
+            f"batch: runtime_slots={num_slots}, bs={bs}."
+        )
+    if num_slots > 1 << COMPACT_ROW_SEARCH_NBITS:
+        raise ValueError(
+            "DSpark compact hidden commit supports at most 2048 runtime slots, "
+            f"got runtime_slots={num_slots}."
+        )
+
+    out = torch.empty(
+        graph_num_tokens, dtype=torch.int64, device=verify_cache_loc.device
+    )
+    block = 256
+    _compact_commit_locs_kernel[(triton.cdiv(graph_num_tokens, block),)](
+        verify_cache_loc,
+        runtime_qo_indptr,
+        commit_lens,
+        out,
+        bs,
+        num_slots,
+        graph_num_tokens,
+        BLOCK=block,
+        NBITS=COMPACT_ROW_SEARCH_NBITS,
+    )
+    return out

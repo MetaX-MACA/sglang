@@ -1,4 +1,5 @@
 import logging
+from dataclasses import replace
 from typing import Optional, Union
 
 import torch
@@ -24,6 +25,30 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
+
+
+def _ragged_verify_layout_from_spec(
+    spec_info: Optional[SpecInput], *, padded_bs: Optional[int] = None
+):
+    layout = getattr(spec_info, "ragged_verify_layout", None)
+    if layout is None or layout.graph_num_slots is None:
+        return None
+    if padded_bs is None:
+        padded_bs = layout.bs
+    if (
+        layout.bs != padded_bs
+        or layout.total_verify_tokens != layout.graph_num_tokens
+    ):
+        layout = layout.padded_to_bucket(padded_bs=padded_bs)
+    return layout
+
+
+def _spec_info_with_ragged_layout(spec_info: Optional[SpecInput], layout):
+    if spec_info is None or layout is None:
+        return spec_info
+    if getattr(spec_info, "ragged_verify_layout", None) is layout:
+        return spec_info
+    return replace(spec_info, ragged_verify_layout=layout)
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -195,13 +220,19 @@ class MambaAttnBackendBase(AttentionBackend):
                 # the draft model, so mamba metadata can be skipped.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
-                query_start_loc = torch.arange(
-                    0,
-                    forward_batch.input_ids.shape[0] + 1,
-                    step=forward_batch.spec_info.draft_token_num,
-                    dtype=torch.int32,
-                    device=forward_batch.input_ids.device,
+                ragged_layout = _ragged_verify_layout_from_spec(
+                    forward_batch.spec_info
                 )
+                if ragged_layout is not None:
+                    query_start_loc = ragged_layout.qo_indptr_device
+                else:
+                    query_start_loc = torch.arange(
+                        0,
+                        forward_batch.input_ids.shape[0] + 1,
+                        step=forward_batch.spec_info.draft_token_num,
+                        dtype=torch.int32,
+                        device=forward_batch.input_ids.device,
+                    )
 
                 if self.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrieve_next_token
@@ -256,6 +287,9 @@ class MambaAttnBackendBase(AttentionBackend):
             has_mamba_track_mask=has_mamba_track_mask,
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
+            ragged_verify_layout=_ragged_verify_layout_from_spec(
+                forward_batch.spec_info
+            ),
         )
 
     def init_forward_metadata_out_graph(
@@ -545,14 +579,22 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        ragged_layout = None
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
-            self.query_start_loc_list[bs - 1].copy_(
-                self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
-            )
+            ragged_layout = _ragged_verify_layout_from_spec(spec_info, padded_bs=bs)
+            if ragged_layout is not None:
+                self.query_start_loc_list[bs - 1].copy_(
+                    ragged_layout.qo_indptr_device[: bs + 1]
+                )
+                spec_info = _spec_info_with_ragged_layout(spec_info, ragged_layout)
+            else:
+                self.query_start_loc_list[bs - 1].copy_(
+                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+                )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -590,6 +632,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                ragged_verify_layout=ragged_layout,
             )
         else:
             return ForwardMetadata(
@@ -597,6 +640,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                ragged_verify_layout=ragged_layout,
             )
 
     def _replay_metadata(
@@ -699,6 +743,7 @@ class MambaAttnBackendBase(AttentionBackend):
                         )
                         new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
                         write_pos_buf[uniq_slots] = new_vals
+        ragged_layout = None
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
@@ -712,7 +757,13 @@ class MambaAttnBackendBase(AttentionBackend):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
-            if num_padding == 0:
+            ragged_layout = _ragged_verify_layout_from_spec(spec_info, padded_bs=bs)
+            if ragged_layout is not None:
+                self.query_start_loc_list[bs - 1].copy_(
+                    ragged_layout.qo_indptr_device[: bs + 1]
+                )
+                spec_info = _spec_info_with_ragged_layout(spec_info, ragged_layout)
+            elif num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                 )
@@ -747,6 +798,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                ragged_verify_layout=ragged_layout,
             )
         else:
             return ForwardMetadata(
@@ -754,6 +806,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                ragged_verify_layout=ragged_layout,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -959,6 +1012,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.needs_cpu_seq_lens = (
             full_attn_backend.needs_cpu_seq_lens
             or linear_attn_backend.needs_cpu_seq_lens
+        )
+        self.supports_ragged_verify_graph = (
+            full_attn_backend.supports_ragged_verify_graph
+            and linear_attn_backend.supports_ragged_verify_graph
         )
 
     def _is_full_attn(

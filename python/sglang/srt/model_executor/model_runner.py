@@ -477,6 +477,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.spec_algorithm.is_dflash_or_dspark() and not self.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
+            qwen3_5_family_dspark_enabled = False
+            if self.spec_algorithm.is_dspark():
+                from sglang.srt.speculative.dspark_components.dspark_utils import (
+                    is_qwen3_5_family_dspark_enabled,
+                    is_qwen3_5_family_target,
+                    parse_dspark_draft_config,
+                )
+
+                qwen3_5_family_dspark_enabled = (
+                    is_qwen3_5_family_dspark_enabled(self)
+                )
+                if (
+                    is_qwen3_5_family_target(self)
+                    and not qwen3_5_family_dspark_enabled
+                ):
+                    raise RuntimeError(
+                        "Qwen3.5/Qwen3.6 DSpark support is experimental. Set "
+                        "SGLANG_ENABLE_DSPARK_QWEN3_5_FAMILY=1 to enable it."
+                    )
+
             draft_model_config = self._build_model_config(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
@@ -516,12 +536,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
             if self.spec_algorithm.is_dspark():
-                from sglang.srt.speculative.dspark_components.dspark_utils import (
-                    parse_dspark_draft_config,
-                )
-
                 dspark_draft_config = parse_dspark_draft_config(
-                    draft_hf_config=draft_model_config.hf_config
+                    draft_hf_config=draft_model_config.hf_config,
+                    enable_qwen3_5_family_aliases=qwen3_5_family_dspark_enabled,
                 )
                 if not dspark_draft_config.require_markov():
                     raise ValueError(

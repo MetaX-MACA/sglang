@@ -91,6 +91,8 @@ STATIC_CONDITIONING_CAVEAT = (
 )
 CONVERSION_FORMULA = (
     "batch_tokens = num_running_reqs_per_rank * verify_num_draft_tokens; "
+    "with SGLANG_ENABLE_DSPARK_QWEN3_5_FAMILY=1, off-diagonal compact rows "
+    "use the replayed physical CUDA Graph token tier; "
     "steps_per_sec = 1 / median(server-side step_time over aligned steady steps)"
 )
 
@@ -141,6 +143,7 @@ class ServerContext(msgspec.Struct, frozen=True):
     skip_max_running_requests_threshold: float
     skip_token_capacity_threshold: float
     record_source: RecordSource
+    qwen3_5_family_enabled: bool = False
 
 
 class RoundSettings(msgspec.Struct, frozen=True):
@@ -495,6 +498,9 @@ def fetch_server_context(
         int(payload["verify_num_draft_tokens"]) for payload in sps_payloads
     }
     simulate_acc_lens = {float(payload["simulate_acc_len"]) for payload in sps_payloads}
+    qwen3_5_family_enabled_values = {
+        bool(payload.get("qwen3_5_family_enabled", False)) for payload in sps_payloads
+    }
     if len(simulate_acc_lens) != 1:
         raise RuntimeError(
             f"DP ranks disagree on simulate_acc_len: {sorted(simulate_acc_lens)}."
@@ -503,6 +509,11 @@ def fetch_server_context(
         raise RuntimeError(
             "DP ranks disagree on verify_num_draft_tokens: "
             f"{sorted(verify_num_draft_tokens)}."
+        )
+    if len(qwen3_5_family_enabled_values) != 1:
+        raise RuntimeError(
+            "DP ranks disagree on qwen3_5_family_enabled: "
+            f"{sorted(qwen3_5_family_enabled_values)}."
         )
 
     tokenizer_path = local_tokenizer_path or info.get("tokenizer_path")
@@ -539,6 +550,7 @@ def fetch_server_context(
         dp_size=dp_size,
         verify_num_draft_tokens=verify_num_draft_tokens.pop(),
         simulate_acc_len=simulate_acc_lens.pop(),
+        qwen3_5_family_enabled=qwen3_5_family_enabled_values.pop(),
         cuda_graph_max_bs=cuda_graph_max_bs,
         skip_max_running_requests_threshold=skip_max_running,
         skip_token_capacity_threshold=skip_token_capacity,
@@ -747,6 +759,7 @@ def run_one_round(
             wall_seconds=round(wall_seconds, 3),
             reached_target=reached_target,
         ),
+        qwen3_5_family_enabled=context.qwen3_5_family_enabled,
         frac=frac,
     )
 
@@ -934,6 +947,7 @@ def postprocess_round(
     verify_num_draft_tokens: int,
     min_steady_steps: int,
     load_info: LoadInfo,
+    qwen3_5_family_enabled: bool = False,
     frac: Optional[float] = None,
 ) -> RoundOutcome:
     offdiag = frac is not None
@@ -1036,14 +1050,16 @@ def postprocess_round(
             )
         graph_tier = aligned_verify_tokens.pop()
         budget = int(frac * batch_size_per_rank * (verify_num_draft_tokens - 1))
-        batch_tokens = batch_size_per_rank + budget
-        if graph_tier < batch_tokens:
+        semantic_batch_tokens = batch_size_per_rank + budget
+        if graph_tier < semantic_batch_tokens:
             raise RuntimeError(
                 f"Round bs={batch_size} frac={frac}: replayed graph tier "
-                f"{graph_tier} is smaller than the pinned M={batch_tokens} "
+                f"{graph_tier} is smaller than the pinned semantic token count "
+                f"{semantic_batch_tokens} "
                 f"(= {batch_size_per_rank} + int({frac} * {batch_size_per_rank} "
                 f"* {verify_num_draft_tokens - 1})); the budget pin did not take."
             )
+        batch_tokens = graph_tier if qwen3_5_family_enabled else semantic_batch_tokens
     else:
         batch_tokens = expected_tokens
 
