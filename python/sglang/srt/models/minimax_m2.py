@@ -577,7 +577,14 @@ class MiniMaxM2MoE(nn.Module):
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[1]
+            # RMSNorm fused_quant returns two layouts:
+            #   Path A (packed_quant + residual): (packed_out, bf16_out, (int8, scales))  -> bf16 at idx 1
+            #   Path B (else):                    (int8_out, scale, bf16_out)             -> bf16 at idx 2
+            hidden_states = (
+                hidden_states[1]
+                if isinstance(hidden_states[2], tuple)
+                else hidden_states[2]
+            )
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -603,7 +610,12 @@ class MiniMaxM2MoE(nn.Module):
     ) -> torch.Tensor:
         if isinstance(hidden_states, tuple):
             packed_hidden = hidden_states[0]
-            hidden_states = hidden_states[1]
+            # bf16 is at idx 1 (Path A) or idx 2 (Path B); see forward_normal.
+            hidden_states = (
+                hidden_states[1]
+                if isinstance(hidden_states[2], tuple)
+                else hidden_states[2]
+            )
         else:
             packed_hidden = hidden_states
             if self.use_fused_quant and packed_hidden.shape[0] == 0:
@@ -992,7 +1004,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
             prefix=add_prefix("block_sparse_moe", prefix),
         )
 
-        packed_quant = False
+        packed_quant = True
         fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
         fused_quant_pd = fused_quant or get_bool_env_var(
             "FUSED_RMSNORM_QUANT_PREFILL", default="false"
