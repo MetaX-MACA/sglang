@@ -2135,6 +2135,8 @@ def silu_and_mul_masked_fwd_no_pack(
     input: torch.Tensor,
     output: torch.Tensor,
     masked_m: torch.Tensor,
+    gemm1_alpha: float = 0.0,
+    gemm1_clamp_limit: float = 0.0,
 ):
     """
     input shape [expert_num, token_num_padded, hidden_dim]
@@ -2178,6 +2180,8 @@ def silu_and_mul_masked_fwd_no_pack(
         BLOCK_N=BLOCK_N,
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
+        GEMM1_ALPHA=gemm1_alpha if gemm1_alpha is not None else 0.0,
+        GEMM1_CLAMP_LIMIT=gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0,
     )
     return
 
@@ -2195,6 +2199,8 @@ def _silu_and_mul_masked_kernel(
     size_n,
     BLOCK_N: tl.constexpr,
     NUM_STAGE: tl.constexpr,
+    GEMM1_ALPHA: tl.constexpr,
+    GEMM1_CLAMP_LIMIT: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -2230,9 +2236,16 @@ def _silu_and_mul_masked_kernel(
             other=0.0,
         ).to(tl.float32)
 
-        # Compute SILU(gate) * up
-        sigmoid = 1.0 / (1.0 + tl.exp(-gate))
-        gate_up = up * (gate * sigmoid)
+        # Compute activation
+        if GEMM1_ALPHA > 0:
+            # swigluoai: gate * sigmoid(gate * alpha) * (up + 1) with clamping
+            gate = tl.minimum(gate, GEMM1_CLAMP_LIMIT)
+            up = tl.clamp(up, -GEMM1_CLAMP_LIMIT, GEMM1_CLAMP_LIMIT)
+            gate_up = gate * tl.sigmoid(gate * GEMM1_ALPHA) * (up + 1)
+        else:
+            # standard silu: silu(gate) * up
+            sigmoid = 1.0 / (1.0 + tl.exp(-gate))
+            gate_up = up * (gate * sigmoid)
 
         # Store BF16 result
         tl.store(
@@ -2619,8 +2632,41 @@ def silu_and_mul_masked(
     input: torch.Tensor,
     masked_m: torch.Tensor,
     swiglu_limit: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
 ):
-    out_stride = (input.shape[-1]//4 + 257) // 256 * 256
+    if gemm1_alpha is not None and gemm1_alpha > 0 and swiglu_limit is not None and swiglu_limit > 0:
+        expert_num, token_num, two_inter = input.shape
+        inter = two_inter // 2
+
+        temp = torch.zeros(
+            (expert_num, token_num, inter),
+            device=input.device,
+            dtype=torch.bfloat16,
+        )
+        silu_and_mul_masked_fwd_no_pack(
+            input, temp, masked_m, gemm1_alpha, swiglu_limit
+        )
+
+        absmax = temp.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+        scale = (absmax / 127.0).to(torch.float32).contiguous()
+
+        q = (temp / scale.to(temp.dtype)).round().clamp(-127, 127).to(torch.int8)
+
+        out_stride = (two_inter // 4 + 257) // 256 * 256
+        output = torch.zeros(
+            (expert_num, token_num, out_stride),
+            device=input.device,
+            dtype=input.dtype,
+        )
+        out_i8 = output.view(torch.int8)
+        out_i8[:, :, :inter] = q
+
+        scale_bytes = scale.view(torch.int8)
+        out_i8[:, :, inter : inter + 4] = scale_bytes
+
+        return output
+
+    out_stride = (input.shape[-1] // 4 + 257) // 256 * 256
     output = torch.empty((input.shape[0], input.shape[1], out_stride), device=input.device, dtype=input.dtype)
     mcoplib.op.fused_silu_mul_dq_mask_quant(output, input, masked_m, swiglu_limit)
     return output

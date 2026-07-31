@@ -138,14 +138,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # New forward -> invalidate the cached per-forward MSA decode metadata.
         self._msa_dec_meta = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if extend_lens is not None:
+        if extend_lens is not None and len(extend_lens) > 0:
             self._max_seqlen_q = int(max(extend_lens))
         else:
             self._max_seqlen_q = 1
         if in_capture and forward_batch.forward_mode.is_decode_or_idle():
             self._max_seqlen_k = self.max_context_len
-        else:
+        elif forward_batch.seq_lens_cpu.numel() > 0:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+        else:
+            self._max_seqlen_k = 1
 
         # Build the MSA decode plan + page table here (eager, outside graph capture)
         # so forward_decode — captured into the graph — only runs device-side ops.

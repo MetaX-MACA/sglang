@@ -706,7 +706,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         
         # Act
-        down_input = silu_and_mul_masked(gateup_output, masked_m, self.swiglu_limit)
+        down_input = silu_and_mul_masked(
+            gateup_output, masked_m,
+            gemm1_alpha=getattr(self.config, 'gemm1_alpha', 0.0) or 0.0,
+            swiglu_limit=getattr(self.config, 'swiglu_limit', 0.0) or 0.0,
+        )
         del gateup_output
 
         # GroupGemm-2
@@ -1105,9 +1109,6 @@ def _varlen_deep_gemm_silu_mul_quant(
             silu_and_mul_masked_post_quant_packed_fwd,
         )
 
-        assert (
-            swiglu_limit is None
-        ), "swiglu_limit and gemm1_alpha are mutually exclusive"
         assert not swizzle, "swizzle is not supported with gemm1_alpha"
         down_input = torch.empty(
             (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
@@ -1171,9 +1172,6 @@ def _varlen_deep_gemm_silu_mul_quant(
             and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         )
         if gemm1_alpha is not None:
-            assert (
-                swiglu_limit is None
-            ), "swiglu_limit and gemm1_alpha are mutually exclusive"
             assert not swizzle, "swizzle is not supported with gemm1_alpha"
         else:
             assert (

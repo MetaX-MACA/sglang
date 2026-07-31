@@ -88,12 +88,14 @@ from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
+    get_bool_env_var,
     get_device_sm,
     is_cuda,
     is_hip,
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.common import align_packed_tensor_size
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
@@ -329,6 +331,7 @@ class MiniMaxM3MoE(nn.Module):
             )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.use_routing_bias = getattr(config, "use_routing_bias", False)
+        self.use_fused_quant = get_bool_env_var("MX_ENABLE_FUSE_RMSNORM_QUANT", default="false")
         if self.use_routing_bias:
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty(config.num_local_experts, dtype=torch.float32)
@@ -427,6 +430,13 @@ class MiniMaxM3MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        if isinstance(hidden_states, tuple):
+            hidden_states = (
+                hidden_states[1]
+                if isinstance(hidden_states[2], tuple)
+                else hidden_states[2]
+            )
+
         if hidden_states.shape[0] > 0:
             shared_output = self._forward_shared_experts(hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
@@ -447,6 +457,22 @@ class MiniMaxM3MoE(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        if isinstance(hidden_states, tuple):
+            packed_hidden = hidden_states[0]
+            hidden_states = (
+                hidden_states[1]
+                if isinstance(hidden_states[2], tuple)
+                else hidden_states[2]
+            )
+        else:
+            packed_hidden = hidden_states
+            if self.use_fused_quant and packed_hidden.shape[0] == 0:
+                packed_hidden = torch.empty(
+                    (0, align_packed_tensor_size(hidden_states.shape[-1])),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+
         shared_output = None
         if hidden_states.shape[0] > 0:
             shared_output = self._forward_shared_experts(hidden_states)
@@ -1386,6 +1412,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
             )
 
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
+
+        packed_quant = True if self.is_layer_sparse else False
+        fused_quant = get_bool_env_var("MX_ENABLE_FUSE_RMSNORM_QUANT", default="false")
+        fused_quant_pd = fused_quant or get_bool_env_var(
+            "MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL", default="false"
+        )
+
         if self.use_gemma_norm:
             self.input_layernorm = GemmaRMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -1394,9 +1427,17 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 config.hidden_size, eps=config.rms_norm_eps
             )
         else:
-            self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.input_layernorm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                fused_quant=fused_quant_pd,
+            )
             self.post_attention_layernorm = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                fused_quant=fused_quant,
+                packed_quant=packed_quant,
+                packed_size=align_packed_tensor_size(config.hidden_size),
             )
 
         def _is_layer_sparse(lid):
