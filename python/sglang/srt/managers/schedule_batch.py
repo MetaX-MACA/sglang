@@ -902,6 +902,9 @@ class Req(ReqDllmMixin):
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+        # Set once this req's first token has already been streamed to the client,
+        # so the inflight-queue path does not send it a second time.
+        self.disagg_prefill_inflight_stream_output = False
 
         # For Matryoshka embeddings
         self.dimensions = dimensions

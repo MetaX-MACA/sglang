@@ -240,6 +240,7 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        mamba_layer_global_start: int = 0,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -252,6 +253,12 @@ class MambaPool:
 
         self.size = size
         self.device = device
+        # Index of this stage's first mamba layer among the model's *global* mamba
+        # layer list. Non-zero only under PP, where each stage owns a slice of the
+        # mamba layers. Used by PD disaggregation to map a prefill stage's local
+        # state buffers onto the decode side's full-layer buffers when P and D run
+        # with different pp_size.
+        self.mamba_layer_global_start = mamba_layer_global_start
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -491,6 +498,14 @@ class MambaPool:
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
 
+    def get_state_num_mamba_layers(self) -> int:
+        """Number of mamba layers held by this PP stage."""
+        return self.num_mamba_layers
+
+    def get_state_layer_global_start(self) -> int:
+        """Index of this stage's first mamba layer in the global mamba layer list."""
+        return self.mamba_layer_global_start
+
 
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
@@ -510,6 +525,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_num_draft_tokens: int = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
+        mamba_layer_global_start: int = 0,
     ):
         super().__init__(
             size=size,
@@ -531,6 +547,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            mamba_layer_global_start=mamba_layer_global_start,
         )
 
     def _init_mamba_pool(
@@ -542,6 +559,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        mamba_layer_global_start: int = 0,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -551,6 +569,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            mamba_layer_global_start=mamba_layer_global_start,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
@@ -641,6 +660,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def get_state_dim_per_tensor(self):
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_num_mamba_layers(self):
+        return self.mamba_pool.get_state_num_mamba_layers()
+
+    def get_state_layer_global_start(self):
+        return self.mamba_pool.get_state_layer_global_start()
 
     def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
         if self.mamba_ping_pong_track_buffer_size == 2:
@@ -1414,6 +1439,8 @@ class HybridLinearKVPool(KVCache):
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
+        full_attention_layer_global_start: int = 0,
+        full_attention_layer_num_total: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1421,6 +1448,20 @@ class HybridLinearKVPool(KVCache):
         self.full_layer_nums = len(full_attention_layer_ids)
         self.page_size = page_size
         self.start_layer = start_layer if start_layer is not None else 0
+        # This pool only holds the *full-attention* layers, so buffer lists are
+        # indexed by position in the full-attention layer sequence, not by absolute
+        # layer id. Under PP, this is where this stage's slice of that sequence
+        # begins; PD KV transfer needs it to index into decode's buffer list.
+        # For pure full-attention models it equals start_layer.
+        self.full_attention_layer_global_start = full_attention_layer_global_start
+        # Number of main-model full-attention layers across every PP stage.
+        # Decode's flattened MHA pointer layout uses this as the V_main offset;
+        # num_hidden_layers is not a valid substitute for hybrid models.
+        self.full_attention_layer_num_total = (
+            full_attention_layer_num_total
+            if full_attention_layer_num_total is not None
+            else self.full_layer_nums
+        )
         self.layer_transfer_counter = None
         self.head_num = head_num
         self.head_dim = head_dim
@@ -1498,6 +1539,12 @@ class HybridLinearKVPool(KVCache):
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_num_mamba_layers(self):
+        return self.mamba_pool.get_state_num_mamba_layers()
+
+    def get_state_layer_global_start(self):
+        return self.mamba_pool.get_state_layer_global_start()
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()

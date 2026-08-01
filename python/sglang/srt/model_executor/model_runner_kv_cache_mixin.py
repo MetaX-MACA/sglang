@@ -317,6 +317,11 @@ class ModelRunnerKVCacheMixin:
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
+                    mamba_layer_global_start=sum(
+                        1
+                        for i in config.mamba2_cache_params.layers
+                        if i < self.start_layer
+                    ),
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
@@ -619,6 +624,25 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
+                    # Position of this PP stage's first full-attention layer within
+                    # the model's global full-attention layer sequence. Note
+                    # config.full_attention_layer_ids is still the global list here:
+                    # adjust_hybrid_swa_layers_for_pp() only rewrites it for
+                    # is_hybrid_swa models, which take the SWAKVPool branch above.
+                    full_attention_layer_global_start=(
+                        0
+                        if self.is_draft_worker
+                        else sum(
+                            1
+                            for i in config.full_attention_layer_ids
+                            if i < self.start_layer
+                        )
+                    ),
+                    full_attention_layer_num_total=(
+                        1
+                        if self.is_draft_worker
+                        else len(config.full_attention_layer_ids)
+                    ),
                     **extra_args,
                 )
             else:

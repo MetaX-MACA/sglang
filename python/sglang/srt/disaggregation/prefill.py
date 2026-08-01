@@ -149,8 +149,22 @@ class PrefillBootstrapQueue:
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        # get_mha_kv_ptrs_with_pp() uses this to offset into decode's dst_kv_ptrs,
+        # which is indexed by position in the KV-holding layer sequence. For hybrid
+        # linear/mamba models that sequence contains only the full-attention layers,
+        # so the absolute start_layer would over-shoot; use the full-attention-layer
+        # global start instead. The two are equal for pure full-attention models.
+        kv_args.prefill_start_layer = getattr(
+            self.token_to_kv_pool,
+            "full_attention_layer_global_start",
+            self.token_to_kv_pool.start_layer,
+        )
         kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
+        kv_args.prefill_num_total_layers = getattr(
+            self.token_to_kv_pool,
+            "full_attention_layer_num_total",
+            self.scheduler.model_config.num_hidden_layers,
+        )
         kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
@@ -522,6 +536,7 @@ class SchedulerDisaggregationPrefillMixin:
                     logits_output.input_token_logprobs.tolist()
                 )
 
+        completed_reqs: List[Req] = []
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -532,6 +547,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
+                completed_reqs.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
                     req.output_topk_index = batch.spec_info.topk_index[i]
@@ -597,6 +613,25 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
+        if envs.SGLANG_TTFT_PREFILL_RETURN_FIRST_TOKEN.get():
+            # The first token is already sampled here; releasing it now takes the
+            # KV transfer and the decode-side scheduling out of the client's TTFT.
+            output_reqs = [
+                req
+                for req in completed_reqs
+                if not req.disagg_prefill_inflight_stream_output
+            ]
+            for req in output_reqs:
+                req.disagg_prefill_inflight_stream_output = True
+                if req.finished_reason is None:
+                    req.finished_reason = FINISH_LENGTH(length=0)
+            if output_reqs:
+                self.stream_output(
+                    output_reqs,
+                    any(req.return_logprob for req in output_reqs),
+                    None,
+                )
+
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
             batch=batch,
@@ -651,7 +686,11 @@ class SchedulerDisaggregationPrefillMixin:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
-                req.finished_reason = FINISH_LENGTH(length=0)
+                if (
+                    not envs.SGLANG_TTFT_PREFILL_RETURN_FIRST_TOKEN.get()
+                    or req.finished_reason is None
+                ):
+                    req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
                     req.disagg_kv_sender.clear()
@@ -700,12 +739,25 @@ class SchedulerDisaggregationPrefillMixin:
                 if "speed_gb_s" in metrics:
                     self.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
-        # Stream requests which have finished transfer
-        self.stream_output(
-            done_reqs,
-            any(req.return_logprob for req in done_reqs),
-            None,
-        )
+        # Stream requests which have finished transfer, skipping the ones whose
+        # first token already went out right after the prefill forward.
+        if envs.SGLANG_TTFT_PREFILL_RETURN_FIRST_TOKEN.get():
+            output_reqs = [
+                req
+                for req in done_reqs
+                if not req.disagg_prefill_inflight_stream_output
+            ]
+            for req in output_reqs:
+                req.disagg_prefill_inflight_stream_output = True
+        else:
+            output_reqs = done_reqs
+
+        if output_reqs or not envs.SGLANG_TTFT_PREFILL_RETURN_FIRST_TOKEN.get():
+            self.stream_output(
+                output_reqs,
+                any(req.return_logprob for req in output_reqs),
+                None,
+            )
         for req in done_reqs:
             req: Req
 

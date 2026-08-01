@@ -68,7 +68,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -112,6 +112,24 @@ _is_amx_available = cpu_has_amx_support()
 cached_get_processor = lru_cache(get_processor)
 
 SGLANG_QWEN3_ENABLE_ALT_STREAM = envs.SGLANG_QWEN3_ENABLE_ALT_STREAM.get()
+
+if _is_cuda or _is_hip:
+    from sglang.jit_kernel.triton.sigmoid_gate_mul import sigmoid_gate_mul
+
+if _is_cuda:
+    from sglang.srt.layers.fused_qk_rmsnorm_rope_gate import (
+        fused_qk_gemma_rmsnorm_rope_gate,
+    )
+
+# Kill switch for the fused QK norm + RoPE + gate path (upstream PR #28320)
+SGLANG_QWEN35_FUSED_QK_ROPE_GATE = _is_cuda and get_bool_env_var(
+    "SGLANG_QWEN35_FUSED_QK_ROPE_GATE", "true"
+)
+
+# Kill switch for the fused attention output gate (upstream PR #27630)
+SGLANG_QWEN35_FUSED_OUTPUT_GATE = (_is_cuda or _is_hip) and get_bool_env_var(
+    "SGLANG_QWEN35_FUSED_OUTPUT_GATE", "true"
+)
 
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
@@ -810,6 +828,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         self.alt_stream = alt_stream
 
+        # MRoPE takes 3D positions and a different cache layout; the kernel
+        # assumes plain NeoX cos_sin_cache indexed by a 1D position.
+        self.use_fused_qk_rope_gate = (
+            SGLANG_QWEN35_FUSED_QK_ROPE_GATE
+            and self.attn_output_gate
+            and self.rotary_emb.is_neox_style
+            and not isinstance(self.rotary_emb, MRotaryEmbedding)
+        )
+
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -850,25 +877,49 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """Full attention forward pass."""
         qkv, _ = self.qkv_proj(hidden_states)
 
-        if self.attn_output_gate:
+        if self.use_fused_qk_rope_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
             )
-            orig_shape = q_gate.shape[:-1]
-            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
-            q, gate = torch.chunk(q_gate, 2, dim=-1)
-            q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
+            q, k, gate = fused_qk_gemma_rmsnorm_rope_gate(
+                q_gate,
+                k,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.q_norm.variance_epsilon,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+                has_gate=True,
+            )
+            gate = gate.view(q.shape)
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.attn_output_gate:
+                q_gate, k, v = qkv.split(
+                    [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+                )
+                orig_shape = q_gate.shape[:-1]
+                q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+                q, gate = torch.chunk(q_gate, 2, dim=-1)
+                q = q.reshape(*orig_shape, -1)
+                gate = gate.reshape(*orig_shape, -1)
+            else:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+            q, k = self._apply_qk_norm(q, k)
+            q, k = self.rotary_emb(positions, q, k)
+
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if SGLANG_QWEN35_FUSED_OUTPUT_GATE:
+                attn_output = sigmoid_gate_mul(attn_output, gate)
+            else:
+                gate = torch.sigmoid(gate)
+                attn_output = attn_output * gate
 
         output, _ = self.o_proj(attn_output)
         return output

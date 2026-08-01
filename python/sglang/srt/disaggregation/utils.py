@@ -593,6 +593,16 @@ def append_state_component(
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
 
 
+def _set_mamba_pp_metadata(kv_args: KVArgs, pool) -> None:
+    """Record how this PP stage's mamba layers map onto the model's global mamba
+    layer list. Only meaningful on the prefill side, where a stage may own a
+    subset of the mamba layers while decode (pp_size=1) owns all of them."""
+    if hasattr(pool, "get_state_num_mamba_layers"):
+        kv_args.state_num_mamba_layers = pool.get_state_num_mamba_layers()
+    if hasattr(pool, "get_state_layer_global_start"):
+        kv_args.state_layer_global_start = pool.get_state_layer_global_start()
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
@@ -614,6 +624,8 @@ def setup_state_kv_args(
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
+    kv_args.state_num_mamba_layers = 0
+    kv_args.state_layer_global_start = 0
 
     if hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
@@ -633,6 +645,7 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
             )
+            _set_mamba_pp_metadata(kv_args, token_to_kv_pool)
         elif isinstance(token_to_kv_pool, (NSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, NSATokenToKVPool
@@ -670,6 +683,7 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
             )
+            _set_mamba_pp_metadata(kv_args, req_to_token_pool)
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

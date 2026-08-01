@@ -48,6 +48,12 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.input_truncation import (
+    AUTO_TRUNCATE_INPUT_TOKENS_ENV,
+    get_auto_truncate_input_tokens,
+    truncate_input_ids_head_tail,
+    truncate_sequence_head_tail,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -819,19 +825,69 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
-        self._validate_one_request(obj, input_ids)
+        self._validate_one_request(
+            obj,
+            input_ids,
+            token_type_ids=token_type_ids,
+            allow_env_truncate=(
+                mm_inputs is None
+                and input_embeds is None
+                and getattr(obj, "positional_embed_overrides", None) is None
+                and getattr(obj, "multi_item_delimiter_indices", None) is None
+                and getattr(obj, "session_params", None) is None
+            ),
+        )
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
 
     def _validate_one_request(
-        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        input_ids: List[int],
+        *,
+        token_type_ids: Optional[List[int]] = None,
+        allow_env_truncate: bool = True,
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
+
+        env_truncate_input_tokens = (
+            get_auto_truncate_input_tokens() if allow_env_truncate else None
+        )
+        if input_ids is not None and env_truncate_input_tokens is not None:
+            max_input_tokens = max(
+                1,
+                _max_req_len - self.num_reserved_tokens - 1,
+            )
+            if self.max_req_input_len is not None:
+                max_input_tokens = min(
+                    max_input_tokens, max(1, self.max_req_input_len - 1)
+                )
+            truncate_len = min(env_truncate_input_tokens, max_input_tokens)
+            old_input_token_num = len(input_ids)
+            if truncate_input_ids_head_tail(input_ids, truncate_len):
+                if token_type_ids is not None:
+                    if len(token_type_ids) != old_input_token_num:
+                        raise ValueError(
+                            "token_type_ids must have the same length as input_ids "
+                            "before server-side input truncation."
+                        )
+                    truncate_sequence_head_tail(token_type_ids, truncate_len)
+                logger.warning(
+                    "Server-side head-tail input truncation applied via %s. "
+                    "configured_limit=%s, effective_limit=%s, "
+                    "old_input_len=%s, new_input_len=%s.",
+                    AUTO_TRUNCATE_INPUT_TOKENS_ENV,
+                    env_truncate_input_tokens,
+                    truncate_len,
+                    old_input_token_num,
+                    len(input_ids),
+                )
+                input_token_num = len(input_ids) + self.num_reserved_tokens
 
         # Validate input length
         if input_token_num >= self.context_len:

@@ -1077,6 +1077,39 @@ class MooncakeKVManager(CommonKVManager):
                 )
         return rc
 
+    def _mamba_index_pairs(
+        self,
+        src_state_data_ptrs: list[int],
+        dst_state_data_ptrs: list[int],
+    ) -> list[tuple[int, int]]:
+        """Map local (src) mamba state buffers onto the destination's buffers.
+
+        Both sides lay the buffers out as ``[tensor_kind][layer]`` flattened, so
+        when prefill and decode hold the same number of mamba layers the mapping
+        is the identity. Under PD-different pp_size (P has pp_size=N, D has
+        pp_size=1) this stage only owns a slice of the mamba layers while decode
+        owns all of them, so each local layer must be shifted by this stage's
+        global mamba layer offset within each tensor kind.
+        """
+        num_src = len(src_state_data_ptrs)
+        num_dst = len(dst_state_data_ptrs)
+        local_mamba_layers = getattr(self.kv_args, "state_num_mamba_layers", 0)
+        layer_global_start = getattr(self.kv_args, "state_layer_global_start", 0)
+
+        if num_src == num_dst or not local_mamba_layers:
+            return [(i, i) for i in range(num_src)]
+
+        num_tensor_kinds = num_src // local_mamba_layers
+        total_mamba_layers = num_dst // num_tensor_kinds
+        return [
+            (
+                t * local_mamba_layers + k,
+                t * total_mamba_layers + layer_global_start + k,
+            )
+            for t in range(num_tensor_kinds)
+            for k in range(local_mamba_layers)
+        ]
+
     def _send_mamba_state(
         self,
         req: TransferInfo,
@@ -1089,10 +1122,12 @@ class MooncakeKVManager(CommonKVManager):
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
 
         transfer_blocks = []
-        for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
-            length = src_state_item_lens[i]
-            src_addr = src_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
-            dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
+        for src_i, dst_i in self._mamba_index_pairs(
+            src_state_data_ptrs, dst_state_data_ptrs
+        ):
+            length = src_state_item_lens[src_i]
+            src_addr = src_state_data_ptrs[src_i] + length * int(prefill_mamba_index[0])
+            dst_addr = dst_state_data_ptrs[dst_i] + length * int(dst_mamba_index[0])
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
@@ -1142,11 +1177,14 @@ class MooncakeKVManager(CommonKVManager):
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
 
         transfer_blocks = []
-        for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
-            src_item_len = src_state_item_lens[i]
-            dst_item_len = dst_state_item_lens[i]
-            src_dim = src_state_dim_per_tensor[i]
-            dst_dim = dst_state_dim_per_tensor[i]
+        for src_i, dst_i in self._mamba_index_pairs(
+            src_state_data_ptrs, dst_state_data_ptrs
+        ):
+            dst_state_ptr = dst_state_data_ptrs[dst_i]
+            src_item_len = src_state_item_lens[src_i]
+            dst_item_len = dst_state_item_lens[dst_i]
+            src_dim = src_state_dim_per_tensor[src_i]
+            dst_dim = dst_state_dim_per_tensor[dst_i]
 
             # item_len = dim * trailing_dims_size, so trailing_dims_size = item_len / dim
             src_bytes_per_dim = src_item_len // src_dim
@@ -1170,7 +1208,7 @@ class MooncakeKVManager(CommonKVManager):
             bytes_to_send = num_dims_to_send * src_bytes_per_dim
 
             src_addr = (
-                src_state_data_ptrs[i]
+                src_state_data_ptrs[src_i]
                 + src_item_len * int(prefill_mamba_index[0])
                 + src_dim_offset
             )

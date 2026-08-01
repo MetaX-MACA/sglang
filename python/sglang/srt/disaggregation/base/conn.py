@@ -41,6 +41,12 @@ class KVArgs:
     state_item_lens: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
+    # Mamba PP metadata, used when prefill/decode pp_size differ. Both describe
+    # the local (this PP stage's) mamba state buffers: how many mamba layers this
+    # stage owns, and where they start in the model's global mamba layer list.
+    # Defaults keep the non-PP path unchanged.
+    state_num_mamba_layers: int = 0
+    state_layer_global_start: int = 0
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
@@ -57,6 +63,11 @@ class KVArgs:
     # layer-indexed layout (e.g. DeepSeek V4's buffer-type-organized flat
     # list).
     prefill_end_layer: Optional[int]
+    # Total number of main-model MHA/full-attention KV layers across all PP
+    # stages. This equals num_hidden_layers for a pure MHA/GQA model, but can
+    # be smaller for hybrid linear-attention/Mamba models. It is used to find
+    # V_main in a decode pointer layout that may also contain draft/MTP KV.
+    prefill_num_total_layers: Optional[int]
     # For DeepSeek V4 (and other compressed-MLA) memory pools only.
     # Full-model compression ratio per layer (entries are 0/4/128). Used by
     # the connection layer to slice the buffer-type-organized flat list in a

@@ -8,6 +8,12 @@ import torch
 
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.input_truncation import (
+    AUTO_TRUNCATE_INPUT_TOKENS_ENV,
+    get_auto_truncate_input_tokens,
+    truncate_input_ids_head_tail,
+    truncate_sequence_head_tail,
+)
 from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -129,16 +135,46 @@ class GenerationBatchResult:
 def validate_input_length(
     req: Req, max_req_input_len: int, allow_auto_truncate: bool
 ) -> Optional[str]:
-    """Validate and potentially truncate input length.
+    """Validate and potentially truncate input length."""
+    env_truncate_input_tokens = get_auto_truncate_input_tokens()
+    origin_input_ids_unpadded = getattr(req, "origin_input_ids_unpadded", None)
+    token_type_ids = getattr(req, "token_type_ids", None)
+    can_head_tail_truncate = (
+        getattr(req, "input_embeds", None) is None
+        and getattr(req, "multimodal_inputs", None) is None
+        and getattr(req, "session", None) is None
+        and getattr(req, "positional_embed_overrides", None) is None
+        and getattr(req, "multi_item_delimiter_indices", None) is None
+        and (
+            origin_input_ids_unpadded is None
+            or origin_input_ids_unpadded is req.origin_input_ids
+        )
+        and (
+            token_type_ids is None
+            or len(token_type_ids) == len(req.origin_input_ids)
+        )
+    )
+    if env_truncate_input_tokens is not None and can_head_tail_truncate:
+        truncate_len = min(
+            env_truncate_input_tokens,
+            max(1, max_req_input_len - 1),
+        )
+        old_input_len = len(req.origin_input_ids)
+        if truncate_input_ids_head_tail(req.origin_input_ids, truncate_len):
+            if token_type_ids is not None:
+                truncate_sequence_head_tail(token_type_ids, truncate_len)
+            logger.warning(
+                "Request input head-tail truncated via %s. "
+                "configured_limit=%s, effective_limit=%s, "
+                "old_input_len=%s, new_input_len=%s.",
+                AUTO_TRUNCATE_INPUT_TOKENS_ENV,
+                env_truncate_input_tokens,
+                truncate_len,
+                old_input_len,
+                len(req.origin_input_ids),
+            )
+            return None
 
-    Args:
-        req: The request containing input_ids to validate
-        max_req_input_len: Maximum allowed input length
-        allow_auto_truncate: Whether to truncate long inputs
-
-    Returns:
-        Error message if validation fails, None if successful
-    """
     if len(req.origin_input_ids) >= max_req_input_len:
         if allow_auto_truncate:
             logger.warning(
@@ -148,13 +184,12 @@ def validate_input_length(
             )
             req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
             return None
-        else:
-            error_msg = (
-                f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
-                f"the maximum allowed length ({max_req_input_len} tokens). "
-                f"Use a shorter input or enable --allow-auto-truncate."
-            )
-            return error_msg
+
+        return (
+            f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
+            f"the maximum allowed length ({max_req_input_len} tokens). "
+            f"Use a shorter input or enable --allow-auto-truncate."
+        )
 
     return None
 

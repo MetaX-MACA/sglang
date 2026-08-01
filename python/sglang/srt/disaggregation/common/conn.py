@@ -188,6 +188,22 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
+    @property
+    def prefill_dp_rank(self) -> int:
+        """Return the DP rank used to route requests to this prefill worker.
+
+        With DP attention, the prefill replicas are attention-DP groups inside
+        one system-DP group. Without DP attention, each system-DP rank is a
+        complete model replica and all of them have ``attn_dp_rank == 0``.
+        This mirrors the rank selection used by the bootstrap server when it
+        builds ``prefill_port_table``.
+        """
+        return (
+            self.attn_dp_rank
+            if self.system_dp_size == 1
+            else self.system_dp_rank
+        )
+
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
 
@@ -448,28 +464,46 @@ class CommonKVManager(BaseKVManager):
         dst_num_total_layers = len(dst_kv_ptrs) // 2
         src_k_ptrs = src_kv_ptrs[:num_kv_layers]
         src_v_ptrs = src_kv_ptrs[num_kv_layers:]
+
+        # dst_kv_ptrs is either [K_main, V_main] or
+        # [K_main, V_main, K_draft, V_draft]. Locate V_main from the explicit
+        # number of main-model KV layers. A modulo relation between the local
+        # PP layer count and dst_num_total_layers cannot distinguish draft KV
+        # from an ordinary uneven PP split (issue #27740).
+        total_main_layers = getattr(self.kv_args, "prefill_num_total_layers", None)
+
         if num_kv_layers == dst_num_total_layers:
             dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
             dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
-        elif (
-            num_kv_layers < dst_num_total_layers
-            and dst_num_total_layers % num_kv_layers != 0
-        ):
-            # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
-            # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
-            multiplier_ratio = dst_num_total_layers // num_kv_layers
-            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-            v_ptr_offset = num_kv_layers * multiplier_ratio
-            dst_v_ptrs = dst_kv_ptrs[
-                v_ptr_offset + start_layer : v_ptr_offset + end_layer
-            ]
         else:
-            # Decode pp size should be equal to prefill pp size or 1
+            has_draft_kv = (
+                total_main_layers is not None
+                and dst_num_total_layers > total_main_layers
+            )
+            v_section_start = (
+                total_main_layers if has_draft_kv else dst_num_total_layers
+            )
             dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
             dst_v_ptrs = dst_kv_ptrs[
-                dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
+                v_section_start + start_layer : v_section_start + end_layer
             ]
+
         layers_current_pp_stage = len(src_k_ptrs)
+        ptr_lengths = {
+            "src_k": len(src_k_ptrs),
+            "src_v": len(src_v_ptrs),
+            "dst_k": len(dst_k_ptrs),
+            "dst_v": len(dst_v_ptrs),
+        }
+        if any(length != layers_current_pp_stage for length in ptr_lengths.values()):
+            raise ValueError(
+                "MHA PP KV pointer slice mismatch: "
+                f"pp_rank={self.pp_rank}, start_layer={start_layer}, "
+                f"local_layers={layers_current_pp_stage}, "
+                f"total_main_layers={total_main_layers}, "
+                f"dst_num_total_layers={dst_num_total_layers}, "
+                f"pointer_lengths={ptr_lengths}"
+            )
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
     def get_mla_kv_ptrs_with_pp(
@@ -633,7 +667,7 @@ class CommonKVSender(BaseKVSender):
             if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
             elif (
-                self.kv_mgr.attn_dp_rank
+                self.kv_mgr.prefill_dp_rank
                 != self.bootstrap_room % self.kv_mgr.server_args.dp_size
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
@@ -643,7 +677,7 @@ class CommonKVSender(BaseKVSender):
                     self.kv_mgr.record_failure(
                         self.bootstrap_room,
                         f"follow_bootstrap_room conflict: dispatched to dp_rank "
-                        f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
+                        f"{self.kv_mgr.prefill_dp_rank} but bootstrap_room "
                         f"{self.bootstrap_room} implies dp_rank "
                         f"{self.bootstrap_room % self.kv_mgr.server_args.dp_size}. "
                         f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
@@ -657,7 +691,7 @@ class CommonKVSender(BaseKVSender):
         url = f"http://{self.bootstrap_server_url}/register_dp_rank"
         payload = {
             "bootstrap_room": self.bootstrap_room,
-            "dp_rank": self.kv_mgr.attn_dp_rank,
+            "dp_rank": self.kv_mgr.prefill_dp_rank,
         }
         try:
             response = requests.post(url, json=payload, timeout=5)

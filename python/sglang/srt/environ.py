@@ -443,6 +443,10 @@ class Envs:
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
+    SGLANG_AUTO_TRUNCATE_INPUT_TOKENS = EnvInt(None)
+    # PD disagg: stream prefill's first token to the client right after the
+    # prefill forward, without waiting for the KV transfer to decode to finish.
+    SGLANG_TTFT_PREFILL_RETURN_FIRST_TOKEN = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
     SGLANG_CUTLASS_MOE = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
