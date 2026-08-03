@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import einops
 import torch
+from mcoplib.op import fused_silu_mul_dq_mask_quant_fp8_nopack
 
 from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
 from sglang.srt.environ import envs
@@ -1142,6 +1143,13 @@ def _varlen_deep_gemm_silu_mul_quant(
         if packed_ue8m0:
             down_input_scale = down_input_scale.transpose(-1, -2)
     else:
+        use_mx_fused_quant = (
+            envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
+            and gemm1_alpha is None
+            and swiglu_limit is None
+            and not swizzle
+            and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        )
         if gemm1_alpha is not None:
             assert (
                 swiglu_limit is None
@@ -1159,16 +1167,26 @@ def _varlen_deep_gemm_silu_mul_quant(
             device=hidden_states_device,
             dtype=torch.float32,
         )
-        silu_and_mul_masked_post_quant_fwd(
-            gateup_output,
-            down_input,
-            down_input_scale,
-            group_size,
-            masked_m,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            gemm1_alpha=gemm1_alpha or 0.0,
-            gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
-        )
+        if use_mx_fused_quant:
+            fused_silu_mul_dq_mask_quant_fp8_nopack(
+                down_input,
+                down_input_scale,
+                gateup_output,
+                masked_m,
+                group_size,
+                swiglu_limit,
+            )
+        else:
+            silu_and_mul_masked_post_quant_fwd(
+                gateup_output,
+                down_input,
+                down_input_scale,
+                group_size,
+                masked_m,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                gemm1_alpha=gemm1_alpha or 0.0,
+                gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
+            )
     return down_input, down_input_scale
 
 
