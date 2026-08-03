@@ -46,7 +46,10 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from mcoplib.custom_ops import fused_add_rms_norm_dynamic_per_token_quant_padding_output
-from sgl_kernel import rms_norm_dynamic_per_token_quant_custom
+from sgl_kernel import (
+    rms_norm_dynamic_per_group_quant_custom,
+    rms_norm_dynamic_per_token_quant_custom,
+)
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
@@ -312,7 +315,8 @@ class RMSNorm(MultiPlatformOp):
         x_pad_to_multiple: int = 0,
         fused_quant: bool = False,
         packed_quant: bool = False,
-        packed_size: int = 3840
+        packed_size: int = 3840,
+        return_quant_tuple: bool = False,
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
@@ -351,7 +355,7 @@ class RMSNorm(MultiPlatformOp):
         self.fused_quant = fused_quant
         self.packed_quant = packed_quant
         self.packed_size = packed_size
-        
+        self.return_quant_tuple = return_quant_tuple
 
     def forward_cuda(
         self,
@@ -367,6 +371,33 @@ class RMSNorm(MultiPlatformOp):
                     residual = residual + post_residual_addition
                 return x, residual
             return x
+
+        if (
+            self.return_quant_tuple
+            and envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
+        ):
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                if not residual.is_contiguous():
+                    residual = residual.contiguous()
+            original_shape = x.shape
+            fp8_out, bf16_out, scales = rms_norm_dynamic_per_group_quant_custom(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+                torch.float8_e4m3fn,
+                128,
+                residual=residual,
+            )
+            quant_tuple = (
+                fp8_out.reshape(original_shape),
+                scales,
+                bf16_out.reshape(original_shape),
+            )
+            if residual is not None:
+                return quant_tuple, residual
+            return quant_tuple
 
         if self.fused_quant: 
             if self.packed_quant and residual is not None:
