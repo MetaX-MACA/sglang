@@ -161,7 +161,7 @@ class DeepseekModelNextN(nn.Module):
             else None
         )
         
-        if 'USE_SINGLE_STREAM' or 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
+        if 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
             self.alt_stream = None
 
         layer_name = "decoder"

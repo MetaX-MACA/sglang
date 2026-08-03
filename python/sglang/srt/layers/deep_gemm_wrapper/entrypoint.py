@@ -142,16 +142,68 @@ def grouped_gemm_nt_int8int8bf16_masked(
     out: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 128,
+    clamp_limit: Optional[float] = None,
 ):
     if not isinstance(lhs, tuple):
         lhs = (lhs.view(torch.int8), None)
-    deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(
-        lhs,
-        rhs,
-        out,
-        masked_m,
-        expected_m,
-    )
+    if clamp_limit is not None:
+        import mctlassEx
+        lhs_data, lhs_scales = lhs
+        rhs_data, rhs_scales = rhs
+
+        @lru_cache(maxsize=1)
+        def get_mctlass_op():
+            """Get mctlassEx operation handle (singleton)"""
+            return mctlassEx.mctlassExHandleWrapper()
+
+        mctlass_op = get_mctlass_op()
+        stream = torch.cuda.current_stream().cuda_stream
+
+        mctlass_op.mctlass_masked_group_gemm(
+            lhs_data,
+            rhs_data,
+            out,
+            lhs_scales,
+            rhs_scales,
+            masked_m,
+            stream
+        )
+        return None
+
+    if overlap_args is None:
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(
+            lhs,
+            rhs,
+            out,
+            masked_m,
+            expected_m,
+        )
+        return None
+    else:
+        import mctlassEx
+        from mctlassEx import MaskedGroupedGEMM
+        assert isinstance(lhs, tuple), "lhs must be a tuple"
+        assert isinstance(rhs, tuple), "rhs must be a tuple"
+        num_groups, m, _ = lhs[0].shape
+        _, n, k = rhs[0].shape
+        MaskedGroupedGEMM()([m, n, k],
+                lhs[0],
+                rhs[0],
+                out,
+                masked_m,
+                A_packed = True,
+                B_packed = False,
+                scale_b = rhs[1],
+                signal = overlap_args.signal,
+                single_batch_overlap = True,
+                num_blocks=overlap_args.num_sms)
+        kernel_n = 128
+        kernel_m = 128
+        threshold = (n + kernel_n - 1) // kernel_n
+        # logger.info(f"kernel_m: {kernel_m}, threshold: {threshold}")
+        return kernel_m, threshold
 
 
 def grouped_gemm_nt_int8int4bf16_masked(

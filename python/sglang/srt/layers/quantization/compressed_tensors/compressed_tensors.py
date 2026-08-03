@@ -1288,7 +1288,9 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-        return layer.scheme.create_moe_runner(layer, moe_runner_config)
+        layer.scheme.create_moe_runner(layer, moe_runner_config)
+        self.runner = layer.scheme.runner
+        return
 
     def get_triton_quant_info(self, layer: torch.nn.Module):
         return layer.scheme.get_triton_quant_info(layer)

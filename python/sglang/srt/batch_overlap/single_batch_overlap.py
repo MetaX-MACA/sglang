@@ -120,7 +120,9 @@ def compute_overlap_args(dispatch_output, alt_stream):
                 num_local_experts, dtype=torch.uint32, device=hidden_states.device
             )
         else:
-            MIN_BLOCK_M = 64
+            if torch.cuda.get_device_name(0) != 'MetaX C550' and torch.cuda.get_device_name(0) != 'MetaX C500':
+                raise ValueError("Current sbo only support C550/C500")
+            MIN_BLOCK_M = 128
             combine_signal_size = num_local_experts * (
                 (num_tokens_static + MIN_BLOCK_M - 1) // MIN_BLOCK_M
             )

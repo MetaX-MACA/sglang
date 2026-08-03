@@ -1198,14 +1198,34 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
+        down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
+        if down_gemm_overlap_args is None:
+            gemm_overlap_args_dict = {}
+        else:
+            down_gemm_overlap_args.start_event.record()
+            max_block_n = 128
+            gemm_overlap_args_dict = {
+                "overlap_args": down_gemm_overlap_args,
+                "max_block_n": max_block_n,
+            }
+        # if self.config.gemm1_clamp_limit is not None:
+        #     gemm_overlap_args_dict["clamp_limit"] = self.config.gemm1_clamp_limit
+        #     down_input = per_token_quant_int8(down_input)
+
+        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
             down_input,
             (w2_weight, w2_scale),
             down_output,
             masked_m,
             expected_m,
+            **gemm_overlap_args_dict,
         )
 
+        meta_overlap_args = running_state.get("meta_overlap_args", None)
+        if meta_overlap_args is not None:
+            block_m, threshold = deep_gemm_return_value
+            meta_overlap_args["block_m"] = block_m
+            meta_overlap_args["threshold"] = threshold
         return down_output
 
     @property
