@@ -1513,7 +1513,8 @@ class Scheduler(
             dispatch_event_loop(self)
             return
 
-        self.schedule_stream = self.device_module.Stream(priority=0)
+        # self.schedule_stream = self.device_module.Stream(priority=0)
+        self.schedule_stream = self.device_module.current_stream()
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         # The global WAR barrier fences the scheduler's next shared-buffer write
