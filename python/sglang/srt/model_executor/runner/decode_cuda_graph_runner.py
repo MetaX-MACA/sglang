@@ -1240,7 +1240,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._post_process_after_profile(prof)
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
-        if self.qwen3_5_ragged_graph_grid_enabled:
+        if hasattr(self, "qwen3_5_ragged_graph_grid_enabled") and self.qwen3_5_ragged_graph_grid_enabled:
             self._capture_one_ragged_stream(stream_idx)
             return
 
