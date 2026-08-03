@@ -677,6 +677,8 @@ class Envs:
     SGLANG_DSA_DISABLE_FUSED_KERNEL = EnvBool(False)
     
     # Metax
+    MX_ENABLE_FUSE_RMSNORM_QUANT = EnvBool(False)
+    MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL = EnvBool(False)
     MX_ENABLE_TILELANG_INT8_MQA_LOGITS = EnvBool(False)
     MX_FUSED_MLA_ABSORB_ROPE = EnvBool(False)
     MX_ENABLE_FLASH_MLA_METADATA_CACHE = EnvBool(False)

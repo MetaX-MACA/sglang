@@ -604,7 +604,7 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
-        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.use_fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
@@ -1648,8 +1648,8 @@ class DeepseekV2AttentionMLA(
             self.q_a_layernorm = RMSNorm(
                 self.q_lora_rank,
                 eps=config.rms_norm_eps,
-                fused_quant=get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
-                or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL", default="false"),
+                fused_quant=envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+                    or envs.MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL.get(),
                 return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
             )
             self.q_b_proj = ColumnParallelLinear(
@@ -2174,10 +2174,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         #     config.hidden_size, eps=config.rms_norm_eps
         # )
         packed_quant = True if self.is_layer_sparse else False
-        fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
-        fused_quant_pd = fused_quant or get_bool_env_var(
-            "FUSED_RMSNORM_QUANT_PREFILL", default="false"
-        )
+        fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+        fused_quant_pd = fused_quant or envs.MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL.get()
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
