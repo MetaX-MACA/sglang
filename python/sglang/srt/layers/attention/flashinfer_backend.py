@@ -282,11 +282,10 @@ def fast_prefill_plan(
         head_dim_qk,
         head_dim_vo,
         causal,
-        window_left,
-        fixed_split_size if fixed_split_size is not None else -1,
-        False,  # disable_split_kv
-        0,  # num_colocated_ctas
-        0,  # uniform_q_len
+        #window_left,
+        #fixed_split_size if fixed_split_size is not None else -1,
+        #False,  # disable_split_kv
+        #0,  # num_colocated_ctas
     ]
     self._plan_info = self._cached_module.plan(*args)
 
@@ -2284,31 +2283,53 @@ class FlashInferIndicesUpdaterPrefill:
                 max_q_len=num_tokens_per_req,
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
+            if window_left >= 0:
+                # selects the module with the per-element window mask compiled in
+                paged_plan_kwargs["window_left"] = window_left
 
-        if window_left >= 0:
-            # selects the module with the per-element window mask compiled in
-            paged_plan_kwargs["window_left"] = window_left
+            wrapper_paged.begin_forward(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+                custom_mask=use_custom_mask,
+                non_blocking=True,
+                # fixed_split_size=fixed_split_size,
+                # prefix_len_ptr=prefix_len_ptr,
+                # token_pos_in_items_ptr=token_pos_in_items_ptr,
+                # token_pos_in_items_len=token_pos_in_items_len,
+                # max_item_len_ptr=max_item_len_ptr,
+                **paged_plan_kwargs,
+            )
 
-        wrapper_paged.begin_forward(
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1,
-            q_data_type=self.q_data_type,
-            kv_data_type=self.data_type,
-            custom_mask=use_custom_mask,
-            non_blocking=True,
-            # fixed_split_size=fixed_split_size,
-            # prefix_len_ptr=prefix_len_ptr,
-            # token_pos_in_items_ptr=token_pos_in_items_ptr,
-            # token_pos_in_items_len=token_pos_in_items_len,
-            # max_item_len_ptr=max_item_len_ptr,
-            # **paged_plan_kwargs,
-        )
+
+        else:
+            wrapper_paged.begin_forward(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+                custom_mask=use_custom_mask,
+                non_blocking=True,
+                # fixed_split_size=fixed_split_size,
+                # prefix_len_ptr=prefix_len_ptr,
+                # token_pos_in_items_ptr=token_pos_in_items_ptr,
+                # token_pos_in_items_len=token_pos_in_items_len,
+                # max_item_len_ptr=max_item_len_ptr,
+                # **paged_plan_kwargs,
+            )
 
 
 class FlashInferMultiStepDraftBackend:
