@@ -681,6 +681,7 @@ class Envs:
     MX_FUSED_MLA_ABSORB_ROPE = EnvBool(False)
     MX_ENABLE_FLASH_MLA_METADATA_CACHE = EnvBool(False)
     MX_ENABLE_DSA_INDEXER_GEMM_BF16 = EnvBool(False)
+    MX_ENABLE_FUSE_ACT_FP8_QUANT = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

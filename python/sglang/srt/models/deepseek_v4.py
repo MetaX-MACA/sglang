@@ -434,7 +434,11 @@ class MqaAttentionBase(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("wkv", prefix),
             )
-        self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
+        self.q_norm = RMSNorm(
+            self.q_lora_rank,
+            eps=self.eps,
+            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
+        )
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -1249,7 +1253,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_deepseek_v4=True,
         )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
+        )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -1267,7 +1275,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         ) = make_hc_mixing_params(hc_mult, config.hidden_size)
         self.rms_norm_eps = config.rms_norm_eps
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
+        self.use_fused_mhc_post_pre = (
+            _is_fused_mhc_post_pre_enabled()
+            and not envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
+        )
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
 
@@ -1614,7 +1625,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
-                norm=self.input_layernorm,
+                # Keep RMSNorm outside hc_pre only when it needs to return the
+                # FP8 tuple; otherwise preserve the fused MHC pre-norm path.
+                norm=(
+                    None
+                    if envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
+                    else self.input_layernorm
+                ),
                 forward_batch=forward_batch,
             )
             if not norm_fused:
@@ -1626,7 +1643,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                     )
                 else:
                     hidden_states = self.input_layernorm(hidden_states)
-                    x_quant = None
+                    if isinstance(hidden_states, tuple):
+                        x_quant = hidden_states[:2]
+                        hidden_states = hidden_states[2]
+                    else:
+                        x_quant = None
             else:
                 x_quant = None
 
@@ -1861,7 +1882,10 @@ class DeepseekV4Model(nn.Module):
             ) = make_hc_head_params(hc_mult, config.hidden_size)
 
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
+        self.use_fused_mhc_post_pre = (
+            _is_fused_mhc_post_pre_enabled()
+            and not envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
+        )
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
 
