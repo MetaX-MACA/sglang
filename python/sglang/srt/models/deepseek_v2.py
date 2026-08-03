@@ -846,14 +846,9 @@ class DeepseekV2MoE(nn.Module):
         work_rank = get_tensor_model_parallel_rank()
         if 'ENABLE_EP_MOCK_BALANCE' in os.environ:
             self.balance_tensor = EP_BALANCED_TENSOR[work_rank].to(torch.cuda.current_device())
-        self.use_single_stream = False
-        if 'USE_SINGLE_STREAM' in os.environ:
-            self.use_single_stream = True
         self.use_single_stream_dispatch_overlap = False
         if 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
-            self.use_single_stream = True
             self.use_single_stream_dispatch_overlap = True
-        if self.use_single_stream:
             self.alt_stream = None
         self.sbo_tokens_threshold = get_int_env_var("SBO_TOKENS_THRESHOLD", 32)
 
@@ -2120,7 +2115,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             layer_id=layer_id,
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
-            alt_stream=alt_stream,
+            alt_stream=None if 'USE_SINGLE_STREAM' in os.environ else alt_stream,
             is_nextn=is_nextn,
             dsa_enable_prefill_cp=dsa_enable_prefill_cp,
             mla_enable_prefill_cp=mla_enable_prefill_cp,
@@ -2433,7 +2428,7 @@ class DeepseekV2Model(nn.Module):
             else None
         )
 
-        if 'USE_SINGLE_STREAM' or 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
+        if 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
             self.alt_stream = None
 
         self.layers, self.start_layer, self.end_layer = make_layers(
@@ -2787,11 +2782,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(q_lora_rank, is_deepseek_dsa(config))
-        
-        if SboFlags.fuse_shared_experts_inside_sbo():
-            self.execute_stream = torch.cuda.Stream()
-        else:
-            self.execute_stream = None
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -2901,15 +2891,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
         execute_stream = torch.cuda.current_stream()
-        if self.execute_stream and not torch.cuda.is_current_stream_capturing():
-            execute_stream = self.execute_stream
         with torch.cuda.stream(execute_stream):
             with get_attn_tp_context().maybe_input_scattered(forward_batch):
                 hidden_states = self.model(
                     input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
                 )
-        if self.execute_stream and not torch.cuda.is_current_stream_capturing():
-            execute_stream.synchronize()
+
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
