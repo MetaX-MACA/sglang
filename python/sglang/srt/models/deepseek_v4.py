@@ -1958,12 +1958,29 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        incoming_pd_aux_hidden_states: List[torch.Tensor] = []
         if self.pp_group.is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
+            incoming_pd_aux_hidden_states = [
+                pp_proxy_tensors[key]
+                for key in sorted(
+                    key
+                    for key in pp_proxy_tensors.tensors
+                    if key.startswith("pd_aux_hidden_states_")
+                )
+            ]
+            if hidden_states.shape[0] != positions.shape[0]:
+                rids = getattr(forward_batch, "rids", None)
+                raise RuntimeError(
+                    "PP proxy hidden token count does not match current positions: "
+                    f"pp_rank={self.pp_group.rank_in_group}, "
+                    f"hidden_tokens={hidden_states.shape[0]}, "
+                    f"position_tokens={positions.shape[0]}, rids={rids}"
+                )
             # Unflatten 2D PP IPC tensor back to 3D mHC shape.
             if hidden_states.ndim == 2:
                 hidden_states = hidden_states.view(
@@ -1996,14 +2013,21 @@ class DeepseekV4Model(nn.Module):
                 delattr(forward_batch, _attr)
 
         use_fused = self.use_fused_mhc_post_pre
-        capture_dspark = self.dspark_layers_to_capture is not None
+        dspark_layers_to_capture = getattr(
+            forward_batch, "pd_hidden_capture_layer_ids", None
+        )
+        if dspark_layers_to_capture is None:
+            dspark_layers_to_capture = self.dspark_layers_to_capture
+        capture_dspark = dspark_layers_to_capture is not None
         if capture_dspark and dsa_use_prefill_cp(forward_batch):
             raise NotImplementedError(
                 "DSpark aux hidden-state capture is not supported together with "
                 "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
                 "of them: DSpark static-verify is CP-off for v1."
             )
-        dspark_aux_hidden_states: List[torch.Tensor] = []
+        pd_aux_hidden_states: List[torch.Tensor] = list(
+            incoming_pd_aux_hidden_states
+        )
         prev_residual, prev_post, prev_comb = None, None, None
         last_layer = None
         for i in range(self.start_layer, self.end_layer):
@@ -2025,14 +2049,14 @@ class DeepseekV4Model(nn.Module):
                     prev_post=prev_post,
                     prev_comb=prev_comb,
                 )
-            if capture_dspark and i in self.dspark_layers_to_capture:
+            if capture_dspark and i in dspark_layers_to_capture:
                 if use_fused:
                     completed = layer.hc_post(
                         hidden_states, prev_residual, prev_post, prev_comb
                     )
                 else:
                     completed = hidden_states
-                dspark_aux_hidden_states.append(completed.mean(dim=1))
+                pd_aux_hidden_states.append(completed.mean(dim=1))
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb
@@ -2049,7 +2073,13 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
+            if capture_dspark:
+                for idx, aux_hidden in enumerate(pd_aux_hidden_states):
+                    proxy_tensors[f"pd_aux_hidden_states_{idx}"] = (
+                        aux_hidden.flatten(1) if aux_hidden.ndim == 3 else aux_hidden
+                    )
+            return PPProxyTensors(proxy_tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -2059,7 +2089,7 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+            return (hidden_states, pre_hc_head), pd_aux_hidden_states
 
         return hidden_states, pre_hc_head
 
@@ -2207,11 +2237,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             return hidden_states
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        pd_aux_hidden_states = None
+        has_pd_hidden_capture = (
+            getattr(forward_batch, "pd_hidden_capture_layer_ids", None) is not None
+        )
+        if has_pd_hidden_capture:
+            hidden_states, pd_aux_hidden_states = hidden_states
+            if self.capture_aux_hidden_states:
+                aux_hidden_states = pd_aux_hidden_states
+        elif self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
@@ -2221,6 +2259,20 @@ class DeepseekV4ForCausalLM(nn.Module):
                 None if aux_hidden_states is not None else pre_hc_head
             ),
         )
+        if (
+            has_pd_hidden_capture
+            and pd_aux_hidden_states
+            and logits_output.hidden_states is None
+        ):
+            flattened_aux_hidden_states = [
+                x.flatten(1) if x.ndim == 3 else x for x in pd_aux_hidden_states
+            ]
+            logits_output.hidden_states = (
+                flattened_aux_hidden_states[0]
+                if len(flattened_aux_hidden_states) == 1
+                else torch.cat(flattened_aux_hidden_states, dim=-1)
+            )
+        return logits_output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from deep_gemm import transform_sf_into_required_layout
