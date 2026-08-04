@@ -169,6 +169,18 @@ if _is_cuda:
         fused_k_indexer_norm_rope_store,
     )
 
+    def _hadamard_transform_fake_impl(
+        x: torch.Tensor,
+        scale: float = 1.0,
+    ) -> torch.Tensor:
+        return torch.empty_like(x)
+    
+    
+    @register_custom_op(fake_impl=_hadamard_transform_fake_impl)
+    def _hadamard_transform(x: torch.Tensor, scale: float = 1.0)->torch.Tensor:
+        return hadamard_transform(x, scale)
+
+
     @register_custom_op(mutates_args=["topk_indices"])
     @register_split_op()
     def broadcast_indexer_topk_from_rank0_(topk_indices: torch.Tensor) -> None:
@@ -221,7 +233,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert (
         hidden_size & (hidden_size - 1)
     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
-    return hadamard_transform(x, scale=hidden_size**-0.5)
+    return _hadamard_transform(x, scale=hidden_size**-0.5)
 
 
 class Indexer(DSANPUIndexerMixin, BaseFusedOp):

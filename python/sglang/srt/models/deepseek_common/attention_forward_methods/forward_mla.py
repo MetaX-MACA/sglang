@@ -110,12 +110,21 @@ def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
 
 
 if _is_cuda:
-    scaled_gemm_int8 = ScaledGEMM()
+    _scaled_gemm_int8 = ScaledGEMM()
     try:
         from sglang.kernels.ops.gemm import bmm_fp8
     except:
         bmm_fp8 = None
     
+
+    def _scaled_gemm_int8_fake_impl(M: int, N: int, K: int, A: torch.Tensor, B:torch.Tensor, C:torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor, bias: torch.Tensor)->None:
+        return
+
+    @register_custom_op(fake_impl=_scaled_gemm_int8_fake_impl)
+    def scaled_gemm_int8(M: int, N: int, K: int, A: torch.Tensor, B:torch.Tensor, C:torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor, bias: torch.Tensor)->None:
+        gemm_shapes = [M, N, K]
+        _scaled_gemm_int8(gemm_shapes, A, B, C, scale_a, scale_b, bias)
+        return 
 
 
 def should_defer_dsa_cp_kv_gather(
@@ -899,7 +908,9 @@ class DeepseekMLAForwardMixin:
                 device=attn_output.device,
             )
             scaled_gemm_int8(
-                [num_tokens, v_head_dim, kv_lora],
+                num_tokens,
+                v_head_dim,
+                kv_lora,
                 attn_output_quant_val,
                 self.w_vc,
                 attn_bmm_output,
