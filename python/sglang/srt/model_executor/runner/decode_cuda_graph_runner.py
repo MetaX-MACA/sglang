@@ -1475,8 +1475,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.deepep_adapter.replay()
 
-        must_refresh_metadata = self.model_runner.spec_algorithm.is_dspark()
-        if not forward_batch.needs_forward_metadata_init() and not must_refresh_metadata:
+        if not forward_batch.needs_forward_metadata_init():
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
             if is_ragged:
