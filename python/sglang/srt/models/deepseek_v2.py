@@ -268,17 +268,8 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        fused_quant = False
-        if quant_config is not None and quant_config.get_name() == "compressed_tensors":
-            
-            from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-                CompressedTensorsW8A8Int8,
-            )
-
-            fused_quant = isinstance(
-                getattr(self.down_proj, "scheme", None), CompressedTensorsW8A8Int8
-            )
-        self.act_fn = SiluAndMul(fused_quant=fused_quant)
+        self.fused_quant = envs.MX_ENABLE_FUSE_SILUMUL_QUANT.get()
+        self.act_fn = SiluAndMul(fused_quant=self.fused_quant)
         self.use_fused_clamp_act_mul = (
             _is_hip and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
         )
@@ -430,17 +421,20 @@ class DeepseekV2MLP(nn.Module):
 
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
-            if _is_npu:
-                _g, _u = gate_up.chunk(2, dim=-1)
-                _lim = float(self.swiglu_limit)
-                gate_up = torch.cat(
-                    [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
-                )
-                x = self.act_fn(gate_up)
+            if self.fused_quant:
+                x = self.act_fn(gate_up, self.swiglu_limit)
             else:
-                M, N = gate_up.shape
-                x = gate_up.new_empty((M, N // 2))
-                silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+                if _is_npu:
+                    _g, _u = gate_up.chunk(2, dim=-1)
+                    _lim = float(self.swiglu_limit)
+                    gate_up = torch.cat(
+                        [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+                    )
+                    x = self.act_fn(gate_up)
+                else:
+                    M, N = gate_up.shape
+                    x = gate_up.new_empty((M, N // 2))
+                    silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
             x = self.act_fn(gate_up)
         x, _ = self.down_proj(
@@ -1216,7 +1210,7 @@ class DeepseekV2MoE(nn.Module):
             packed_hidden = hidden_states
             if self.use_fused_quant and packed_hidden.shape[0] == 0:
                 packed_hidden = torch.empty(
-                    (0, align_packed_tensor_size(packed_hidden.shape[-1])), 
+                    (0, align_packed_tensor_size(packed_hidden.shape[-1], envs.MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE.get())), 
                     dtype=hidden_states.dtype, 
                     device=hidden_states.device
                 )

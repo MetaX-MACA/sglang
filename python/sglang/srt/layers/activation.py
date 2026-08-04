@@ -101,9 +101,9 @@ class SiluAndMul(MultiPlatformOp):
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_cuda(self, x: torch.Tensor, limit: Optional[float]=None) -> torch.Tensor:
         if self.fused_quant:
-            output,scale = fused_silu_mul_dq_quant(x)
+            output,scale = fused_silu_mul_dq_quant(x, limit)
             return (output,scale)
         else:
             d = x.shape[-1] // 2
