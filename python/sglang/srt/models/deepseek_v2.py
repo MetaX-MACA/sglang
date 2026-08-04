@@ -270,7 +270,14 @@ class DeepseekV2MLP(nn.Module):
             )
         fused_quant = False
         if quant_config is not None and quant_config.get_name() == "compressed_tensors":
-            fused_quant = True
+            
+            from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+                CompressedTensorsW8A8Int8,
+            )
+
+            fused_quant = isinstance(
+                getattr(self.down_proj, "scheme", None), CompressedTensorsW8A8Int8
+            )
         self.act_fn = SiluAndMul(fused_quant=fused_quant)
         self.use_fused_clamp_act_mul = (
             _is_hip and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
