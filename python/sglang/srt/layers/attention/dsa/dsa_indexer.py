@@ -1741,8 +1741,10 @@ class Indexer(MultiPlatformOp):
             # In piecewise CUDA graph, any access to seq_lens_cpu creates a Dynamo shape guard.
             # Piecewise CUDA graph never has empty batches.
             if not is_in_tc_piecewise_cuda_graph():
-                assert forward_batch.seq_lens_cpu is not None
-                if len(forward_batch.seq_lens_cpu) == 0:
+                seq_lens_cpu = forward_batch.seq_lens_cpu
+                is_empty = ((seq_lens_cpu is not None and len(seq_lens_cpu) == 0)
+                    or (seq_lens_cpu is None and forward_batch.batch_size == 0))
+                if is_empty:
                     # this seems b/c max-pad, no worries?
                     # if x.shape[0] != 0:
                     #     print(
