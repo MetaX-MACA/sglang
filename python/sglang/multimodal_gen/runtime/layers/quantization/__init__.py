@@ -37,8 +37,7 @@ QuantizationMethods = Literal[
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
-# The customized quantization methods which will be added to this dict.
-_CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
+_BUILTIN_METHOD_TO_CONFIG: dict[str, type[QuantizationConfig]] = {
     "modelopt": ModelOptFp8DiffusionConfig,
     "modelopt_fp8": ModelOptFp8Config,
     "modelopt_fp4": ModelOptFp4Config,
@@ -49,6 +48,9 @@ _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
     "mxfp8": MXFP8Config,
     "mxfp4_npu": NPUMXFP4Config,
 }
+
+# The customized quantization methods which will be added to this dict.
+_CUSTOMIZED_METHOD_TO_QUANT_CONFIG: dict[str, type[QuantizationConfig]] = {}
 
 
 def register_quantization_config(quantization: str):
@@ -70,7 +72,7 @@ def register_quantization_config(quantization: str):
             )
         if not issubclass(quant_config_cls, QuantizationConfig):
             raise ValueError(
-                "The quantization config must be a subclass of " "`QuantizationConfig`."
+                "The quantization config must be a subclass of `QuantizationConfig`."
             )
         _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization] = quant_config_cls
         QUANTIZATION_METHODS.append(quantization)
@@ -83,16 +85,25 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
-    method_to_config: dict[str, type[QuantizationConfig]] = {}
-    # Update the `method_to_config` with customized quantization methods.
-    method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
+    if quantization in _CUSTOMIZED_METHOD_TO_QUANT_CONFIG:
+        return _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization]
 
-    return method_to_config[quantization]
+    return _BUILTIN_METHOD_TO_CONFIG[quantization]
 
 
 __all__ = [
+    "BitsAndBytesConfig",
+    "Fp8Config",
+    "ModelOptFp8DiffusionConfig",
+    "ModelOptFp8Config",
+    "ModelOptFp4Config",
+    "ModelSlimConfig",
+    "Mxfp4Config",
+    "NPUMXFP4Config",
+    "MXFP8Config",
     "QuantizationMethods",
     "QuantizationConfig",
+    "register_quantization_config",
     "get_quantization_config",
     "QUANTIZATION_METHODS",
 ]

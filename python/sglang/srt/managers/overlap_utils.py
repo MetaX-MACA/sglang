@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_maca
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -63,6 +63,7 @@ def decide_needs_confidence_relay(server_args: ServerArgs) -> bool:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_maca = is_maca()
 _is_npu = is_npu()
 
 # Token-buf consume tracking: init to -1, assert non-negative on gather,
@@ -348,6 +349,8 @@ class FutureMap:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return
         indices = draft_input.future_indices
+        if indices is None:
+            return
         if indices.shape[0] == 0:
             return
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
@@ -395,7 +398,7 @@ class FutureMap:
         if fi is None:
             return
         if self.publish_ready is not None:
-            if _is_hip:
+            if _is_hip or _is_maca:
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
                 self.publish_ready.synchronize()
             else:

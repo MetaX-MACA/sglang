@@ -83,8 +83,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         server_args: ServerArgs,
         gpu_id: int,
         port_args: PortArgs,
-        task_pipes_to_slaves: list = None,
-        result_pipes_from_slaves: list = None,
         local_rank: int | None = None,
     ):
         self.server_args = server_args
@@ -119,8 +117,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             server_args=server_args,
         )
         self.worker = worker
-        self.task_pipes_to_slaves = task_pipes_to_slaves
-        self.result_pipes_from_slaves = result_pipes_from_slaves
         self.gpu_id = gpu_id
         self._show_warmup_progress = gpu_id == 0
         self._running = True
@@ -653,16 +649,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             return len(value)
 
         shape = getattr(value, "shape", None)
-        if shape is not None:
-            try:
-                if len(shape) > 0:
-                    return int(shape[0])
-            except Exception:
-                return None
-        return None
+        if shape is None:
+            # Genuine scalar / non-batched metadata.
+            return None
+        if len(shape) == 0:
+            return None
+        return int(shape[0])
 
     def _slice_batched_value(
-        self, value: Any, start: int, end: int, total_items: int
+        self, value: Any, start: int, end: int, total_items: int, *, field_name: str
     ) -> Any:
         if value is None:
             return None
@@ -677,8 +672,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if value_items == total_items:
             try:
                 return value[start:end]
-            except Exception:
-                pass
+            except Exception as exc:
+                # A value whose first dimension matches the batch size is
+                # batched; a slicing failure must not reclassify it as a
+                # shared scalar.
+                raise RuntimeError(
+                    f"failed to slice batched output field {field_name!r} of "
+                    f"type {type(value).__name__} [{start}:{end}] whose first "
+                    f"dimension matches the batch size {total_items}"
+                ) from exc
 
         # Scalar / non-batched metadata
         return deepcopy(value)
@@ -717,31 +719,27 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         start = 0
         for req, req_count in zip(reqs, per_req_counts):
             end = start + req_count
+
+            def slice_field(field_name: str) -> Any:
+                return self._slice_batched_value(
+                    getattr(output_batch, field_name),
+                    start,
+                    end,
+                    total_items,
+                    field_name=field_name,
+                )
+
             split = OutputBatch(
-                output=self._slice_batched_value(
-                    output_batch.output, start, end, total_items
-                ),
-                audio=self._slice_batched_value(
-                    output_batch.audio, start, end, total_items
-                ),
+                output=slice_field("output"),
+                audio=slice_field("audio"),
                 audio_sample_rate=output_batch.audio_sample_rate,
-                trajectory_timesteps=self._slice_batched_value(
-                    output_batch.trajectory_timesteps, start, end, total_items
-                ),
-                trajectory_latents=self._slice_batched_value(
-                    output_batch.trajectory_latents, start, end, total_items
-                ),
-                trajectory_decoded=self._slice_batched_value(
-                    output_batch.trajectory_decoded, start, end, total_items
-                ),
+                trajectory_timesteps=slice_field("trajectory_timesteps"),
+                trajectory_latents=slice_field("trajectory_latents"),
+                trajectory_decoded=slice_field("trajectory_decoded"),
                 error=output_batch.error,
-                output_file_paths=self._slice_batched_value(
-                    output_batch.output_file_paths, start, end, total_items
-                ),
+                output_file_paths=slice_field("output_file_paths"),
                 metrics=deepcopy(output_batch.metrics),
-                noise_pred=self._slice_batched_value(
-                    output_batch.noise_pred, start, end, total_items
-                ),
+                noise_pred=slice_field("noise_pred"),
                 peak_memory_mb=output_batch.peak_memory_mb,
             )
             if split.metrics is not None:
@@ -1070,20 +1068,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._cleanup_disagg()
         self.context.destroy(linger=0)
 
-    def _broadcast_task(self, payload: dict[str, Any]) -> None:
-        """Broadcast a task to all slave worker processes."""
-        method = payload["method"]
-        kwargs = {k: v for k, v in payload.items() if k != "method"}
-        task = {"method": method, "kwargs": kwargs}
-        for pipe in self.task_pipes_to_slaves:
-            pipe.send(task)
-
-    def _collect_slave_results(self) -> List[dict[str, Any]]:
-        """Collect results from all slave worker processes."""
-        results = []
-        for pipe in self.result_pipes_from_slaves:
-            results.append(pipe.recv())
-        return results
 
     def _handle_release_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
         logger.info(f"[SLEEP] handle_release_memory_occupation on rank={self.gpu_id}")

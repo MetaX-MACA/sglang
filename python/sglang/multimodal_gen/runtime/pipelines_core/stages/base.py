@@ -372,6 +372,7 @@ class PipelineStage(StageDedupMixin, ABC):
                 log_stage_start_end=not batch.is_warmup
                 and not (self.server_args and self.server_args.comfyui_mode),
                 perf_dump_path_provided=batch.perf_dump_path is not None,
+                capture_memory=True,
             ):
                 result = self.forward(batch, server_args)
         finally:

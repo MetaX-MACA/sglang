@@ -81,6 +81,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    envs,
     is_non_idle_and_non_empty,
     make_layers,
     align_packed_tensor_size,
@@ -234,7 +235,7 @@ class MiMoV2MoE(nn.Module):
 
         self.config = config
         self.layer_id = layer_id
-        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.use_fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -724,7 +725,7 @@ class MiMoV2DecoderLayer(nn.Module):
             )
 
         packed_quant = True if self.is_layer_sparse else False
-        fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
+        fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.layernorm_epsilon, fused_quant=fused_quant, packed_quant=packed_quant, packed_size=align_packed_tensor_size(config.hidden_size)

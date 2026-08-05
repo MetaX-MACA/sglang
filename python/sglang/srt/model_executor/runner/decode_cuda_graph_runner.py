@@ -1240,7 +1240,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._post_process_after_profile(prof)
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
-        if self.qwen3_5_ragged_graph_grid_enabled:
+        if hasattr(self, "qwen3_5_ragged_graph_grid_enabled") and self.qwen3_5_ragged_graph_grid_enabled:
             self._capture_one_ragged_stream(stream_idx)
             return
 
@@ -1475,8 +1475,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.deepep_adapter.replay()
 
-        must_refresh_metadata = self.model_runner.spec_algorithm.is_dspark()
-        if not forward_batch.needs_forward_metadata_init() and not must_refresh_metadata:
+        if not forward_batch.needs_forward_metadata_init():
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
             if is_ragged:

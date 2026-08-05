@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import einops
 import torch
+from mcoplib.op import fused_silu_mul_dq_mask_quant_fp8_nopack
 
 from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
 from sglang.srt.environ import envs
@@ -162,7 +163,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             assert envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
             assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
             self.use_swizzle = True
-        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.use_fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
 
     def run(
         self,
@@ -705,7 +706,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         
         # Act
-        down_input = silu_and_mul_masked(gateup_output, masked_m, self.swiglu_limit)
+        down_input = silu_and_mul_masked(
+            gateup_output, masked_m,
+            gemm1_alpha=getattr(self.config, 'gemm1_alpha', 0.0) or 0.0,
+            swiglu_limit=getattr(self.config, 'swiglu_limit', 0.0) or 0.0,
+        )
         del gateup_output
 
         # GroupGemm-2
@@ -713,14 +718,34 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
+        down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
+        if down_gemm_overlap_args is None:
+            gemm_overlap_args_dict = {}
+        else:
+            down_gemm_overlap_args.start_event.record()
+            max_block_n = 128
+            gemm_overlap_args_dict = {
+                "overlap_args": down_gemm_overlap_args,
+                "max_block_n": max_block_n,
+            }
+        # if self.config.gemm1_clamp_limit is not None:
+        #     gemm_overlap_args_dict["clamp_limit"] = self.config.gemm1_clamp_limit
+        #     down_input = per_token_quant_int8(down_input)
+
+        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
             down_input,
             (w2_weight, w2_scale),
             down_output,
             masked_m,
             expected_m,
+            **gemm_overlap_args_dict,
         )
 
+        meta_overlap_args = running_state.get("meta_overlap_args", None)
+        if meta_overlap_args is not None:
+            block_m, threshold = deep_gemm_return_value
+            meta_overlap_args["block_m"] = block_m
+            meta_overlap_args["threshold"] = threshold
         return down_output
     
     @property
@@ -1084,9 +1109,6 @@ def _varlen_deep_gemm_silu_mul_quant(
             silu_and_mul_masked_post_quant_packed_fwd,
         )
 
-        assert (
-            swiglu_limit is None
-        ), "swiglu_limit and gemm1_alpha are mutually exclusive"
         assert not swizzle, "swizzle is not supported with gemm1_alpha"
         down_input = torch.empty(
             (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
@@ -1142,10 +1164,14 @@ def _varlen_deep_gemm_silu_mul_quant(
         if packed_ue8m0:
             down_input_scale = down_input_scale.transpose(-1, -2)
     else:
+        use_mx_fused_quant = (
+            envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
+            and gemm1_alpha is None
+            and swiglu_limit is None
+            and not swizzle
+            and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        )
         if gemm1_alpha is not None:
-            assert (
-                swiglu_limit is None
-            ), "swiglu_limit and gemm1_alpha are mutually exclusive"
             assert not swizzle, "swizzle is not supported with gemm1_alpha"
         else:
             assert (
@@ -1159,16 +1185,26 @@ def _varlen_deep_gemm_silu_mul_quant(
             device=hidden_states_device,
             dtype=torch.float32,
         )
-        silu_and_mul_masked_post_quant_fwd(
-            gateup_output,
-            down_input,
-            down_input_scale,
-            group_size,
-            masked_m,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            gemm1_alpha=gemm1_alpha or 0.0,
-            gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
-        )
+        if use_mx_fused_quant:
+            fused_silu_mul_dq_mask_quant_fp8_nopack(
+                down_input,
+                down_input_scale,
+                gateup_output,
+                masked_m,
+                group_size,
+                swiglu_limit,
+            )
+        else:
+            silu_and_mul_masked_post_quant_fwd(
+                gateup_output,
+                down_input,
+                down_input_scale,
+                group_size,
+                masked_m,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                gemm1_alpha=gemm1_alpha or 0.0,
+                gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
+            )
     return down_input, down_input_scale
 
 

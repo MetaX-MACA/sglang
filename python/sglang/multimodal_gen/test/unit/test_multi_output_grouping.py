@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     expand_request_outputs,
     normalize_output_seeds,
 )
+from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
@@ -196,6 +197,44 @@ class TestMultiOutputGrouping(unittest.TestCase):
         self.assertTrue(torch.equal(reqs[1].latents, torch.tensor([[[1.0]]])))
         self.assertTrue(torch.equal(reqs[0].latent_ids, torch.tensor([[[10.0]]])))
         self.assertTrue(torch.equal(reqs[1].latent_ids, torch.tensor([[[11.0]]])))
+
+    def test_dynamic_batch_slice_error_on_batch_sized_value_propagates(self):
+        scheduler = Scheduler.__new__(Scheduler)
+
+        class _UnsliceableBatchValue:
+            shape = (2, 4)
+
+            def __getitem__(self, _item):
+                raise TypeError("slicing unsupported")
+
+        with self.assertRaisesRegex(RuntimeError, r"'output'.*_UnsliceableBatchValue"):
+            scheduler._slice_batched_value(
+                _UnsliceableBatchValue(), 0, 1, 2, field_name="output"
+            )
+
+    def test_dynamic_batch_scalar_metadata_is_still_deepcopied(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scalar_metadata = {"peak_memory_mb": 1.0}
+
+        result = scheduler._slice_batched_value(
+            scalar_metadata, 0, 1, 2, field_name="metrics"
+        )
+
+        self.assertEqual(result, scalar_metadata)
+        self.assertIsNot(result, scalar_metadata)
+
+    def test_count_first_dim_propagates_malformed_shape(self):
+        class _MalformedShape:
+            shape = 5  # not sized: len(shape) raises
+
+        with self.assertRaises(TypeError):
+            Scheduler._count_first_dim(_MalformedShape())
+
+    def test_count_first_dim_keeps_genuine_scalars_and_zero_dim(self):
+        self.assertIsNone(Scheduler._count_first_dim(None))
+        self.assertIsNone(Scheduler._count_first_dim(1.5))
+        self.assertIsNone(Scheduler._count_first_dim(torch.tensor(3.0)))
+        self.assertEqual(Scheduler._count_first_dim(torch.zeros(2, 1)), 2)
 
 
 if __name__ == "__main__":

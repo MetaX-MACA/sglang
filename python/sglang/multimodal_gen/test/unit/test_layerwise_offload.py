@@ -361,6 +361,7 @@ def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypa
     transformer = _NestedDummyModel()
     image_encoder = _NestedEncoderDummyModel()
     vae = _NestedEncoderDummyModel()
+    video_vae = _NestedEncoderDummyModel()
     audio_vae = _NestedEncoderDummyModel()
     vocoder = _NestedEncoderDummyModel()
     spatial_upsampler = _NestedEncoderDummyModel()
@@ -371,6 +372,7 @@ def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypa
         "transformer": transformer,
         "image_encoder": image_encoder,
         "vae": vae,
+        "video_vae": video_vae,
         "audio_vae": audio_vae,
         "vocoder": vocoder,
         "spatial_upsampler": spatial_upsampler,
@@ -386,6 +388,7 @@ def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypa
         "text_encoder_2",
         "image_encoder",
         "vae",
+        "video_vae",
         "condition_image_encoder",
     ]
     assert configured == [
@@ -393,6 +396,7 @@ def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypa
         "text_encoder_2",
         "image_encoder",
         "vae",
+        "video_vae",
         "condition_image_encoder",
     ]
     assert is_layerwise_offloaded_module(text_encoder)
@@ -400,6 +404,7 @@ def test_layerwise_configuration_default_group_selects_non_dit_defaults(monkeypa
     assert not is_layerwise_offloaded_module(transformer)
     assert is_layerwise_offloaded_module(image_encoder)
     assert is_layerwise_offloaded_module(vae)
+    assert is_layerwise_offloaded_module(video_vae)
     assert not is_layerwise_offloaded_module(audio_vae)
     assert not is_layerwise_offloaded_module(vocoder)
     assert not is_layerwise_offloaded_module(spatial_upsampler)

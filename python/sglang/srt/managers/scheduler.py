@@ -1513,7 +1513,8 @@ class Scheduler(
             dispatch_event_loop(self)
             return
 
-        self.schedule_stream = self.device_module.Stream(priority=0)
+        # self.schedule_stream = self.device_module.Stream(priority=0)
+        self.schedule_stream = self.device_module.current_stream()
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         # The global WAR barrier fences the scheduler's next shared-buffer write
@@ -3226,7 +3227,7 @@ class Scheduler(
                     self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    self.schedule_stream.synchronize()
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring

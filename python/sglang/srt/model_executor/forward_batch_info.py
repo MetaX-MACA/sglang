@@ -40,6 +40,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
+from sglang.srt.disaggregation.hidden_state import get_pd_hidden_capture_layer_ids
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -435,6 +436,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     topk_indices: Optional[torch.Tensor] = None
     reuse_mtp_topk_indices: Optional[bool] = False
 
+    # DeepSeek-V4 DSpark PD: per-prefill-batch target aux hidden layers to capture.
+    pd_hidden_capture_layer_ids: Optional[List[int]] = None
+
     # MiniMax-M3 sparse-attention layers whose K/V cache was written by a fused
     # norm/RoPE/cache-store kernel during this forward pass.
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
@@ -629,8 +633,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # capture_hidden_mode default: derive from SB.return_hidden_states /
         # spec_info.capture_hidden_mode when caller did not override.
+        pd_hidden_capture_layer_ids = get_pd_hidden_capture_layer_ids(batch.reqs)
         if capture_hidden_mode is None:
-            if batch.return_hidden_states:
+            if batch.return_hidden_states or pd_hidden_capture_layer_ids:
                 capture_hidden_mode = CaptureHiddenMode.FULL
             elif batch.spec_info is not None:
                 capture_hidden_mode = getattr(
@@ -709,6 +714,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
+            pd_hidden_capture_layer_ids=pd_hidden_capture_layer_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,

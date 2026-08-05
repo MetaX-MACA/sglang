@@ -73,6 +73,7 @@ class VideoResponse(BaseModel):
     seconds: str = "4"
     quality: str = "standard"
     url: Optional[str] = None
+    urls: Optional[List[str]] = None
     remixed_from_video_id: Optional[str] = None
     completed_at: Optional[int] = None
     expires_at: Optional[int] = None
@@ -132,10 +133,6 @@ class VideoGenerationsRequest(BaseModel):
 class VideoListResponse(BaseModel):
     data: List[VideoResponse]
     object: str = "list"
-
-
-class VideoRemixRequest(BaseModel):
-    prompt: str
 
 
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):

@@ -268,10 +268,8 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        fused_quant = False
-        if quant_config is not None and quant_config.get_name() == "compressed_tensors":
-            fused_quant = True
-        self.act_fn = SiluAndMul(fused_quant=fused_quant)
+        self.fused_quant = envs.MX_ENABLE_FUSE_SILUMUL_QUANT.get()
+        self.act_fn = SiluAndMul(fused_quant=self.fused_quant)
         self.use_fused_clamp_act_mul = (
             _is_hip and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
         )
@@ -369,7 +367,27 @@ class DeepseekV2MLP(nn.Module):
             )
             return down_output
 
-        if self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
+        if envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get():
+            M, N = gate_up.shape
+            quant_group_size = 128
+            x_quant = torch.empty(
+                (M, N // 2),
+                device=gate_up.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            x_scale = torch.empty(
+                (M, (N // 2) // quant_group_size),
+                device=gate_up.device,
+                dtype=torch.float32,
+            )
+            torch.ops.sgl_kernel.fused_silu_mul_per_group_quant(
+                x_quant,
+                x_scale,
+                gate_up,
+                self.swiglu_limit,
+            )
+            x = (x_quant, x_scale)
+        elif self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
             from aiter.ops.triton.fusions.fused_clamp_act_mul import (
                 fused_clamp_act_mul,
             )
@@ -403,17 +421,20 @@ class DeepseekV2MLP(nn.Module):
 
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
-            if _is_npu:
-                _g, _u = gate_up.chunk(2, dim=-1)
-                _lim = float(self.swiglu_limit)
-                gate_up = torch.cat(
-                    [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
-                )
-                x = self.act_fn(gate_up)
+            if self.fused_quant:
+                x = self.act_fn(gate_up, self.swiglu_limit)
             else:
-                M, N = gate_up.shape
-                x = gate_up.new_empty((M, N // 2))
-                silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+                if _is_npu:
+                    _g, _u = gate_up.chunk(2, dim=-1)
+                    _lim = float(self.swiglu_limit)
+                    gate_up = torch.cat(
+                        [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+                    )
+                    x = self.act_fn(gate_up)
+                else:
+                    M, N = gate_up.shape
+                    x = gate_up.new_empty((M, N // 2))
+                    silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
             x = self.act_fn(gate_up)
         x, _ = self.down_proj(
@@ -584,7 +605,7 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
-        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.use_fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
@@ -826,14 +847,9 @@ class DeepseekV2MoE(nn.Module):
         work_rank = get_tensor_model_parallel_rank()
         if 'ENABLE_EP_MOCK_BALANCE' in os.environ:
             self.balance_tensor = EP_BALANCED_TENSOR[work_rank].to(torch.cuda.current_device())
-        self.use_single_stream = False
-        if 'USE_SINGLE_STREAM' in os.environ:
-            self.use_single_stream = True
         self.use_single_stream_dispatch_overlap = False
         if 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
-            self.use_single_stream = True
             self.use_single_stream_dispatch_overlap = True
-        if self.use_single_stream:
             self.alt_stream = None
         self.sbo_tokens_threshold = get_int_env_var("SBO_TOKENS_THRESHOLD", 32)
 
@@ -1194,7 +1210,7 @@ class DeepseekV2MoE(nn.Module):
             packed_hidden = hidden_states
             if self.use_fused_quant and packed_hidden.shape[0] == 0:
                 packed_hidden = torch.empty(
-                    (0, align_packed_tensor_size(packed_hidden.shape[-1])), 
+                    (0, align_packed_tensor_size(packed_hidden.shape[-1], envs.MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE.get())), 
                     dtype=hidden_states.dtype, 
                     device=hidden_states.device
                 )
@@ -1628,8 +1644,9 @@ class DeepseekV2AttentionMLA(
             self.q_a_layernorm = RMSNorm(
                 self.q_lora_rank,
                 eps=config.rms_norm_eps,
-                fused_quant=get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
-                or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL", default="false"),
+                fused_quant=envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+                    or envs.MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL.get(),
+                return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
             )
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
@@ -2099,7 +2116,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             layer_id=layer_id,
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
-            alt_stream=alt_stream,
+            alt_stream=None if 'USE_SINGLE_STREAM' in os.environ else alt_stream,
             is_nextn=is_nextn,
             dsa_enable_prefill_cp=dsa_enable_prefill_cp,
             mla_enable_prefill_cp=mla_enable_prefill_cp,
@@ -2153,14 +2170,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         #     config.hidden_size, eps=config.rms_norm_eps
         # )
         packed_quant = True if self.is_layer_sparse else False
-        fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
-        fused_quant_pd = fused_quant or get_bool_env_var(
-            "FUSED_RMSNORM_QUANT_PREFILL", default="false"
-        )
+        fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+        fused_quant_pd = fused_quant or envs.MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL.get()
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_quant=fused_quant_pd,
+            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
@@ -2413,7 +2429,7 @@ class DeepseekV2Model(nn.Module):
             else None
         )
 
-        if 'USE_SINGLE_STREAM' or 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
+        if 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
             self.alt_stream = None
 
         self.layers, self.start_layer, self.end_layer = make_layers(
@@ -2767,11 +2783,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(q_lora_rank, is_deepseek_dsa(config))
-        
-        if SboFlags.fuse_shared_experts_inside_sbo():
-            self.execute_stream = torch.cuda.Stream()
-        else:
-            self.execute_stream = None
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -2881,15 +2892,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
         execute_stream = torch.cuda.current_stream()
-        if self.execute_stream and not torch.cuda.is_current_stream_capturing():
-            execute_stream = self.execute_stream
         with torch.cuda.stream(execute_stream):
             with get_attn_tp_context().maybe_input_scattered(forward_batch):
                 hidden_states = self.model(
                     input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
                 )
-        if self.execute_stream and not torch.cuda.is_current_stream_capturing():
-            execute_stream.synchronize()
+
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states

@@ -31,6 +31,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     Cosmos3Config,
     FastHunyuanConfig,
     FluxPipelineConfig,
+    MiniMaxH3PipelineConfig,
     HeliosDistilledConfig,
     HeliosMidConfig,
     HeliosT2VConfig,
@@ -106,6 +107,7 @@ from sglang.multimodal_gen.configs.sample.flux import (
     FluxSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.helios import (
     HeliosDistilledSamplingParams,
     HeliosMidSamplingParams,
@@ -786,6 +788,15 @@ def _register_configs():
             lambda hf_id: "mova" in hf_id.lower() and "720p" in hf_id.lower()
         ],
     )
+    # MiniMax H3 has one CFG-distilled, single-positive-branch serving path.
+    register_configs(
+        sampling_param_cls=MiniMaxH3SamplingParams,
+        pipeline_config_cls=MiniMaxH3PipelineConfig,
+        model_detectors=[
+            lambda model_id: "minimaxh3"
+            in model_id.lower().replace("-", "").replace("_", "")
+        ],
+    )
     # FLUX
     register_configs(
         sampling_param_cls=FluxSamplingParams,
@@ -1096,14 +1107,6 @@ def _register_configs():
 
 
 _register_configs()
-
-
-def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
-    model_path_lower = model_path.lower()
-    return any(
-        pattern in model_path_lower
-        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
-    )
 
 
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
