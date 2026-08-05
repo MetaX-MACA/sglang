@@ -466,7 +466,8 @@ class Indexer(MultiPlatformOp):
         if self.int8_cache:
             self.scale_fmt = None
         self.softmax_scale = self.head_dim**-0.5
-        self.int8_mqa_logits_backend = "tilelang" if envs.MX_ENABLE_TILELANG_INT8_MQA_LOGITS.get() else "triton"
+        self.int8_mqa_logits_backend = envs.MX_INT8_MQA_LOGITS_BACKEND.get()
+        assert self.int8_mqa_logits_backend in {"triton", "tilelang", "maca_c"}
 
         # self._indexer_freqs_cis: Optional[torch.Tensor] = None
         # if _use_dsa_indexer_fusion:

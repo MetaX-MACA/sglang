@@ -34,10 +34,7 @@ def try_import_with_message(name: str):
         return None
 
 if try_import_with_message("mctlassEx") != None :
-    backend_name = "mctlassEx" 
-    from deep_gemm import get_mctlass_op
-    mctlass_op = get_mctlass_op()
-
+    backend_name = "mctlassEx"
 else:
     backend_name = "torch_bf16"
 
