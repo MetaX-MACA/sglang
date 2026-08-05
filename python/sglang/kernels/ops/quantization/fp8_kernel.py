@@ -566,6 +566,13 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
 ):
+    if use_mcoplib:
+        return torch.empty(
+            x_shape[:-1] + (x_shape[-1] // group_size,),
+            device=device,
+            dtype=torch.float32,
+        )
+
     if scale_ue8m0:
         if column_major_scales and scale_tma_aligned:
             *x_batch, x_q_mn, x_q_k = x_shape
@@ -980,7 +987,7 @@ def sglang_per_token_quant_fp8(
         dtype=torch.float32,
     )
 
-    # sgl_per_token_quant_fp8(x, x_q, x_s)
+    sgl_per_token_quant_fp8(x, x_q, x_s)
 
     return x_q, x_s
 
