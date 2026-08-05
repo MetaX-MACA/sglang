@@ -80,8 +80,8 @@ def flatten_extra_params(payload: Any) -> dict[str, Any]:
     if isinstance(extra_params, str):
         try:
             extra_params = json.loads(extra_params)
-        except Exception:
-            extra_params = None
+        except ValueError as exc:
+            raise _bad_request(f"extra_params must be valid JSON: {exc}") from exc
     if not isinstance(extra_params, dict):
         if "guardrails" in payload:
             payload.setdefault("use_guardrails", payload["guardrails"])
@@ -215,8 +215,8 @@ async def _save_upload_to_path(
             raise TypeError(
                 f"Image upload read() returned {type(content).__name__}, expected bytes"
             )
-    with open(target_path, "wb") as f:
-        f.write(content)
+    with open(target_path, "wb") as output:
+        output.write(content)
     return target_path
 
 
@@ -343,8 +343,12 @@ async def process_generation_batch(
     batch,
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
-    with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
-        result = await scheduler_client.forward([batch])
+    requests = batch if isinstance(batch, list) else [batch]
+    if not requests or not all(hasattr(item, "trace_ctx") for item in requests):
+        raise TypeError("process_generation_batch expects a Req or list of Req")
+    primary = requests[0]
+    with trace_req(primary.trace_ctx), log_generation_timer(logger, primary.prompt):
+        result = await scheduler_client.forward(requests)
 
         if (
             result.output is None
@@ -361,23 +365,62 @@ async def process_generation_batch(
             save_file_path_list = result.output_file_paths
         elif result.output is not None:
             num_outputs = len(result.output)
-            save_file_path_list = save_outputs(
-                result.output,
-                batch.data_type,
-                batch.fps,
-                batch.save_output,
-                lambda idx: str(batch.output_file_path(num_outputs, idx)),
-                audio=result.audio,
-                audio_sample_rate=result.audio_sample_rate,
-                output_compression=batch.output_compression,
-                enable_frame_interpolation=batch.enable_frame_interpolation,
-                frame_interpolation_exp=batch.frame_interpolation_exp,
-                frame_interpolation_scale=batch.frame_interpolation_scale,
-                frame_interpolation_model_path=batch.frame_interpolation_model_path,
-                enable_upscaling=batch.enable_upscaling,
-                upscaling_model_path=batch.upscaling_model_path,
-                upscaling_scale=batch.upscaling_scale,
-            )
+            if len(requests) > 1:
+                if num_outputs != len(requests):
+                    raise RuntimeError(
+                        "Model generation returned "
+                        f"{num_outputs} raw outputs for {len(requests)} "
+                        "expanded requests"
+                    )
+                output_paths = [
+                    str(request.output_file_path(1, 0)) for request in requests
+                ]
+            else:
+                # A pipeline may still return multiple native outputs for one
+                # request. Preserve its historical basename-indexing scheme.
+                output_paths = [
+                    str(primary.output_file_path(num_outputs, output_idx))
+                    for output_idx in range(num_outputs)
+                ]
+
+            preexisting_paths = {path for path in output_paths if os.path.lexists(path)}
+            try:
+                save_file_path_list = save_outputs(
+                    result.output,
+                    primary.data_type,
+                    primary.fps,
+                    primary.save_output,
+                    lambda idx: output_paths[idx],
+                    audio=result.audio,
+                    audio_sample_rate=result.audio_sample_rate,
+                    output_compression=primary.output_compression,
+                    enable_frame_interpolation=primary.enable_frame_interpolation,
+                    frame_interpolation_exp=primary.frame_interpolation_exp,
+                    frame_interpolation_scale=primary.frame_interpolation_scale,
+                    frame_interpolation_model_path=primary.frame_interpolation_model_path,
+                    enable_upscaling=primary.enable_upscaling,
+                    upscaling_model_path=primary.upscaling_model_path,
+                    upscaling_scale=primary.upscaling_scale,
+                    strict_audio_mux=(
+                        get_global_server_args().pipeline_config.requires_audio_output
+                    ),
+                )
+            except Exception:
+                if primary.save_output:
+                    for path in dict.fromkeys(output_paths):
+                        if path in preexisting_paths:
+                            continue
+                        try:
+                            os.remove(path)
+                        except FileNotFoundError:
+                            pass
+                        except OSError as cleanup_error:
+                            logger.warning(
+                                "Failed to remove incomplete generated output %s: %s",
+                                path,
+                                cleanup_error,
+                            )
+                raise
 
     total_time = time.perf_counter() - total_start_time
     if get_global_server_args().batching_max_size > 1:
@@ -435,7 +478,16 @@ def add_common_data_to_response(
     return response
 
 
-def adjust_output_quality(output_quality: str, data_type: DataType = None) -> int:
+def adjust_output_quality(
+    output_quality: str | None, data_type: DataType = None
+) -> int | None:
+    if output_quality is None:
+        return None
     if output_quality == "default":
         return 50 if data_type == DataType.VIDEO else 75
-    return OUTPUT_QUALITY_MAPPER.get(output_quality, None)
+    if output_quality not in OUTPUT_QUALITY_MAPPER:
+        allowed = ", ".join([*sorted(OUTPUT_QUALITY_MAPPER), "default"])
+        raise _bad_request(
+            f"output_quality must be one of: {allowed}; got {output_quality!r}"
+        )
+    return OUTPUT_QUALITY_MAPPER[output_quality]

@@ -1,4 +1,3 @@
-import importlib.util
 import os
 
 import torch
@@ -6,6 +5,7 @@ import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 
 from sglang.multimodal_gen.configs.models import ModelConfig
+from sglang.multimodal_gen.configs.models.vaes.base import VAEContractError
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -13,6 +13,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
+    RemoteComponentLoadError,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.remote_code import (
+    _REMOTE_VAE_IMPORT_LOCK,
+    _get_remote_vae_auto_model_reference,
+    _load_remote_vae_class,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
@@ -60,7 +66,7 @@ def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
             try:
                 m.weight.data = m.weight.data.to(memory_format=torch.channels_last_3d)
                 num_converted += 1
-            except Exception:
+            except (RuntimeError, TypeError, ValueError):
                 # Best-effort; skip unsupported cases.
                 continue
     return num_converted
@@ -96,7 +102,11 @@ def _should_use_channels_last_3d(
 class VAELoader(ComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
 
-    component_names = ["vae", "audio_vae", "video_vae"]
+    component_names = [
+        "vae",
+        "audio_vae",
+        "video_vae",
+    ]
     expected_library = "diffusers"
 
     def should_offload(
@@ -113,6 +123,20 @@ class VAELoader(ComponentLoader):
         assert (
             class_name is not None
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        try:
+            auto_model_map = _get_remote_vae_auto_model_reference(config)
+        except Exception as exc:
+            raise RemoteComponentLoadError(
+                f"Invalid remote VAE auto_map in {component_model_path}"
+            ) from exc
+        if auto_model_map is not None and not server_args.trust_remote_code:
+            error = ValueError(
+                "Loading a VAE class from auto_map requires trust_remote_code=True"
+            )
+            raise RemoteComponentLoadError(
+                f"Refusing to load untrusted remote VAE {auto_model_map!r} "
+                f"from {component_model_path}"
+            ) from error
 
         server_args.model_paths[component_name] = component_model_path
 
@@ -134,39 +158,47 @@ class VAELoader(ComponentLoader):
             if resolved_vae_dtype is not None
             else PRECISION_TO_TYPE[vae_precision]
         )
-        vae_config.update_model_arch(config)
-        if hasattr(vae_config, "post_init"):
-            # NOTE: some post init logics are only available after updated with config
-            vae_config.post_init()
+        try:
+            vae_config.update_model_arch(config)
+            if hasattr(vae_config, "post_init"):
+                # NOTE: some post init logics are only available after updated with config
+                vae_config.post_init()
+        except VAEContractError as exc:
+            raise RemoteComponentLoadError(str(exc)) from exc
 
         should_offload = self.should_offload(server_args)
         target_device = self.target_device(should_offload)
 
-        # Check for auto_map first (custom VAE classes)
-        auto_map = config.get("auto_map", {})
-        auto_model_map = auto_map.get("AutoModel")
-        if auto_model_map:
-            module_path, cls_name = auto_model_map.rsplit(".", 1)
-            custom_module_file = os.path.join(component_model_path, f"{module_path}.py")
-            spec = importlib.util.spec_from_file_location("_custom", custom_module_file)
-            custom_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(custom_module)
-            vae_cls = getattr(custom_module, cls_name)
-            with set_default_torch_dtype(vae_dtype):
-                vae = vae_cls.from_pretrained(
-                    component_model_path,
-                    revision=server_args.revision,
-                    trust_remote_code=server_args.trust_remote_code,
-                )
-            vae = vae.to(device=target_device, dtype=vae_dtype)
-            if _should_use_channels_last_3d(server_args, component_name):
-                n = _convert_conv3d_weights_to_channels_last_3d(vae)
-                if n > 0:
-                    logger.info(
-                        "VAE: converted %d Conv3d weights to channels_last_3d", n
+        # Check for auto_map first (custom VAE classes).
+        if auto_model_map is not None:
+            with _REMOTE_VAE_IMPORT_LOCK:
+                try:
+                    vae_cls = _load_remote_vae_class(
+                        component_model_path,
+                        auto_model_map,
+                        trust_remote_code=server_args.trust_remote_code,
                     )
-            vae = current_platform.optimize_vae(vae)
-            return vae
+                    with set_default_torch_dtype(vae_dtype):
+                        vae = vae_cls.from_pretrained(
+                            component_model_path,
+                            revision=server_args.revision,
+                            trust_remote_code=server_args.trust_remote_code,
+                        )
+                    vae = vae.to(device=target_device, dtype=vae_dtype)
+                    if _should_use_channels_last_3d(server_args, component_name):
+                        n = _convert_conv3d_weights_to_channels_last_3d(vae)
+                        if n > 0:
+                            logger.info(
+                                "VAE: converted %d Conv3d weights to channels_last_3d",
+                                n,
+                            )
+                    vae = current_platform.optimize_vae(vae)
+                    return vae
+                except Exception as exc:
+                    raise RemoteComponentLoadError(
+                        f"Failed to load remote VAE {auto_model_map!r} "
+                        f"from {component_model_path}"
+                    ) from exc
 
         # Load from ModelRegistry (standard VAE classes)
         with (

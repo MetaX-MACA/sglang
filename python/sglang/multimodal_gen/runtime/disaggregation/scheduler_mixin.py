@@ -63,6 +63,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Receive slots pre-allocated per receiver role (denoiser/decoder). There is
+# intentionally no ServerArgs knob for this.
+_DISAGG_PREALLOC_SLOTS = 2
+
 # ---------------------------------------------------------------------------
 # Field extraction: split Req into tensors (transfer buffer) and scalars (JSON)
 # ---------------------------------------------------------------------------
@@ -472,7 +476,7 @@ class SchedulerDisaggMixin:
         self._preallocated_slots: dict[int, object] = {}
         preallocated_slot_info = []
         if self._disagg_role in (RoleType.DENOISER, RoleType.DECODER):
-            capacity = getattr(sa, "disagg_prealloc_slots", 2)
+            capacity = _DISAGG_PREALLOC_SLOTS
             typical_size = 64 * 1024 * 1024  # 64 MiB per slot
             for i in range(capacity):
                 slot = buffer.allocate(typical_size, f"prealloc_{i}")
@@ -993,7 +997,7 @@ class SchedulerDisaggMixin:
         )
         use_prefetch = self._compute_ready_queue is not None
         logger.info(
-            "Pool mode %s rank %d event loop started " "(multi_rank=%s, prefetch=%s)",
+            "Pool mode %s rank %d event loop started (multi_rank=%s, prefetch=%s)",
             role_name,
             self.gpu_id,
             is_multi_rank,

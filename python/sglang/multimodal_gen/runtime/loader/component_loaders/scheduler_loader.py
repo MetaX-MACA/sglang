@@ -27,7 +27,6 @@ class SchedulerLoader(ComponentLoader):
         assert (
             class_name is not None
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
-
         scheduler_cls, _ = ModelRegistry.resolve_model_cls(class_name)
 
         scheduler = scheduler_cls(**config)

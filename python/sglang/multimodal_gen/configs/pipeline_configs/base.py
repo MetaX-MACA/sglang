@@ -5,7 +5,7 @@ import json
 import math
 import os
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum, auto
 from typing import Any
 
@@ -34,13 +34,13 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.models.vision_utils import get_default_height_width
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
-    shallow_asdict,
 )
 
 logger = init_logger(__name__)
@@ -149,26 +149,21 @@ def shard_rotary_emb_for_sp(emb):
     Shard rotary embeddings [S, D] along sequence for SP.
     If S is not divisible by SP degree, pad by repeating the last row.
     """
-    # Sequence Parallelism: slice image RoPE to local shard if enabled
-    try:
-        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-            get_sp_parallel_rank,
-            get_sp_world_size,
-        )
-
+    # Sequence Parallelism: slice image RoPE to local shard if enabled.
+    # (1, 0) is only legitimate before model parallelism is initialized
+    # (single-process/unit-test paths); once initialized, lookup errors
+    # must propagate instead of silently sharding as rank 0 of world 1.
+    if model_parallel_is_initialized():
         sp_world_size = get_sp_world_size()
-    except Exception:
-        sp_world_size = 1
+        rank = get_sp_parallel_rank()
+    else:
+        sp_world_size, rank = 1, 0
     seq_len = emb.shape[0]
     if seq_len % sp_world_size != 0:
         pad_len = sp_world_size - (seq_len % sp_world_size)
         pad = emb[-1:].repeat(pad_len, 1)
         emb = torch.cat([emb, pad], dim=0)
     if sp_world_size > 1:
-        try:
-            rank = get_sp_parallel_rank()
-        except Exception:
-            rank = 0
         seq_len = emb.shape[0]
         local_len = seq_len // sp_world_size
         start = rank * local_len
@@ -218,6 +213,10 @@ class PipelineConfig:
     generator_device: str | None = None
     flow_shift: float | None = None
     disable_autocast: bool = False
+    # Optional strict AV delivery contract. ``None`` disables that check.
+    output_audio_sample_rate: int | None = None
+    output_audio_channels: int | None = None
+    output_av_drift_tolerance_s: float | None = None
 
     # Model configuration
     dit_config: DiTConfig = field(default_factory=DiTConfig)
@@ -262,14 +261,9 @@ class PipelineConfig:
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
     STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
-    skip_time_steps: int = 15
 
     # DMD parameters
     dmd_denoising_steps: list[int] | None = field(default=None)
-
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        # return the model-specific config for optimal deployment setting
-        return ModelDeploymentConfig()
 
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
@@ -310,9 +304,6 @@ class PipelineConfig:
         return image.resize(
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
-
-    def preprocess_realtime_condition_image(self, batch, _vae_image_processor) -> bool:
-        return False
 
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, image.width, image.height)
@@ -394,12 +385,26 @@ class PipelineConfig:
     def allow_set_num_frames(self):
         return False
 
+    def accepts_audio_input(self) -> bool:
+        return False
+
+    @property
+    def requires_audio_output(self) -> bool:
+        """Whether a delivered video must contain generated audio."""
+
+        return False
+
     def supports_dynamic_batching(self):
         """Return whether this pipeline can opt in to dynamic batching.
 
         The scheduler still checks each request before merging it into a batch.
         """
         return self.task_type in (ModelTaskType.T2I, ModelTaskType.T2V)
+
+    def supports_disaggregation(self) -> bool:
+        """Return whether multi-service disaggregated deployment is supported."""
+
+        return True
 
     def estimate_request_cost(self, batch) -> float:
         """Return the relative cost used for batching admission caps.
@@ -1054,35 +1059,6 @@ class PipelineConfig:
                 f"Length of text postprocess functions ({len(self.postprocess_text_funcs)}) must be equal to length of text preprocessing functions ({len(self.preprocess_text_funcs)})"
             )
 
-    def dump_to_json(self, file_path: str):
-        output_dict = shallow_asdict(self)
-        del_keys = []
-        for key, value in output_dict.items():
-            if isinstance(value, ModelConfig):
-                model_dict = asdict(value)
-                # Model Arch Config should be hidden away from the users
-                model_dict.pop("arch_config")
-                output_dict[key] = model_dict
-            elif isinstance(value, tuple) and all(
-                isinstance(v, ModelConfig) for v in value
-            ):
-                model_dicts = []
-                for v in value:
-                    model_dict = asdict(v)
-                    # Model Arch Config should be hidden away from the users
-                    model_dict.pop("arch_config")
-                    model_dicts.append(model_dict)
-                output_dict[key] = model_dicts
-            elif isinstance(value, tuple) and all(callable(f) for f in value):
-                # Skip dumping functions
-                del_keys.append(key)
-
-        for key in del_keys:
-            output_dict.pop(key, None)
-
-        with open(file_path, "w") as f:
-            json.dump(output_dict, f, indent=2)
-
     def load_from_json(self, file_path: str):
         with open(file_path) as f:
             input_pipeline_dict = json.load(f)
@@ -1225,10 +1201,6 @@ class SlidingTileAttnConfig(PipelineConfig):
     # You can provide custom defaults for inherited fields
     height: int = 576
     width: int = 1024
-
-    # Additional configuration specific to sliding tile attention
-    pad_to_square: bool = False
-    use_overlap_optimization: bool = True
 
 
 def parse_int_list(value: str) -> list[int]:

@@ -23,6 +23,16 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+
+class UnsupportedCustomArchitecture(ValueError):
+    """Raised when an architecture has no registered customized implementation.
+
+    This is the only condition under which ComponentLoader.load() may fall
+    back from the customized loader to the native diffusers/transformers
+    loader.
+    """
+
+
 MODELS_PATH = os.path.dirname(__file__)
 COMPONENT_DIRS = [
     d
@@ -373,7 +383,7 @@ class _ModelRegistry:
         for arch in architectures:
             if arch not in self.registered_models:
                 registered_models = list(self.registered_models.keys())
-                raise Exception(
+                raise UnsupportedCustomArchitecture(
                     f"Unsupported model architecture: {arch}. Registered architectures: {registered_models}"
                 )
             normalized_arch.append(arch)

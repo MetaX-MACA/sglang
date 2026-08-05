@@ -635,6 +635,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             enable_upscaling=req.enable_upscaling,
             upscaling_model_path=req.upscaling_model_path,
             upscaling_scale=req.upscaling_scale,
+            strict_audio_mux=self.server_args.pipeline_config.requires_audio_output,
         )
 
     def _save_group_output_paths(
@@ -666,6 +667,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             enable_upscaling=first_req.enable_upscaling,
             upscaling_model_path=first_req.upscaling_model_path,
             upscaling_scale=first_req.upscaling_scale,
+            strict_audio_mux=self.server_args.pipeline_config.requires_audio_output,
         )
 
     @staticmethod
@@ -985,14 +987,6 @@ def run_scheduler_process(
     master_port: int,
     server_args: ServerArgs,
     pipe_writer: mp.connection.Connection,
-    # For all workers: pipe to receive tasks from rank 0
-    task_pipe_r: mp.connection.Connection,
-    # For slave workers: pipe to send results back to rank 0
-    result_pipe_w: mp.connection.Connection | None,
-    # For rank 0 worker only: pipes to send tasks to slaves
-    task_pipes_to_slaves: list[mp.connection.Connection] | None = None,
-    # For rank 0 worker only: pipes to receive results from slaves
-    result_pipes_from_slaves: list[mp.connection.Connection] | None = None,
 ) -> None:
     """
     The entry point for the worker process.
@@ -1011,8 +1005,6 @@ def run_scheduler_process(
     port_args = PortArgs.from_server_args(server_args)
 
     # start the scheduler event loop
-    assert task_pipes_to_slaves is not None
-    assert result_pipes_from_slaves is not None
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
     try:
@@ -1020,8 +1012,6 @@ def run_scheduler_process(
             server_args,
             gpu_id=rank,
             port_args=port_args,
-            task_pipes_to_slaves=task_pipes_to_slaves,
-            result_pipes_from_slaves=result_pipes_from_slaves,
             local_rank=local_rank,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")

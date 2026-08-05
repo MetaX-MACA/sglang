@@ -227,6 +227,7 @@ def expand_request_outputs(
         req.seed = seeds[0]
         req.seeds = None
         req.generator = None
+        req.sampling_params.refresh_request_extra_after_output_expansion(req)
         return [req]
 
     expanded: list[Req] = []
@@ -243,6 +244,9 @@ def expand_request_outputs(
         output_req.generator = None
         output_req.extra["parent_request_id"] = req.request_id
         output_req.extra["output_index"] = output_index
+        output_req.sampling_params.refresh_request_extra_after_output_expansion(
+            output_req
+        )
 
         if output_request_id is not None:
             output_req.request_id = output_request_id
@@ -257,14 +261,28 @@ def expand_request_outputs(
     return expanded
 
 
-def _normalize_audio_to_numpy(audio: Any) -> np.ndarray | None:
-    """Convert audio (torch / numpy) into a float32 numpy array in [-1, 1], best-effort."""
+def _normalize_audio_to_numpy(
+    audio: Any,
+    *,
+    reject_non_finite: bool = False,
+) -> np.ndarray | None:
+    """Convert audio into float32 samples, optionally rejecting NaN/Inf first.
+
+    Best-effort callers retain the historical clamp/clip behavior. Strict AV
+    delivery must inspect the original values before that normalization,
+    otherwise infinities would be silently converted to finite +/-1 samples.
+    """
     if audio is None:
         return None
     if isinstance(audio, torch.Tensor):
-        audio_np = audio.detach().float().clamp(-1.0, 1.0).cpu().numpy()
+        audio_tensor = audio.detach().float()
+        if reject_non_finite and not torch.isfinite(audio_tensor).all().item():
+            raise ValueError("strict AV delivery requires finite audio samples")
+        audio_np = audio_tensor.clamp(-1.0, 1.0).cpu().numpy()
     elif isinstance(audio, np.ndarray):
         audio_np = audio.astype(np.float32, copy=False)
+        if reject_non_finite and not np.isfinite(audio_np).all():
+            raise ValueError("strict AV delivery requires finite audio samples")
         audio_np = np.clip(audio_np, -1.0, 1.0)
     else:
         return None
@@ -309,6 +327,52 @@ def _pick_audio_sample_rate(
         except Exception:
             pass
     return selected_sr
+
+
+def _validate_required_audio_output(
+    *,
+    audio_np: np.ndarray,
+    sample_rate: int,
+    fps: int,
+    num_frames: int,
+    expected_sample_rate: int | None,
+    expected_channels: int | None,
+    drift_tolerance_s: float | None,
+) -> None:
+    """Validate a pipeline-declared strict AV delivery contract before muxing."""
+
+    if audio_np.size == 0:
+        raise ValueError("strict AV delivery requires at least one audio sample")
+    if expected_channels is not None and (
+        audio_np.ndim != 2 or audio_np.shape[1] != expected_channels
+    ):
+        raise ValueError(
+            "strict AV delivery requires 2-D audio shaped as samples x "
+            f"{expected_channels}, "
+            f"got shape={audio_np.shape}"
+        )
+    if not np.isfinite(audio_np).all():
+        raise ValueError("strict AV delivery requires finite audio samples")
+    if expected_sample_rate is not None and sample_rate != expected_sample_rate:
+        raise ValueError(
+            "strict AV delivery requires a "
+            f"{expected_sample_rate} Hz audio sample rate, got {sample_rate}"
+        )
+    if fps <= 0 or num_frames <= 0:
+        raise ValueError(
+            "strict AV delivery requires positive video fps and frame count"
+        )
+    video_duration = float(num_frames) / float(fps)
+    audio_duration = float(audio_np.shape[0]) / float(sample_rate)
+    if (
+        drift_tolerance_s is not None
+        and abs(audio_duration - video_duration) > drift_tolerance_s
+    ):
+        raise ValueError(
+            "strict AV delivery audio/video duration drift exceeds "
+            f"{drift_tolerance_s:g}s: "
+            f"video={video_duration:.6f}s audio={audio_duration:.6f}s"
+        )
 
 
 def _resolve_ffmpeg_exe() -> str:
@@ -391,13 +455,28 @@ def _maybe_mux_audio_into_mp4(
     frames: list,
     fps: int,
     audio_sample_rate: Optional[int],
+    strict: bool = False,
+    output_audio_sample_rate: int | None = None,
+    output_audio_channels: int | None = None,
+    output_av_drift_tolerance_s: float | None = None,
 ) -> None:
-    """Best-effort mux audio into an already-written mp4 at save_file_path.
+    """Mux audio into an already-written mp4 at ``save_file_path``.
 
-    Any failure should keep the silent video and only log a warning.
+    Legacy pipelines retain best-effort behavior. Contract-driven AV
+    pipelines can request strict mode so an audio-bearing generation cannot be
+    reported as a successful silent video.
     """
-    audio_np = _normalize_audio_to_numpy(audio)
+    audio_np = _normalize_audio_to_numpy(audio, reject_non_finite=strict)
     if audio_np is None:
+        if strict:
+            if audio is None:
+                raise RuntimeError(
+                    "strict AV delivery requires generated audio, but the pipeline "
+                    "returned none"
+                )
+            raise TypeError(
+                f"cannot materialize generated audio of type {type(audio).__name__}"
+            )
         return
     selected_sr = _pick_audio_sample_rate(
         audio_np=audio_np,
@@ -405,6 +484,16 @@ def _maybe_mux_audio_into_mp4(
         fps=fps,
         num_frames=len(frames),
     )
+    if strict:
+        _validate_required_audio_output(
+            audio_np=audio_np,
+            sample_rate=selected_sr,
+            fps=fps,
+            num_frames=len(frames),
+            expected_sample_rate=output_audio_sample_rate,
+            expected_channels=output_audio_channels,
+            drift_tolerance_s=output_av_drift_tolerance_s,
+        )
 
     try:
         ffmpeg_exe = _resolve_ffmpeg_exe()
@@ -415,6 +504,10 @@ def _maybe_mux_audio_into_mp4(
             ffmpeg_exe=ffmpeg_exe,
         )
     except Exception as e:
+        if strict:
+            raise RuntimeError(
+                f"failed to mux generated audio into {save_file_path}: {e}"
+            ) from e
         logger.warning(
             "Failed to mux audio into mp4 (saved silent video): %s",
             str(e),
@@ -578,32 +671,69 @@ def save_materialized_output(
     save_output: bool = True,
     audio_sample_rate: Optional[int] = None,
     output_compression: Optional[int] = None,
+    strict_audio_mux: bool = False,
+    output_audio_sample_rate: int | None = None,
+    output_audio_channels: int | None = None,
+    output_av_drift_tolerance_s: float | None = None,
 ) -> None:
     if not save_output:
         return
     if not save_file_path:
-        logger.info(f"No output path provided, output not saved")
+        logger.info("No output path provided, output not saved")
         return
 
-    os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
+    output_dir = os.path.dirname(save_file_path) or "."
+    os.makedirs(output_dir, exist_ok=True)
     if data_type == DataType.VIDEO:
         quality = output_compression / 10 if output_compression is not None else 5
-        imageio.mimsave(
-            save_file_path,
-            materialized.frames,
-            fps=materialized.fps,
-            format=data_type.get_default_extension(),
-            codec="libx264",
-            quality=quality,
-        )
+        write_path = save_file_path
+        strict_temp_path = None
+        if strict_audio_mux:
+            suffix = os.path.splitext(save_file_path)[1] or ".mp4"
+            fd, strict_temp_path = tempfile.mkstemp(
+                prefix=".sglang-strict-av-",
+                suffix=suffix,
+                dir=output_dir,
+            )
+            os.close(fd)
+            write_path = strict_temp_path
+        try:
+            imageio.mimsave(
+                write_path,
+                materialized.frames,
+                fps=materialized.fps,
+                format=data_type.get_default_extension(),
+                codec="libx264",
+                quality=quality,
+            )
 
-        _maybe_mux_audio_into_mp4(
-            save_file_path=save_file_path,
-            audio=materialized.audio,
-            frames=materialized.frames,
-            fps=materialized.fps,
-            audio_sample_rate=audio_sample_rate,
-        )
+            _maybe_mux_audio_into_mp4(
+                save_file_path=write_path,
+                audio=materialized.audio,
+                frames=materialized.frames,
+                fps=materialized.fps,
+                audio_sample_rate=audio_sample_rate,
+                strict=strict_audio_mux,
+                output_audio_sample_rate=output_audio_sample_rate,
+                output_audio_channels=output_audio_channels,
+                output_av_drift_tolerance_s=output_av_drift_tolerance_s,
+            )
+            if strict_temp_path is not None:
+                os.replace(strict_temp_path, save_file_path)
+                strict_temp_path = None
+        except Exception:
+            if strict_temp_path is not None:
+                try:
+                    os.remove(strict_temp_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as cleanup_error:
+                    logger.warning(
+                        "Failed to remove incomplete strict AV output %s: %s",
+                        strict_temp_path,
+                        cleanup_error,
+                    )
+            raise
     else:
         quality = output_compression if output_compression is not None else 75
         if len(materialized.frames) > 1:
@@ -656,6 +786,10 @@ def save_outputs(
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
+    strict_audio_mux: bool = False,
+    output_audio_sample_rate: int | None = None,
+    output_audio_channels: int | None = None,
+    output_av_drift_tolerance_s: float | None = None,
 ) -> list[str]:
     output_paths: list[str] = []
     for idx, sample in enumerate(outputs):
@@ -678,6 +812,10 @@ def save_outputs(
             enable_upscaling=enable_upscaling,
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
+            strict_audio_mux=strict_audio_mux,
+            output_audio_sample_rate=output_audio_sample_rate,
+            output_audio_channels=output_audio_channels,
+            output_av_drift_tolerance_s=output_av_drift_tolerance_s,
         )
 
         if samples_out is not None:
@@ -708,6 +846,10 @@ def post_process_sample(
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
+    strict_audio_mux: bool = False,
+    output_audio_sample_rate: int | None = None,
+    output_audio_channels: int | None = None,
+    output_av_drift_tolerance_s: float | None = None,
 ) -> list[Any]:
     """materialize frames and save outputs (optional)"""
     materialized = materialize_output_sample(
@@ -729,5 +871,9 @@ def post_process_sample(
         save_output=save_output,
         audio_sample_rate=audio_sample_rate,
         output_compression=output_compression,
+        strict_audio_mux=strict_audio_mux,
+        output_audio_sample_rate=output_audio_sample_rate,
+        output_audio_channels=output_audio_channels,
+        output_av_drift_tolerance_s=output_av_drift_tolerance_s,
     )
     return materialized.frames

@@ -3,12 +3,17 @@
 import asyncio
 import io
 
+import pytest
+from fastapi import HTTPException
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size_or_raise,
     _save_upload_to_path,
     _validate_positive_int,
+    adjust_output_quality,
+    flatten_extra_params,
 )
 
 
@@ -57,3 +62,39 @@ def test_validate_positive_int_rejects_non_positive_sampling_fields():
         assert "num_frames must be positive" in exc.detail
     else:
         raise AssertionError("expected bad request")
+
+
+def test_flatten_extra_params_rejects_invalid_json_with_400():
+    with pytest.raises(HTTPException) as exc_info:
+        flatten_extra_params({"extra_params": "{not valid json"})
+
+    assert exc_info.value.status_code == 400
+    assert "extra_params" in exc_info.value.detail
+
+
+def test_flatten_extra_params_promotes_valid_json_fields():
+    payload = flatten_extra_params({"extra_params": '{"task": "t2va"}'})
+
+    assert payload["task"] == "t2va"
+
+
+def test_flatten_extra_params_keeps_non_string_payloads_unchanged():
+    payload = flatten_extra_params({"guardrails": True})
+
+    assert payload == {"guardrails": True, "use_guardrails": True}
+
+
+def test_adjust_output_quality_maps_known_levels_and_keeps_none_default():
+    assert adjust_output_quality(None) is None
+    assert adjust_output_quality("high") == 90
+    assert adjust_output_quality("default", DataType.VIDEO) == 50
+    assert adjust_output_quality("default", DataType.IMAGE) == 75
+
+
+def test_adjust_output_quality_rejects_unknown_value_with_400():
+    with pytest.raises(HTTPException) as exc_info:
+        adjust_output_quality("ultra")
+
+    assert exc_info.value.status_code == 400
+    for allowed in ("maximum", "high", "medium", "low", "default"):
+        assert allowed in exc_info.value.detail

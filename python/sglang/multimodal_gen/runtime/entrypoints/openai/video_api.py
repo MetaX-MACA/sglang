@@ -20,10 +20,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    SamplingParams,
-    generate_request_id,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
     VideoListResponse,
@@ -32,14 +29,18 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    DEFAULT_FPS,
-    DEFAULT_VIDEO_SECONDS,
     add_common_data_to_response,
-    build_sampling_params,
     flatten_extra_params,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_adapter import (
+    COMMON_MULTIPART_FORM_FIELDS,
+    BaseVideoModelAdapter,
+    get_video_model_adapter,
+    known_video_model_fields,
+    validate_adapter_field_claims,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -60,90 +61,128 @@ def _parse_form_extra_value(value: Any) -> Any:
         return value
     try:
         return json.loads(value)
-    except Exception:
+    except (json.JSONDecodeError, ValueError, TypeError):
         return value
 
 
-def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
-    """Resolve video-specific defaults (fps, seconds → num_frames) then
-    delegate to the shared build_sampling_params."""
-    seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
-    fps = request.fps if request.fps is not None else DEFAULT_FPS
-    num_frames = request.num_frames if request.num_frames is not None else fps * seconds
-    num_outputs = request.num_outputs_per_prompt
-    if num_outputs is None:
-        num_outputs = request.n or 1
-
-    return build_sampling_params(
-        request_id,
-        prompt=request.prompt,
-        num_outputs_per_prompt=max(1, min(int(num_outputs), 10)),
-        size=request.size,
-        width=request.width,
-        height=request.height,
-        num_frames=num_frames,
-        fps=fps,
-        image_path=request.input_reference,
-        output_file_name=request_id,
-        seed=request.seed,
-        generator_device=request.generator_device,
-        num_inference_steps=request.num_inference_steps,
-        guidance_scale=request.guidance_scale,
-        guidance_scale_2=request.guidance_scale_2,
-        negative_prompt=request.negative_prompt,
-        max_sequence_length=request.max_sequence_length,
-        flow_shift=request.flow_shift,
-        use_duration_template=_extra_value(request, "use_duration_template"),
-        use_resolution_template=_extra_value(request, "use_resolution_template"),
-        use_system_prompt=_extra_value(request, "use_system_prompt"),
-        use_guardrails=_extra_value(request, "use_guardrails"),
-        enable_teacache=request.enable_teacache,
-        enable_frame_interpolation=request.enable_frame_interpolation,
-        frame_interpolation_exp=request.frame_interpolation_exp,
-        frame_interpolation_scale=request.frame_interpolation_scale,
-        frame_interpolation_model_path=request.frame_interpolation_model_path,
-        enable_upscaling=request.enable_upscaling,
-        upscaling_model_path=request.upscaling_model_path,
-        upscaling_scale=request.upscaling_scale,
-        output_path=request.output_path,
-        output_compression=request.output_compression,
-        output_quality=request.output_quality,
-        perf_dump_path=request.perf_dump_path,
-        diffusers_kwargs=request.diffusers_kwargs,
+def _multipart_extra_form_keys() -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            (
+                *VideoGenerationsRequest.model_fields,
+                *COMMON_MULTIPART_FORM_FIELDS,
+                *sorted(known_video_model_fields()),
+            )
+        )
     )
+
+
+def _filter_multipart_declared_fields(
+    extra_from_form: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Keep only protocol and registered model fields from multipart extras.
+
+    Starlette exposes every submitted form key.  The video request model uses
+    ``extra='allow'`` for JSON compatibility, but multipart has to build the
+    model explicitly; retaining only declared fields keeps unrelated form
+    controls out of the request while preserving the same lowering semantics.
+    """
+
+    declared = set(VideoGenerationsRequest.model_fields)
+    declared.update(_multipart_extra_form_keys())
+    return {key: value for key, value in extra_from_form.items() if key in declared}
+
+
+def _merge_multipart_extra_form_fields(
+    raw_form: Any,
+    extra_from_form: Dict[str, Any],
+) -> None:
+    for key in _multipart_extra_form_keys():
+        if key in raw_form and key not in extra_from_form:
+            extra_from_form[key] = _parse_form_extra_value(raw_form[key])
+
+
+def _multipart_video_extras(
+    raw_form: Any,
+    *,
+    extra_body: Any,
+    extra_params: Any,
+) -> Dict[str, Any]:
+    """Build multipart extras once for the early task gate and request model."""
+
+    extra_from_form: Dict[str, Any] = {}
+    if extra_body:
+        try:
+            extra_from_form = flatten_extra_params(json.loads(extra_body))
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400, detail="extra_body is not valid JSON"
+            ) from exc
+    if extra_params:
+        try:
+            extra_from_form.update(
+                flatten_extra_params({"extra_params": json.loads(extra_params)})
+            )
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400, detail="extra_params is not valid JSON"
+            ) from exc
+    _merge_multipart_extra_form_fields(raw_form, extra_from_form)
+    flatten_extra_params(extra_from_form)
+    return _filter_multipart_declared_fields(extra_from_form)
+
+
+def _multipart_declared_request_fields(
+    raw_form: Any,
+    extra_from_form: Dict[str, Any],
+    values: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Preserve presence for optional declared fields in multipart requests."""
+
+    declared: Dict[str, Any] = {}
+    for field_name, field_value in values.items():
+        if field_name not in raw_form and field_name not in extra_from_form:
+            continue
+        raw_value = (
+            field_value if field_value is not None else extra_from_form.get(field_name)
+        )
+        declared[field_name] = _parse_form_extra_value(raw_value)
+    return declared
+
+
+def _json_video_payload(body: Any) -> Dict[str, Any]:
+    """Flatten OpenAI extra wrappers without losing task presence semantics."""
+
+    payload: Dict[str, Any] = dict(body or {})
+    extra = payload.pop("extra_body", None)
+    if isinstance(extra, str):
+        extra = json.loads(extra)
+    if isinstance(extra, dict):
+        payload.update(flatten_extra_params(extra))
+    extra_json = payload.pop("extra_json", None)
+    if isinstance(extra_json, str):
+        extra_json = json.loads(extra_json)
+    if isinstance(extra_json, dict):
+        payload.update(flatten_extra_params(extra_json))
+    flatten_extra_params(payload)
+    return payload
 
 
 def _reject_unsupported_cosmos3_modes(
     req: VideoGenerationsRequest, model_path: str | None
 ) -> None:
-    if "cosmos3" not in (model_path or "").lower():
-        return
-
-    extra = req.model_extra or {}
-    if extra.get("generate_sound"):
-        raise HTTPException(
-            status_code=400,
-            detail="Cosmos3 video-with-sound is not supported by SGLang yet; omit generate_sound for video-only generation.",
-        )
-    if extra.get("action_mode"):
-        raise HTTPException(
-            status_code=400,
-            detail="Cosmos3 action generation is not supported by SGLang yet.",
-        )
-    if extra.get("condition_frame_indexes_vision") or extra.get("condition_video_keep"):
-        raise HTTPException(
-            status_code=400,
-            detail="Cosmos3 video-to-video conditioning is not supported by SGLang yet.",
-        )
+    BaseVideoModelAdapter().validate_transport_options(req, model_path=model_path)
 
 
-# extract metadata which http_server needs to know
-def _video_job_from_sampling(
-    request_id: str, req: VideoGenerationsRequest, sampling: SamplingParams
+def _video_job_from_batch(
+    request_id: str,
+    req: VideoGenerationsRequest,
+    batch: Req,
+    adapter: BaseVideoModelAdapter,
 ) -> Dict[str, Any]:
-    size_str = f"{sampling.width}x{sampling.height}"
-    seconds = int(round((sampling.num_frames or 0) / float(sampling.fps or 24)))
-    return {
+    size_str = f"{batch.width}x{batch.height}"
+    seconds = int(round((batch.num_frames or 0) / float(batch.fps or 24)))
+    job = {
         "id": request_id,
         "object": "video",
         "model": req.model or "sora-2",
@@ -153,8 +192,10 @@ def _video_job_from_sampling(
         "size": size_str,
         "seconds": str(seconds),
         "quality": "standard",
-        "file_path": os.path.abspath(sampling.output_file_path()),
+        "file_path": os.path.abspath(batch.output_file_path()),
     }
+    job.update(adapter.project_queued_job_fields(batch))
+    return job
 
 
 async def _save_first_input_image(
@@ -171,7 +212,6 @@ async def _save_first_input_image(
     image = image_list[0]
 
     os.makedirs(uploads_dir, exist_ok=True)
-
     filename = image.filename if hasattr(image, "filename") else "url_image"
     target_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
     return await save_image_to_path(
@@ -179,51 +219,129 @@ async def _save_first_input_image(
     )
 
 
+def _cleanup_generated_outputs(paths: list[str]) -> None:
+    """Remove outputs from a failed generation when they were materialized."""
+    for path in paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except (OSError, TypeError) as cleanup_error:
+            logger.warning(
+                "failed to remove generated video output %s: %s",
+                path,
+                cleanup_error,
+            )
+
+
 async def _dispatch_job_async(
     job_id: str,
     batch: Req,
     *,
+    adapter: BaseVideoModelAdapter | None = None,
     temp_dirs: list[str] | None = None,
+    temp_resources: list[Any] | None = None,
     output_persistent: bool = True,
 ) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
+    generated_output_paths: list[str] = []
     try:
+        adapter = adapter or BaseVideoModelAdapter()
+        dispatch_batch = adapter.expand_for_dispatch(batch)
         save_file_path_list, result = await process_generation_batch(
-            async_scheduler_client, batch
+            async_scheduler_client, dispatch_batch
         )
-        save_file_path = save_file_path_list[0]
+        generated_output_paths = list(save_file_path_list)
+        if not save_file_path_list:
+            raise RuntimeError("video generation produced no output files")
+        final_media_fields = await adapter.validate_final_outputs(
+            save_file_path_list,
+            batch,
+        )
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        cloud_urls: list[str] = []
+        if cloud_storage.is_enabled():
+            for path in save_file_path_list:
+                cloud_url = await cloud_storage.upload_and_cleanup(path)
+                if not cloud_url:
+                    # Preserve the legacy local fallback when the first upload
+                    # fails and every output still exists. Once any earlier
+                    # output has uploaded and been cleaned, falling back would
+                    # publish an incomplete local result and must fail closed.
+                    if not cloud_urls and output_persistent:
+                        break
+                    raise RuntimeError(f"failed to upload generated video {path}")
+                cloud_urls.append(cloud_url)
+        if not cloud_urls and not output_persistent:
+            raise RuntimeError(
+                "generated video has no durable destination; configure an "
+                "output path or enable cloud storage"
+            )
 
-        persistent_path = (
-            save_file_path if not cloud_url and output_persistent else None
+        persistent_paths = (
+            [os.path.abspath(path) for path in save_file_path_list]
+            if not cloud_urls and output_persistent
+            else None
         )
         update_fields = {
             "status": "completed",
             "progress": 100,
             "completed_at": int(time.time()),
-            "url": cloud_url,
-            "file_path": persistent_path,
-            "file_paths": (
-                [os.path.abspath(path) for path in save_file_path_list]
-                if output_persistent
-                else None
-            ),
+            "url": cloud_urls[0] if cloud_urls else None,
+            "urls": cloud_urls or None,
+            "file_path": persistent_paths[0] if persistent_paths else None,
+            "file_paths": persistent_paths,
             "num_outputs": len(save_file_path_list),
+            **final_media_fields,
         }
         update_fields = add_common_data_to_response(
             update_fields, request_id=job_id, result=result
         )
         await VIDEO_STORE.update_fields(job_id, update_fields)
+    except asyncio.CancelledError:
+        if adapter is not None and adapter.strict_file_delivery:
+            _cleanup_generated_outputs(generated_output_paths)
+        await asyncio.shield(
+            VIDEO_STORE.update_fields(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": {"message": "Video generation cancelled"},
+                    "url": None,
+                    "urls": None,
+                    "file_path": None,
+                    "file_paths": None,
+                    "num_outputs": None,
+                },
+            )
+        )
+        raise
     except Exception as e:
-        logger.error(f"{e}")
+        if adapter is not None and adapter.strict_file_delivery:
+            _cleanup_generated_outputs(generated_output_paths)
+        logger.error("video job %s failed (%s)", job_id, type(e).__name__)
         await VIDEO_STORE.update_fields(
-            job_id, {"status": "failed", "error": {"message": str(e)}}
+            job_id,
+            {
+                "status": "failed",
+                "error": {"message": str(e)},
+                "url": None,
+                "urls": None,
+                "file_path": None,
+                "file_paths": None,
+                "num_outputs": None,
+            },
         )
     finally:
-        for td in temp_dirs or []:
-            shutil.rmtree(td, ignore_errors=True)
+        try:
+            if adapter is not None:
+                await asyncio.shield(adapter.cleanup_request(batch))
+        finally:
+            for resource in temp_resources or []:
+                resource.cleanup()
+            for td in temp_dirs or []:
+                shutil.rmtree(td, ignore_errors=True)
 
 
 # TODO: support image to video generation
@@ -263,83 +381,85 @@ async def create_video(
     extra_body: Optional[str] = Form(None),
 ):
     content_type = request.headers.get("content-type", "").lower()
+    is_multipart = "multipart/form-data" in content_type
     request_id = generate_request_id()
 
     server_args = get_global_server_args()
+    adapter = get_video_model_adapter(server_args.pipeline_config)
     task_type = server_args.pipeline_config.task_type
 
-    # Resolve input upload directory (may be a temp dir when saving is disabled)
+    # MiniMax H3 task identity controls the canonical pipeline. Validate it before
+    # creating request-owned directories, saving uploads, or scheduling work.
+    raw_form: Any = None
+    extra_from_form: Dict[str, Any] | None = None
+    payload: Dict[str, Any] | None = None
+    try:
+        if is_multipart:
+            raw_form = await request.form()
+            extra_from_form = _multipart_video_extras(
+                raw_form,
+                extra_body=extra_body,
+                extra_params=extra_params,
+            )
+            adapter.validate_task_gate(
+                extra_from_form.get("task"),
+                provided="task" in extra_from_form,
+            )
+        else:
+            try:
+                body = await request.json()
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400, detail="request body is not valid JSON"
+                ) from exc
+            payload = _json_video_payload(body)
+            adapter.validate_task_gate(
+                payload.get("task"),
+                provided="task" in payload,
+            )
+    except HTTPException:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Resolve input upload directory using the historical image/video API
+    # behavior: honor input_save_path, otherwise keep a request temp directory.
     temp_dirs: list[str] = []
-    if server_args.input_save_path is not None:
-        uploads_dir = server_args.input_save_path
+    temp_resources: list[Any] = []
+    input_save_path = getattr(server_args, "input_save_path", None)
+    if input_save_path is not None:
+        uploads_dir = input_save_path
         os.makedirs(uploads_dir, exist_ok=True)
     else:
-        uploads_dir = tempfile.mkdtemp(prefix="sglang_input_")
+        input_resource = tempfile.TemporaryDirectory(prefix="sglang_input_")
+        temp_resources.append(input_resource)
+        uploads_dir = input_resource.name
         temp_dirs.append(uploads_dir)
 
-    # Resolve output directory
-    effective_output_path = server_args.output_path
     output_persistent = True
-    if "multipart/form-data" not in content_type:
-        # JSON body may carry a per-request output_path; checked after parsing below
-        pass
 
-    if "multipart/form-data" in content_type:
+    def cleanup_request_resources() -> None:
+        for resource in temp_resources:
+            resource.cleanup()
+        for temp_dir in temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    if is_multipart:
         if not prompt:
+            cleanup_request_resources()
             raise HTTPException(status_code=400, detail="prompt is required")
-        # Validate image input based on model task type
         image_sources = merge_image_input_list(input_reference, reference_url)
         if task_type.requires_image_input() and not image_sources:
+            cleanup_request_resources()
             raise HTTPException(
                 status_code=400,
                 detail="input_reference or reference_url is required for image-to-video generation",
             )
-        try:
-            input_path = await _save_first_input_image(
-                image_sources,
-                request_id,
-                uploads_dir,
-                prefer_remote_source=server_args.input_save_path is None,
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=400, detail=f"Failed to process image source: {str(e)}"
-            )
-
-        # Parse extra_body JSON (if provided in multipart form) to get fps/num_frames overrides
-        extra_from_form: Dict[str, Any] = {}
-        if extra_body:
-            try:
-                extra_from_form = flatten_extra_params(json.loads(extra_body))
-            except Exception:
-                extra_from_form = {}
-        if extra_params:
-            try:
-                extra_from_form.update(
-                    flatten_extra_params({"extra_params": json.loads(extra_params)})
-                )
-            except Exception:
-                pass
+        assert extra_from_form is not None
+        assert raw_form is not None
 
         def form_value(name: str, value: Any) -> Any:
             return value if value is not None else extra_from_form.get(name)
-
-        raw_form = await request.form()
-        for key in (
-            "use_duration_template",
-            "use_resolution_template",
-            "use_system_prompt",
-            "use_guardrails",
-            "guardrails",
-            "generate_sound",
-            "sound_duration",
-            "action_mode",
-            "condition_frame_indexes_vision",
-            "condition_video_keep",
-        ):
-            if key in raw_form and key not in extra_from_form:
-                extra_from_form[key] = _parse_form_extra_value(raw_form[key])
-        flatten_extra_params(extra_from_form)
 
         request_field_names = set(VideoGenerationsRequest.model_fields)
         extra_request_fields = {
@@ -349,10 +469,24 @@ async def create_video(
         }
         fps_val = form_value("fps", fps)
         num_frames_val = form_value("num_frames", num_frames)
+        declared_model_fields = _multipart_declared_request_fields(
+            raw_form,
+            extra_from_form,
+            {
+                "width": None,
+                "height": None,
+                "guidance_scale": guidance_scale,
+                "guidance_scale_2": None,
+                "negative_prompt": negative_prompt,
+                "true_cfg_scale": None,
+                "perf_dump_path": None,
+            },
+        )
 
         req = VideoGenerationsRequest(
             prompt=prompt,
-            input_reference=input_path,
+            input_reference=None,
+            reference_url=reference_url,
             model=form_value("model", model),
             n=form_value("n", n),
             num_outputs_per_prompt=form_value(
@@ -364,9 +498,7 @@ async def create_video(
             num_frames=num_frames_val,
             seed=form_value("seed", seed),
             generator_device=form_value("generator_device", generator_device),
-            negative_prompt=form_value("negative_prompt", negative_prompt),
             num_inference_steps=form_value("num_inference_steps", num_inference_steps),
-            guidance_scale=form_value("guidance_scale", guidance_scale),
             max_sequence_length=form_value("max_sequence_length", max_sequence_length),
             flow_shift=form_value("flow_shift", flow_shift),
             enable_teacache=form_value("enable_teacache", enable_teacache),
@@ -391,102 +523,168 @@ async def create_video(
             output_quality=form_value("output_quality", output_quality),
             output_path=form_value("output_path", output_path),
             diffusers_kwargs=form_value("diffusers_kwargs", None),
+            **declared_model_fields,
             **extra_request_fields,
         )
+        try:
+            validate_adapter_field_claims(req, adapter)
+            adapter.validate_transport_options(req, model_path=server_args.model_path)
+            input_path = await _save_first_input_image(
+                image_sources,
+                request_id,
+                uploads_dir,
+                prefer_remote_source=input_save_path is None,
+            )
+        except Exception as e:
+            cleanup_request_resources()
+            raise HTTPException(
+                status_code=400, detail=f"Failed to process image source: {str(e)}"
+            ) from e
+        req.input_reference = input_path
+        req.reference_url = None
     else:
         try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        try:
-            # If client uses extra_body, merge it into the top-level payload
-            payload: Dict[str, Any] = dict(body or {})
-            extra = payload.pop("extra_body", None)
-            if isinstance(extra, str):
-                extra = json.loads(extra)
-            if isinstance(extra, dict):
-                payload.update(flatten_extra_params(extra))
-            # openai may turn extra_body to extra_json
-            extra_json = payload.pop("extra_json", None)
-            if isinstance(extra_json, str):
-                extra_json = json.loads(extra_json)
-            if isinstance(extra_json, dict):
-                payload.update(flatten_extra_params(extra_json))
-            flatten_extra_params(payload)
-            # Validate image input based on model task type
+            assert payload is not None
             has_image_input = payload.get("reference_url") or payload.get(
                 "input_reference"
             )
             if task_type.requires_image_input() and not has_image_input:
+                cleanup_request_resources()
                 raise HTTPException(
                     status_code=400,
                     detail="input_reference or reference_url is required for image-to-video generation",
                 )
-            # for non-multipart/form-data type
+            image_source = payload.get("reference_url") or payload.get(
+                "input_reference"
+            )
+            preflight_req = VideoGenerationsRequest(**payload)
+            validate_adapter_field_claims(preflight_req, adapter)
+            adapter.validate_transport_options(
+                preflight_req,
+                model_path=server_args.model_path,
+            )
+            # Preserve the legacy behavior: URL/data references are localized
+            # only when supplied through reference_url; local input_reference
+            # paths are passed through to the selected adapter unchanged.
             if payload.get("reference_url"):
                 try:
                     input_path = await _save_first_input_image(
-                        payload.get("reference_url"),
+                        image_source,
                         request_id,
                         uploads_dir,
-                        prefer_remote_source=server_args.input_save_path is None,
+                        prefer_remote_source=input_save_path is None,
                     )
                 except Exception as e:
+                    cleanup_request_resources()
                     raise HTTPException(
                         status_code=400,
                         detail=f"Failed to process image source: {str(e)}",
-                    )
+                    ) from e
                 payload["input_reference"] = input_path
             req = VideoGenerationsRequest(**payload)
+        except HTTPException:
+            cleanup_request_resources()
+            raise
         except Exception as e:
+            cleanup_request_resources()
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
 
-    # Resolve per-request output_path override
-    effective_output_path = req.output_path or server_args.output_path
+    try:
+        validate_adapter_field_claims(req, adapter)
+        adapter.validate_transport_options(req, model_path=server_args.model_path)
+    except (TypeError, ValueError) as exc:
+        for resource in temp_resources:
+            resource.cleanup()
+        for temp_dir in temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Resolve per-request output_path override without imposing a shared path
+    # allowlist. The cloud-only fallback remains the historical behavior.
+    effective_output_path = req.output_path or getattr(server_args, "output_path", None)
     if effective_output_path is None:
-        output_tmp = tempfile.mkdtemp(prefix="sglang_output_")
+        if not cloud_storage.is_enabled():
+            for resource in temp_resources:
+                resource.cleanup()
+            for temp_dir in temp_dirs:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Video delivery is unavailable: configure an output path "
+                    "or enable cloud storage"
+                ),
+            )
+        output_resource = tempfile.TemporaryDirectory(prefix="sglang_output_")
+        temp_resources.append(output_resource)
+        output_tmp = output_resource.name
         temp_dirs.append(output_tmp)
         effective_output_path = output_tmp
         output_persistent = False
 
-    # Inject resolved output_path so _build_video_sampling_params picks it up
     req.output_path = effective_output_path
 
-    logger.debug(f"Server received from create_video endpoint: req={req}")
-
-    _reject_unsupported_cosmos3_modes(req, server_args.model_path)
-
-    try:
-        sampling_params = _build_video_sampling_params(request_id, req)
-    except (ValueError, TypeError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    job = _video_job_from_sampling(request_id, req, sampling_params)
-    await VIDEO_STORE.upsert(request_id, job)
-
-    # Build Req for scheduler
-    trace_headers = extract_trace_headers(request.headers)
-    batch = prepare_request(
-        server_args=server_args,
-        sampling_params=sampling_params,
-        external_trace_header=trace_headers,
+    logger.debug(
+        "video request admitted: id=%s model=%s task=%s",
+        request_id,
+        req.model,
+        _extra_value(req, "task"),
     )
-    # Add diffusers_kwargs if provided
+
+    batch: Req | None = None
+    try:
+        sampling_params = adapter.lower_sampling_params(request_id, req)
+        trace_headers = extract_trace_headers(request.headers)
+        batch = prepare_request(
+            server_args=server_args,
+            sampling_params=sampling_params,
+            external_trace_header=trace_headers,
+        )
+        await adapter.prepare_for_queue(batch)
+        job = _video_job_from_batch(request_id, req, batch, adapter)
+    except (ValueError, TypeError) as e:
+        if batch is not None:
+            await adapter.cleanup_request(batch)
+        for resource in temp_resources:
+            resource.cleanup()
+        for temp_dir in temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        if batch is not None:
+            await adapter.cleanup_request(batch)
+        for resource in temp_resources:
+            resource.cleanup()
+        for temp_dir in temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
     if req.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
         if "max_sequence_length" in req.diffusers_kwargs:
             batch.max_sequence_length = req.diffusers_kwargs["max_sequence_length"]
         if "flow_shift" in req.diffusers_kwargs:
             batch.flow_shift = req.diffusers_kwargs["flow_shift"]
-    # Enqueue the job asynchronously and return immediately
-    asyncio.create_task(
-        _dispatch_job_async(
-            request_id,
-            batch,
-            temp_dirs=temp_dirs or None,
-            output_persistent=output_persistent,
+
+    try:
+        await VIDEO_STORE.upsert(request_id, job)
+        asyncio.create_task(
+            _dispatch_job_async(
+                request_id,
+                batch,
+                adapter=adapter,
+                temp_dirs=temp_dirs or None,
+                temp_resources=temp_resources or None,
+                output_persistent=output_persistent,
+            )
         )
-    )
+    except Exception:
+        await adapter.cleanup_request(batch)
+        for resource in temp_resources:
+            resource.cleanup()
+        for temp_dir in temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
     return VideoResponse(**job)
 
 
@@ -496,14 +694,11 @@ async def list_videos(
     limit: Optional[int] = Query(None, ge=1, le=100),
     order: Optional[str] = Query("desc"),
 ):
-    # Normalize order
     order = (order or "desc").lower()
     if order not in ("asc", "desc"):
         order = "desc"
     jobs = await VIDEO_STORE.list_values()
-
-    reverse = order != "asc"
-    jobs.sort(key=lambda j: j.get("created_at", 0), reverse=reverse)
+    jobs.sort(key=lambda j: j.get("created_at", 0), reverse=order != "asc")
 
     if after is not None:
         try:
@@ -511,11 +706,9 @@ async def list_videos(
             jobs = jobs[idx + 1 :]
         except StopIteration:
             jobs = []
-
     if limit is not None:
         jobs = jobs[:limit]
-    items = [VideoResponse(**j) for j in jobs]
-    return VideoListResponse(data=items)
+    return VideoListResponse(data=[VideoResponse(**job) for job in jobs])
 
 
 @router.get("/{video_id}", response_model=VideoResponse)
@@ -532,30 +725,59 @@ async def delete_video(video_id: str = Path(...)):
     job = await VIDEO_STORE.pop(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
-    # Mark as deleted in response semantics
     job["status"] = "deleted"
     return VideoResponse(**job)
 
 
 @router.get("/{video_id}/content")
 async def download_video_content(
-    video_id: str = Path(...), variant: Optional[str] = Query(None)
+    video_id: str = Path(...),
+    variant: Optional[str] = Query(None),
+    output_index: int = Query(0, ge=0),
 ):
     job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
 
-    if job.get("url"):
+    if variant not in (None, "video"):
         raise HTTPException(
             status_code=400,
-            detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {job.get('url')}",
+            detail=f"Unsupported video content variant: {variant!r}",
         )
 
-    file_path = job.get("file_path")
-    if not file_path or not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Generation is still in-progress")
+    urls = job.get("urls") or ([job["url"]] if job.get("url") else [])
+    if urls:
+        if output_index >= len(urls):
+            raise HTTPException(status_code=404, detail="Video output not found")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Video has been uploaded to cloud storage. "
+                f"Please use the cloud URL: {urls[output_index]}"
+            ),
+        )
 
-    media_type = "video/mp4"  # default variant
+    file_paths = job.get("file_paths") or (
+        [job["file_path"]] if job.get("file_path") else []
+    )
+    if output_index >= len(file_paths):
+        detail = (
+            "Generation is still in-progress"
+            if job.get("status") in {"queued", "in_progress"}
+            else "Video output not found"
+        )
+        raise HTTPException(status_code=404, detail=detail)
+    file_path = file_paths[output_index]
+    if not file_path or not os.path.exists(file_path):
+        status = job.get("status")
+        detail = (
+            "Generation is still in-progress"
+            if status in {"queued", "in_progress"}
+            else "Video output not found"
+        )
+        raise HTTPException(status_code=404, detail=detail)
+
+    media_type = "video/mp4"
     return FileResponse(
         path=file_path, media_type=media_type, filename=os.path.basename(file_path)
     )
