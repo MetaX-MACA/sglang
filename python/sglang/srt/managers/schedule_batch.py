@@ -1769,6 +1769,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    # PP output token ids, populated on PP output paths.
+    output_ids: torch.Tensor = None  # shape: [b], int64
     # DSV4-NPU: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator (None
     # elsewhere); c4/c128 state lens ride on ``batch.dsv4_state_lens``.
     out_cache_loc_dsv4: Optional[Any] = None

@@ -6,6 +6,7 @@ import time
 from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -28,6 +29,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -46,6 +48,8 @@ from sglang.srt.utils.common import get_device_module, is_xpu, require_attn_tp_g
 
 logger = logging.getLogger(__name__)
 
+_PP_BATCH_DEBUG_INFO_KEY = "__pp_batch_debug_info__"
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -60,6 +64,42 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
+
+
+def _pp_batch_debug_info(
+    batch: Optional[ScheduleBatch], mb_id: Optional[int] = None
+) -> Optional[dict]:
+    if batch is None:
+        return None
+
+    def _pp_req_is_chunked(req: Req) -> bool:
+        return getattr(req, "is_chunked", req is batch.chunked_req)
+
+    reqs = [
+        {
+            "rid": req.rid,
+            "is_chunked": _pp_req_is_chunked(req),
+            "finished": req.finished(),
+        }
+        for req in batch.reqs
+    ]
+    chunked_req = batch.chunked_req
+    return {
+        "mb_id": mb_id,
+        "forward_iter": batch.forward_iter,
+        "forward_mode": str(batch.forward_mode),
+        "num_reqs": len(batch.reqs),
+        "rids": [req["rid"] for req in reqs],
+        "reqs": reqs,
+        "chunked_req_rid": chunked_req.rid if chunked_req is not None else None,
+        "chunked_req_is_chunked": (
+            _pp_req_is_chunked(chunked_req) if chunked_req is not None else None
+        ),
+        "contains_last_prefill_chunk": batch.contains_last_prefill_chunk,
+        "return_logprob": batch.return_logprob,
+        "input_ids_len": len(batch.input_ids) if batch.input_ids is not None else None,
+        "extend_num_tokens": batch.extend_num_tokens,
+    }
 
 
 @dataclass
@@ -104,6 +144,7 @@ class SchedulerPPMixin:
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
+                self._pp_check_and_sync_running_timeout(recv_reqs)
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
@@ -255,6 +296,7 @@ class SchedulerPPMixin:
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
+                self._pp_record_debug_event("schedule", mb_id, batch)
 
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
@@ -311,6 +353,9 @@ class SchedulerPPMixin:
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
+                    self._pp_record_debug_event(
+                        "process_result", next_mb_id, self.mbs[next_mb_id]
+                    )
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
@@ -541,6 +586,34 @@ class SchedulerPPMixin:
             if server_is_idle and queue_size == 0:
                 self.on_idle()
 
+    def _pp_check_and_sync_running_timeout(self: Scheduler, recv_reqs: List):
+        timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
+        if timeout_s <= 0 or not self.pp_group.is_first_rank:
+            return
+
+        deadline = time.perf_counter() - timeout_s
+        timed_out = {}
+        for batch in self.running_mbs:
+            for req in batch.reqs:
+                if (
+                    not req.finished()
+                    and 0 < req.time_stats.forward_entry_time < deadline
+                ):
+                    timed_out[req.rid] = req
+
+        for req in timed_out.values():
+            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+                logger.warning(
+                    "PP running timeout: rid=%s timeout_s=%s", req.rid, timeout_s
+                )
+            abort_req = AbortReq(
+                rid=req.rid,
+                abort_message="Request running timeout reached.",
+                abort_status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            self.abort_request(abort_req)
+            recv_reqs.append(abort_req)
+
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
@@ -566,6 +639,49 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        self._pp_debug_events = deque(maxlen=32)
+
+    def _pp_record_debug_event(
+        self: Scheduler,
+        event: str,
+        mb_id: Optional[int],
+        batch: Optional[ScheduleBatch],
+        **extra,
+    ) -> None:
+        if self.ps.attn_tp_rank != 0:
+            return
+        record = {
+            "event": event,
+            "pp_rank": self.ps.pp_rank,
+            "attn_cp_rank": self.ps.attn_cp_rank,
+            "batch": _pp_batch_debug_info(batch, mb_id),
+        }
+        record.update(extra)
+        self._pp_debug_events.append(record)
+
+    def _pp_raise_output_mismatch(
+        self: Scheduler,
+        message: str,
+        expected_batch: Optional[ScheduleBatch],
+        expected_mb_id: Optional[int],
+        received_info: Optional[dict],
+    ) -> None:
+        expected_info = _pp_batch_debug_info(expected_batch, expected_mb_id)
+        concise = (
+            f"{message}; expected={expected_info}; received={received_info}"
+        )
+        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            slots = [
+                _pp_batch_debug_info(batch, mb_id)
+                for mb_id, batch in enumerate(self.mbs)
+            ]
+            logger.error(
+                "%s; pp_slots=%s; recent_pp_events=%s",
+                concise,
+                slots,
+                list(self._pp_debug_events),
+            )
+        raise RuntimeError(concise)
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -984,10 +1100,25 @@ class SchedulerPPMixin:
         return data
 
     def _pp_prepare_tensor_dict(
-        self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+        self: Scheduler,
+        result: GenerationBatchResult,
+        batch: ScheduleBatch,
+        mb_id: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
+        if not batch.forward_mode.is_prebuilt():
+            num_reqs = len(batch.reqs)
+            num_next_token_ids = result.next_token_ids.shape[0]
+            if num_next_token_ids != num_reqs:
+                raise RuntimeError(
+                    "PP output token count does not match the microbatch request "
+                    f"count: num_next_token_ids={num_next_token_ids}, "
+                    f"num_reqs={num_reqs}, forward_mode={batch.forward_mode}, "
+                    f"pp_rank={self.ps.pp_rank}, attn_cp_size={self.ps.attn_cp_size}"
+                )
+
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
+            _PP_BATCH_DEBUG_INFO_KEY: _pp_batch_debug_info(batch, mb_id),
         }
 
         if batch.return_logprob:
@@ -1170,12 +1301,32 @@ class SchedulerPPMixin:
         batch: ScheduleBatch,
         mb_metadata: PPBatchMetadata,
         pp_outputs: PPProxyTensors,
+        mb_id: Optional[int] = None,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
 
         logits_output = None
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
+
+        received_info = pp_outputs.tensors.get(_PP_BATCH_DEBUG_INFO_KEY)
+        expected_info = _pp_batch_debug_info(batch, mb_id)
+        num_next_token_ids = pp_outputs["next_token_ids"].shape[0]
+        identity_mismatch = received_info is None or (
+            received_info.get("num_reqs") != expected_info["num_reqs"]
+            or received_info.get("rids") != expected_info["rids"]
+            or num_next_token_ids != expected_info["num_reqs"]
+        )
+        if identity_mismatch:
+            self._pp_raise_output_mismatch(
+                "PP received output for a different microbatch",
+                batch,
+                mb_id,
+                {
+                    "sender": received_info,
+                    "num_next_token_ids": num_next_token_ids,
+                },
+            )
 
         if batch.return_logprob:
             (
@@ -1204,8 +1355,46 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            pp_batch_debug_info=received_info,
         )
         return output_result
+
+    def _pp_make_skip_output_result(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        mb_metadata: Optional[PPBatchMetadata],
+    ):
+        num_reqs = len(batch.reqs)
+        if (
+            batch.chunked_req is None
+            or batch.contains_last_prefill_chunk
+            or any(req is not batch.chunked_req for req in batch.reqs)
+        ):
+            raise RuntimeError(
+                "PP attempted to skip output communication for a non-middle "
+                f"prefill chunk: num_reqs={num_reqs}, "
+                f"batch_rids={[req.rid for req in batch.reqs]}, "
+                f"chunked_req_rid={batch.chunked_req.rid if batch.chunked_req is not None else None}, "
+                f"contains_last_prefill_chunk={batch.contains_last_prefill_chunk}"
+            )
+
+        placeholder = torch.zeros(num_reqs, dtype=torch.int64, device=self.device)
+        batch.output_ids = placeholder
+        batch_result = GenerationBatchResult(
+            logits_output=None,
+            pp_hidden_states_proxy_tensors=None,
+            next_token_ids=placeholder,
+            can_run_cuda_graph=(
+                mb_metadata.can_run_cuda_graph if mb_metadata is not None else False
+            ),
+            pp_batch_debug_info={
+                "skipped_output_comm": True,
+                "receiver": _pp_batch_debug_info(batch),
+            },
+        )
+        d2h_event = self.device_module.Event()
+        d2h_event.record(self.device_module.current_stream())
+        return None, batch_result, d2h_event
 
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
@@ -1225,6 +1414,15 @@ class SchedulerPPMixin:
             target = mbs[next_first_rank_mb_id]
             if target is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
+                self._pp_record_debug_event(
+                    (
+                        "skip_output_send"
+                        if _pp_can_skip_output_comm(target)
+                        else "output_send"
+                    ),
+                    next_first_rank_mb_id,
+                    target,
+                )
                 if (
                     not target.forward_mode.is_prebuilt()
                     and not _pp_can_skip_output_comm(target)
@@ -1293,16 +1491,25 @@ class SchedulerPPMixin:
             if target is None or target.forward_mode.is_prebuilt():
                 return
             if _pp_can_skip_output_comm(target):
+                self._pp_record_debug_event(
+                    "skip_output_recv", next_mb_id, target
+                )
                 next_pp_outputs, batch_result, d2h_event = (
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
                 )
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+            self._pp_record_debug_event(
+                "output_recv",
+                next_mb_id,
+                target,
+                received=next_pp_outputs.tensors.get(_PP_BATCH_DEBUG_INFO_KEY),
+            )
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
                 batch_result = self._pp_prep_batch_result(
-                    target, mb_metadata[next_mb_id], next_pp_outputs
+                    target, mb_metadata[next_mb_id], next_pp_outputs, next_mb_id
                 )
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
@@ -1350,7 +1557,9 @@ class SchedulerPPMixin:
                         (
                             event,
                             PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, self.cur_batch)
+                                self._pp_prepare_tensor_dict(
+                                    result, self.cur_batch, mb_id
+                                )
                             ),
                         )
                     )

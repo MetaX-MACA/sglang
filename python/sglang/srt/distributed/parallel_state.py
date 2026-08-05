@@ -1203,6 +1203,7 @@ class GroupCoordinator:
         obj: Any,
         dst: int,
         async_send: bool = False,
+        tag: int = 0,
     ) -> List[P2PWork]:
         """
         Send the input object list to the destination rank.
@@ -1233,6 +1234,7 @@ class GroupCoordinator:
             size_tensor,
             self.ranks[dst],
             group=self.cpu_group,
+            tag=tag,
         )
         if async_send:
             p2p_work.append(P2PWork(size_work, size_tensor))
@@ -1241,6 +1243,7 @@ class GroupCoordinator:
             object_tensor,
             self.ranks[dst],
             group=self.cpu_group,
+            tag=tag,
         )
         if async_send:
             p2p_work.append(P2PWork(object_work, object_tensor))
@@ -1250,6 +1253,7 @@ class GroupCoordinator:
     def recv_object(
         self,
         src: int,
+        tag: int = 0,
     ) -> Any:
         """Receive the input object list from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
@@ -1264,7 +1268,7 @@ class GroupCoordinator:
         # Receive object size
         # We have to use irecv here to make it work for both isend and send.
         work = torch.distributed.irecv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
+            size_tensor, src=self.ranks[src], group=self.cpu_group, tag=tag
         )
         work.wait()
 
@@ -1276,7 +1280,7 @@ class GroupCoordinator:
         )
 
         work = torch.distributed.irecv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
+            object_tensor, src=self.ranks[src], group=self.cpu_group, tag=tag
         )
         work.wait()
 
@@ -2289,7 +2293,9 @@ def initialize_model_parallel(
 
 
 def create_custom_parallel_group(
-    group_ranks: List[int], backend: str = "gloo"
+    group_ranks: List[int],
+    backend: str = "gloo",
+    sync_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Optional[torch.distributed.ProcessGroup]:
     """
     Create a custom parallel group based on the provided ranks.
@@ -2298,6 +2304,9 @@ def create_custom_parallel_group(
         group_ranks: The list of ranks that the CURRENT process wants to join.
                      (e.g., Rank 0 passes [0...7], Rank 8 passes [8...15])
         backend: The communication backend (default: "gloo").
+        sync_group: Optional group used to exchange group configs before creating
+                    custom groups. Passing a CPU/Gloo group avoids touching the
+                    default CUDA backend during late initialization.
 
     Returns:
         The ProcessGroup if the current rank is in group_ranks, else None.
@@ -2310,7 +2319,9 @@ def create_custom_parallel_group(
     local_config = sorted(list(set(group_ranks)))
     gathered_configs = [None for _ in range(world_size)]
 
-    torch.distributed.all_gather_object(gathered_configs, local_config)
+    torch.distributed.all_gather_object(
+        gathered_configs, local_config, group=sync_group
+    )
 
     unique_groups = []
     seen_signatures = set()

@@ -1467,7 +1467,10 @@ class Scheduler(
         )
 
     def _abort_on_running_timeout(self):
-        # NOTE: this should be called before a batch is launched.
+        # NOTE: this should be called before a batch is launched,
+        # as current spec-v1 still filters batch inside verify stage.
+        if self.ps.pp_size > 1:
+            return
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
         if timeout_s <= 0:
             return
@@ -2362,12 +2365,12 @@ class Scheduler(
         if self.enable_priority_scheduling:
             # With priority scheduling, consider aboritng an existing request based on the priority.
             # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
-            # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
-            # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
+            # max(...) picks the least-preferred request. The queue index is a
+            # deterministic newer-first tie breaker shared by all PP stages.
             direction = 1 if self.schedule_low_priority_values_first else -1
             key_fn = lambda item: (
                 direction * item[1].priority,
-                item[1].time_stats.wait_queue_entry_time,
+                item[0],
             )
             idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
             abort_existing_req = (
@@ -2377,8 +2380,6 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(candidate_req.rid)
-                elif self.enable_hierarchical_cache:
-                    self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -2403,9 +2404,22 @@ class Scheduler(
 
         deleted_reqs = set()
         deadline = time.perf_counter() - timeout_s
-        for req in self.waiting_queue:
+        expired = [0] * len(self.waiting_queue)
+        pp_rank = getattr(self.tree_cache, "pp_rank", 0)
+        if not self.enable_hicache_storage or pp_rank == 0:
+            for i, req in enumerate(self.waiting_queue):
+                entry_time = req.time_stats.wait_queue_entry_time
+                expired[i] = int(0 < entry_time < deadline)
+        if self.enable_hicache_storage and expired:
+            expired_tensor = torch.tensor(expired, dtype=torch.int)
+            self.tree_cache._all_reduce(
+                expired_tensor, torch.distributed.ReduceOp.MAX
+            )
+            expired = list(map(int, expired_tensor.tolist()))
+
+        for req, should_abort in zip(self.waiting_queue, expired):
             entry_time = req.time_stats.wait_queue_entry_time
-            if 0 < entry_time < deadline:
+            if should_abort:
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
@@ -2750,7 +2764,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass
         )
 
-        if self.prefill_delayer:
+        if prefill_delayer_single_pass is not None:
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
 
         return ret
@@ -2839,7 +2853,15 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self.chunked_req = adder.add_chunked_req(
+                self.chunked_req,
+                truncation_align_size=self.truncation_align_size,
+            )
+            self._chunked_req_scheduled_last_iter = (
+                self.chunked_req in adder.can_run_list
+            )
+        else:
+            self._chunked_req_scheduled_last_iter = False
 
         if self.enable_lora:
             running_loras = {
@@ -2962,7 +2984,6 @@ class Scheduler(
         new_batch.contains_last_prefill_chunk = (
             self.chunked_req is None or len(can_run_list) != 1
         )
-
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
@@ -3979,11 +4000,17 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        # Delete requests in the running batch
-        if self.cur_batch is self.running_batch or self.cur_batch is None:
-            reqs = self.running_batch.reqs
+        # Under PP, requests can reside in any microbatch slot.
+        if self.ps.pp_size > 1:
+            inflight_batches = [*self.running_mbs, *self.mbs]
         else:
-            reqs = self.running_batch.reqs + self.cur_batch.reqs
+            inflight_batches = [self.running_batch, self.cur_batch]
+        reqs = {
+            id(req): req
+            for batch in inflight_batches
+            if batch is not None
+            for req in batch.reqs
+        }.values()
 
         for req in reqs:
             if not req.finished() and (
@@ -3993,7 +4020,9 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
+                req.to_finish = FINISH_ABORT(
+                    recv_req.abort_message, recv_req.abort_status_code
+                )
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

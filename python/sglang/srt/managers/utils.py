@@ -51,6 +51,9 @@ class GenerationBatchResult:
     # to validate that skipped output is never consumed.
     skipped_output_comm: bool = False
 
+    # Internal PP microbatch identity used only for mismatch diagnostics.
+    pp_batch_debug_info: Optional[dict] = None
+
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None
     extend_logprob_start_len_per_req: Optional[List[int]] = None
