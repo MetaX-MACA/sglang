@@ -92,6 +92,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
+    align_packed_tensor_size,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
@@ -163,8 +164,11 @@ class Qwen2MoeMLP(nn.Module):
         prefix: str = "",
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        swiglu_limit: Optional[float] = None,
     ) -> None:
         super().__init__()
+        self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.swiglu_limit = swiglu_limit
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -188,7 +192,7 @@ class Qwen2MoeMLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        self.act_fn = SiluAndMul(fused_quant=self.fused_quant)
 
     def forward(
         self,
@@ -197,7 +201,11 @@ class Qwen2MoeMLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        x = (
+            self.act_fn(gate_up, self.swiglu_limit)
+            if self.fused_quant
+            else self.act_fn(gate_up)
+        )
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )
@@ -214,11 +222,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         prefix: str = "",
         is_nextn: bool = False,
         support_shared_expert_fusion: bool = False,
+        swiglu_limit: Optional[float] = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.fused_quant_packed_size = align_packed_tensor_size(
+            config.hidden_size,
+            envs.MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE.get(),
+        )
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -273,6 +287,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.RenormalizeNaive,
             num_fused_shared_experts=self.num_fused_shared_experts,
+            **(
+                {"swiglu_limit": swiglu_limit}
+                if get_moe_a2a_backend().is_deepep() and swiglu_limit is not None
+                else {}
+            ),
         )
 
         self.gate = ReplicatedLinear(
@@ -296,6 +315,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
+                swiglu_limit=swiglu_limit,
                 **(
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
@@ -371,14 +391,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             router_logits=topk_output.router_logits,
         )
 
-    def _forward_shared_experts(self, hidden_states: torch.Tensor):
+    def _forward_shared_experts(
+        self,
+        hidden_states,
+        gate_hidden_states: Optional[torch.Tensor] = None,
+    ):
         shared_output = None
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
+                gate_hidden_states = (
+                    hidden_states if gate_hidden_states is None else gate_hidden_states
+                )
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
-                        hidden_states,
+                        gate_hidden_states,
                         self.shared_expert_gate.weight,
                         self.shared_expert_gate.bias,
                         True,
@@ -386,7 +413,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     )
                 else:
                     shared_output = (
-                        F.sigmoid(self.shared_expert_gate(hidden_states))
+                        F.sigmoid(self.shared_expert_gate(gate_hidden_states))
                         * shared_output
                     )
 
@@ -399,6 +426,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and forward_batch.forward_mode.is_cuda_graph()
         )
         shared_output = None
+        quantized_hidden_states = None
+        if isinstance(hidden_states, tuple):
+            assert len(hidden_states) == 3 and isinstance(hidden_states[2], tuple), (
+                "DeepEP fused quant expects (packed, bf16, (int8, scale))"
+            )
+            packed_hidden_states, hidden_states, quantized_hidden_states = hidden_states
+        else:
+            packed_hidden_states = hidden_states
+            if self.use_fused_quant and hidden_states.shape[0] == 0:
+                packed_hidden_states = torch.empty(
+                    (0, self.fused_quant_packed_size),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
@@ -407,7 +449,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     hidden_states.clone(), self._forward_shared_experts
                 )
             else:
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_expert_input = (
+                    quantized_hidden_states
+                    if quantized_hidden_states is not None
+                    else hidden_states
+                )
+                shared_output = self._forward_shared_experts(
+                    shared_expert_input,
+                    gate_hidden_states=hidden_states,
+                )
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -423,7 +473,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
         final_hidden_states = self.experts(
-            hidden_states=hidden_states,
+            hidden_states=packed_hidden_states,
             topk_output=topk_output,
         )
         if enable_dual_stream:
@@ -466,8 +516,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_reduce_scatter: bool = False,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+        if isinstance(hidden_states, tuple):
+            assert get_moe_a2a_backend().is_deepep(), (
+                "packed fused quant is only supported by the DeepEP path"
+            )
+            assert len(hidden_states) == 3 and isinstance(hidden_states[2], tuple), (
+                "DeepEP fused quant expects (packed, bf16, (int8, scale))"
+            )
+            num_tokens, hidden_dim = hidden_states[1].shape
+        else:
+            num_tokens, hidden_dim = hidden_states.shape
+            hidden_states = hidden_states.view(-1, hidden_dim)
 
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)

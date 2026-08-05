@@ -843,19 +843,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
+        current_size = tensor.shape[0]
+        if current_size > size:
+            raise ValueError(
+                f"Cannot pad tensor from size {current_size} to smaller size {size}."
+            )
+
+        output_shape = (size, *tensor.shape[1:])
         if value == 0:
-            return torch.cat(
-                [tensor, tensor.new_zeros(size - tensor.shape[0], *tensor.shape[1:])],
-                dim=0,
-            )
+            output = tensor.new_zeros(output_shape)
         else:
-            return torch.cat(
-                [
-                    tensor,
-                    tensor.new_full((size - tensor.shape[0], *tensor.shape[1:]), value),
-                ],
-                dim=0,
-            )
+            output = tensor.new_full(output_shape, value)
+
+        output[:current_size].copy_(tensor)
+        return output
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer

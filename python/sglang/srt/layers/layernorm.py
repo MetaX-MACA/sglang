@@ -679,6 +679,9 @@ class GemmaRMSNorm(MultiPlatformOp):
         self,
         hidden_size: int,
         eps: float = 1e-6,
+        fused_quant: bool = False,
+        packed_quant: bool = False,
+        packed_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
@@ -688,6 +691,12 @@ class GemmaRMSNorm(MultiPlatformOp):
         # If TRTLLM allreduce fusion ever provides gemma-style norm
         # natively, this can be removed.
         self.weight.weight_loader = self._weight_loader
+        self.fused_quant = fused_quant
+        self.packed_quant = packed_quant
+        self.packed_size = packed_size
+
+        if self.packed_quant and self.packed_size is None:
+            raise ValueError("packed_size must be set when packed_quant is enabled")
 
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
@@ -700,10 +709,54 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if x.numel() == 0:
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                return x, residual
+            return x
+
         needs_reshape = x.dim() != 2 and residual is None
         if needs_reshape:
             original_shape = x.shape
             x = x.contiguous().reshape(-1, original_shape[-1])
+
+        if self.fused_quant:
+            # The MetaX fused kernels implement standard RMSNorm semantics, while
+            # Gemma stores (weight - 1) in the checkpoint. Use the precomputed
+            # +1 weight so the fused and unfused paths are mathematically equal.
+            if residual is not None and post_residual_addition is not None:
+                residual = residual + post_residual_addition
+
+            if self.packed_quant:
+                packed_out, residual_out, bf16_out, int8_out, int8_scale = (
+                    fused_add_rms_norm_dynamic_per_token_quant_padding_output(
+                        x.contiguous(),
+                        residual,
+                        self.gemma_weight.data,
+                        self.packed_size,
+                        self.variance_epsilon,
+                    )
+                )
+                outputs = (packed_out, bf16_out, (int8_out, int8_scale))
+                if residual is not None:
+                    return outputs, residual_out
+                return outputs
+
+            int8_out, bf16_out, int8_scale = (
+                rms_norm_dynamic_per_token_quant_custom(
+                    x.contiguous(),
+                    self.gemma_weight.data,
+                    self.variance_epsilon,
+                    quant_dtype=torch.int8,
+                    residual=residual,
+                )
+            )
+            outputs = (int8_out, int8_scale, bf16_out)
+            if residual is not None:
+                return outputs, residual
+            return outputs
+
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition

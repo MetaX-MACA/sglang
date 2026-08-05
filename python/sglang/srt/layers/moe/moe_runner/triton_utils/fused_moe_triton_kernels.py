@@ -1047,6 +1047,9 @@ def invoke_fused_moe_kernel(
                 FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
                 FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
                 ROUTER_TOPK=router_topk,
+                # LoRA-only knobs added by newer mcoplib; off on the normal path
+                MASK_OUTPUT=False,
+                LORA_PRESERVE_BASE=False,
                 **config,
             )
 

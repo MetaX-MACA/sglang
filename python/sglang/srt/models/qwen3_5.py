@@ -60,6 +60,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
@@ -88,6 +89,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    align_packed_tensor_size,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
@@ -130,6 +132,11 @@ SGLANG_QWEN35_FUSED_QK_ROPE_GATE = _is_cuda and get_bool_env_var(
 SGLANG_QWEN35_FUSED_OUTPUT_GATE = (_is_cuda or _is_hip) and get_bool_env_var(
     "SGLANG_QWEN35_FUSED_OUTPUT_GATE", "true"
 )
+
+# Match the previous Qwen FP8 fused-activation path: use a large finite limit
+# to select kernels that require a SwiGLU limit without changing model values.
+QWEN3_5_SWIGLU_LIMIT = 1e9
+
 
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
@@ -450,7 +457,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
-        seq_len, _ = hidden_states.shape
+        qkvz_hidden_states = hidden_states
+        if isinstance(hidden_states, tuple):
+            assert len(hidden_states) == 3, (
+                "fused input_layernorm must return (int8, scale, bf16)"
+            )
+            qkvz_hidden_states = (hidden_states[0], hidden_states[1])
+            ba_hidden_states = hidden_states[2]
+        else:
+            ba_hidden_states = hidden_states
+
+        seq_len, _ = ba_hidden_states.shape
         if (
             self.alt_stream is not None
             and get_is_capture_mode()
@@ -458,13 +475,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_qkvz, _ = self.in_proj_qkvz(qkvz_hidden_states)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                projected_states_ba, _ = self.in_proj_ba(ba_hidden_states)
             current_stream.wait_stream(self.alt_stream)
         else:
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_qkvz, _ = self.in_proj_qkvz(qkvz_hidden_states)
+            projected_states_ba, _ = self.in_proj_ba(ba_hidden_states)
         return projected_states_qkvz, projected_states_ba
 
     def forward(
@@ -580,6 +597,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
+                swiglu_limit=QWEN3_5_SWIGLU_LIMIT,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -591,6 +609,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                swiglu_limit=QWEN3_5_SWIGLU_LIMIT,
             )
             is_layer_sparse = False
             is_previous_layer_sparse = False
@@ -606,9 +625,31 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        use_packed_deepep_quant = (
+            self.fused_quant
+            and is_layer_sparse
+            and get_moe_a2a_backend().is_deepep()
+        )
+        packed_size = (
+            align_packed_tensor_size(
+                config.hidden_size,
+                envs.MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE.get(),
+            )
+            if use_packed_deepep_quant
+            else None
+        )
+        self.input_layernorm = GemmaRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.fused_quant,
+        )
         self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=use_packed_deepep_quant,
+            packed_quant=use_packed_deepep_quant,
+            packed_size=packed_size,
         )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -645,6 +686,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_states,
                 forward_batch,
             )
+        elif isinstance(hidden_states, tuple):
+            # Attention is skipped on an idle DP rank, so consume the BF16
+            # component that would otherwise have been selected by the projection.
+            hidden_states = hidden_states[2]
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -782,6 +827,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                swiglu_limit=QWEN3_5_SWIGLU_LIMIT,
             )
             is_layer_sparse = False
             is_previous_layer_sparse = False
@@ -795,6 +841,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=True,
+                swiglu_limit=QWEN3_5_SWIGLU_LIMIT,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -810,9 +857,31 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        use_packed_deepep_quant = (
+            self.fused_quant
+            and is_layer_sparse
+            and get_moe_a2a_backend().is_deepep()
+        )
+        packed_size = (
+            align_packed_tensor_size(
+                config.hidden_size,
+                envs.MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE.get(),
+            )
+            if use_packed_deepep_quant
+            else None
+        )
+        self.input_layernorm = GemmaRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.fused_quant,
+        )
         self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=use_packed_deepep_quant,
+            packed_quant=use_packed_deepep_quant,
+            packed_size=packed_size,
         )
 
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -875,7 +944,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        qkv, _ = self.qkv_proj(hidden_states)
+        if isinstance(hidden_states, tuple):
+            assert len(hidden_states) == 3, (
+                "fused input_layernorm must return (int8, scale, bf16)"
+            )
+            qkv_hidden_states = (hidden_states[0], hidden_states[1])
+        else:
+            qkv_hidden_states = hidden_states
+        qkv, _ = self.qkv_proj(qkv_hidden_states)
 
         if self.use_fused_qk_rope_gate:
             q_gate, k, v = qkv.split(
@@ -951,6 +1027,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        elif isinstance(hidden_states, tuple):
+            # Attention is skipped on an idle DP rank, so consume the BF16
+            # component that would otherwise have been selected by qkv_proj.
+            hidden_states = hidden_states[2]
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(

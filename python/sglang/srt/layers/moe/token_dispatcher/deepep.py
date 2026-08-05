@@ -74,6 +74,22 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 logger = logging.getLogger(__name__)
 
 
+def Check_DeepEP_Package():
+    import pkg_resources
+
+    try:
+        pkg_resources.get_distribution("mxmesh")
+        return "mxmesh"
+    except pkg_resources.DistributionNotFound:
+        try:
+            pkg_resources.get_distribution("deep_ep")
+            return "deep_ep"
+        except pkg_resources.DistributionNotFound:
+            raise FileNotFoundError(
+                "Init DeepEP need import deep_ep/mxmesh, please use 'pip install deep_ep/mxmesh'"
+            )
+
+
 def _deepep_precompile_tp_barrier() -> None:
     # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
     # so if different ranks compile at different speeds, it may quickly trigger a timeout.
@@ -657,6 +673,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
+        self.enable_mxmesh = Check_DeepEP_Package() == "mxmesh"
 
         """
         num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
@@ -682,6 +699,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
+            topk_weights,
         )
         return (
             hidden_states,
@@ -728,6 +746,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
+        topk_weights: Optional[torch.Tensor] = None,
     ):
         use_nvfp4 = use_fp8 = False
         input_global_scale = None
@@ -773,8 +792,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             buffer.low_latency_dispatch(
                 hidden_states,
                 topk_ids,
-                self.num_max_dispatch_tokens_per_rank,
-                self.num_experts,
+                **(dict(topk_weights=topk_weights) if self.enable_mxmesh else dict()),
+                num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+                num_experts=self.num_experts,
                 use_fp8=use_fp8,
                 **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
                 **(
