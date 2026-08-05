@@ -16,6 +16,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
 from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
     Flux2FinetunedPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.helios import (
     HeliosDistilledConfig,
     HeliosMidConfig,
@@ -58,6 +61,7 @@ __all__ = [
     "HeliosDistilledConfig",
     "HeliosMidConfig",
     "HeliosT2VConfig",
+    "MiniMaxH3PipelineConfig",
     "HunyuanConfig",
     "FastHunyuanConfig",
     "Hunyuan3D2PipelineConfig",

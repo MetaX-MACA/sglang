@@ -352,13 +352,6 @@ class ServerArgs(DisaggServerArgsMixin):
     def broker_port(self) -> int:
         return self.port + 1
 
-    @property
-    def is_local_mode(self) -> bool:
-        """
-        If no server is running when a generation task begins, 'local_mode' will be enabled: a dedicated server will be launched
-        """
-        return self.host is None or self.port is None
-
     def _adjust_path(self):
         expand_path_fields(self)
         self._adjust_save_paths()
@@ -1071,6 +1064,7 @@ class ServerArgs(DisaggServerArgsMixin):
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
             self.disagg_role = RoleType.from_string(self.disagg_role)
+        self._validate_disagg_capability()
         self.gpu_ids = normalize_gpu_ids(self.gpu_ids)
 
         # 1. adjust parameters
@@ -1941,6 +1935,20 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
+        self._validate_disagg_capability()
+
+    def _validate_disagg_capability(self) -> None:
+        if self.pipeline_config is None:
+            return
+        if (
+            self.disagg_role != RoleType.MONOLITHIC
+            and not self.pipeline_config.supports_disaggregation()
+        ):
+            raise ValueError(
+                f"{type(self.pipeline_config).__name__} only supports monolithic "
+                f"deployment; disaggregation role {self.disagg_role.value!r} "
+                "is not supported"
+            )
 
     def _validate_offload(self):
         # validate dit_offload_prefetch_size

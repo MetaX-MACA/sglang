@@ -444,13 +444,28 @@ class ComposedPipelineBase(ABC):
         component_load_specs: list[ComponentLoadSpec] = []
 
         # enqueue only real weight loads (e.g., scheduler, tokenizer is excluded); skipped/provided modules keep old handling
-        for index, (
-            module_name,
-            (
-                transformers_or_diffusers,
-                architecture,
-            ),
-        ) in enumerate(model_index.items()):
+        for index, (module_name, component_spec) in enumerate(model_index.items()):
+            # Diffusers model_index.json uses JSON null for an unavailable
+            # optional component.  Check it before unpacking the normal
+            # [library, architecture] pair; unpacking first raises TypeError
+            # and prevents backwards-compatible model bundles from starting.
+            if component_spec is None:
+                logger.warning(
+                    "Module %s in model_index.json has null value, removing from required_config_modules",
+                    module_name,
+                )
+                if module_name in self.required_config_modules:
+                    self.required_config_modules.remove(module_name)
+                continue
+            if (
+                not isinstance(component_spec, (list, tuple))
+                or len(component_spec) != 2
+            ):
+                raise ValueError(
+                    f"Module {module_name!r} in model_index.json must be null or "
+                    f"a [library, architecture] pair, got {component_spec!r}"
+                )
+            transformers_or_diffusers, architecture = component_spec
             if transformers_or_diffusers is None:
                 logger.warning(
                     "Module %s in model_index.json has null value, removing from required_config_modules",

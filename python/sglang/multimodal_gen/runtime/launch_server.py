@@ -96,22 +96,6 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     num_gpus = server_args.num_gpus
     processes = []
 
-    # Pipes for master to talk to slaves
-    task_pipes_to_slaves_w = []
-    task_pipes_to_slaves_r = []
-    for _ in range(num_gpus - 1):
-        r, w = mp.Pipe(duplex=False)
-        task_pipes_to_slaves_r.append(r)
-        task_pipes_to_slaves_w.append(w)
-
-    # Pipes for slaves to talk to master
-    result_pipes_from_slaves_w = []
-    result_pipes_from_slaves_r = []
-    for _ in range(num_gpus - 1):
-        r, w = mp.Pipe(duplex=False)
-        result_pipes_from_slaves_r.append(r)
-        result_pipes_from_slaves_w.append(w)
-
     # Launch all worker processes
     master_port = server_args.master_port
     scheduler_pipe_readers = []
@@ -120,40 +104,18 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     for i in range(num_gpus):
         reader, writer = mp.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
-        if i == 0:  # Master worker
-            process = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    i,  # local_rank
-                    i,  # rank
-                    master_port,
-                    server_args,
-                    writer,
-                    None,  # No task pipe to read from master
-                    None,  # No result pipe to write to master
-                    task_pipes_to_slaves_w,
-                    result_pipes_from_slaves_r,
-                ),
-                name=f"sglang-diffusionWorker-{i}",
-                daemon=True,
-            )
-        else:  # Slave workers
-            process = mp.Process(
-                target=run_scheduler_process,
-                args=(
-                    i,  # local_rank
-                    i,  # rank
-                    master_port,
-                    server_args,
-                    writer,
-                    None,  # No task pipe to read from master
-                    None,  # No result pipe to write to master
-                    task_pipes_to_slaves_r[i - 1],
-                    result_pipes_from_slaves_w[i - 1],
-                ),
-                name=f"sglang-diffusionWorker-{i}",
-                daemon=True,
-            )
+        process = mp.Process(
+            target=run_scheduler_process,
+            args=(
+                i,  # local_rank
+                i,  # rank
+                master_port,
+                server_args,
+                writer,
+            ),
+            name=f"sglang-diffusionWorker-{i}",
+            daemon=True,
+        )
         scheduler_pipe_readers.append(reader)
         process.start()
         processes.append(process)
@@ -162,16 +124,6 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     scheduler_infos = []
     for writer in scheduler_pipe_writers:
         writer.close()
-
-    # Close unused pipe ends in parent process
-    for p in task_pipes_to_slaves_w:
-        p.close()
-    for p in task_pipes_to_slaves_r:
-        p.close()
-    for p in result_pipes_from_slaves_w:
-        p.close()
-    for p in result_pipes_from_slaves_r:
-        p.close()
 
     for i, reader in enumerate(scheduler_pipe_readers):
         try:
@@ -200,7 +152,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             http_server_process = mp.Process(
                 target=launch_http_server_only,
                 args=(server_args,),
-                name=f"sglang-diffusion-webui",
+                name="sglang-diffusion-webui",
                 daemon=True,
             )
             http_server_process.start()
@@ -347,7 +299,7 @@ def launch_pool_disagg_server(
 
                 process = pool_ctx.Process(
                     target=_run_disagg_role_process,
-                    args=(gpu_id, rank_idx, rank_idx, role_args, writer, [], []),
+                    args=(gpu_id, rank_idx, rank_idx, role_args, writer),
                     name=f"sglang-pool-{role_type.value}-{inst_idx}-r{rank_idx}",
                     daemon=True,
                 )
@@ -419,8 +371,6 @@ def _run_disagg_role_process(
     rank: int,
     server_args: ServerArgs,
     pipe_writer: mp.connection.Connection,
-    task_pipes: list,
-    result_pipes: list,
 ):
     """Entry point for a disagg role process.
 
@@ -435,10 +385,6 @@ def _run_disagg_role_process(
         master_port=server_args.master_port,
         server_args=server_args,
         pipe_writer=pipe_writer,
-        task_pipe_r=None,
-        result_pipe_w=None,
-        task_pipes_to_slaves=task_pipes,
-        result_pipes_from_slaves=result_pipes,
     )
 
 
@@ -621,7 +567,7 @@ def launch_disagg_role(server_args: ServerArgs):
 
         process = pool_ctx.Process(
             target=_run_disagg_role_process,
-            args=(gpu_id, rank_idx, rank_idx, role_args, writer, [], []),
+            args=(gpu_id, rank_idx, rank_idx, role_args, writer),
             name=f"sglang-{role_type.value}-r{rank_idx}",
             daemon=True,
         )
@@ -675,6 +621,11 @@ def dispatch_launch(server_args: ServerArgs):
 
 
 if __name__ == "__main__":
+    # Match diffusion_generator.py: the parent may touch CUDA before the
+    # scheduler processes start (e.g. server_args auto tuner GPU memory
+    # probing), so forked workers would die with "Cannot re-initialize CUDA
+    # in forked subprocess". The disaggregated paths already use spawn.
+    mp.set_start_method("spawn", force=True)
     server_args = prepare_server_args(sys.argv[1:])
 
     try:

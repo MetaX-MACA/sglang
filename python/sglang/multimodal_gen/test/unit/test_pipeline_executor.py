@@ -118,6 +118,7 @@ def test_execute_group_with_profiling_uses_platform_inference_mode(monkeypatch):
         (_server_args(text_encoder_cpu_offload=True), ("text_encoder",)),
         (_server_args(image_encoder_cpu_offload=True), ("image_encoder",)),
         (_server_args(vae_cpu_offload=True), ("vae",)),
+        (_server_args(vae_cpu_offload=True), ("video_vae",)),
     ],
 )
 def test_stage_context_preserves_version_counters_when_needed(

@@ -311,6 +311,9 @@ async def forward_to_scheduler(
                 enable_upscaling=sp.enable_upscaling,
                 upscaling_model_path=sp.upscaling_model_path,
                 upscaling_scale=sp.upscaling_scale,
+                strict_audio_mux=(
+                    get_global_server_args().pipeline_config.requires_audio_output
+                ),
             )
 
         if hasattr(response, "model_dump"):

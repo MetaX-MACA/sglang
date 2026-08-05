@@ -15,8 +15,6 @@ class TeaCacheParams(CacheParams):
     Parameters for [TeaCache](https://arxiv.org/abs/2411.14324).
 
     Attributes:
-        cache_type: (`str`, defaults to `teacache`):
-            A string labeling these parameters as belonging to teacache.
         teacache_thresh (`float`, defaults to `0.0`):
             Threshold for accumulated relative L1 distance. When below this threshold, the
             forward pass is skipped. Recommended values: 0.25 for ~1.5x speedup, 0.4 for ~1.8x,
@@ -47,7 +45,6 @@ class TeaCacheParams(CacheParams):
             Used exclusively for wanvideo models to select different modulated inputs.
     """
 
-    cache_type: str = "teacache"
     teacache_thresh: float = 0.0
     start_skipping: int | float = 5
     end_skipping: int | float = -1

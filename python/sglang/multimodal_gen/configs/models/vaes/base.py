@@ -16,6 +16,16 @@ AUTO_PARALLEL_DECODE_MODE = "auto"
 SPATIAL_SHARD_PARALLEL_DECODE_MODES = ("spatial_shard", "spatial")
 
 
+class VAEContractError(ValueError):
+    """A VAE component config violates its model's declared contract.
+
+    Model-specific VAE configs raise (subclasses of) this from
+    ``update_model_arch``/``post_init`` validation so generic loaders can
+    convert contract violations into load errors without importing
+    model-specific modules.
+    """
+
+
 @lru_cache(maxsize=8)
 def is_spatial_shard_parallel_decode_mode(mode: str) -> bool:
     return mode in SPATIAL_SHARD_PARALLEL_DECODE_MODES

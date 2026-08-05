@@ -30,6 +30,7 @@ def _make_unit_server_args():
         vae_config=vae_config,
         dit_precision="bfloat16",
         vae_precision="bfloat16",
+        requires_audio_output=False,
         get_latent_dtype=lambda dtype: dtype,
     )
     return SimpleNamespace(
@@ -41,6 +42,7 @@ def _make_unit_server_args():
         enable_layerwise_nvtx_marker=False,
         enable_torch_compile=False,
         model_loaded={},
+        model_path=None,
         model_paths={},
         pipeline_config=pipeline_config,
     )

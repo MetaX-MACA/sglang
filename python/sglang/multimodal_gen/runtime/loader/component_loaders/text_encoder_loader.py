@@ -278,11 +278,30 @@ class TextEncoderLoader(ComponentLoader):
         cpu_offload_flag: bool | None = None,
     ):
         """Load the text encoders based on the model path, and inference args."""
-        diffusers_pretrained_config = get_config(
-            component_model_path, trust_remote_code=True
-        )
         model_config = get_diffusers_component_config(
             component_path=component_model_path
+        )
+        if self.component_architecture in ModelRegistry.registered_models:
+            model_cls, _ = ModelRegistry.resolve_model_cls(self.component_architecture)
+            # Only architectures that opt into the self-contained
+            # ``load_component`` classmethod (e.g. MiniMaxH3Qwen3VLHFEncoder)
+            # are loaded through the registry here. Every other registered
+            # encoder (UMT5EncoderModel, CLIPTextModel, LlamaModel, ...)
+            # keeps using the legacy per-encoder-config path below.
+            load_component = getattr(model_cls, "load_component", None)
+            if callable(load_component):
+                logger.info(
+                    "Loading registered text encoder %s from %s",
+                    self.component_architecture,
+                    component_model_path,
+                )
+                return load_component(
+                    component_model_path=component_model_path,
+                    component_name=component_name,
+                    config=model_config,
+                )
+        diffusers_pretrained_config = get_config(
+            component_model_path, trust_remote_code=True
         )
 
         # TODO(mick): had to throw an exception for different text-encoder arch

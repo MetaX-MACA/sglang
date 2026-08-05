@@ -210,12 +210,23 @@ def maybe_load_fsdp_model(
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
     default_torch_dtype = param_dtype if param_dtype else torch.bfloat16
-    mp_policy = MixedPrecisionPolicy(
-        default_torch_dtype, reduce_dtype, output_dtype, cast_forward_inputs=False
-    )
+    if getattr(model_cls, "_fsdp_mixed_dtype_params", False):
+        # The model constructs parameters with per-module dtypes (e.g. fp32
+        # adaln/patch_proj/final layers among bf16 blocks). A uniform
+        # param_dtype policy would silently cast the fp32 params to bf16 at
+        # all-gather time, breaking the model's precision contract while
+        # post-load dtype validation still passes on the sharded params.
+        # param_dtype=None keeps each parameter's own dtype for compute.
+        mp_policy = MixedPrecisionPolicy(None, None, None, cast_forward_inputs=False)
+        policy_param_dtype = None
+    else:
+        mp_policy = MixedPrecisionPolicy(
+            default_torch_dtype, reduce_dtype, output_dtype, cast_forward_inputs=False
+        )
+        policy_param_dtype = default_torch_dtype
 
     set_mixed_precision_policy(
-        param_dtype=default_torch_dtype,
+        param_dtype=policy_param_dtype,
         reduce_dtype=reduce_dtype,
         output_dtype=output_dtype,
         mp_policy=mp_policy,

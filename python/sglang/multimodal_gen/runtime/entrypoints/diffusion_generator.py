@@ -11,6 +11,8 @@ diffusion models.
 import dataclasses
 import multiprocessing as mp
 import os
+import shutil
+import tempfile
 import time
 from contextlib import ExitStack
 from typing import Any, List, Union
@@ -26,7 +28,6 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
-    expand_request_outputs,
     format_lora_message,
     prepare_request,
     save_outputs,
@@ -53,6 +54,17 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
 )
 
 logger = init_logger(__name__)
+
+
+def get_video_model_adapter(pipeline_config):
+    """Resolve a video adapter lazily so importing DiffGenerator stays light."""
+
+    from sglang.multimodal_gen.runtime.entrypoints.openai.video_adapter import (
+        get_video_model_adapter as _resolve_video_model_adapter,
+    )
+
+    return _resolve_video_model_adapter(pipeline_config)
+
 
 # TODO: move to somewhere appropriate
 try:
@@ -101,13 +113,20 @@ class DiffGenerator:
 
         Priority level: Default pipeline config < User's pipeline config < User's kwargs
         """
-        # If users also provide some kwargs, it will override the ServerArgs and PipelineConfig.
-
-        if (server_args := kwargs.get("server_args", None)) is not None:
-            if isinstance(server_args, ServerArgs):
-                pass
-            elif isinstance(server_args, dict):
+        server_args = kwargs.pop("server_args", None)
+        if server_args is not None:
+            if kwargs:
+                raise ValueError(
+                    "server_args cannot be combined with additional override "
+                    f"kwargs; unexpected kwargs: {sorted(kwargs)}"
+                )
+            if isinstance(server_args, dict):
                 server_args = ServerArgs.from_kwargs(**server_args)
+            elif not isinstance(server_args, ServerArgs):
+                raise TypeError(
+                    "server_args must be a ServerArgs instance or a dict, got "
+                    f"{type(server_args).__name__}"
+                )
         else:
             server_args = ServerArgs.from_kwargs(**kwargs)
 
@@ -198,10 +217,14 @@ class DiffGenerator:
     ) -> GenerationResult | list[GenerationResult] | None:
         """Generate image(s)/video(s) based on the given prompt(s).
 
-        Returns a single GenerationResult for a single prompt, a list for
-        multiple prompts, or None when every request failed.
+        Each parent request owns one complete admission/dispatch/validation/
+        cleanup lifecycle.  Keeping that sequence together is important for
+        MiniMax H3: localized condition media and resolved shape facts must stay
+        alive until every expanded output has been delivered.
         """
-        # 1. prepare requests
+        if sampling_params_kwargs is None:
+            sampling_params_kwargs = {}
+        adapter = get_video_model_adapter(self.server_args.pipeline_config)
         prompts = self._resolve_prompts(
             sampling_params_kwargs.get("prompt"),
             sampling_params_kwargs.get("prompt_path"),
@@ -219,163 +242,441 @@ class DiffGenerator:
             server_args=self.server_args,
             **sampling_params_kwargs,
         )
+        # Model-specific admission happens before request-owned resources exist.
+        adapter.validate_sampling_params(sampling_params_orig)
 
-        request_groups: list[list[Req]] = []
         image_paths_per_prompt = self._resolve_image_paths_per_prompt(
             prompts, sampling_params_orig.image_path
         )
+        results: list[GenerationResult] = []
+        failures: list[str] = []
+        total_start_time = time.perf_counter()
+        global_output_index = 0
 
-        for i, p in enumerate(prompts):
+        for prompt_index, prompt in enumerate(prompts):
             sampling_params = dataclasses.replace(
                 sampling_params_orig,
-                prompt=p,
+                prompt=prompt,
                 output_file_name=user_output_file_name,
-                image_path=image_paths_per_prompt[i],
+                image_path=image_paths_per_prompt[prompt_index],
             )
-            # `dataclasses.replace` drops non-field attrs; restore
-            # `_explicit_fields` so InputValidationStage honors user-supplied
-            # width/height, and mark the keys overridden above as explicit.
+            requested_output_count = int(sampling_params.num_outputs_per_prompt)
+            # ``dataclasses.replace`` drops non-field attributes; restore the
+            # explicit-field marker consumed by input validation stages.
             sampling_params._explicit_fields = getattr(
                 sampling_params_orig, "_explicit_fields", set()
             ) | {"prompt", "output_file_name", "image_path"}
             sampling_params._set_output_file_name()
+            if len(prompts) > 1:
+                # ``SamplingParams`` derives a filename from the prompt and
+                # current second. Identical prompts in one batch would
+                # otherwise overwrite one another; parent request IDs also
+                # need a stable prompt component before output expansion.
+                sampling_params.request_id = (
+                    f"{sampling_params.request_id}:{prompt_index}"
+                    if sampling_params.request_id is not None
+                    else f"prompt:{prompt_index}"
+                )
+                if user_output_file_name is None:
+                    base, extension = os.path.splitext(sampling_params.output_file_name)
+                    sampling_params.output_file_name = (
+                        f"{base}_{prompt_index}{extension}"
+                    )
+
             req = prepare_request(
                 server_args=self.server_args,
                 sampling_params=sampling_params,
                 external_trace_header=external_trace_header,
             )
-            request_groups.append(
-                expand_request_outputs(
+            requests: list[Req] = []
+            try:
+                # Admission is deliberately once per parent, before output
+                # expansion. Children share the resolved plan but own derived
+                # per-output resources.
+                adapter.prepare_for_queue_sync(req)
+                dispatch_batch = adapter.expand_for_offline_dispatch(
                     req,
                     num_prompts=len(prompts),
-                    prompt_index=i,
+                    prompt_index=prompt_index,
                 )
+                requests = (
+                    list(dispatch_batch)
+                    if isinstance(dispatch_batch, list)
+                    else [dispatch_batch]
+                )
+                preexisting_paths = {
+                    os.path.abspath(path)
+                    for output_req in requests
+                    for path in (output_req.output_file_path(1, 0),)
+                    if path is not None and os.path.lexists(path)
+                }
+            except Exception as exc:
+                self._cleanup_offline_requests(adapter, req, requests)
+                logger.error(
+                    "Generation admission failed: %s",
+                    req.request_id,
+                    exc_info=True,
+                )
+                failures.append(
+                    f"prompt {prompt_index} ({req.request_id}): admission "
+                    f"failed: {exc!r}"
+                )
+                global_output_index += requested_output_count
+                continue
+
+            group_results = self._process_request_group(
+                adapter=adapter,
+                requests=requests,
+                parent_req=req,
+                preexisting_paths=preexisting_paths,
+                global_output_index=global_output_index,
+                failures=failures,
+            )
+            results.extend(group_results)
+            # Use the requested cardinality even if admission/dispatch failed,
+            # so later prompt_index values remain globally stable.
+            global_output_index += requested_output_count
+
+        total_gen_time = time.perf_counter() - total_start_time
+        if self.server_args.batching_max_size > 1:
+            log_batch_completion(logger, len(results), total_gen_time)
+        self._log_summary(results)
+
+        if not results:
+            if failures:
+                # Per-prompt isolation supports partial success, but a run
+                # where every prompt failed must not exit successfully with
+                # zero outputs.
+                raise RuntimeError(
+                    f"all {len(prompts)} prompt(s) produced no successful "
+                    f"outputs; first error: {failures[0]}; all errors: "
+                    f"{'; '.join(failures)}"
+                )
+            return None
+        return results[0] if len(results) == 1 else results
+
+    @staticmethod
+    def _cleanup_offline_requests(
+        adapter: Any,
+        parent_req: Req | None,
+        requests: list[Req],
+    ) -> None:
+        """Clean child-owned derived media, then the parent source closure."""
+
+        seen: set[int] = set()
+        for child in requests:
+            if parent_req is not None and child is parent_req:
+                continue
+            child_id = id(child)
+            if child_id in seen:
+                continue
+            seen.add(child_id)
+            try:
+                adapter.cleanup_request_sync(child)
+            except Exception:
+                logger.warning(
+                    "Failed to clean offline child request resources",
+                    exc_info=True,
+                )
+        if parent_req is not None and id(parent_req) not in seen:
+            try:
+                adapter.cleanup_request_sync(parent_req)
+            except Exception:
+                logger.warning(
+                    "Failed to clean offline request resources",
+                    exc_info=True,
+                )
+
+    def _process_request_group(
+        self,
+        *,
+        adapter: Any,
+        requests: list[Req],
+        parent_req: Req,
+        preexisting_paths: set[str],
+        global_output_index: int,
+        failures: list[str],
+    ) -> list[GenerationResult]:
+        """Dispatch one already-admitted parent and publish all-or-nothing outputs."""
+
+        generated_output_paths: set[str] = set()
+        preserve_generated_outputs = False
+        preexisting_backups: dict[str, str] = {}
+
+        def _elapsed_generation_time(timer: Any) -> float:
+            start_time = getattr(timer, "start_time", None)
+            if isinstance(start_time, (int, float)) and start_time > 0:
+                return max(0.0, time.perf_counter() - start_time)
+            return float(getattr(timer, "duration", 0.0) or 0.0)
+
+        def _record_generated_paths(paths: Any) -> list[str]:
+            normalized: list[str] = []
+            for raw_path in paths or ():
+                if raw_path is None:
+                    continue
+                path = os.path.abspath(os.fspath(raw_path))
+                generated_output_paths.add(path)
+                normalized.append(path)
+            return normalized
+
+        def _backup_existing_path(raw_path: Any) -> None:
+            if raw_path is None:
+                return
+            path = os.path.abspath(os.fspath(raw_path))
+            if path in preexisting_backups or not os.path.lexists(path):
+                return
+            fd, backup_path = tempfile.mkstemp(
+                prefix="sglang_diffusion_output_backup_", suffix=".bak"
+            )
+            os.close(fd)
+            preexisting_backups[path] = backup_path
+            try:
+                shutil.copy2(path, backup_path)
+            except Exception:
+                preexisting_backups.pop(path, None)
+                try:
+                    os.remove(backup_path)
+                except OSError:
+                    pass
+                raise
+            preexisting_paths.add(path)
+
+        try:
+            # Snapshot destinations before a potentially non-atomic saver runs.
+            if self.server_args.pipeline_config.requires_audio_output or any(
+                bool(getattr(request, "save_output", False)) for request in requests
+            ):
+                for path in list(preexisting_paths):
+                    _backup_existing_path(path)
+            _record_generated_paths(
+                request.output_file_path(1, 0) for request in requests
             )
 
-        results: list[GenerationResult] = []
-        total_start_time = time.perf_counter()
-        global_output_index = 0
-
-        for requests in request_groups:
-            try:
-                timer_prompt = [req.prompt for req in requests]
-                logger.info("Processing %d grouped request(s)", len(requests))
-                with ExitStack() as stack:
-                    for req in requests:
-                        stack.enter_context(trace_req(req.trace_ctx))
-                    timer = stack.enter_context(
-                        log_generation_timer(logger, timer_prompt)
+            timer_prompt = [request.prompt for request in requests]
+            logger.info("Processing %d grouped request(s)", len(requests))
+            with ExitStack() as stack:
+                for request in requests:
+                    stack.enter_context(trace_req(request.trace_ctx))
+                timer = stack.enter_context(log_generation_timer(logger, timer_prompt))
+                output_batch = self._send_to_scheduler_and_wait_for_response(requests)
+                if output_batch.error:
+                    raise RuntimeError(str(output_batch.error))
+                if (
+                    output_batch.output is None
+                    and output_batch.output_file_paths is None
+                ):
+                    logger.error("Received empty output from scheduler")
+                    failures.append(
+                        f"request group {parent_req.request_id}: scheduler "
+                        "returned empty output"
                     )
-                    output_batch = self._send_to_scheduler_and_wait_for_response(
-                        requests
-                    )
-                    if output_batch.error:
-                        raise Exception(f"{output_batch.error}")
+                    stack.close()
+                    return []
 
-                    if (
-                        output_batch.output is None
-                        and output_batch.output_file_paths is None
-                    ):
-                        logger.error("Received empty output from scheduler")
-                        continue
-
-                    if requests[0].save_output and requests[0].return_file_paths_only:
-                        output_file_paths = output_batch.output_file_paths or []
-                        self._validate_output_count(
-                            len(output_file_paths), len(requests)
-                        )
-                        for idx, path in enumerate(output_file_paths):
-                            req = requests[idx]
-                            results.append(
-                                GenerationResult(
-                                    **self._result_common(
-                                        req, output_batch, timer.duration, idx
-                                    ),
-                                    prompt_index=global_output_index + idx,
-                                    output_file_path=path,
-                                )
+                if self.server_args.pipeline_config.requires_audio_output:
+                    output_file_paths = [
+                        str(path) for path in (output_batch.output_file_paths or [])
+                    ]
+                    samples_out: list[Any] = []
+                    audios_out: list[Any] = []
+                    frames_out: list[Any] = []
+                    if not output_file_paths:
+                        if output_batch.output is None:
+                            raise RuntimeError(
+                                "strict AV delivery produced no file output"
                             )
-                    elif requests[0].data_type == DataType.MESH:
-                        output_file_paths = output_batch.output_file_paths or []
-                        self._validate_output_count(
-                            len(output_file_paths), len(requests)
-                        )
-                        for idx, sample in enumerate(output_file_paths):
-                            req = requests[idx]
-                            results.append(
-                                GenerationResult(
-                                    **self._result_common(
-                                        req, output_batch, timer.duration, idx
-                                    ),
-                                    prompt_index=global_output_index + idx,
-                                    output_file_path=sample,
-                                )
-                            )
-                    else:
                         self._validate_output_count(
                             len(output_batch.output), len(requests)
                         )
-                        samples_out: list[Any] = []
-                        audios_out: list[Any] = []
-                        frames_out: list[Any] = []
-                        save_outputs(
+                        output_file_paths = save_outputs(
                             output_batch.output,
                             requests[0].data_type,
                             requests[0].fps,
-                            requests[0].save_output,
-                            lambda idx: requests[idx].output_file_path(1, 0),
+                            True,
+                            lambda index: requests[index].output_file_path(1, 0),
                             audio=output_batch.audio,
                             audio_sample_rate=output_batch.audio_sample_rate,
                             samples_out=samples_out,
                             audios_out=audios_out,
                             frames_out=frames_out,
                             output_compression=requests[0].output_compression,
-                            enable_frame_interpolation=requests[
-                                0
-                            ].enable_frame_interpolation,
-                            frame_interpolation_exp=requests[0].frame_interpolation_exp,
-                            frame_interpolation_scale=requests[
-                                0
-                            ].frame_interpolation_scale,
-                            frame_interpolation_model_path=requests[
-                                0
-                            ].frame_interpolation_model_path,
-                            enable_upscaling=requests[0].enable_upscaling,
-                            upscaling_model_path=requests[0].upscaling_model_path,
-                            upscaling_scale=requests[0].upscaling_scale,
+                            enable_frame_interpolation=False,
+                            enable_upscaling=False,
+                            strict_audio_mux=True,
+                            output_audio_sample_rate=self.server_args.pipeline_config.output_audio_sample_rate,
+                            output_audio_channels=self.server_args.pipeline_config.output_audio_channels,
+                            output_av_drift_tolerance_s=self.server_args.pipeline_config.output_av_drift_tolerance_s,
                         )
+                    _record_generated_paths(output_file_paths)
+                    self._validate_output_count(len(output_file_paths), len(requests))
+                    adapter.validate_final_outputs_sync(
+                        output_file_paths,
+                        parent_req,
+                    )
+                    generation_time = _elapsed_generation_time(timer)
+                    group_results = [
+                        GenerationResult(
+                            **self._result_common(
+                                request,
+                                output_batch,
+                                generation_time,
+                                index,
+                            ),
+                            samples=(
+                                samples_out[index] if index < len(samples_out) else None
+                            ),
+                            frames=(
+                                frames_out[index] if index < len(frames_out) else None
+                            ),
+                            audio=(
+                                audios_out[index] if index < len(audios_out) else None
+                            ),
+                            prompt_index=global_output_index + index,
+                            output_file_path=path,
+                        )
+                        for index, (request, path) in enumerate(
+                            zip(requests, output_file_paths)
+                        )
+                    ]
+                    # No child is published until every output validates.
+                    stack.close()
+                    preserve_generated_outputs = True
+                    return group_results
 
-                        for idx in range(len(samples_out)):
-                            req = requests[idx]
-                            results.append(
-                                GenerationResult(
-                                    **self._result_common(
-                                        req, output_batch, timer.duration, idx
-                                    ),
-                                    samples=samples_out[idx],
-                                    frames=frames_out[idx],
-                                    audio=audios_out[idx],
-                                    prompt_index=global_output_index + idx,
-                                    output_file_path=req.output_file_path(1, 0),
-                                )
-                            )
-            except Exception as e:
-                logger.error("Generation failed: %s", e, exc_info=True)
-            finally:
-                global_output_index += len(requests)
+                if requests[0].save_output and requests[0].return_file_paths_only:
+                    output_file_paths = output_batch.output_file_paths or []
+                    _record_generated_paths(output_file_paths)
+                    self._validate_output_count(len(output_file_paths), len(requests))
+                    generation_time = _elapsed_generation_time(timer)
+                    group_results = [
+                        GenerationResult(
+                            **self._result_common(
+                                requests[index],
+                                output_batch,
+                                generation_time,
+                                index,
+                            ),
+                            prompt_index=global_output_index + index,
+                            output_file_path=path,
+                        )
+                        for index, path in enumerate(output_file_paths)
+                    ]
+                    stack.close()
+                    preserve_generated_outputs = True
+                    return group_results
 
-        total_gen_time = time.perf_counter() - total_start_time
-        if self.server_args.batching_max_size > 1:
-            log_batch_completion(
-                logger,
-                len(results),
-                total_gen_time,
-            )
-        self._log_summary(results)
+                if requests[0].data_type == DataType.MESH:
+                    output_file_paths = output_batch.output_file_paths or []
+                    _record_generated_paths(output_file_paths)
+                    self._validate_output_count(len(output_file_paths), len(requests))
+                    generation_time = _elapsed_generation_time(timer)
+                    group_results = [
+                        GenerationResult(
+                            **self._result_common(
+                                requests[index],
+                                output_batch,
+                                generation_time,
+                                index,
+                            ),
+                            prompt_index=global_output_index + index,
+                            output_file_path=path,
+                        )
+                        for index, path in enumerate(output_file_paths)
+                    ]
+                    stack.close()
+                    preserve_generated_outputs = True
+                    return group_results
 
-        if not results:
-            return None
-        return results[0] if len(results) == 1 else results
+                self._validate_output_count(len(output_batch.output), len(requests))
+                samples_out: list[Any] = []
+                audios_out: list[Any] = []
+                frames_out: list[Any] = []
+                save_outputs(
+                    output_batch.output,
+                    requests[0].data_type,
+                    requests[0].fps,
+                    requests[0].save_output,
+                    lambda index: requests[index].output_file_path(1, 0),
+                    audio=output_batch.audio,
+                    audio_sample_rate=output_batch.audio_sample_rate,
+                    samples_out=samples_out,
+                    audios_out=audios_out,
+                    frames_out=frames_out,
+                    output_compression=requests[0].output_compression,
+                    enable_frame_interpolation=requests[0].enable_frame_interpolation,
+                    frame_interpolation_exp=requests[0].frame_interpolation_exp,
+                    frame_interpolation_scale=requests[0].frame_interpolation_scale,
+                    frame_interpolation_model_path=requests[
+                        0
+                    ].frame_interpolation_model_path,
+                    enable_upscaling=requests[0].enable_upscaling,
+                    upscaling_model_path=requests[0].upscaling_model_path,
+                    upscaling_scale=requests[0].upscaling_scale,
+                    strict_audio_mux=self.server_args.pipeline_config.requires_audio_output,
+                    output_audio_sample_rate=self.server_args.pipeline_config.output_audio_sample_rate,
+                    output_audio_channels=self.server_args.pipeline_config.output_audio_channels,
+                    output_av_drift_tolerance_s=self.server_args.pipeline_config.output_av_drift_tolerance_s,
+                )
+                generation_time = _elapsed_generation_time(timer)
+                group_results = [
+                    GenerationResult(
+                        **self._result_common(
+                            requests[index],
+                            output_batch,
+                            generation_time,
+                            index,
+                        ),
+                        samples=samples_out[index],
+                        frames=frames_out[index],
+                        audio=audios_out[index],
+                        prompt_index=global_output_index + index,
+                        output_file_path=requests[index].output_file_path(1, 0),
+                    )
+                    for index in range(len(samples_out))
+                ]
+                stack.close()
+                preserve_generated_outputs = True
+                return group_results
+        except Exception as exc:
+            logger.error("Generation failed: %s", exc, exc_info=True)
+            failures.append(f"request group {parent_req.request_id}: {exc!r}")
+            return []
+        finally:
+            self._cleanup_offline_requests(adapter, parent_req, requests)
+            if not preserve_generated_outputs:
+                for path in generated_output_paths:
+                    if path in preexisting_paths:
+                        continue
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        logger.warning(
+                            "Failed to remove incomplete offline output %s",
+                            path,
+                            exc_info=True,
+                        )
+                for original_path, backup_path in preexisting_backups.items():
+                    try:
+                        shutil.copy2(backup_path, original_path)
+                    except OSError:
+                        logger.warning(
+                            "Failed to restore pre-existing offline output %s",
+                            original_path,
+                            exc_info=True,
+                        )
+            for backup_path in preexisting_backups.values():
+                try:
+                    os.remove(backup_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.warning(
+                        "Failed to remove offline output backup %s",
+                        backup_path,
+                        exc_info=True,
+                    )
 
     def _resolve_prompts(
         self,
