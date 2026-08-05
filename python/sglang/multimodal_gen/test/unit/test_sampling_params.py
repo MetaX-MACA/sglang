@@ -1,5 +1,6 @@
 import argparse
 import math
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -48,6 +49,8 @@ class TestSamplingParamsValidate(unittest.TestCase):
             SamplingParams(seed=[])
         with self.assertRaisesRegex(ValueError, r"seed"):
             SamplingParams(seed=[1, -1])
+        with self.assertRaisesRegex(ValueError, r"seed"):
+            SamplingParams(seed=-7)
 
     def test_fps_must_be_positive_int(self):
         with self.assertRaisesRegex(ValueError, r"\bfps\b"):
@@ -286,6 +289,54 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertIn("width", explicit_fields)
         self.assertIn("height", explicit_fields)
 
+    def test_factory_rejects_unknown_kwargs(self):
+        server_args = MagicMock()
+        server_args.pipeline_class_name = None
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+
+        with patch.object(
+            SamplingParams,
+            "from_pretrained",
+            side_effect=lambda *args, **kwargs: Flux2SamplingParams(),
+        ):
+            with self.assertRaisesRegex(TypeError, "arbitrary_compatibility_value"):
+                SamplingParams.from_user_sampling_params_args(
+                    "dummy-model",
+                    server_args=server_args,
+                    prompt="p",
+                    image_path="/tmp/in.png",
+                    width=768,
+                    arbitrary_compatibility_value={"invalid": True},
+                )
+
+    def test_safetensors_path_propagates_sampling_params_constructor_error(self):
+        """A broken model-specific schema must not degrade to the generic one."""
+        server_args = MagicMock()
+        server_args.pipeline_class_name = "BrokenPipeline"
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+
+        class _BrokenSamplingParams:
+            def __init__(self):
+                raise ValueError("broken sampling params schema")
+
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            with patch(
+                "sglang.multimodal_gen.registry.get_pipeline_config_classes",
+                return_value=(MagicMock(), _BrokenSamplingParams),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "broken sampling params schema"
+                ):
+                    SamplingParams.from_user_sampling_params_args(
+                        checkpoint.name,
+                        server_args=server_args,
+                        prompt="p",
+                    )
+
     def test_cli_path_preserves_diffusers_kwargs_in_request_extra(self):
         server_args = MagicMock()
         server_args.backend = "sglang"
@@ -311,6 +362,7 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
             params.build_request_extra()["diffusers_kwargs"],
             diffusers_kwargs,
         )
+        self.assertIn("diffusers_kwargs", params._explicit_fields)
 
     def test_dataclasses_replace_preserves_explicit_fields(self):
         """`dataclasses.replace` drops `_explicit_fields`; DiffGenerator must restore it."""

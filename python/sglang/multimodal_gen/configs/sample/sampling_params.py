@@ -103,6 +103,9 @@ class SamplingParams:
     # Image inputs
     image_path: str | list[str] | None = None
 
+    # Audio inputs
+    audio_path: str | list[str] | None = None
+
     # Text inputs
     prompt: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
@@ -148,7 +151,6 @@ class SamplingParams:
     # The base __post_init__ will apply them when height/width are not provided.
     _default_height: ClassVar[int | None] = None
     _default_width: ClassVar[int | None] = None
-
     height: int | None = None
     width: int | None = None
     fps: int = 24
@@ -321,6 +323,16 @@ class SamplingParams:
         if self.realtime_chunk_size is not None:
             req.realtime_chunk_size = self.realtime_chunk_size
 
+    def refresh_request_extra_after_output_expansion(self, req: Any) -> None:
+        """Refresh model extras after selecting one output seed, if needed.
+
+        Most model extras do not depend on the selected output and therefore
+        need no work. Model-specific SamplingParams can override this hook
+        without teaching the generic request expander about model classes.
+        """
+
+        del req
+
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""
         output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
@@ -455,10 +467,6 @@ class SamplingParams:
 
         RLRolloutArgs.validate_sampling_params(self)
 
-    def check_sampling_param(self):
-        # Keep backward-compatibility for old call sites.
-        self._validate()
-
     def _validate_with_pipeline_config(self, pipeline_config):
         """
         check if the sampling params is compatible and valid with server_args
@@ -476,6 +484,11 @@ class SamplingParams:
                 raise ValueError(
                     f"input_reference is not supported for {pipeline_config.task_type.name} models."
                 )
+
+        if self.audio_path is not None and not pipeline_config.accepts_audio_input():
+            raise ValueError(
+                f"audio_path is not supported for {pipeline_config.task_type.name} models."
+            )
 
     def _adjust(
         self,
@@ -681,18 +694,14 @@ class SamplingParams:
 
                 if config_classes is not None:
                     _, sampling_params_cls = config_classes
-                    try:
-                        sampling_params = sampling_params_cls()
-                        logger.info(
-                            f"Using {sampling_params_cls.__name__} for {pipeline_class_name} safetensors file (no model_index.json): %s",
-                            model_path,
-                        )
-                    except Exception as import_error:
-                        logger.warning(
-                            f"Failed to instantiate {sampling_params_cls.__name__}: {import_error}. "
-                            "Using default SamplingParams"
-                        )
-                        sampling_params = SamplingParams()
+                    # A model-specific schema that fails to construct is a
+                    # model/config bug; propagate instead of silently
+                    # degrading to the generic SamplingParams schema.
+                    sampling_params = sampling_params_cls()
+                    logger.info(
+                        f"Using {sampling_params_cls.__name__} for {pipeline_class_name} safetensors file (no model_index.json): %s",
+                        model_path,
+                    )
                 else:
                     raise ValueError(
                         f"Could not get pipeline config classes for {pipeline_class_name}"
@@ -704,22 +713,44 @@ class SamplingParams:
         user_kwargs = dict(kwargs)
         diffusers_kwargs = user_kwargs.pop("diffusers_kwargs", None)
 
+        # Construct the resolved target type directly so Python reports unknown
+        # or non-initializable fields instead of silently dropping caller input.
+        target_fields = tuple(
+            field_info
+            for field_info in dataclasses.fields(type(sampling_params))
+            if field_info.init
+        )
+        positional_fields = tuple(
+            field_info for field_info in target_fields if not field_info.kw_only
+        )
+        target_field_names = {field_info.name for field_info in target_fields}
         user_sampling_params = type(sampling_params)(*args, **user_kwargs)
+
+        # In addition to keyword fields, account for positional arguments so
+        # the marker remains truthful for callers using the dataclass API.
+        explicit_fields = set(user_kwargs)
+        explicit_fields.update(
+            field_info.name for field_info in positional_fields[: len(args)]
+        )
         # TODO: refactor
         sampling_params._merge_with_user_params(
-            user_sampling_params, explicit_fields=set(user_kwargs.keys())
+            user_sampling_params, explicit_fields=explicit_fields
         )
-        sampling_params._explicit_fields = set(user_kwargs.keys())
+        sampling_params._explicit_fields = explicit_fields
         if diffusers_kwargs is not None:
             sampling_params.diffusers_kwargs = diffusers_kwargs
+            # ``diffusers_kwargs`` is a declared SamplingParams field and is
+            # consumed by the factory's post-construction assignment. Keep
+            # the explicit-field marker truthful even though this nested
+            # mapping is handled separately from the dataclass constructor.
+            if "diffusers_kwargs" in target_field_names:
+                explicit_fields.add("diffusers_kwargs")
+                sampling_params._explicit_fields = explicit_fields
         sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
 
         return sampling_params
-
-    def output_size_str(self) -> str:
-        return f"{self.width}x{self.height}"
 
     def seconds(self) -> float:
         return self.num_frames / self.fps
@@ -949,6 +980,17 @@ class SamplingParams:
             ),
         )
         add_argument(
+            "--audio-path",
+            "--audio-paths",
+            type=str,
+            nargs="+",
+            help=(
+                "Path(s) to input audio file(s) for pipelines that support "
+                "audio conditioning. For multiple audio files, pass them "
+                "space-separated (alias: --audio-paths)."
+            ),
+        )
+        add_argument(
             "--action",
             type=str,
             help=(
@@ -1168,4 +1210,4 @@ class SamplingParams:
 
 @dataclass
 class CacheParams:
-    cache_type: str = "none"
+    """Base class for denoising cache parameter families (e.g. TeaCache)."""

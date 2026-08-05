@@ -5,7 +5,6 @@
 import importlib
 import os
 import pkgutil
-import traceback
 from abc import ABC
 from typing import Any, Type
 
@@ -35,6 +34,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     layerwise_component_matches_any_selection,
     normalize_layerwise_offload_components,
 )
+from sglang.multimodal_gen.runtime.models.registry import UnsupportedCustomArchitecture
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -45,6 +45,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 
 logger = init_logger(__name__)
+
+
+class RemoteComponentLoadError(RuntimeError):
+    """A remote component failure that must not fall back to another loader."""
 
 
 def _load_auto_tokenizer_with_roberta_processing_compat(*args, **kwargs):
@@ -184,9 +188,11 @@ class ComponentLoader(ABC):
         Template method that standardizes logging around the core load implementation.
         The priority of loading method is:
             1. load customized component
-            2. load native diffusers/transformers component
-        If all of the above methods failed, an error will be thrown
-
+            2. load native diffusers/transformers component, only when the
+               customized load raises UnsupportedCustomArchitecture (i.e. no
+               customized implementation is registered for the architecture)
+        Any other failure in the customized load propagates without a native
+        fallback.
         """
         gpu_mem_before_loading = current_platform.get_available_gpu_memory()
         logger.info(
@@ -223,22 +229,12 @@ class ComponentLoader(ABC):
                     component, server_args, component_name, load_kwargs
                 )
             source = "sgl-diffusion"
-        except Exception as e:
-            if self.should_raise_customized_load_error(server_args, component_name):
-                traceback.print_exc()
-                raise RuntimeError(
-                    f"Failed to load customized {component_name}; native fallback "
-                    "is disabled for this component configuration."
-                ) from e
-            if "Unsupported model architecture" in str(e):
-                logger.info(
-                    f"Component: {component_name} doesn't have a customized version yet, using native version"
-                )
-            else:
-                traceback.print_exc()
-                logger.error(
-                    f"Error while loading customized {component_name}, falling back to native version"
-                )
+        except RemoteComponentLoadError:
+            raise
+        except UnsupportedCustomArchitecture:
+            logger.info(
+                f"Component: {component_name} doesn't have a customized version yet, using native version"
+            )
             # fallback to native version
             with component_attn_backend_context_manager(
                 attn_backend, component_name=component_attn_name
@@ -374,6 +370,7 @@ class ComponentLoader(ABC):
         # TODO(CloudRipple): remove most of these special cases after unifying the loading logic
         if component_name in [
             "audio_vae",
+            "video_vae",
             "audio_dit",
             "dual_tower_bridge",
             "video_dit",

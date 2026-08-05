@@ -466,7 +466,8 @@ class Indexer(MultiPlatformOp):
         if self.int8_cache:
             self.scale_fmt = None
         self.softmax_scale = self.head_dim**-0.5
-        self.int8_mqa_logits_backend = "tilelang" if envs.MX_ENABLE_TILELANG_INT8_MQA_LOGITS.get() else "triton"
+        self.int8_mqa_logits_backend = envs.MX_INT8_MQA_LOGITS_BACKEND.get()
+        assert self.int8_mqa_logits_backend in {"triton", "tilelang", "maca_c"}
 
         # self._indexer_freqs_cis: Optional[torch.Tensor] = None
         # if _use_dsa_indexer_fusion:
@@ -490,10 +491,10 @@ class Indexer(MultiPlatformOp):
     def _weights_proj_bf16_in_fp32_out(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
     ) -> torch.Tensor:
-        # aiter (ROCm gfx95): extract the passthrough bf16 tensor from the
-        # 3-tuple (fp8, scale, bf16) produced by fused_rms_fp8_group_quant,
-        # avoiding an expensive FP8-to-bf16 dequantization.
-        if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
+        # A fused RMSNorm + FP8 producer may preserve its BF16 result as the
+        # third tuple item. Reuse it for the BF16/FP32 gate projection instead
+        # of immediately dequantizing the FP8 side channel.
+        if isinstance(x, tuple) and len(x) == 3:
             x = x[2]
         if _is_cuda:
             if envs.MX_ENABLE_DSA_INDEXER_GEMM_BF16.get():
@@ -1562,9 +1563,9 @@ class Indexer(MultiPlatformOp):
             
         if isinstance(x, tuple):
             x = x[-1]
-            q_lora_shape0 = q_lora[0].shape[0]
-        else:
-            q_lora_shape0 = q_lora.shape[0]
+
+        q_lora_meta = q_lora[0] if isinstance(q_lora, tuple) else q_lora
+        q_lora_shape0 = q_lora_meta.shape[0]
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -1683,17 +1684,11 @@ class Indexer(MultiPlatformOp):
                 # so delay store_k_cache after weights proj.
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
 
-            # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
-            # fused_rms_fp8_group_quant is passed directly to _get_logits_head_gate,
-            # which extracts the bf16 tensor via _weights_proj_bf16_in_fp32_out,
-            # completely skipping the FP8 dequantization path below.
-            if (
-                _use_aiter
-                and _is_gfx95_supported
-                and isinstance(x, tuple)
-                and len(x) == 3
-            ):
-                x_for_gate = x
+            # A fused RMSNorm + FP8 producer carries BF16 as item 3 for this
+            # gate path. Extract it before the piecewise/LoRA branches, which
+            # require a tensor rather than the quantization tuple.
+            if isinstance(x, tuple) and len(x) == 3:
+                x_for_gate = x[2]
             elif isinstance(x, tuple):
                 assert len(x) in (
                     2,
@@ -1747,8 +1742,10 @@ class Indexer(MultiPlatformOp):
             # In piecewise CUDA graph, any access to seq_lens_cpu creates a Dynamo shape guard.
             # Piecewise CUDA graph never has empty batches.
             if not is_in_tc_piecewise_cuda_graph():
-                assert forward_batch.seq_lens_cpu is not None
-                if len(forward_batch.seq_lens_cpu) == 0:
+                seq_lens_cpu = forward_batch.seq_lens_cpu
+                is_empty = ((seq_lens_cpu is not None and len(seq_lens_cpu) == 0)
+                    or (seq_lens_cpu is None and forward_batch.batch_size == 0))
+                if is_empty:
                     # this seems b/c max-pad, no worries?
                     # if x.shape[0] != 0:
                     #     print(

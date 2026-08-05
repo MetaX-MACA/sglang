@@ -34,6 +34,7 @@ def get_module_role(module_name: str) -> "RoleType | None":
         "text_encoder",
         "tokenizer",
         "image_encoder",
+        "visual_encoder",
         "image_processor",
         "processor",
         "connectors",

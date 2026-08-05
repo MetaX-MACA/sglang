@@ -139,6 +139,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
     get_int_env_var,
+    align_packed_tensor_size,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -434,7 +435,13 @@ class MqaAttentionBase(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("wkv", prefix),
             )
-        self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
+        self.fused_quant =envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+        self.q_norm = RMSNorm(
+            self.q_lora_rank,
+            eps=self.eps,
+            fused_quant=self.fused_quant,
+            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
+        )
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -974,7 +981,12 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
         else:
             q_lora = self.q_norm(q_lora)
-            q = self._compute_q_b(q_lora, positions, q_out)
+            if isinstance(q_lora, tuple):
+                q_linear = (q_lora[0], q_lora[1])
+                q_lora = q_lora[2]
+            else:
+                q_linear = q_lora
+            q = self._compute_q_b(q_linear, positions, q_out)
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
@@ -1249,9 +1261,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_deepseek_v4=True,
         )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.fused_quant,
+            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.fused_quant,
+            packed_quant=True,
+            packed_size=align_packed_tensor_size(config.hidden_size, envs.MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE.get()),
         )
 
         self.hc_mult = hc_mult = config.hc_mult
@@ -1267,7 +1289,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         ) = make_hc_mixing_params(hc_mult, config.hidden_size)
         self.rms_norm_eps = config.rms_norm_eps
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
+        self.use_fused_mhc_post_pre = (
+            _is_fused_mhc_post_pre_enabled()
+            and not envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
+        )
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
 
@@ -1614,7 +1639,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
-                norm=self.input_layernorm,
+                # Keep RMSNorm outside hc_pre only when it needs to return the
+                # FP8 tuple; otherwise preserve the fused MHC pre-norm path.
+                norm=(
+                    None
+                    if envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get() or envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+                    else self.input_layernorm
+                ),
                 forward_batch=forward_batch,
             )
             if not norm_fused:
@@ -1626,7 +1657,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                     )
                 else:
                     hidden_states = self.input_layernorm(hidden_states)
-                    x_quant = None
+                    if isinstance(hidden_states, tuple):
+                        x_quant = hidden_states[:2]
+                        hidden_states = hidden_states[2]
+                    else:
+                        x_quant = None
             else:
                 x_quant = None
 
@@ -1758,8 +1793,20 @@ class DeepseekV4DecoderLayer(nn.Module):
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
-            _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
-            hidden_states = _a2a_scatter_chunks[r].contiguous()
+            if isinstance(hidden_states, tuple):
+                packed_out, out, (quant_out, quant_scale) = hidden_states
+                _a2a_scatter_chunks_packed_out = list(packed_out.tensor_split(s))
+                _a2a_scatter_chunks = list(out.tensor_split(s))
+                _a2a_scatter_chunks_quant_out = list(quant_out.tensor_split(s))
+                _a2a_scatter_chunks_quant_scale = list(quant_scale.tensor_split(s))
+                packed_out = _a2a_scatter_chunks_packed_out[r].contiguous()
+                out = _a2a_scatter_chunks[r].contiguous()
+                quant_out = _a2a_scatter_chunks_quant_out[r].contiguous()
+                quant_scale = _a2a_scatter_chunks_quant_scale[r].contiguous()
+                hidden_states = (packed_out, out, (quant_out, quant_scale))
+            else:
+                _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
+                hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
         hidden_states = self.mlp(
@@ -1827,11 +1874,14 @@ class DeepseekV4Model(nn.Module):
             )
         )
         num_alt_streams = 5 if _is_cuda else 2
-        self.alt_streams = (
-            [torch.cuda.Stream() for _ in range(num_alt_streams)]
-            if use_stream_pool
-            else None
-        )
+        if envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get():
+            self.alt_streams = (
+                [torch.cuda.Stream() for _ in range(num_alt_streams)]
+                if use_stream_pool
+                else None
+            )
+        else:
+            self.alt_streams = None
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV4DecoderLayer(
@@ -1861,7 +1911,10 @@ class DeepseekV4Model(nn.Module):
             ) = make_hc_head_params(hc_mult, config.hidden_size)
 
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
+        self.use_fused_mhc_post_pre = (
+            _is_fused_mhc_post_pre_enabled()
+            and not envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
+        )
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
 
@@ -1905,12 +1958,29 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        incoming_pd_aux_hidden_states: List[torch.Tensor] = []
         if self.pp_group.is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
+            incoming_pd_aux_hidden_states = [
+                pp_proxy_tensors[key]
+                for key in sorted(
+                    key
+                    for key in pp_proxy_tensors.tensors
+                    if key.startswith("pd_aux_hidden_states_")
+                )
+            ]
+            if hidden_states.shape[0] != positions.shape[0]:
+                rids = getattr(forward_batch, "rids", None)
+                raise RuntimeError(
+                    "PP proxy hidden token count does not match current positions: "
+                    f"pp_rank={self.pp_group.rank_in_group}, "
+                    f"hidden_tokens={hidden_states.shape[0]}, "
+                    f"position_tokens={positions.shape[0]}, rids={rids}"
+                )
             # Unflatten 2D PP IPC tensor back to 3D mHC shape.
             if hidden_states.ndim == 2:
                 hidden_states = hidden_states.view(
@@ -1943,14 +2013,21 @@ class DeepseekV4Model(nn.Module):
                 delattr(forward_batch, _attr)
 
         use_fused = self.use_fused_mhc_post_pre
-        capture_dspark = self.dspark_layers_to_capture is not None
+        dspark_layers_to_capture = getattr(
+            forward_batch, "pd_hidden_capture_layer_ids", None
+        )
+        if dspark_layers_to_capture is None:
+            dspark_layers_to_capture = self.dspark_layers_to_capture
+        capture_dspark = dspark_layers_to_capture is not None
         if capture_dspark and dsa_use_prefill_cp(forward_batch):
             raise NotImplementedError(
                 "DSpark aux hidden-state capture is not supported together with "
                 "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
                 "of them: DSpark static-verify is CP-off for v1."
             )
-        dspark_aux_hidden_states: List[torch.Tensor] = []
+        pd_aux_hidden_states: List[torch.Tensor] = list(
+            incoming_pd_aux_hidden_states
+        )
         prev_residual, prev_post, prev_comb = None, None, None
         last_layer = None
         for i in range(self.start_layer, self.end_layer):
@@ -1972,14 +2049,14 @@ class DeepseekV4Model(nn.Module):
                     prev_post=prev_post,
                     prev_comb=prev_comb,
                 )
-            if capture_dspark and i in self.dspark_layers_to_capture:
+            if capture_dspark and i in dspark_layers_to_capture:
                 if use_fused:
                     completed = layer.hc_post(
                         hidden_states, prev_residual, prev_post, prev_comb
                     )
                 else:
                     completed = hidden_states
-                dspark_aux_hidden_states.append(completed.mean(dim=1))
+                pd_aux_hidden_states.append(completed.mean(dim=1))
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb
@@ -1996,7 +2073,13 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
+            if capture_dspark:
+                for idx, aux_hidden in enumerate(pd_aux_hidden_states):
+                    proxy_tensors[f"pd_aux_hidden_states_{idx}"] = (
+                        aux_hidden.flatten(1) if aux_hidden.ndim == 3 else aux_hidden
+                    )
+            return PPProxyTensors(proxy_tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -2006,7 +2089,7 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+            return (hidden_states, pre_hc_head), pd_aux_hidden_states
 
         return hidden_states, pre_hc_head
 
@@ -2154,11 +2237,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             return hidden_states
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        pd_aux_hidden_states = None
+        has_pd_hidden_capture = (
+            getattr(forward_batch, "pd_hidden_capture_layer_ids", None) is not None
+        )
+        if has_pd_hidden_capture:
+            hidden_states, pd_aux_hidden_states = hidden_states
+            if self.capture_aux_hidden_states:
+                aux_hidden_states = pd_aux_hidden_states
+        elif self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
@@ -2168,6 +2259,20 @@ class DeepseekV4ForCausalLM(nn.Module):
                 None if aux_hidden_states is not None else pre_hc_head
             ),
         )
+        if (
+            has_pd_hidden_capture
+            and pd_aux_hidden_states
+            and logits_output.hidden_states is None
+        ):
+            flattened_aux_hidden_states = [
+                x.flatten(1) if x.ndim == 3 else x for x in pd_aux_hidden_states
+            ]
+            logits_output.hidden_states = (
+                flattened_aux_hidden_states[0]
+                if len(flattened_aux_hidden_states) == 1
+                else torch.cat(flattened_aux_hidden_states, dim=-1)
+            )
+        return logits_output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from deep_gemm import transform_sf_into_required_layout

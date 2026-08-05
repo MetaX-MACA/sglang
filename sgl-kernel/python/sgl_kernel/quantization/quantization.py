@@ -50,6 +50,7 @@ def mx_awq_dequantize(qweight: torch.Tensor, scales: torch.Tensor,
 
 def fused_silu_mul_dq_quant(
     input: torch.Tensor,
+    limit: Optional[float] = None,
 ) -> torch.Tensor:
     """
     input shape [token_num, hidden_dim]
@@ -59,5 +60,5 @@ def fused_silu_mul_dq_quant(
     """
     output = torch.empty((input.shape[0], input.shape[1] // 2), device=input.device, dtype=torch.int8)
     scale = torch.empty((input.shape[0],1), device=input.device, dtype=torch.float32)
-    torch.ops.sgl_kernel.fused_silu_mul_dq_quant_interface.default(output, scale, input)
+    torch.ops.sgl_kernel.fused_silu_mul_dq_nomask_quant_nopack.default(output, scale, input, limit, None)
     return output, scale
