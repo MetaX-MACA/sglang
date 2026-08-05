@@ -588,6 +588,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
         out_cache_loc = forward_batch.out_cache_loc
+        # Segmentation by step is also required under the hybrid-SWA model
+        out_cache_loc_swa = getattr(forward_batch, "out_cache_loc_swa", None)
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
             spec_info.topk_index,
@@ -606,6 +608,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps,
         )
 
+        if out_cache_loc_swa is not None:
+            out_cache_loc_swa = per_step_draft_out_cache_loc(
+                out_cache_loc_swa,
+                forward_batch.batch_size,
+                self.topk,
+                self.speculative_num_steps,
+            )
         # Return values
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
@@ -640,6 +649,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ):
                 out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
+            if out_cache_loc_swa is not None:
+                forward_batch.out_cache_loc_swa = out_cache_loc_swa[i]
             spec_info.hidden_states = hidden_states
 
             # Run forward under a per-step ForwardContext so the model layer
