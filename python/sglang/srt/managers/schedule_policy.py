@@ -722,7 +722,9 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
+    def add_chunked_req(
+        self, req: Req, truncation_align_size: Optional[int] = None
+    ):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -739,6 +741,11 @@ class PrefillAdder:
                 if self.is_hybrid_swa:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
+
+        if truncation_align_size is not None:
+            _rem_tokens = truncation_align_size * (
+                _rem_tokens // truncation_align_size
+            )
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices

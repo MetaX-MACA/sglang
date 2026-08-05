@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -3294,17 +3295,15 @@ class DSAIndexerPoolHost(HostKVCache):
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
         self.indexer_dtype = device_pool.index_k_with_scale_buffer_dtype
-        if device_pool.index_cache_dtype == "bf16":
-            self.indexer_size_per_token = self.index_head_dim
-        else:
-            self.indexer_size_per_token = (
-                self.index_head_dim
-                + self.index_head_dim // self.indexer_quant_block_size * 4
-            )
+        self.indexer_page_stride_elems = device_pool.index_k_with_scale_buffer[0].shape[
+            1
+        ]
+        assert self.indexer_page_stride_elems % self.page_size == 0
+        self.indexer_size_per_token = self.indexer_page_stride_elems // self.page_size
         self.size = anchor_host.size
         self.page_num = anchor_host.page_num
 
-        self.indexer_page_stride_size = self.indexer_size_per_token * self.page_size
+        self.indexer_page_stride_size = self.indexer_page_stride_elems
         self.indexer_page_stride_bytes = (
             self.indexer_page_stride_size * self.indexer_dtype.itemsize
         )
@@ -3314,7 +3313,9 @@ class DSAIndexerPoolHost(HostKVCache):
             self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
 
-        buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
+        buf_elem_size = (
+            self.page_num * self.layer_num * self.indexer_page_stride_elems
+        )
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
         host_mem = psutil.virtual_memory()
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
@@ -3353,7 +3354,7 @@ class DSAIndexerPoolHost(HostKVCache):
         )
         if self.layout == "layer_first":
             self.index_k_with_scale_buffer = alloc_func(
-                (self.layer_num, self.indexer_page_num, self.indexer_page_stride_size),
+                (self.layer_num, self.indexer_page_num, self.indexer_page_stride_elems),
                 dtype=self.indexer_dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
@@ -3373,7 +3374,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     self.indexer_page_num,
                     self.layer_num,
                     1,
-                    self.indexer_page_stride_size,
+                    self.indexer_page_stride_elems,
                 ),
                 dtype=self.indexer_dtype,
                 device=self.device,
@@ -3550,7 +3551,7 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
         return torch.zeros(
-            (self.layer_num, self.indexer_page_stride_size),
+            (self.layer_num, self.indexer_page_stride_elems),
             dtype=self.indexer_dtype,
             device=self.device,
             pin_memory=self.pin_memory,
@@ -3563,7 +3564,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 data_page.reshape(
                     self.layer_num,
                     1,
-                    self.indexer_page_stride_size,
+                    self.indexer_page_stride_elems,
                 )
             )
         elif self.layout in ["page_first", "page_first_direct"]:
@@ -3572,7 +3573,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     1,
                     self.layer_num,
                     1,
-                    self.indexer_page_stride_size,
+                    self.indexer_page_stride_elems,
                 )
             )
         else:
