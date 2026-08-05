@@ -186,6 +186,11 @@ class DeepseekMLAForwardMixin:
             q_input = hidden_states.new_empty(
                 q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
             )
+        use_mx_fused_mla_absorb_rope = (
+            self.q_lora_rank is not None
+            and get_attention_dcp_world_size() == 1
+            and envs.MX_FUSED_MLA_ABSORB_ROPE.get()
+        )
         q_lora = None
         topk_indices = None
         if self.q_lora_rank is not None:
@@ -265,7 +270,7 @@ class DeepseekMLAForwardMixin:
                         )
                     else:
                         q = self.q_a_layernorm(q)
-                        if not envs.MX_FUSED_MLA_ABSORB_ROPE.get():
+                        if not use_mx_fused_mla_absorb_rope:
                             k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
@@ -276,6 +281,7 @@ class DeepseekMLAForwardMixin:
             # overlap q_b_proj and indexer during decode
             if (
                 self.alt_stream is not None
+                and not envs.MX_DISABLE_INDEXER_ALT_STREAM.get()
                 and get_is_capture_mode()
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
@@ -347,11 +353,10 @@ class DeepseekMLAForwardMixin:
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
-            if not envs.MX_FUSED_MLA_ABSORB_ROPE.get():
+            if not use_mx_fused_mla_absorb_rope:
                 k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
-        if self.q_lora_rank is not None and dcp_enabled() and envs.MX_FUSED_MLA_ABSORB_ROPE.get():
-        # if self.q_lora_rank is not None and self.use_dsa is False and get_dcp_world_size() == 1:
+        if use_mx_fused_mla_absorb_rope:
             from sgl_kernel import fused_mla_absorb_rotary_emb
             assert q.dtype != torch.float16, "fused_mla_absorb_rotary_emb not support float16 !"
             k_input = torch.empty(q_len, 1, self.kv_lora_rank + self.qk_rope_head_dim, dtype=torch.bfloat16, device=q_input.device)

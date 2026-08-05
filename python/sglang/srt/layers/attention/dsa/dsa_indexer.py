@@ -408,7 +408,9 @@ class Indexer(MultiPlatformOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
-        self.alt_stream = alt_stream
+        self.alt_stream = (
+            None if envs.MX_DISABLE_INDEXER_ALT_STREAM.get() else alt_stream
+        )
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.index_cache_dtype = get_nsa_index_cache_dtype()
         self.fp8_cache = self.index_cache_dtype == "fp8"
