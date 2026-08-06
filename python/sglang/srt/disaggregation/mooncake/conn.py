@@ -42,7 +42,10 @@ from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    filter_kv_indices_for_cp_rank,
+)
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.observability.mooncake_trace import (
@@ -1144,6 +1147,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_state_indices: List,
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+        state_index_slices: Optional[List[Optional[slice]]] = None,
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
@@ -1181,6 +1185,12 @@ class MooncakeKVManager(CommonKVManager):
             dst_indices = (
                 req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
             )
+            if (
+                state_index_slices is not None
+                and i < len(state_index_slices)
+                and state_index_slices[i] is not None
+            ):
+                dst_indices = dst_indices[state_index_slices[i]]
 
             if st == StateType.MAMBA:
                 if (
@@ -1912,6 +1922,7 @@ class MooncakeKVManager(CommonKVManager):
                                     ),
                                     executor,
                                     target_rank_registration_info,
+                                    kv_chunk.state_index_slices,
                                 )
 
                             # Only the last chunk we need to send the aux data
@@ -2249,6 +2260,7 @@ class MooncakeKVManager(CommonKVManager):
         pd_hidden_row_len: int = 0,
         pd_hidden_is_last_chunk: bool = False,
         pd_hidden_release_indices: Optional[List[int]] = None,
+        state_index_slices: Optional[List[Optional[slice]]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2286,6 +2298,7 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                state_index_slices=state_index_slices,
                 source_event=source_event,
                 pd_hidden_start=pd_hidden_start,
                 pd_hidden_row_len=pd_hidden_row_len,
@@ -2377,6 +2390,53 @@ class MooncakeKVSender(CommonKVSender):
             [int(x) for x in release_indices] if release_indices else None,
         )
 
+    def pop_decode_prefix_len(self) -> int:
+        return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
+
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0 or last_chunk
+
+    def _filter_state_indices_for_cp_rank(
+        self, state_indices: Optional[List]
+    ) -> Tuple[Optional[List], Optional[List[Optional[slice]]]]:
+        if state_indices is None or not self.kv_mgr.enable_all_cp_ranks_for_transfer:
+            return state_indices, None
+
+        filtered_state_indices = []
+        state_index_slices = []
+        state_types = getattr(self.kv_mgr.kv_args, "state_types", [])
+
+        for i, indices in enumerate(state_indices):
+            if indices is None:
+                filtered_state_indices.append(None)
+                state_index_slices.append(None)
+                continue
+
+            state_type = state_types[i] if i < len(state_types) else None
+            if state_type == StateType.MAMBA:
+                if self.kv_mgr.attn_cp_rank == 0:
+                    filtered_state_indices.append(indices)
+                    state_index_slices.append(None)
+                else:
+                    filtered_state_indices.append(None)
+                    state_index_slices.append(None)
+                continue
+
+            if state_type in (StateType.SWA, StateType.NSA):
+                indices_array = np.asarray(indices, dtype=np.int32)
+                filtered_indices, index_slice = filter_kv_indices_for_cp_rank(
+                    self.kv_mgr,
+                    indices_array,
+                    slice(0, len(indices_array)),
+                )
+                filtered_state_indices.append(filtered_indices)
+                state_index_slices.append(index_slice)
+            else:
+                filtered_state_indices.append(indices)
+                state_index_slices.append(None)
+
+        return filtered_state_indices, state_index_slices
+
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
         self,
@@ -2388,10 +2448,32 @@ class MooncakeKVSender(CommonKVSender):
         )
         if should_skip:
             self._source_event = None
+            self._pd_hidden_chunk_meta = None
             return
 
         pd_hidden_chunk_meta = self._pd_hidden_chunk_meta
         self._pd_hidden_chunk_meta = None
+
+        # Special handling for cp. KV indices are already filtered by
+        # CommonKVSender._prepare_send_indices(); only state indices need the
+        # Mooncake-specific companion slicing here.
+        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+            if is_last_chunk:
+                state_indices, state_index_slices = (
+                    self._filter_state_indices_for_cp_rank(state_indices)
+                )
+            else:
+                state_index_slices = None
+        elif self.kv_mgr.is_dummy_cp_rank:
+            self._source_event = None
+            if not is_last_chunk:
+                return
+            else:
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                return
+        else:
+            state_index_slices = None
+
         if not is_last_chunk:
             source_event = self._source_event
             self._source_event = None
@@ -2402,6 +2484,7 @@ class MooncakeKVSender(CommonKVSender):
                 False,
                 state_indices=state_indices,
                 source_event=source_event,
+                state_index_slices=state_index_slices,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
                 pd_hidden_start=(
                     pd_hidden_chunk_meta[0] if pd_hidden_chunk_meta else None
@@ -2427,6 +2510,7 @@ class MooncakeKVSender(CommonKVSender):
                 aux_index=self.aux_index,
                 state_indices=state_indices,
                 source_event=source_event,
+                state_index_slices=state_index_slices,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
                 pd_hidden_start=(
                     pd_hidden_chunk_meta[0] if pd_hidden_chunk_meta else None

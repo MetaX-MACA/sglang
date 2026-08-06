@@ -1366,6 +1366,25 @@ class SchedulerDisaggregationPrefillMixin:
 
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
+        num_reqs = len(batch.reqs)
+        num_next_token_ids = result.next_token_ids.shape[0]
+        if num_next_token_ids != num_reqs:
+            message = (
+                "Disaggregated prefill result does not match its PP microbatch: "
+                f"num_reqs={num_reqs}, num_next_token_ids={num_next_token_ids}, "
+                f"batch_forward_iter={batch.forward_iter}, "
+                f"batch_rids={[req.rid for req in batch.reqs]}, "
+                f"batch_is_chunked={[getattr(req, 'is_chunked', req is batch.chunked_req) for req in batch.reqs]}, "
+                f"pp_batch_debug_info={result.pp_batch_debug_info}"
+            )
+            if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+                logger.error(
+                    "%s; recent_pp_events=%s",
+                    message,
+                    list(getattr(self, "_pp_debug_events", ())),
+                )
+            raise RuntimeError(message)
+
         next_token_ids = result.next_token_ids.tolist()
         self.batch_result_processor.move_logprobs_to_cpu(
             batch=batch,

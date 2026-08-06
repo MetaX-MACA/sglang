@@ -1013,7 +1013,7 @@ class CommonKVReceiver(BaseKVReceiver):
         if prefill_dp_rank is not None:
             logger.debug(f"Targeting DP rank: {prefill_dp_rank}")
             self.prefill_dp_rank = prefill_dp_rank
-        elif mgr.server_args.load_balance_method == "shortest_queue":
+        elif self.kv_mgr.server_args.load_balance_method == "shortest_queue":
             prefill_room_id, _ = unpack_room_id(self.bootstrap_room)
             self.prefill_dp_rank = prefill_room_id % self.prefill_info.dp_size
         else:
@@ -1022,7 +1022,29 @@ class CommonKVReceiver(BaseKVReceiver):
         self._setup_bootstrap_infos()
         if self.conclude_state == KVPoll.Failed:
             return
+        self._calibrate_required_prefill_response_num()
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+
+    def _calibrate_required_prefill_response_num(self) -> None:
+        required = sum(
+            1
+            for bootstrap_info in self.bootstrap_infos
+            if not bootstrap_info.get("is_dummy", False)
+        )
+        if required <= 0:
+            required = len(self.bootstrap_infos)
+        if required != self.required_prefill_response_num:
+            logger.warning(
+                "Adjust required prefill response count for bootstrap_room=%s "
+                "from %s to %s based on bootstrap endpoints.",
+                self.bootstrap_room,
+                self.required_prefill_response_num,
+                required,
+            )
+            self.required_prefill_response_num = required
+            self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
+                required
+            )
 
     def _setup_bootstrap_infos(self):
         all_bootstrap_infos = []

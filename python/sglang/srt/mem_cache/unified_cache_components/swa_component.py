@@ -819,7 +819,6 @@ class SWAComponent(TreeComponent):
         # Buffer prefix that fell outside the anchor→leaf path.
         if pos > loaded_start:
             self._release_swa_host(host_indices[: pos - loaded_start])
-
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]
     ) -> None:

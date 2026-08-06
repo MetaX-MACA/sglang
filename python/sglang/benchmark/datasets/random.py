@@ -1,10 +1,12 @@
 import json
+import os
 import random
 from argparse import Namespace
 from dataclasses import dataclass
 from typing import List
 
 import numpy as np
+from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets.common import (
@@ -15,6 +17,9 @@ from sglang.benchmark.datasets.common import (
     compute_random_lens,
 )
 from sglang.benchmark.utils import download_and_cache_hf_file, is_file_valid_json
+
+_BENCH_NUM_SAMPLES = int(os.getenv("SGLANG_BENCH_NUM_SAMPLES", "0"))
+_BENCH_MIN_PROMPT_LENGTH = int(os.getenv("SGLANG_BENCH_MIN_PROMPT_LENGTH", "128"))
 
 
 @dataclass
@@ -118,34 +123,68 @@ def sample_random_requests(
             dataset = [dataset[i % repeat_num] for i in range(len(dataset))]
         # Filter out sequences that are too long or too short
         input_requests: List[DatasetRow] = []
-        for data in dataset:
-            i = len(input_requests)
-            if i == num_prompts:
-                break
-
-            # Tokenize the prompts and completions.
-            prompt = data[0]
-            prompt_token_ids = tokenizer.encode(prompt)
-            prompt_len = len(prompt_token_ids)
-
-            # Skip empty prompt
-            if prompt_len == 0:
-                continue
-
-            if prompt_len > input_lens[i]:
-                input_ids = prompt_token_ids[: input_lens[i]]
-            else:
-                ratio = (input_lens[i] + prompt_len - 1) // prompt_len
-                input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
-            input_content = input_ids
-            if return_text:
-                input_content = tokenizer.decode(input_content)
-            input_requests.append(
-                DatasetRow(
-                    prompt=input_content,
-                    prompt_len=input_lens[i],
-                    output_len=output_lens[i],
+        samples: List[List[int]] = []
+        if _BENCH_NUM_SAMPLES > 0:
+            for data in dataset:
+                prompt_token_ids = tokenizer.encode(data[0])
+                if len(prompt_token_ids) < _BENCH_MIN_PROMPT_LENGTH:
+                    continue
+                samples.append(prompt_token_ids)
+                if len(samples) == _BENCH_NUM_SAMPLES:
+                    break
+            if not samples:
+                raise ValueError(
+                    "Failed to generate random requests: "
+                    "SGLANG_BENCH_NUM_SAMPLES/SGLANG_BENCH_MIN_PROMPT_LENGTH "
+                    "filter out all samples."
                 )
+            dataset_iter = [samples[i % len(samples)] for i in range(num_prompts)]
+        else:
+            dataset_iter = dataset
+
+        pbar_prompts = tqdm(total=num_prompts, desc="prompts")
+        try:
+            for data in dataset_iter:
+                i = len(input_requests)
+                if i == num_prompts:
+                    break
+
+                # Tokenize the prompts and completions.
+                if _BENCH_NUM_SAMPLES > 0:
+                    prompt_token_ids = data
+                else:
+                    prompt = data[0]
+                    prompt_token_ids = tokenizer.encode(prompt)
+                prompt_len = len(prompt_token_ids)
+
+                # Skip empty prompt
+                if prompt_len == 0:
+                    continue
+
+                if prompt_len > input_lens[i]:
+                    input_ids = prompt_token_ids[: input_lens[i]]
+                else:
+                    ratio = (input_lens[i] + prompt_len - 1) // prompt_len
+                    input_ids = (prompt_token_ids * ratio)[: input_lens[i]]
+                input_content = input_ids
+                if return_text:
+                    input_content = tokenizer.decode(input_content)
+                input_requests.append(
+                    DatasetRow(
+                        prompt=input_content,
+                        prompt_len=input_lens[i],
+                        output_len=output_lens[i],
+                    )
+                )
+                pbar_prompts.update(1)
+        finally:
+            pbar_prompts.close()
+        if len(input_requests) < num_prompts:
+            raise ValueError(
+                "Failed to generate enough random requests: "
+                f"requested {num_prompts}, generated {len(input_requests)}. "
+                "SGLANG_BENCH_NUM_SAMPLES/SGLANG_BENCH_MIN_PROMPT_LENGTH may "
+                "filter out too many samples."
             )
     else:
         # Sample token ids from random integers. This can cause some NaN issues.

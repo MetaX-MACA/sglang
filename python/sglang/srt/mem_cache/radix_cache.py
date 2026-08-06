@@ -31,8 +31,18 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
+from numpy import float64
 
 logger = logging.getLogger(__name__)
+
+_LAST_ACCESS_TIME_COUNTER = float64(1.0)
+
+
+def get_and_increase_time_counter() -> float64:
+    global _LAST_ACCESS_TIME_COUNTER
+    value = _LAST_ACCESS_TIME_COUNTER
+    _LAST_ACCESS_TIME_COUNTER += 1.0
+    return value
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -230,8 +240,9 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
-        self.last_access_time = time.monotonic()
-        self.creation_time = time.monotonic()
+        creation_time = get_and_increase_time_counter()
+        self.last_access_time = creation_time
+        self.creation_time = creation_time
 
         self.hit_count = 0
         # indicating the node is locked to protect from eviction
@@ -652,7 +663,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
-        access_time = time.monotonic()
+        access_time = get_and_increase_time_counter()
         node.last_access_time = access_time
 
         child_key = key.child_key(self.page_size)
@@ -718,7 +729,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         # Convert None priority to 0
         if priority is None:
             priority = 0
-        access_time = time.monotonic()
+        access_time = get_and_increase_time_counter()
         node.last_access_time = access_time
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
