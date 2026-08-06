@@ -833,6 +833,16 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # LinearBase prepends the requested output dtype to fused-quant tuples
+        # for INT8 consumers. FP8 consumers use the original (data, scale)
+        # layout, so strip that prefix before selecting an FP8 backend.
+        if (
+            isinstance(x, tuple)
+            and len(x) == 3
+            and isinstance(x[0], torch.dtype)
+        ):
+            x = (x[1], x[2])
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
