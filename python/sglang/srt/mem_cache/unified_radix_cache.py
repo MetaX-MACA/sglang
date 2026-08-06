@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -35,6 +36,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
@@ -122,14 +124,11 @@ class UnifiedTreeNode:
         return self.last_access_time < other.last_access_time
 
     def get_last_hash_value(self) -> Optional[str]:
-        if self.hash_value is None or len(self.hash_value) == 0:
-            return None
-        return self.hash_value[-1]
+        return self.hash_value[-1] if self.hash_value else None
 
-    def get_prefix_hash_values(self, node: UnifiedTreeNode) -> list[str]:
+    def get_prefix_hash_values(self, node: Optional[UnifiedTreeNode]) -> list[str]:
         if node is None or node.hash_value is None:
             return []
-
         return node.get_prefix_hash_values(node.parent) + node.hash_value
 
 
@@ -373,6 +372,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        self._enable_metrics_flag = params.enable_metrics
+        self.enable_storage_metrics = False
+        self.storage_metrics_collector = None
+        self.extra_metric_labels = None
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
@@ -422,18 +425,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _pp_sync(self, data: torch.Tensor) -> None:
         """
-        Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
+        Synchronize data across the PP pipeline, where PPn (n>0) receives PP0's data.
         """
         if self.pp_size <= 1 or self.pp_group is None:
             return
+
+        pp_ranks = torch.distributed.get_process_group_ranks(self.pp_group)
         if self.pp_rank > 0:
             torch.distributed.recv(
-                data, group_src=self.pp_rank - 1, group=self.pp_group, tag=2
+                data,
+                src=pp_ranks[self.pp_rank - 1],
+                group=self.pp_group,
+                tag=P2PTag.HIRADIX_PP_SYNC,
             )
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
             send_work = torch.distributed.isend(
-                copy_of_data, group_dst=self.pp_rank + 1, group=self.pp_group, tag=2
+                copy_of_data,
+                dst=pp_ranks[self.pp_rank + 1],
+                group=self.pp_group,
+                tag=P2PTag.HIRADIX_PP_SYNC,
             )
             self.work_list.append(send_work)
 
@@ -1220,15 +1231,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node = node.children[child_key]
             self._touch_node(node)
             prefix_len = node.key.match(key, page_size=self.page_size)
-
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
-
             if prefix_len < len(node.key):
                 node = self._split_node(node.key, node, prefix_len)
-
             if len(key):
                 child_key = key.child_key(self.page_size)
 
@@ -2020,7 +2028,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ) = self.ongoing_prefetch[req_id]
         if operation.host_indices is None:
             return True
-        if not self.can_terminate_prefetch(operation):
+
+        should_terminate = (
+            self.can_terminate_prefetch(operation) if self.pp_rank == 0 else False
+        )
+        state = torch.tensor(int(should_terminate), dtype=torch.int)
+        self._all_reduce(state, torch.distributed.ReduceOp.MAX)
+        if not bool(state.item()):
             return False
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
@@ -2028,18 +2042,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         min_completed_tokens = completed_tokens
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
-        if self.tp_world_size > 1:
-            # Reduce full completed tokens together with the sidecar pools that
-            # this prefetch actually transferred, in one all_reduce.
-            sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
-            packed = torch.tensor(
-                [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
-                dtype=torch.int,
-            )
-            self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
-            min_completed_tokens = int(packed[0].item())
-            for i, p in enumerate(sidecar_pools, start=1):
-                hit_pages[p] = int(packed[i].item())
+        # Reduce full completed tokens together with the sidecar pools that this
+        # prefetch actually transferred, in one CP/TP/PP synchronization.
+        sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
+        packed = torch.tensor(
+            [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
+            dtype=torch.int,
+        )
+        self._all_reduce(packed, torch.distributed.ReduceOp.MIN)
+        min_completed_tokens = int(packed[0].item())
+        for i, p in enumerate(sidecar_pools, start=1):
+            hit_pages[p] = int(packed[i].item())
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
@@ -2121,109 +2134,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
-    def _drain_storage_control_queues_impl(
-        self,
-        n_revoke: Optional[int],
-        n_backup: Optional[int],
-        n_release: Optional[int],
-        extra_release_counts: Optional[dict[PoolName, int]],
-        log_metrics: bool,
-    ) -> None:
-        cc = self.cache_controller
-
-        def _drain_queue(q: Queue[T], limit: Optional[int]) -> Iterator[T]:
-            drained = 0
-            while limit is None or drained < limit:
-                try:
-                    item = q.get_nowait()
-                except Empty:
-                    break
-                drained += 1
-                yield item
-
-        def _drain_revoke():
-            drained = 0
-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                info = self.ongoing_prefetch.pop(req_id, None)
-                if info is None:
-                    continue
-                drained += 1
-                (
-                    last_host_node,
-                    prefetch_key,
-                    _host_indices,
-                    _operation,
-                    anchor_lock_params,
-                    comp_xfers,
-                ) = info
-                cc.append_host_mem_release(
-                    extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
-                )
-                self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-                cc.prefetch_tokens_occupied -= len(prefetch_key)
-                if cc.prefetch_tokens_occupied < 0:
-                    cc.prefetch_tokens_occupied = 0
-            return drained
-
-        def _drain_backup():
-            drained = 0
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
-                drained += 1
-                entry = self.ongoing_backup.pop(operation.id, None)
-                if entry is not None:
-                    node, lock_params = entry
-                    self.dec_host_lock_ref(node, lock_params)
-                if (
-                    log_metrics
-                    and self.enable_storage_metrics
-                    and self.storage_metrics_collector is not None
-                ):
-                    self.storage_metrics_collector.log_backuped_tokens(
-                        operation.completed_tokens
-                    )
-            return drained
-
-        def _drain_release():
-            host_indices_list = []
-            released_tokens = 0
-            for host_indices in _drain_queue(cc.host_mem_release_queue, n_release):
-                host_indices_list.append(host_indices)
-                released_tokens += len(host_indices)
-            if host_indices_list:
-                cc.mem_pool_host.free(torch.cat(host_indices_list, dim=0))
-            return len(host_indices_list), released_tokens
-
-        def _drain_extra_release():
-            drained: dict[PoolName, tuple[int, int]] = {}
-            if not extra_release_counts:
-                return drained
-            for pool_name, limit in extra_release_counts.items():
-                release_queue = cc.extra_host_mem_release_queues.get(pool_name)
-                if release_queue is None:
-                    continue
-                host_indices_list = []
-                released_tokens = 0
-                for host_indices in _drain_queue(release_queue, limit):
-                    host_indices_list.append(host_indices)
-                    released_tokens += len(host_indices)
-                if host_indices_list:
-                    entry = cc.mem_pool_host.entry_map.get(pool_name)
-                    if entry is not None:
-                        entry.host_pool.free(torch.cat(host_indices_list, dim=0))
-                drained[pool_name] = (len(host_indices_list), released_tokens)
-            return drained
-
-        _drain_revoke()
-        _drain_backup()
-        _drain_release()
-        _drain_extra_release()
-
     def drain_storage_control_queues(self) -> None:
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = list(extra_release_queues)
         local_qsize_list = [
             cc.prefetch_revoke_queue.qsize(),
+            cc.ack_prefetch_queue.qsize(),
             cc.ack_backup_queue.qsize(),
             cc.host_mem_release_queue.qsize(),
             *[
@@ -2235,20 +2152,65 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             local_qsize_list,
             dtype=torch.int,
         )
-        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
+        self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
-        n_revoke, n_backup, n_release = qsize_list[:3]
+        n_revoke, n_prefetch, n_backup, n_release = qsize_list[:4]
         extra_release_counts = {
             pool_name: count
-            for pool_name, count in zip(extra_pool_names, qsize_list[3:])
+            for pool_name, count in zip(extra_pool_names, qsize_list[4:])
         }
-        self._drain_storage_control_queues_impl(
-            n_revoke=n_revoke,
-            n_backup=n_backup,
-            n_release=n_release,
-            extra_release_counts=extra_release_counts,
-            log_metrics=True,
-        )
+
+        def drain(q: Queue[T], count: int) -> Iterator[T]:
+            for _ in range(count):
+                yield q.get(block=True)
+
+        for rid in drain(cc.prefetch_revoke_queue, n_revoke):
+            info = self.ongoing_prefetch.pop(rid, None)
+            if info is not None:
+                cc.append_host_mem_release(
+                    extra_pools=[x for xfers in info.comp_xfers.values() for x in xfers]
+                )
+                self.dec_host_lock_ref(info.anchor_node, info.anchor_lock_params)
+                cc.prefetch_tokens_occupied -= len(info.prefetch_key)
+                if cc.prefetch_tokens_occupied < 0:
+                    cc.prefetch_tokens_occupied = 0
+
+        for ack in drain(cc.ack_prefetch_queue, n_prefetch):
+            operation = ack.operation
+            if operation.request_id not in self.ongoing_prefetch:
+                continue
+            if ack.completed_tokens is not None:
+                operation.completed_tokens = max(
+                    operation.completed_tokens, ack.completed_tokens
+                )
+            if ack.pool_hits is not None:
+                operation.pool_storage_result.update_extra_pool_hit_pages(ack.pool_hits)
+                operation.pool_transfers_done = True
+            if ack.completed_req:
+                self.handle_prefetch_result(operation)
+
+        for operation in drain(cc.ack_backup_queue, n_backup):
+            entry = self.ongoing_backup.pop(operation.id, None)
+            if entry is not None:
+                node, lock_params = entry
+                self.dec_host_lock_ref(node, lock_params)
+            if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+                self.storage_metrics_collector.log_backuped_tokens(
+                    operation.completed_tokens
+                )
+
+        host_indices_list = list(drain(cc.host_mem_release_queue, n_release))
+        if host_indices_list:
+            cc.mem_pool_host.free(torch.cat(host_indices_list, dim=0))
+        for pool_name, count in extra_release_counts.items():
+            release_queue = extra_release_queues.get(pool_name)
+            if release_queue is None:
+                continue
+            host_indices_list = list(drain(release_queue, count))
+            if host_indices_list:
+                entry = cc.mem_pool_host.entry_map.get(pool_name)
+                if entry is not None:
+                    entry.host_pool.free(torch.cat(host_indices_list, dim=0))
 
     def _apply_storage_runtime_config(
         self,
@@ -2369,7 +2331,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        finish_count = int(finish_count_tensor.item())
 
         # Process completed acks
         while finish_count > 0:
@@ -2392,9 +2354,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if not finish_event.query():
                     break
                 finish_count += 1
+
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        finish_count = int(finish_count_tensor.item())
 
         while finish_count > 0:
             _, finish_event, ack_list = cc.ack_load_queue.pop(0)

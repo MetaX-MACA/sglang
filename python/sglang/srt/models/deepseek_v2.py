@@ -64,6 +64,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
+    is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -2858,6 +2859,59 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def _align_round_robin_dsa_cp_pp_proxy_with_inputs(
+        self,
+        input_len: int,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ) -> None:
+        cp_input_len = input_len
+        if (
+            not is_dsa_prefill_cp_round_robin_split()
+            or pp_proxy_tensors is None
+            or self.pp_group.is_first_rank
+            or not forward_batch.forward_mode.is_context_parallel_extend()
+            or not can_dsa_cp_split(
+                cp_input_len, self.cp_size, self.use_dsa, forward_batch
+            )
+        ):
+            return
+
+        # PP transports already CP-split hidden states, while MLP/DP sync can
+        # remove trailing padding. Restore it so positions, DSA metadata, and
+        # cache locations keep using the local padded ForwardBatch shape.
+        expected_local_len = cp_input_len // self.cp_size
+        proxy_lengths = {
+            name: pp_proxy_tensors[name].shape[0]
+            for name in ("hidden_states", "residual")
+        }
+        if len(set(proxy_lengths.values())) != 1:
+            raise RuntimeError(
+                "DSA round-robin CP PP proxy tensors have different token counts: "
+                f"expected_local_len={expected_local_len}, "
+                f"proxy_lengths={proxy_lengths}"
+            )
+
+        proxy_len = proxy_lengths["hidden_states"]
+        if proxy_len > expected_local_len:
+            raise RuntimeError(
+                "DSA round-robin CP PP proxy is longer than the local CP batch: "
+                f"expected_local_len={expected_local_len}, "
+                f"proxy_lengths={proxy_lengths}, input_len={input_len}"
+            )
+
+        pad_len = expected_local_len - proxy_len
+        if pad_len > 0:
+            for name in proxy_lengths:
+                tensor = pp_proxy_tensors[name]
+                pp_proxy_tensors[name] = torch.cat(
+                    [
+                        tensor,
+                        tensor.new_zeros((pad_len, *tensor.shape[1:])),
+                    ],
+                    dim=0,
+                )
+
     @torch.no_grad()
     def forward(
         self,
@@ -2868,10 +2922,17 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         # Minor fix for multi-modal model: input_ids is None
-        len_input_ids = (
-            input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
-        )
+        if input_ids is not None:
+            len_input_ids = input_ids.shape[0]
+        elif input_embeds is not None:
+            len_input_ids = input_embeds.shape[0]
+        else:
+            len_input_ids = 0
+
         if self.dsa_enable_prefill_cp:
+            self._align_round_robin_dsa_cp_pp_proxy_with_inputs(
+                len_input_ids, forward_batch, pp_proxy_tensors
+            )
             if can_dsa_cp_split(
                 len_input_ids, self.cp_size, self.use_dsa, forward_batch
             ):

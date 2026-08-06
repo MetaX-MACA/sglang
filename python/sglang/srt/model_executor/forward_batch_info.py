@@ -1479,8 +1479,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
         elif self.forward_mode.is_extend():
             num_tokens = self.seq_lens_sum
+            # LogitsProcessor emits one next-token logit per sequence. MLP/CP
+            # padding may leave additional rows, but those rows must not reach
+            # the sampler as synthetic requests.
             logits_output.next_token_logits = logits_output.next_token_logits[
-                :num_tokens
+                :bs
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]

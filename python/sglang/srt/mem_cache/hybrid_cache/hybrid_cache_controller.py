@@ -13,6 +13,7 @@ import torch
 from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
 from sglang.srt.managers.cache_controller import (
     HiCacheAck,
+    PrefetchAck,
 )
 from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
@@ -128,6 +129,8 @@ class PrefetchOperation(StorageOperation):
         self.request_id = request_id
         self._lock = threading.Lock()
         self._terminated_flag = False
+        self._aborted_flag = False
+        self.pool_transfers_done = not bool(pool_transfers)
         self.start_time = time.monotonic()
         super().__init__(
             host_indices,
@@ -138,22 +141,72 @@ class PrefetchOperation(StorageOperation):
         )
         self.pool_transfers_done = not bool(pool_transfers)
 
-    def increment(self, num_tokens: int):
-        with self._lock:
-            if self._terminated_flag:
-                return False
-            self.completed_tokens += num_tokens
-            return True
-
     def mark_terminate(self):
         with self._lock:
             self._terminated_flag = True
 
     def is_terminated(self) -> bool:
-        return self._terminated_flag
+        with self._lock:
+            return self._terminated_flag
+
+    def mark_abort(self):
+        with self._lock:
+            self._aborted_flag = True
+            self._terminated_flag = True
+
+    def is_aborted(self) -> bool:
+        with self._lock:
+            return self._aborted_flag
 
 
 class HybridCacheController(BaseHiCacheController):
+    @staticmethod
+    def parse_storage_backend_extra_config(
+        storage_backend_extra_config: Optional[str],
+    ) -> tuple[dict, int, float, float, bool]:
+        extra_config = {}
+        if storage_backend_extra_config:
+            if storage_backend_extra_config.startswith("@"):
+                path = storage_backend_extra_config[1:]
+                ext = os.path.splitext(path)[1].lower()
+                with open(path, "rb" if ext == ".toml" else "r") as f:
+                    if ext == ".json":
+                        extra_config = json.load(f)
+                    elif ext == ".toml":
+                        import tomllib
+
+                        extra_config = tomllib.load(f)
+                    elif ext in (".yaml", ".yml"):
+                        import yaml
+
+                        extra_config = yaml.safe_load(f)
+                    else:
+                        raise ValueError(f"Unsupported storage config format: {ext}")
+            else:
+                extra_config = json.loads(storage_backend_extra_config)
+
+        threshold = extra_config.pop("prefetch_threshold", 256)
+        timeout_base = extra_config.pop("prefetch_timeout_base", 1.0)
+        timeout_per_ki = extra_config.pop("prefetch_timeout_per_ki_token", 0.25)
+        pass_prefix_keys = extra_config.pop(
+            "hicache_storage_pass_prefix_keys", False
+        )
+        if not isinstance(threshold, int):
+            raise ValueError("prefetch_threshold must be int")
+        if not isinstance(timeout_base, (int, float)) or not isinstance(
+            timeout_per_ki, (int, float)
+        ):
+            raise ValueError("prefetch timeout values must be numbers")
+        if not isinstance(pass_prefix_keys, bool):
+            raise ValueError("hicache_storage_pass_prefix_keys must be bool")
+        return (
+            extra_config,
+            threshold,
+            float(timeout_base),
+            float(timeout_per_ki),
+            pass_prefix_keys,
+        )
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -163,6 +216,8 @@ class HybridCacheController(BaseHiCacheController):
         load_cache_event: threading.Event,
         attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
         attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pp_rank: int = 0,
+        pp_size: int = 1,
         pp_group: Optional[torch.distributed.ProcessGroup] = None,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
@@ -183,15 +238,18 @@ class HybridCacheController(BaseHiCacheController):
             load_cache_event=load_cache_event,
             attn_cp_group=attn_cp_group,
             attn_tp_group=attn_tp_group,
-            pp_group=pp_group,
             write_policy=write_policy,
             io_backend=io_backend,
             storage_backend=None,
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            pp_group=pp_group,
             enable_storage_metrics=enable_storage_metrics,
         )
+        self._init_extra_host_mem_release_queues()
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
@@ -314,9 +372,8 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             self.extra_host_mem_release_queues[entry.name] = Queue()
 
-    def _append_host_mem_release_pages(
-        self, release_queue: Queue, host_indices: torch.Tensor, page_size: int
-    ) -> None:
+    @staticmethod
+    def _append_host_mem_release_pages(release_queue, host_indices, page_size):
         if host_indices.numel() == 0:
             return
         for page in host_indices.split(page_size):
@@ -326,7 +383,7 @@ class HybridCacheController(BaseHiCacheController):
         self,
         host_indices: Optional[torch.Tensor] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
-    ):
+    ) -> None:
         if host_indices is not None:
             self._append_host_mem_release_pages(
                 self.host_mem_release_queue,
@@ -344,19 +401,10 @@ class HybridCacheController(BaseHiCacheController):
             ):
                 continue
             release_queue = self.extra_host_mem_release_queues.get(transfer.name)
-            if release_queue is None:
-                continue
-            self._append_host_mem_release_pages(
-                release_queue, transfer.host_indices, entry.host_pool.page_size
-            )
-
-    def reset(self):
-        super().reset()
-        if self.enable_storage:
-            self.host_mem_release_queue.queue.clear()
-            for release_queue in self.extra_host_mem_release_queues.values():
-                release_queue.queue.clear()
-            self.prefetch_tokens_occupied = 0
+            if release_queue is not None:
+                self._append_host_mem_release_pages(
+                    release_queue, transfer.host_indices, entry.host_pool.page_size
+                )
 
     def write(
         self,
@@ -642,29 +690,33 @@ class HybridCacheController(BaseHiCacheController):
                 )
         return host_indices, device_indices, resolved_pool_transfers
 
-    def _page_transfer(self, operation):
-        # KV pools first — determines actual completed page count
-        super()._page_transfer(operation)
-
-        # Extra pools only after KV fully completes. If KV terminated early
-        # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
-        # data misalignment.
-        kv_completed_pages = operation.completed_tokens // self.page_size
-        if operation.pool_transfers and kv_completed_pages == len(operation.hash_value):
-            self._sync_trailing_keys(
-                operation.pool_transfers, operation.hash_value, kv_completed_pages
+    def _page_transfer(self, operation) -> bool:
+        kv_success = super()._page_transfer(operation)
+        if operation.pool_transfers:
+            pool_hits: dict[str, int] = {}
+            if kv_success and not operation.is_terminated():
+                self._sync_trailing_keys(operation.pool_transfers, operation.hash_value)
+                self._resolve_sidecar_derived_pool_transfers(operation)
+                results = self.storage_backend.batch_get_v2(operation.pool_transfers)
+                pool_hits = {name: sum(rs) for name, rs in results.items()}
+            operation.pool_transfers_done = True
+            self.prefetch_sync_queue.put(
+                PrefetchAck(
+                    request_id=operation.request_id,
+                    operation=operation,
+                    pool_hits=pool_hits,
+                )
             )
-            self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(operation.pool_transfers)
-            operation.pool_storage_result.update_extra_pool_hit_pages(results)
-        operation.pool_transfers_done = True
+        return kv_success
 
     def _page_backup(self, operation):
         # Backup extra pools
         if operation.pool_transfers:
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_set_v2(operation.pool_transfers)
-            operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            operation.pool_storage_result.update_extra_pool_hit_pages(
+                {name: sum(rs) for name, rs in results.items()}
+            )
 
         # Backup kv pools
         super()._page_backup(operation)
@@ -700,7 +752,7 @@ class HybridCacheController(BaseHiCacheController):
         self,
         pool_transfers: list[PoolTransfer],
         all_hashes: list[str],
-        kv_hit_pages: int,
+        kv_hit_pages: Optional[int] = None,
     ) -> None:
         """Re-align trailing-page sidecar keys after KV hit truncation.
 
@@ -714,7 +766,12 @@ class HybridCacheController(BaseHiCacheController):
             if transfer.hit_policy != PoolHitPolicy.TRAILING_PAGES:
                 continue
             trailing_n = len(transfer.keys) if transfer.keys else 1
-            transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]
+            if kv_hit_pages is None:
+                transfer.keys = all_hashes[-trailing_n:]
+            else:
+                transfer.keys = all_hashes[
+                    max(0, kv_hit_pages - trailing_n) : kv_hit_pages
+                ]
 
     def _resolve_pool_transfers_allocation(
         self,
@@ -798,3 +855,20 @@ class HybridCacheController(BaseHiCacheController):
             pool.host_indices = source.host_indices
             pool.device_indices = source.device_indices
         return extra_pools
+
+    def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
+        super()._reduce_prefetch_ack(ack)
+        if ack.pool_hits is None:
+            return
+        packed = torch.tensor(
+            [ack.pool_hits.get(pool.value, 0) for pool in PoolName],
+            dtype=torch.int,
+        )
+        self._all_reduce(
+            packed,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_completion_sync_groups,
+        )
+        ack.pool_hits = {
+            pool.value: int(packed[i].item()) for i, pool in enumerate(PoolName)
+        }
