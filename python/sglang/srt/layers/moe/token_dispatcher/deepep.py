@@ -92,6 +92,22 @@ def check_deepep_package() -> str:
             ) from exc
 
 
+
+def check_deepep_package() -> str:
+    import importlib.metadata
+
+    try:
+        importlib.metadata.distribution("mxmesh")
+        return "mxmesh"
+    except importlib.metadata.PackageNotFoundError:
+        try:
+            importlib.metadata.distribution("deep_ep")
+            return "deep_ep"
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise FileNotFoundError(
+                "Initializing DeepEP requires either the deep_ep or mxmesh package"
+            ) from exc
+
 def _deepep_precompile_tp_barrier() -> None:
     # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
     # so if different ranks compile at different speeds, it may quickly trigger a timeout.
@@ -822,7 +838,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
-        topk_weights: Optional[torch.Tensor]=None,        
+        topk_weights: Optional[torch.Tensor]=None,
     ):
         use_nvfp4 = use_fp8 = False
         use_nvfp4 = use_fp8 = False
@@ -876,8 +892,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 ),
                 num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
                 num_experts=self.num_experts,
-                use_fp8=self.use_fp8,
-                **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
+                use_fp8=use_fp8,
+                **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)
                     if input_global_scale is not None

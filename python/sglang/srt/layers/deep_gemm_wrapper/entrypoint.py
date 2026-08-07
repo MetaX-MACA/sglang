@@ -125,6 +125,25 @@ def append_scale_batch_cuda(input_tensor: torch.Tensor, scale_tensor: torch.Tens
     output = torch.cat([input_tensor, scale_bytes_tensor], dim=-1)  # B×M×(K+4)
     return output
 
+def grouped_gemm_nt_fp4bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+):
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    return deep_gemm.m_grouped_gemm_bf16_fp4_bf16_nt_masked(
+        lhs,
+        rhs,
+        out,
+        masked_m,
+        expected_m,
+    )
+
 def grouped_gemm_nt_int8int8bf16_masked(
     lhs: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     rhs: Tuple[torch.Tensor, torch.Tensor],
