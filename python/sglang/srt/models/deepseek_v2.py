@@ -891,10 +891,12 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not self._enable_a2a_moe:
+            bs = hidden_states[0].shape[0] if isinstance(hidden_states, tuple) \
+                else hidden_states.shape[0]
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
-                and hidden_states.shape[0] > 0
+                and bs > 0
                 and get_is_capture_mode()
                 and not (
                     get_global_server_args().enable_torch_compile
@@ -1035,7 +1037,9 @@ class DeepseekV2MoE(nn.Module):
             else None
         )
         defer_shared = not self.experts.moe_runner_config.inplace
-        if hidden_states.shape[0] > 0:
+        bs = hidden_states[0].shape[0] if isinstance(hidden_states, tuple) \
+                else hidden_states.shape[0]
+        if bs > 0:
             if not defer_shared and not self._fuse_shared_experts_inside_sbo:
                 shared_output = self._forward_shared_experts(
                     hidden_states, gemm_output_zero_allocator
