@@ -246,6 +246,8 @@ def _get_quantization_config(
 
         if isinstance(quant_config, Fp8Config):
             quant_config.is_fp4_experts = model_config.is_fp4_experts
+            if hasattr(model_config.hf_text_config,"expert_dtype"):
+                quant_config.is_fp4_experts = (model_config.hf_text_config.expert_dtype == 'fp4')
             # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
             nvfp4_meta = model_config.nvfp4_moe_meta
             if nvfp4_meta is not None:
