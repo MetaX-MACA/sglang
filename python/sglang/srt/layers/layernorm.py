@@ -699,7 +699,7 @@ class RMSNorm(BaseFusedOp):
                 fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
                 result = x, residual
         else:
-            result = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            result = sgl_rmsnorm(x, self.weight.data, self.variance_epsilon)
 
         if needs_reshape:
             if residual is not None:

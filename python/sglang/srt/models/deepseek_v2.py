@@ -1194,13 +1194,17 @@ class DeepseekV2MoE(nn.Module):
                 gemm_output_zero_allocator,
                 pre_quant_input=pre_quant_input,
             )
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
-        )
+        if self.is_deepseek_v4:
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
+                self.routed_scaling_factor,
+            )
 
+        if shared_output is not None:
+            final_hidden_states+=shared_output
+        
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
@@ -3332,28 +3336,28 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
 
-@register_custom_op(out_shape="hidden_states")
-def dsv2_flashinfer_moe_dual_stream_graph(
-    hidden_states: torch.Tensor,
-    layer_id: int,
-    fuse_mlp_allreduce: bool,
-    mlp_reduce_scatter: bool,
-) -> torch.Tensor:
-    forward_context = get_tc_piecewise_forward_context()
-    assert forward_context is not None
-    assert forward_context.moe_fusions is not None
+# @register_custom_op(out_shape="hidden_states")
+# def dsv2_flashinfer_moe_dual_stream_graph(
+#     hidden_states: torch.Tensor,
+#     layer_id: int,
+#     fuse_mlp_allreduce: bool,
+#     mlp_reduce_scatter: bool,
+# ) -> torch.Tensor:
+#     forward_context = get_tc_piecewise_forward_context()
+#     assert forward_context is not None
+#     assert forward_context.moe_fusions is not None
 
-    moe_fusion = forward_context.moe_fusions[layer_id]
-    assert moe_fusion is not None
+    # moe_fusion = forward_context.moe_fusions[layer_id]
+    # assert moe_fusion is not None
     # Custom-op execution happens outside the caller's Python scope under
     # torch.compile. Carry graph-varying control state as scalar operands and
     # republish it for the nested MoE/linear consumers.
-    with get_forward().scoped(
-        fuse_mlp_allreduce=fuse_mlp_allreduce,
-        mlp_reduce_scatter=mlp_reduce_scatter,
-        flashinfer_trtllm_bypass=True,
-    ):
-        return moe_fusion.forward_normal_dual_stream(hidden_states)
+    # with get_forward().scoped(
+    #     fuse_mlp_allreduce=fuse_mlp_allreduce,
+    #     mlp_reduce_scatter=mlp_reduce_scatter,
+    #     flashinfer_trtllm_bypass=True,
+    # ):
+    #     return moe_fusion.forward_normal_dual_stream(hidden_states)
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]

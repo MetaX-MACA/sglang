@@ -206,9 +206,9 @@ else:
     sgl_per_token_quant_fp8 = _native_sgl_per_token_quant_fp8
     sgl_per_tensor_quant_fp8 = _native_sgl_per_tensor_quant_fp8
 
-if _is_musa:
-    # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
-    from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
+# if _is_musa:
+#     # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
+#     from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
 
 @lru_cache()
 def is_fp8_fnuz() -> bool:
@@ -980,7 +980,7 @@ def sglang_per_token_quant_fp8(
         dtype=torch.float32,
     )
 
-    sgl_per_token_quant_fp8(x, x_q, x_s)
+    # sgl_per_token_quant_fp8(x, x_q, x_s)
 
     return x_q, x_s
 
