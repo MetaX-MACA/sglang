@@ -165,16 +165,20 @@ class DraftBlockProposer:
         embed_module,
     ) -> DraftForwardResult:
         gamma = self.gamma
+        draft_width = gamma + 1
         prefix_lens = batch.seq_lens
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
         draft_block_ids = torch.full(
-            (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=device
+            (bs, draft_width),
+            int(self._mask_token_id),
+            dtype=torch.long,
+            device=device,
         )
         draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
-        draft_positions = positions_2d[:, :gamma].reshape(-1)
-        draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
+        draft_positions = positions_2d[:, :draft_width].reshape(-1)
+        draft_cache_loc = verify_cache_loc_2d[:, :draft_width].reshape(-1)
 
         draft_owns_embed = hasattr(self.draft_model, "forward_embed")
         draft_input_embeds: Optional[torch.Tensor] = None
@@ -183,13 +187,18 @@ class DraftBlockProposer:
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         if batch.seq_lens_cpu is not None:
-            draft_seq_lens_cpu = batch.seq_lens_cpu + gamma
-            draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
-        elif draft_input.reserved_seq_lens_cpu is not None:
-            draft_seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-            draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+            # TARGET_VERIFY backends add the fixed draft width while planning
+            # metadata. Keep this value at the committed prefix length.
+            draft_seq_lens_cpu = batch.seq_lens_cpu
+            seq_lens_sum = getattr(batch, "seq_lens_sum", None)
+            draft_seq_lens_sum = (
+                int(seq_lens_sum)
+                if seq_lens_sum is not None
+                else int(batch.seq_lens_cpu.sum().item())
+            )
         else:
-            raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
+            draft_seq_lens_cpu = prefix_lens.detach().to("cpu")
+            draft_seq_lens_sum = int(draft_seq_lens_cpu.sum().item())
 
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
@@ -217,7 +226,10 @@ class DraftBlockProposer:
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
-        draft_hidden_3d = raw_hidden.view(bs, gamma, -1)
+        # Slot 0 is the anchor. Markov sampling consumes slots 1..gamma.
+        raw_hidden_3d = raw_hidden.view(bs, draft_width, -1)
+        draft_hidden_3d = raw_hidden_3d[:, 1:, :].contiguous()
+        raw_hidden = draft_hidden_3d.reshape(bs * gamma, -1)
         return DraftForwardResult(
             draft_block_ids=draft_block_ids,
             raw_hidden=raw_hidden,

@@ -224,8 +224,6 @@ class SpeculativeAlgorithm(Enum):
         # graph support. We can use it for target verify, or we can use it for
         # other cases which is not target verify but fixed length prefill.
         # Here, we expose this interface to allow the other use cases.
-        if self.is_dspark() and is_draft_worker:
-            return num_draft_tokens - 1
         return num_draft_tokens
 
     def create_worker(
@@ -376,7 +374,7 @@ def create_dummy_verify_input(
         spec_info = DFlashVerifyInput(
             draft_token=None,
             positions=None,
-            draft_token_num=server_args.speculative_num_draft_tokens,
+            draft_token_num=num_tokens_per_bs,
             custom_mask=None,
             capture_hidden_mode=(
                 CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL

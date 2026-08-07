@@ -19,6 +19,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -67,7 +68,7 @@ def _get_dflash_layer_attention_params(
 
 
 class DFlashAttention(nn.Module):
-    def __init__(self, config, layer_id: int) -> None:
+    def __init__(self, config, layer_id: int, quant_config: Optional[QuantizationConfig] = None) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         tp_size = int(get_parallel().tp_size)
@@ -110,12 +111,14 @@ class DFlashAttention(nn.Module):
             total_num_kv_heads=self.total_num_kv_heads,
             bias=attention_bias,
             prefix="qkv_proj",
+            quant_config=quant_config,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * head_dim,
             hidden_size,
             bias=attention_bias,
             prefix="o_proj",
+            quant_config=quant_config,
         )
 
         # Per-head Q/K RMSNorm, matching HF Qwen3.
@@ -268,15 +271,15 @@ class DFlashMLP(nn.Module):
 
 
 class DFlashDecoderLayer(nn.Module):
-    def __init__(self, config, layer_id: int) -> None:
+    def __init__(self, config, layer_id: int, quant_config: Optional[QuantizationConfig] = None) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.self_attn = DFlashAttention(config=config, layer_id=layer_id)
+        self.self_attn = DFlashAttention(config=config, layer_id=layer_id, quant_config=quant_config)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = DFlashMLP(config=config)
+        self.mlp = DFlashMLP(config=config, quant_config=quant_config)
 
     def forward(
         self,
@@ -326,7 +329,7 @@ class DFlashDraftModel(nn.Module):
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
         self.layers = nn.ModuleList(
-            [DFlashDecoderLayer(config=config, layer_id=i) for i in range(num_layers)]
+            [DFlashDecoderLayer(config=config, layer_id=i, quant_config=quant_config) for i in range(num_layers)]
         )
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
