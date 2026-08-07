@@ -249,7 +249,9 @@ class DeepseekV2WeightLoaderMixin:
                             # To be compatible with the W4A8 weights
                             try_name = name + "_packed"
                             if try_name not in params_dict:
-                                continue
+                                try_name = name + "_inv"
+                                if try_name not in params_dict:
+                                    continue
                             name = try_name 
                         param = params_dict[name]
                         weight_loader = param.weight_loader
