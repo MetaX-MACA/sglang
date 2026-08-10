@@ -30,6 +30,7 @@ if _is_cuda:
     from sglang.srt.layers.quantization.w8a8_int8 import cutlass_scaled_mm
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
+    supports_prequantized_input = True
 
     def __init__(
         self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool

@@ -330,8 +330,15 @@ class FusedMoE(torch.nn.Module):
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
 
+        # compressed-tensors delegates create_moe_runner to layer.scheme, so the
+        # runner lands on the scheme rather than on quant_method; pick it up there
+        # too, otherwise supports_prequantized_w13_input() can never see it.
         if self.quant_method is not None and hasattr(self.quant_method, "runner"):
             self.runner = self.quant_method.runner
+        elif getattr(self, "scheme", None) is not None and hasattr(
+            self.scheme, "runner"
+        ):
+            self.runner = self.scheme.runner
 
     @cached_property
     def use_padded_loading(self) -> bool:
@@ -1035,7 +1042,36 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def supports_prequantized_w13_input(self) -> bool:
+        return (
+            isinstance(self.dispatcher, StandardDispatcher)
+            and self.dispatcher._original_dispatch_func is None
+            and getattr(
+                getattr(self, "scheme", None),
+                "supports_prequantized_w13_input",
+                False,
+            )
+            and hasattr(self, "runner")
+            and self.runner.runner_backend.is_triton()
+            and self.runner.fused_func is not None
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        prequantized_hidden_states: Optional[torch.Tensor] = None,
+        prequantized_hidden_states_scale: Optional[torch.Tensor] = None,
+    ):
+        if prequantized_hidden_states is not None:
+            assert self.supports_prequantized_w13_input()
+            return self.forward_impl(
+                hidden_states,
+                topk_output,
+                prequantized_hidden_states,
+                prequantized_hidden_states_scale,
+            )
+
         if is_in_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
@@ -1062,13 +1098,29 @@ class FusedMoE(torch.nn.Module):
         else:
             return self.forward_impl(hidden_states, topk_output)
 
-    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        prequantized_hidden_states: Optional[torch.Tensor] = None,
+        prequantized_hidden_states_scale: Optional[torch.Tensor] = None,
+    ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
+        if prequantized_hidden_states is not None:
+            assert isinstance(self.dispatcher, StandardDispatcher)
+            dispatch_output = self.dispatcher.dispatch(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+                prequantized_hidden_states=prequantized_hidden_states,
+                prequantized_hidden_states_scale=prequantized_hidden_states_scale,
+            )
+        else:
+            assert prequantized_hidden_states_scale is None
+            dispatch_output = self.dispatcher.dispatch(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,

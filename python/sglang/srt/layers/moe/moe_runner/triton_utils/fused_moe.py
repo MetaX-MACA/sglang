@@ -252,12 +252,55 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    prequantized_hidden_states: Optional[torch.Tensor] = None,
+    prequantized_hidden_states_scale: Optional[torch.Tensor] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
     )
+    if prequantized_hidden_states is not None:
+        if moe_runner_config.inplace:
+            assert not moe_runner_config.no_combine, (
+                "no combine + inplace makes no sense"
+            )
+        return fused_experts_impl(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            b1,
+            b2,
+            moe_runner_config.inplace,
+            moe_runner_config.activation,
+            moe_runner_config.is_gated,
+            moe_runner_config.apply_router_weight_on_input,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            use_int4_w4a8,
+            use_int4_w4a16,
+            per_channel_quant,
+            w1_scale,
+            w2_scale,
+            w1_zp,
+            w2_zp,
+            a1_scale,
+            a2_scale,
+            block_shape,
+            moe_runner_config.no_combine,
+            moe_runner_config.routed_scaling_factor,
+            moe_runner_config.gemm1_alpha,
+            moe_runner_config.gemm1_clamp_limit,
+            filter_expert,
+            swiglu_limit=moe_runner_config.swiglu_limit,
+            prequantized_hidden_states=prequantized_hidden_states,
+            prequantized_hidden_states_scale=prequantized_hidden_states_scale,
+        )
+    assert prequantized_hidden_states_scale is None
+
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         inplace_fused_experts(
@@ -449,6 +492,8 @@ def _fused_moe_kernel_sequence(
     filter_expert: bool,
     hooks: Optional[Any] = None,
     swiglu_limit: Optional[float] = None,
+    prequantized_hidden_states: Optional[torch.Tensor] = None,
+    prequantized_hidden_states_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -460,6 +505,17 @@ def _fused_moe_kernel_sequence(
     E, N, _ = w1.shape
     topk = topk_ids.shape[1]
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+
+    w13_hidden_states = (
+        prequantized_hidden_states
+        if prequantized_hidden_states is not None
+        else hidden_states
+    )
+    if prequantized_hidden_states is not None:
+        assert prequantized_hidden_states_scale is not None
+        a1_scale = prequantized_hidden_states_scale
+    else:
+        assert prequantized_hidden_states_scale is None
 
     padded_tokens = (
         min(num_tokens * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
@@ -524,7 +580,21 @@ def _fused_moe_kernel_sequence(
         # call mctlass gemm_kernel_mnk to calculate kernel_m
         kernel_m = 0
         if enable_mctlass_fused_moe_python_api:
-            kernel_m = gemm.get_kernel_m(hidden_states.view(torch.int8), w1, intermediate_cache1, w1.shape[0], hidden_states.shape[0], w1.shape[1], hidden_states.shape[1], topk_ids.shape[1])
+            kernel_m_input = (
+                w13_hidden_states
+                if w13_hidden_states.dtype == torch.int8
+                else w13_hidden_states.view(torch.int8)
+            )
+            kernel_m = gemm.get_kernel_m(
+                kernel_m_input,
+                w1,
+                intermediate_cache1,
+                w1.shape[0],
+                hidden_states.shape[0],
+                w1.shape[1],
+                hidden_states.shape[1],
+                topk_ids.shape[1],
+            )
         else:
             kernel_m = cutlass_moe_mm_gemm_kernel_m_w8a8(topk_ids.numel(), N, hidden_states.shape[1], E)
         assert kernel_m > 0, ("cutlass_moe_w8a8 BLOCK_SIZE_M must greater than zero.")
@@ -584,7 +654,7 @@ def _fused_moe_kernel_sequence(
         )        
         
     invoke_fused_moe_kernel(
-        hidden_states,
+        w13_hidden_states,
         w1,
         b1,
         intermediate_cache1,
@@ -920,6 +990,8 @@ def fused_experts_impl(
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
+    prequantized_hidden_states: Optional[torch.Tensor] = None,
+    prequantized_hidden_states_scale: Optional[torch.Tensor] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -939,6 +1011,21 @@ def fused_experts_impl(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+
+    if prequantized_hidden_states is not None:
+        assert use_int8_w8a8
+        assert block_shape is None
+        assert prequantized_hidden_states_scale is not None
+        assert prequantized_hidden_states.dtype == torch.int8
+        assert prequantized_hidden_states.is_contiguous()
+        assert prequantized_hidden_states.shape == hidden_states.shape
+        assert prequantized_hidden_states_scale.dtype == torch.float32
+        assert prequantized_hidden_states_scale.is_contiguous()
+        assert prequantized_hidden_states_scale.device == hidden_states.device
+        assert prequantized_hidden_states.device == hidden_states.device
+        assert prequantized_hidden_states_scale.shape == (hidden_states.shape[0], 1)
+    else:
+        assert prequantized_hidden_states_scale is None
 
     (
         config,
@@ -993,6 +1080,8 @@ def fused_experts_impl(
         filter_expert=filter_expert,
         hooks=None,
         swiglu_limit=swiglu_limit,
+        prequantized_hidden_states=prequantized_hidden_states,
+        prequantized_hidden_states_scale=prequantized_hidden_states_scale,
     )
 
 

@@ -63,6 +63,8 @@ class StandardDispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_output: TopKOutput
+    prequantized_hidden_states: Optional[torch.Tensor] = None
+    prequantized_hidden_states_scale: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -114,10 +116,34 @@ class StandardDispatcher(BaseDispatcher):
         self.expert_mask_gpu = None
 
     def dispatch(
-        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        prequantized_hidden_states: Optional[torch.Tensor] = None,
+        prequantized_hidden_states_scale: Optional[torch.Tensor] = None,
     ) -> StandardDispatchOutput:
 
+        if prequantized_hidden_states is not None:
+            assert prequantized_hidden_states_scale is not None
+            assert prequantized_hidden_states.dtype == torch.int8
+            assert prequantized_hidden_states.is_contiguous()
+            assert prequantized_hidden_states.device == hidden_states.device
+            assert prequantized_hidden_states.shape == hidden_states.shape
+            assert prequantized_hidden_states_scale.dtype == torch.float32
+            assert prequantized_hidden_states_scale.is_contiguous()
+            assert prequantized_hidden_states_scale.device == hidden_states.device
+            assert prequantized_hidden_states_scale.shape == (
+                hidden_states.shape[0],
+                1,
+            )
+        else:
+            assert prequantized_hidden_states_scale is None
+
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
+            assert prequantized_hidden_states is None, (
+                "Prequantized INT8 MoE input is not compatible with the "
+                "FlashInfer FP4 all-gather path."
+            )
             # all-gather fp4 hidden states
             if (
                 fp4_quantize_flashinfer is None
@@ -216,6 +242,8 @@ class StandardDispatcher(BaseDispatcher):
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
             topk_output=topk_output,
+            prequantized_hidden_states=prequantized_hidden_states,
+            prequantized_hidden_states_scale=prequantized_hidden_states_scale,
         )
 
     def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:

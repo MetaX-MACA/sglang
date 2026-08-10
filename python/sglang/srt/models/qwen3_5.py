@@ -631,6 +631,24 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             and is_layer_sparse
             and get_moe_a2a_backend().is_deepep()
         )
+        use_standard_prefill_moe_quant = (
+            self.fused_quant
+            and is_layer_sparse
+            and get_global_server_args().disaggregation_mode == "prefill"
+            and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+            and self.mlp.supports_standard_prequantized_moe_input()
+        )
+        if (
+            is_layer_sparse
+            and get_global_server_args().disaggregation_mode == "prefill"
+        ):
+            logger.info_once(
+                "Qwen3.5 Prefill prequantized fused quant enabled="
+                f"{use_standard_prefill_moe_quant}"
+            )
+        use_post_attention_fused_quant = (
+            use_packed_deepep_quant or use_standard_prefill_moe_quant
+        )
         packed_size = (
             align_packed_tensor_size(
                 config.hidden_size,
@@ -647,7 +665,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_quant=use_packed_deepep_quant,
+            fused_quant=use_post_attention_fused_quant,
             packed_quant=use_packed_deepep_quant,
             packed_size=packed_size,
         )
@@ -863,6 +881,24 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             and is_layer_sparse
             and get_moe_a2a_backend().is_deepep()
         )
+        use_standard_prefill_moe_quant = (
+            self.fused_quant
+            and is_layer_sparse
+            and get_global_server_args().disaggregation_mode == "prefill"
+            and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+            and self.mlp.supports_standard_prequantized_moe_input()
+        )
+        if (
+            is_layer_sparse
+            and get_global_server_args().disaggregation_mode == "prefill"
+        ):
+            logger.info_once(
+                "Qwen3.5 Prefill prequantized fused quant enabled="
+                f"{use_standard_prefill_moe_quant}"
+            )
+        use_post_attention_fused_quant = (
+            use_packed_deepep_quant or use_standard_prefill_moe_quant
+        )
         packed_size = (
             align_packed_tensor_size(
                 config.hidden_size,
@@ -879,7 +915,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_quant=use_packed_deepep_quant,
+            fused_quant=use_post_attention_fused_quant,
             packed_quant=use_packed_deepep_quant,
             packed_size=packed_size,
         )

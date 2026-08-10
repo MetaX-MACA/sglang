@@ -128,8 +128,8 @@ def rms_norm_dynamic_per_token_quant_custom(input: torch.Tensor,
                                                    quant_dtype: torch.dtype,
                                                    scale_ub: torch.Tensor = None,
                                                    residual: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] :
-    out = torch.zeros_like(input, dtype=torch.int8)
-    out_bf16 = torch.zeros_like(input, dtype=torch.bfloat16)
+    out = torch.empty_like(input, dtype=torch.int8)
+    out_bf16 = torch.empty_like(input, dtype=torch.bfloat16)
     scales = torch.empty((input.numel() // input.shape[-1], 1),
                          device=input.device,
                          dtype=torch.float32)

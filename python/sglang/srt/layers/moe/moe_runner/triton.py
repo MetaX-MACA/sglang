@@ -166,6 +166,10 @@ def fused_experts_none_to_triton(
         w2_zp=quant_info.w2_zp,
         a1_scale=quant_info.a13_scale,
         a2_scale=quant_info.a2_scale,
+        prequantized_hidden_states=dispatch_output.prequantized_hidden_states,
+        prequantized_hidden_states_scale=(
+            dispatch_output.prequantized_hidden_states_scale
+        ),
         block_shape=quant_info.block_shape,
     )
 

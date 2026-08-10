@@ -138,6 +138,7 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
 
 
 class CompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
+    supports_prequantized_w13_input = True
 
     def __init__(self, weight_quant, input_quant):
         self.weight_quant = weight_quant

@@ -782,7 +782,10 @@ def invoke_fused_moe_kernel(
             assert (
                 per_channel_quant
             ), "int8 quantization only supports channel-wise quantization except for block-wise quantization"
-            A, A_scale = per_token_quant_int8(A)
+            if A.dtype == torch.int8:
+                assert A_scale is not None
+            else:
+                A, A_scale = per_token_quant_int8(A)
         else:
             # activation block-wise int8 quantization
             assert len(block_shape) == 2

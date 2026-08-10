@@ -484,7 +484,28 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states
 
-    def _forward_router_experts(self, hidden_states: torch.Tensor):
+    def supports_standard_prequantized_moe_input(self) -> bool:
+        shared_expert_supports_prequantized_input = (
+            self.shared_expert is None
+            or getattr(
+                getattr(self.shared_expert.gate_up_proj, "scheme", None),
+                "supports_prequantized_input",
+                False,
+            )
+        )
+        return (
+            isinstance(self.experts, FusedMoE)
+            and self.experts.supports_prequantized_w13_input()
+            and shared_expert_supports_prequantized_input
+        )
+
+    def _forward_router_experts(
+        self,
+        hidden_states: torch.Tensor,
+        prequantized_hidden_states: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,
+    ):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
@@ -492,6 +513,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output
         ):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
+        if prequantized_hidden_states is not None:
+            return self.experts(
+                hidden_states,
+                topk_output,
+                prequantized_hidden_states=prequantized_hidden_states[0],
+                prequantized_hidden_states_scale=prequantized_hidden_states[1],
+            )
         return self.experts(hidden_states, topk_output)
 
     def forward_normal_dual_stream(
@@ -516,14 +544,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_reduce_scatter: bool = False,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
+        prequantized_hidden_states = None
         if isinstance(hidden_states, tuple):
-            assert get_moe_a2a_backend().is_deepep(), (
-                "packed fused quant is only supported by the DeepEP path"
-            )
-            assert len(hidden_states) == 3 and isinstance(hidden_states[2], tuple), (
-                "DeepEP fused quant expects (packed, bf16, (int8, scale))"
-            )
-            num_tokens, hidden_dim = hidden_states[1].shape
+            if get_moe_a2a_backend().is_deepep():
+                assert len(hidden_states) == 3 and isinstance(
+                    hidden_states[2], tuple
+                ), "DeepEP fused quant expects (packed, bf16, (int8, scale))"
+                num_tokens, hidden_dim = hidden_states[1].shape
+            else:
+                assert self.supports_standard_prequantized_moe_input()
+                assert len(hidden_states) == 3, (
+                    "Standard fused quant expects (int8, scale, bf16)"
+                )
+                int8_hidden_states, int8_scale, bf16_hidden_states = hidden_states
+                assert int8_hidden_states.dtype == torch.int8
+                assert int8_scale.dtype == torch.float32
+                prequantized_hidden_states = (int8_hidden_states, int8_scale)
+                hidden_states = bf16_hidden_states
+                num_tokens, hidden_dim = hidden_states.shape
+                hidden_states = hidden_states.view(-1, hidden_dim)
         else:
             num_tokens, hidden_dim = hidden_states.shape
             hidden_states = hidden_states.view(-1, hidden_dim)
@@ -535,13 +574,26 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.alt_stream is not None
             and hidden_states.shape[0] > 0
             and get_is_capture_mode()
+            and prequantized_hidden_states is None
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states
             )
         else:
-            shared_output = self._forward_shared_experts(hidden_states)
-            final_hidden_states = self._forward_router_experts(hidden_states)
+            shared_expert_input = (
+                prequantized_hidden_states
+                if prequantized_hidden_states is not None
+                else hidden_states
+            )
+            shared_output = self._forward_shared_experts(
+                shared_expert_input,
+                gate_hidden_states=(
+                    hidden_states if prequantized_hidden_states is not None else None
+                ),
+            )
+            final_hidden_states = self._forward_router_experts(
+                hidden_states, prequantized_hidden_states
+            )
 
         if shared_output is not None:
             # In-place add is required to keep final_hidden_states in the

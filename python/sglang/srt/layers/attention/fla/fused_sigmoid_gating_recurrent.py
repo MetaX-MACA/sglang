@@ -282,10 +282,13 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    # MACA C600: swept BV x num_warps x num_stages at N=1..9, T=1 and T=4 -- BV=16
+    # with a single warp and no pipelining wins every shape (1.5-2.9x over the
+    # upstream 32/1/3, which is tuned for NVIDIA async-copy pipelining).
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 16)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
+    num_stages = 1
     num_warps = 1
 
     if scale is None:
