@@ -2015,17 +2015,28 @@ class NixlKVManager(CommonKVManager):
                     notif=comp_notif,
                 )
             elif st == StateType.MINIMAX_INDEX_K:
-                # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
-                # lists, so PP>1 mis-slices and heterogeneous TP is unsupported.
-                if self.pp_size is not None and self.pp_size > 1:
-                    raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax sparse index yet."
-                    )
-                if self.attn_tp_size != decode_tp_size:
-                    raise RuntimeError(
-                        "PD disagg: heterogeneous TP not supported for MiniMax "
-                        "sparse index yet."
-                    )
+                # Sparse-layer-aware PP slicing: the dst list is a compacted
+                # list of ALL K-only sparse layers (decode PP=1), while src
+                # has only this PP stage's layers. Model-layer ID !=
+                # compacted-list index, so compute the sparse-layer offset
+                # explicitly instead of relying on get_mla_kv_ptrs_with_pp.
+                if len(src_ptrs) < len(dst_ptrs):
+                    k_only_ids = getattr(
+                        self.kv_args, "minimax_k_only_sparse_layer_ids", None
+                    ) or []
+                    if k_only_ids:
+                        start = self.kv_args.prefill_start_layer
+                        offset = sum(1 for lid in k_only_ids if lid < start)
+                        count = len(src_ptrs)
+                        if offset + count > len(dst_ptrs):
+                            raise RuntimeError(
+                                f"PD disagg: MiniMax sparse index PP slice "
+                                f"out of range: offset={offset}, "
+                                f"count={count}, dst_len={len(dst_ptrs)}"
+                            )
+                        dst_ptrs = list(dst_ptrs[offset : offset + count])
+                # No hetero-TP guard: index_k_pool uses head_num=1, so the
+                # buffer is not TP-sliced and is identical on all ranks.
                 if len(src_indices) != len(dst_indices):
                     raise RuntimeError(
                         f"State index length mismatch at component {i}: "

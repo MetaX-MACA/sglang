@@ -67,6 +67,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils import get_bool_env_var
@@ -244,6 +245,11 @@ class PrefillBootstrapQueue:
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
         kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
         kv_args.mla_compression_ratios = None
+        kv_args.minimax_k_only_sparse_layer_ids = (
+            self.token_to_kv_pool.all_k_only_sparse_layer_ids
+            if isinstance(self.token_to_kv_pool, MiniMaxSparseKVPool)
+            else None
+        )
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )

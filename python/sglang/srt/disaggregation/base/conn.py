@@ -70,6 +70,10 @@ class KVArgs:
     # the connection layer to slice the buffer-type-organized flat list in a
     # PP-aware manner.
     mla_compression_ratios: Optional[List[int]]
+    # Full list of K-only sparse layer IDs (MiniMax sparse models).
+    # Needed because the compacted sparse-layer list cannot be PP-sliced
+    # by model-layer ID; the transfer code uses this to compute the offset.
+    minimax_k_only_sparse_layer_ids: Optional[List[int]]
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
