@@ -2838,7 +2838,6 @@ class ServerArgs:
         original_max_bs = decode_cuda_graph_config.max_bs
         adjusted_max_bs = original_max_bs
         if self.enable_dp_attention:
-            adjusted_max_bs = adjusted_max_bs // self.dp_size
             if self.max_running_requests is not None:
                 adjusted_max_bs = min(
                     adjusted_max_bs, self.max_running_requests // self.dp_size
