@@ -383,6 +383,17 @@ class DeepseekMLAForwardMixin:
                 q_pe       = q_input[:, :, self.kv_lora_rank:]   # [q_len, h, qk_rope_head_dim]
                 k_nope     = k_input[:, :, :self.kv_lora_rank]   # [q_len, 1, kv_lora_rank]
                 k_pe       = k_input[:, :, self.kv_lora_rank:]   # [q_len, 1, qk_rope_head_dim]
+
+                # Prefill CP splits the token dimension before attention, so the
+                # fused kernel above only produces this CP rank's KV rows.  The
+                # paged KV write locations are global; materialize and restore
+                # the full token order before the attention backend writes them.
+                if dsa_use_prefill_cp(
+                    forward_batch, is_dsa_enable_prefill_cp()
+                ):
+                    k_nope, k_pe = self.rebuild_cp_kv_cache(
+                        latent_cache, forward_batch, k_nope, k_pe
+                    )
                 # logger.info(f"{topk_indices=}")
         else:
             q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
