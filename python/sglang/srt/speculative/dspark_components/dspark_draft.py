@@ -16,6 +16,11 @@ def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tenso
     return torch.argmax(step_logits, dim=-1)
 
 
+def uses_anchor_plus_gamma_layout(model) -> bool:
+    """Whether this checkpoint uses the GLM-5.2 anchor-plus-gamma layout."""
+    return type(model).__name__ == "DSparkDraftModel"
+
+
 class DsparkDraftSampler:
 
     def __init__(self, *, model, gamma, max_bs, device, confidence_fn=None, out=None):
@@ -37,21 +42,25 @@ class DsparkDraftSampler:
         )
 
     def __call__(self, hidden_states, input_ids):
-        draft_width = self.gamma + 1
+        anchor_plus_gamma = uses_anchor_plus_gamma_layout(self.model)
+        draft_width = self.gamma + 1 if anchor_plus_gamma else self.gamma
         if hidden_states.shape[0] % draft_width != 0:
             raise RuntimeError(
-                "DSpark folded draft sampler expects full blocks with "
-                f"anchor + gamma tokens, got {hidden_states.shape[0]} rows "
-                f"for gamma={self.gamma}."
+                "DSpark folded draft sampler got an invalid block width: "
+                f"rows={hidden_states.shape[0]}, draft_width={draft_width}, "
+                f"gamma={self.gamma}."
             )
         bs = hidden_states.shape[0] // draft_width
-        hidden_3d = hidden_states.view(bs, draft_width, -1)
+        hidden_shape = hidden_states.shape[1:]
+        hidden_3d = hidden_states.view(bs, draft_width, *hidden_shape)
         ids_2d = input_ids.view(bs, draft_width)
         anchor = ids_2d[:, 0]
-        # Slot 0 conditions the block. Slots 1..gamma are the draft tokens
-        # used by the verifier and confidence scheduler.
-        draft_hidden = hidden_3d[:, 1:, :].contiguous()
-        hidden_for_logits = draft_hidden.reshape(bs * self.gamma, -1)
+        draft_hidden = (
+            hidden_3d[:, 1:].contiguous()
+            if anchor_plus_gamma
+            else hidden_3d
+        )
+        hidden_for_logits = draft_hidden.reshape(bs * self.gamma, *hidden_shape)
 
         base_logits, confidence_tap = self.model.compute_base_logits(hidden_for_logits)
         base_logits = base_logits.view(bs, self.gamma, -1)

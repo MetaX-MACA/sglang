@@ -14,6 +14,7 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     resolve_greedy_mask,
     sample_draft_block,
+    uses_anchor_plus_gamma_layout,
 )
 from sglang.srt.speculative.dspark_components.dspark_info import (
     DraftBlockResult,
@@ -165,7 +166,8 @@ class DraftBlockProposer:
         embed_module,
     ) -> DraftForwardResult:
         gamma = self.gamma
-        draft_width = gamma + 1
+        anchor_plus_gamma = uses_anchor_plus_gamma_layout(self.draft_model)
+        draft_width = gamma + 1 if anchor_plus_gamma else gamma
         prefix_lens = batch.seq_lens
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
@@ -226,10 +228,14 @@ class DraftBlockProposer:
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
-        # Slot 0 is the anchor. Markov sampling consumes slots 1..gamma.
-        raw_hidden_3d = raw_hidden.view(bs, draft_width, -1)
-        draft_hidden_3d = raw_hidden_3d[:, 1:, :].contiguous()
-        raw_hidden = draft_hidden_3d.reshape(bs * gamma, -1)
+        hidden_shape = raw_hidden.shape[1:]
+        raw_hidden_3d = raw_hidden.view(bs, draft_width, *hidden_shape)
+        draft_hidden_3d = (
+            raw_hidden_3d[:, 1:].contiguous()
+            if anchor_plus_gamma
+            else raw_hidden_3d
+        )
+        raw_hidden = draft_hidden_3d.reshape(bs * gamma, *hidden_shape)
         return DraftForwardResult(
             draft_block_ids=draft_block_ids,
             raw_hidden=raw_hidden,
