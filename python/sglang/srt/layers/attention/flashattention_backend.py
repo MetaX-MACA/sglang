@@ -44,7 +44,8 @@ from sgl_kernel import merge_state_v2
 #     flash_attn_with_kvcache,
 # )
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
-
+import torch
+import torch.nn.functional as F
 
 @triton.jit
 def _build_pa_page_table_kernel(

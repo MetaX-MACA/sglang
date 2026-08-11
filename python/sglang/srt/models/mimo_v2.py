@@ -87,6 +87,12 @@ from sglang.srt.utils import (
     align_packed_tensor_size,
     get_bool_env_var,
 )
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
+
+
 
 MiMoV2Config = None
 
