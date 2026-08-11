@@ -35,17 +35,6 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
     resolved_attention_backend: str
 
 
-def _resolve_draft_attention_backend(
-    *, draft_server_args: ServerArgs, algo_label: str
-) -> str:
-    draft_hf_config = _load_draft_hf_config(draft_server_args=draft_server_args)
-    return _select_draft_attention_backend(
-        draft_hf_config=draft_hf_config,
-        draft_server_args=draft_server_args,
-        algo_label=algo_label,
-    )
-
-
 def _load_draft_hf_config(*, draft_server_args: ServerArgs) -> Optional[Any]:
     draft_model_path = draft_server_args.speculative_draft_model_path
     if not draft_model_path:
@@ -112,14 +101,25 @@ def build_draft_tp_worker(
 ) -> DraftWorkerBundle:
     draft_server_args = deepcopy(server_args)
     draft_server_args.skip_tokenizer_init = True
-    draft_backend = _resolve_draft_attention_backend(
-        draft_server_args=draft_server_args, algo_label=algo_label
+    draft_hf_config = _load_draft_hf_config(draft_server_args=draft_server_args)
+    draft_backend = _select_draft_attention_backend(
+        draft_hf_config=draft_hf_config,
+        draft_server_args=draft_server_args,
+        algo_label=algo_label,
     )
     draft_server_args.speculative_draft_attention_backend = None
     draft_server_args.prefill_attention_backend = None
     draft_server_args.decode_attention_backend = None
     draft_server_args.attention_backend = draft_backend
     draft_server_args.context_length = target_model_config.context_len
+    architectures = getattr(draft_hf_config, "architectures", None) or []
+    if "DSparkDraftModel" in architectures:
+        # SpeculativeAlgorithm retains the legacy DSpark draft-worker contract
+        # (num_draft_tokens - 1). Add one only for GLM-5.2 so its resulting
+        # draft graph width is anchor + gamma.
+        num_draft_tokens = draft_server_args.speculative_num_draft_tokens
+        if num_draft_tokens is not None:
+            draft_server_args.speculative_num_draft_tokens = int(num_draft_tokens) + 1
 
     saved_server_args = get_global_server_args()
     draft_worker = TpModelWorker(

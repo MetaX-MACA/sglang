@@ -37,7 +37,7 @@ class TestDSparkDraftAnchorLayout(CustomTestCase):
                 )
 
         proposer = DraftBlockProposer(
-            draft_model=SimpleNamespace(),
+            draft_model=type("DSparkDraftModel", (), {})(),
             draft_model_runner=FakeDraftRunner(),
             gamma=gamma,
             mask_token_id=0,
@@ -92,8 +92,44 @@ class TestDSparkDraftAnchorLayout(CustomTestCase):
             device=torch.device("cpu"),
         )
 
-        with self.assertRaisesRegex(RuntimeError, "anchor \\+ gamma"):
-            sampler(torch.empty((8, 8)), torch.empty((8,), dtype=torch.int64))
+        with self.assertRaisesRegex(RuntimeError, "invalid block width"):
+            sampler(torch.empty((7, 8)), torch.empty((7,), dtype=torch.int64))
+
+    def test_legacy_sampler_keeps_gamma_width_and_hidden_tail_dims(self):
+        bs, gamma, hc_mult, hidden_size = 2, 3, 4, 8
+        seen = {}
+
+        class FakeMarkovHead:
+            def sample_block(
+                self, base_logits, first_prev_tokens, hidden_states, sampler
+            ):
+                seen["draft_hidden_shape"] = tuple(hidden_states.shape)
+                return torch.zeros((bs, gamma), dtype=torch.int64), None
+
+        class LegacyDraftModel:
+            markov_head = FakeMarkovHead()
+
+            def compute_base_logits(self, hidden):
+                seen["logits_hidden_shape"] = tuple(hidden.shape)
+                return torch.zeros((bs * gamma, 16)), None
+
+        sampler = DsparkDraftSampler(
+            model=LegacyDraftModel(),
+            gamma=gamma,
+            max_bs=bs,
+            device=torch.device("cpu"),
+        )
+        sampler(
+            torch.empty((bs * gamma, hc_mult, hidden_size)),
+            torch.arange(bs * gamma),
+        )
+
+        self.assertEqual(
+            seen["logits_hidden_shape"], (bs * gamma, hc_mult, hidden_size)
+        )
+        self.assertEqual(
+            seen["draft_hidden_shape"], (bs, gamma, hc_mult, hidden_size)
+        )
 
 
 if __name__ == "__main__":

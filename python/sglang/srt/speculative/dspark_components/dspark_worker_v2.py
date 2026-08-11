@@ -51,6 +51,7 @@ from sglang.srt.speculative.dspark_components.dspark_decision_dump import (
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DsparkDraftSampler,
     make_next_draft_input,
+    uses_anchor_plus_gamma_layout,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_proposer import (
     DraftBlockProposer,
@@ -239,7 +240,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             length=self.verify_num_draft_tokens, device=self.device
         )
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.verify_num_draft_tokens), device=self.device
+            draft_token_num=int(
+                self.verify_num_draft_tokens
+                if uses_anchor_plus_gamma_layout(self.draft_model)
+                else self.gamma
+            ),
+            device=self.device,
         )
 
         target_model = self.target_worker.model_runner.model
