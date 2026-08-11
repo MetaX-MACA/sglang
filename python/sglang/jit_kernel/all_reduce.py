@@ -101,7 +101,7 @@ def _jit_custom_all_reduce_pull_module(dtype: torch.dtype, world_size: int) -> M
     return load_jit(
         "custom_all_reduce_pull",
         *args,
-        extra_ldflags=["-lcuda"],
+        # extra_ldflags=["-lcuda"],
         cuda_files=["distributed/custom_all_reduce_pull.cuh"],
         cuda_wrappers=[("all_reduce", f"custom_all_reduce<{args}>")],
     )
@@ -113,7 +113,7 @@ def _jit_custom_all_reduce_push_module(dtype: torch.dtype, world_size: int) -> M
     return load_jit(
         "custom_all_reduce_push",
         *args,
-        extra_ldflags=["-lcuda"],
+        # extra_ldflags=["-lcuda"],
         cuda_files=["distributed/custom_all_reduce_push.cuh"],
         cuda_wrappers=[("all_reduce", f"custom_all_reduce<{args}>")],
     )
@@ -128,7 +128,7 @@ def _jit_fused_parallel_qknorm_module(
     return load_jit(
         "tp_qknorm",
         *args,
-        extra_ldflags=["-lcuda"],
+        # extra_ldflags=["-lcuda"],
         cuda_files=["distributed/tp_qknorm.cuh"],
         cuda_wrappers=[
             ("fused_parallel_qknorm", f"{cls_name}::run"),
@@ -141,7 +141,7 @@ def _jit_fused_parallel_qknorm_module(
 def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
     module = load_jit(
         "custom_all_reduce_base",
-        extra_ldflags=["-lcuda"],
+        # extra_ldflags=["-lcuda"],
         cuda_files=["distributed/custom_all_reduce_base.cuh"],
         cuda_wrappers=[("register_once", "register_custom_all_reduce")],
     )

@@ -9,28 +9,54 @@ struct alignas(128) Semaphore {
  public:
   constexpr Semaphore() : m_flag(0), m_counter(0) {}
 
+  // template <bool kFence>
+  // SGL_DEVICE uint32_t get() const {
+  //   uint32_t val;
+  //   if constexpr (kFence) {
+  //     asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(val) : "l"(&m_flag));
+  //   } else {
+  //     asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(val) : "l"(&m_flag));
+  //   }
+  //   return val;
+  // }
+
+  // template <bool kFence>
+  // SGL_DEVICE uint32_t add(uint32_t val) {
+  //   uint32_t old_val;
+  //   if constexpr (kFence) {
+  //     asm volatile("atom.release.sys.global.add.u32 %0, [%1], %2;" : "=r"(old_val) : "l"(&m_flag), "r"(val));
+  //   } else {
+  //     asm volatile("atom.global.add.u32 %0, [%1], %2;" : "=r"(old_val) : "l"(&m_flag), "r"(val));
+  //   }
+  //   return old_val;
+  // }
+
   template <bool kFence>
-  SGL_DEVICE uint32_t get() const {
-    uint32_t val;
-    if constexpr (kFence) {
-      asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(val) : "l"(&m_flag));
-    } else {
-      asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(val) : "l"(&m_flag));
-    }
-    return val;
+  SGL_DEVICE uint32_t get() const
+  {
+      const volatile uint32_t* vol_flag = reinterpret_cast<const volatile uint32_t*>(&m_flag);
+      uint32_t val = *vol_flag;
+
+      if constexpr (kFence)
+      {
+          __threadfence_system();
+      }
+      return val;
   }
 
   template <bool kFence>
-  SGL_DEVICE uint32_t add(uint32_t val) {
-    uint32_t old_val;
-    if constexpr (kFence) {
-      asm volatile("atom.release.sys.global.add.u32 %0, [%1], %2;" : "=r"(old_val) : "l"(&m_flag), "r"(val));
-    } else {
-      asm volatile("atom.global.add.u32 %0, [%1], %2;" : "=r"(old_val) : "l"(&m_flag), "r"(val));
-    }
-    return old_val;
-  }
+  SGL_DEVICE uint32_t add(uint32_t val)
+  {
+      if constexpr (kFence)
+      {
+          __threadfence_system();
+      }
 
+      return atomicAdd(
+          const_cast<unsigned int*>(reinterpret_cast<const unsigned int*>(&m_flag)),
+          val
+      );
+  }
   // Only called by the owning GPU - plain load is sufficient
   SGL_DEVICE uint32_t get_counter() const {
     return m_counter;

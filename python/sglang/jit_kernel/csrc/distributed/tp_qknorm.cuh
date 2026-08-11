@@ -37,21 +37,43 @@ struct ParallelQKNormParams {
   uint32_t num_clean_up_count = 0;
 };
 
-template <typename T>
-SGL_DEVICE void ld_global_volatile_8B(T& x, const void* addr, int64_t offset) {
-  static_assert(alignof(T) == 8 && sizeof(T) == 8);
-  addr = device::pointer::offset<T>(addr, offset);
-  uint2 val;
-  asm volatile("ld.volatile.global.v2.b32 {%0, %1}, [%2];" : "=r"(val.x), "=r"(val.y) : "l"(addr));
-  x = *reinterpret_cast<const T*>(&val);
-}
+// template <typename T>
+// SGL_DEVICE void ld_global_volatile_8B(T& x, const void* addr, int64_t offset) {
+//   static_assert(alignof(T) == 8 && sizeof(T) == 8);
+//   addr = device::pointer::offset<T>(addr, offset);
+//   uint2 val;
+//   asm volatile("ld.volatile.global.v2.b32 {%0, %1}, [%2];" : "=r"(val.x), "=r"(val.y) : "l"(addr));
+//   x = *reinterpret_cast<const T*>(&val);
+// }
 
 template <typename T>
-SGL_DEVICE void st_global_volatile_8B(const T& x, void* addr, int64_t offset) {
-  static_assert(alignof(T) == 8 && sizeof(T) == 8);
-  const uint2 val = *reinterpret_cast<const uint2*>(&x);
-  addr = device::pointer::offset<T>(addr, offset);
-  asm volatile("st.volatile.global.v2.b32 [%2], {%0, %1};" ::"r"(val.x), "r"(val.y), "l"(addr));
+SGL_DEVICE void ld_global_volatile_8B(T& x, const void* addr, int64_t offset)
+{
+    static_assert(alignof(T) == 8 && sizeof(T) == 8,
+                  "Type must be 8-byte aligned and 8 bytes in size");
+    addr = device::pointer::offset<T>(addr, offset);
+    const volatile uint64_t* vol_addr = reinterpret_cast<const volatile uint64_t*>(addr);
+    uint64_t val = *vol_addr;
+    x = *reinterpret_cast<const T*>(&val);
+}
+
+// template <typename T>
+// SGL_DEVICE void st_global_volatile_8B(const T& x, void* addr, int64_t offset) {
+//   static_assert(alignof(T) == 8 && sizeof(T) == 8);
+//   const uint2 val = *reinterpret_cast<const uint2*>(&x);
+//   addr = device::pointer::offset<T>(addr, offset);
+//   asm volatile("st.volatile.global.v2.b32 [%2], {%0, %1};" ::"r"(val.x), "r"(val.y), "l"(addr));
+// }
+
+template <typename T>
+SGL_DEVICE void st_global_volatile_8B(const T& x, void* addr, int64_t offset)
+{
+    static_assert(alignof(T) == 8 && sizeof(T) == 8,
+                  "Type must be 8-byte aligned and 8 bytes in size");
+    const uint64_t val = *reinterpret_cast<const uint64_t*>(&x);
+    addr = device::pointer::offset<T>(addr, offset);
+    volatile uint64_t* vol_addr = reinterpret_cast<volatile uint64_t*>(addr);
+    *vol_addr = val;
 }
 
 [[maybe_unused]]
