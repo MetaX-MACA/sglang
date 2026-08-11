@@ -101,7 +101,8 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     const int64_t push_buffer_size_all = push_all_ranks_bytes();
     RuntimeCheck(pull_buffer_size <= kU32Max, "Pull buffer size is too large: ", pull_buffer_size);
     RuntimeCheck(push_buffer_size_all <= kU32Max, "Push buffer size is too large: ", push_buffer_size_all);
-    RuntimeDeviceCheck(cudaMalloc(&m_storage, storage_bytes()));
+    // RuntimeDeviceCheck(cudaMalloc(&m_storage, storage_bytes()));
+    RuntimeDeviceCheck(mcExtMallocWithFlags(&m_storage, storage_bytes(), 1));
   }
 
   ExternHandle share_storage() {

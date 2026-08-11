@@ -32,7 +32,7 @@ _is_musa = is_musa()
 
 if _is_cuda:
     try:
-        import pynvml
+        import wnvml as pynvml
     except :
         pynvml=None
 
