@@ -252,7 +252,9 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head and
+                              get_global_server_args().lm_head_tp_size <= 1,
+            use_lm_head_tp_group=get_global_server_args().lm_head_tp_size > 1,
         )
         self.logits_processor = LogitsProcessor(config)
 

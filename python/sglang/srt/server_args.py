@@ -529,6 +529,7 @@ class ServerArgs:
 
     attn_cp_size: int = 1
     moe_dp_size: int = 1
+    lm_head_tp_size: int = 1
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -3124,6 +3125,21 @@ class ServerArgs:
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
 
     def _handle_data_parallelism(self):
+        assert self.lm_head_tp_size >= 1, "lm_head_tp_size must be >= 1"
+        if self.lm_head_tp_size > 1:
+            assert (
+                    self.tp_size % self.lm_head_tp_size == 0
+            ), "tp_size must be divisible by lm_head_tp_size"
+        if self.enable_dp_attention:
+            assert (
+                    self.dp_size % self.lm_head_tp_size == 0
+                    or self.lm_head_tp_size % self.dp_size == 0
+                    or self.tp_size == self.dp_size
+            ), (
+                    "lm_head_tp_size with DP attention expects an aligned layout. "
+                    "For EP32/DP32, use tp_size=dp_size and lm_head_tp_size=8."
+            )
+
         if self.dp_size == 1:
             self.enable_dp_attention = False
             self.enable_dp_lm_head = False
@@ -5116,6 +5132,17 @@ class ServerArgs:
             default=ServerArgs.moe_dp_size,
             help="The moe data parallelism size.",
         )
+        parser.add_argument(
+            "--lm-head-tp-size",
+            type=int,
+            default=ServerArgs.lm_head_tp_size,
+            help=(
+                "Shard the LM-head vocabulary dimension across this many ranks "
+                "independently from attention TP. This is useful with DP attention "
+                "layouts such as tp_size=dp_size where attention TP is 1."
+            ),
+        )
+
         parser.add_argument(
             "--pipeline-parallel-size",
             "--pp-size",
