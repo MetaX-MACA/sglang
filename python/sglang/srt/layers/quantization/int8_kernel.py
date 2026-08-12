@@ -60,6 +60,59 @@ def _per_token_quant_int8(
     tl.store(scale_ptr + row_id, scale_x.to(scale_ptr.dtype.element_ty))
 
 
+@triton.jit
+def _per_token_quant_int8_multirow(
+    x_ptr,
+    xq_ptr,
+    scale_ptr,
+    x_sum_ptr,
+    stride_x,
+    stride_xq,
+    n_rows,
+    n_cols,
+    CAL_SUM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row_start = tl.program_id(0) * BLOCK_M
+    rows = row_start + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_N)
+    mask = (rows[:, None] < n_rows) & (cols[None, :] < n_cols)
+
+    x_offsets = rows[:, None] * stride_x + cols[None, :]
+    x = tl.load(x_ptr + x_offsets, mask=mask, other=0.0).to(tl.float32)
+    absmax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-10)
+    scale_x = absmax / 127.0
+    x_q = x * (127.0 / absmax[:, None])
+    x_q = tl.extra.cuda.libdevice.round(x_q).to(tl.int8)
+
+    if CAL_SUM:
+        x_sum = tl.sum(x, axis=1)
+        tl.store(
+            x_sum_ptr + rows,
+            x_sum.to(x_sum_ptr.dtype.element_ty),
+            mask=rows < n_rows,
+        )
+
+    xq_offsets = rows[:, None] * stride_xq + cols[None, :]
+    tl.store(xq_ptr + xq_offsets, x_q, mask=mask)
+    tl.store(
+        scale_ptr + rows,
+        scale_x.to(scale_ptr.dtype.element_ty),
+        mask=rows < n_rows,
+    )
+
+
+def _get_per_token_quant_rows_per_program(n_rows: int, n_cols: int) -> int:
+    block_n = triton.next_power_of_2(n_cols)
+    # Bound the tile working set while retaining enough programs to saturate
+    # the device. These limits cover the C600 prefill shapes without tuning.
+    max_rows_by_work = max(1, 4096 // block_n)
+    rows_by_grid = max(1, n_rows // 512)
+    rows_by_grid = 1 << (rows_by_grid.bit_length() - 1)
+    return min(16, max_rows_by_work, rows_by_grid)
+
+
 def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
     if  _USE_SGL_KERNEL_QUANT:
         x, scale, _ = scaled_int8_quant(x)
@@ -74,23 +127,40 @@ def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
     else:
         x_sum = None
     BLOCK = triton.next_power_of_2(N)
-    # heuristics for number of warps
-    num_warps = min(max(BLOCK // 256, 1), 8)
+    rows_per_program = _get_per_token_quant_rows_per_program(M, N)
+    num_warps = min(max(BLOCK * rows_per_program // 256, 1), 8)
 
     assert x.is_contiguous()
-    _per_token_quant_int8[(M,)](
-        x,
-        x_q,
-        scales,
-        x_sum,
-        stride_x=x.stride(-2),
-        stride_xq=x_q.stride(-2),
-        N=N,
-        CAL_SUM=cal_sum,
-        BLOCK=BLOCK,
-        num_warps=num_warps,
-        num_stages=1,
-    )
+    if rows_per_program > 1:
+        _per_token_quant_int8_multirow[(triton.cdiv(M, rows_per_program),)](
+            x,
+            x_q,
+            scales,
+            x_sum,
+            stride_x=x.stride(-2),
+            stride_xq=x_q.stride(-2),
+            n_rows=M,
+            n_cols=N,
+            CAL_SUM=cal_sum,
+            BLOCK_M=rows_per_program,
+            BLOCK_N=BLOCK,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+    else:
+        _per_token_quant_int8[(M,)](
+            x,
+            x_q,
+            scales,
+            x_sum,
+            stride_x=x.stride(-2),
+            stride_xq=x_q.stride(-2),
+            N=N,
+            CAL_SUM=cal_sum,
+            BLOCK=BLOCK,
+            num_warps=num_warps,
+            num_stages=1,
+        )
     if cal_sum:
         return x_q, scales, x_sum
     else:
