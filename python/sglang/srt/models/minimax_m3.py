@@ -457,25 +457,23 @@ class MiniMaxM3MoE(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        tensor_scale_tuple = None
         if isinstance(hidden_states, tuple):
             packed_hidden = hidden_states[0]
-            hidden_states = (
-                hidden_states[1]
-                if isinstance(hidden_states[2], tuple)
-                else hidden_states[2]
-            )
+            tensor_scale_tuple = hidden_states[2]
+            hidden_states = hidden_states[1]
         else:
             packed_hidden = hidden_states
             if self.use_fused_quant and packed_hidden.shape[0] == 0:
                 packed_hidden = torch.empty(
-                    (0, align_packed_tensor_size(hidden_states.shape[-1])),
+                    (0, align_packed_tensor_size(packed_hidden.shape[-1])),
                     dtype=hidden_states.dtype,
                     device=hidden_states.device,
                 )
 
         shared_output = None
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(hidden_states)
+            shared_output = self._forward_shared_experts(tensor_scale_tuple if (self.use_fused_quant and tensor_scale_tuple is not None) else hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
             topk_output = self.topk(
                 hidden_states,
@@ -491,7 +489,7 @@ class MiniMaxM3MoE(nn.Module):
         # DeepEPMoE returns the complete per-token routed result (no TP all-reduce
         # here, unlike forward_normal), and the shared experts are replicated
         # (tp_size=1, see __init__), so both are complete per token and add directly.
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        final_hidden_states = self.experts(packed_hidden, topk_output)
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
