@@ -787,7 +787,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_input = silu_and_mul_masked(
             gateup_output, masked_m,
             gemm1_alpha=getattr(self.config, 'gemm1_alpha', 0.0) or 0.0,
-            swiglu_limit=getattr(self.config, 'swiglu_limit', 0.0) or 0.0,
+            swiglu_limit=getattr(self.config, 'gemm1_clamp_limit', None) or getattr(self.config, 'swiglu_limit', None) or 0.0,
         )
         del gateup_output
 
