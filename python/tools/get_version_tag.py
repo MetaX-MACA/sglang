@@ -18,35 +18,10 @@ Strategy:
    from main where release tags only exist on release branches.
 """
 
-import re
 import subprocess
 import sys
+import os
 
-
-def parse_version_tuple(tag: str) -> tuple:
-    """Parse a version tag into a sortable tuple using PEP 440 ordering.
-
-    Returns a tuple where:
-    - Base version parts are integers: (major, minor, patch)
-    - Pre-release suffix gets a lower sort key than bare version:
-      v0.5.10rc0  -> (0, 5, 10, 0, 0)   # pre-release
-      v0.5.10     -> (0, 5, 10, 1, 0)   # stable (sorts higher)
-      v0.5.10.post1 -> (0, 5, 10, 2, 1)  # post-release (sorts highest)
-    """
-    v = tag.lstrip("v")
-    # Split base version from suffix
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:\.?(rc|post)(\d+))?$", v)
-    if not m:
-        return (0, 0, 0, 0, 0)
-    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    suffix_type = m.group(4)
-    suffix_num = int(m.group(5)) if m.group(5) else 0
-    if suffix_type == "rc":
-        return (major, minor, patch, 0, suffix_num)
-    elif suffix_type == "post":
-        return (major, minor, patch, 2, suffix_num)
-    else:
-        return (major, minor, patch, 1, 0)
 
 
 def run_git(*args: str, allow_failure: bool = False) -> str:
@@ -79,91 +54,47 @@ def run_git(*args: str, allow_failure: bool = False) -> str:
 
     return result.stdout.strip()
 
+def get_git_branch() -> str:
+    """获取当前分支名，并将斜杠替换为点（例如 release/v0.5.17 -> release.v0.5.17）。"""
+    branch = run_git("branch", "--show-current")
+    if not branch:
+        branch = run_git("rev-parse", "--abbrev-ref", "HEAD")
+        if branch == "HEAD":
+            branch = "detached"
+            
+    if not branch:
+        branch = "unknown"
 
-def get_exact_version_tag() -> str:
-    """Return the version tag name if HEAD has an exact version tag, or empty string."""
-    return run_git(
-        "describe", "--tags", "--exact-match", "--match", "v*", allow_failure=True
-    )
+    return branch.replace('/', '.')
 
+def get_git_short_commit() -> str:
+    """获取短 commit hash。"""
+    return run_git("rev-parse", "--short", "HEAD", allow_failure=True) or "unknown"
 
-def get_latest_version_tag_describe() -> str:
-    """Find the highest version tag and build a describe string relative to it.
+def get_maca_ai_version() -> str:
+    """从 环境变量 提取 MACA 版本，如 "3.8.0.4" """
+    return os.environ.get('MACA_AI_VERSION', '0.0.0.0')
 
-    Uses PEP 440 version ordering so that stable releases sort above
-    pre-release tags (e.g., v0.5.10 > v0.5.10rc0).
-
-    The highest tag may live on a release branch and not be a direct
-    ancestor of HEAD (e.g., main diverged before the release tag was
-    created). In that case, we compute the commit distance from the
-    merge-base and build the describe string manually.
-    """
-    tag = get_latest_version_tag()
+def get_current_base_version() -> str:
+    """获取当前提交的最近标签（不含距离），如 'v0.5.14' 或 '0.5.14'，失败返回 '0.0.0'。"""
+    tag = run_git("describe", "--tags", "--abbrev=0", allow_failure=True)
     if not tag:
-        print("WARNING: No version tags (v*.*.*) found in repo", file=sys.stderr)
-        return ""
-
-    # Fast path: tag is an ancestor of HEAD, git describe works directly
-    result = run_git(
-        "describe", "--tags", "--long", "--match", tag, "HEAD", allow_failure=True
-    )
-    if result:
-        return result
-
-    # Tag is not an ancestor (e.g., release branch diverged from main).
-    # Build describe string manually: {tag}-{distance}-g{hash}
-    merge_base = run_git("merge-base", tag, "HEAD", allow_failure=True)
-    if not merge_base:
-        print(
-            f"WARNING: No common ancestor between {tag} and HEAD. "
-            f"Is this a shallow clone? Try: git fetch --unshallow --tags",
-            file=sys.stderr,
-        )
-        return ""
-    distance = run_git("rev-list", "--count", f"{merge_base}..HEAD")
-    short_hash = run_git("rev-parse", "--short", "HEAD")
-    return f"{tag}-{distance}-g{short_hash}"
-
-
-def get_version_describe() -> str:
-    """Main entry point: resolve the version describe string."""
-    # Prefer exact match — correct for both stable and pre-release tags
-    exact = get_exact_version_tag()
-    if exact:
-        return exact
-
-    # Fallback for untagged commits (e.g., dev install from main)
-    return get_latest_version_tag_describe()
-
-
-def get_latest_version_tag() -> str:
-    """Return just the highest version tag (PEP 440 ordered), or empty string."""
-    tags_raw = run_git("tag", "--list", "v*.*.*")
-    if not tags_raw:
-        return ""
-    tag_list = sorted(tags_raw.splitlines(), key=parse_version_tuple, reverse=True)
-    return tag_list[0] if tag_list else ""
+        return "0.0.0"
+    return tag.lstrip('v')
 
 
 def main() -> None:
-    # --tag-only: print just the latest version tag (for CI scripts)
-    tag_only = "--tag-only" in sys.argv
-    if tag_only:
-        result = get_latest_version_tag()
-    else:
-        result = get_version_describe()
-    if not result:
-        print(
-            "ERROR: Could not determine version from git tags.\n"
-            "Possible causes:\n"
-            "  - No version tags (v*.*.*) exist: run 'git fetch --tags'\n"
-            "  - Shallow clone without tags: run 'git fetch --unshallow --tags'\n"
-            "  - Git safe.directory issue: run 'git config --global --add safe.directory <repo>'\n"
-            "  - Not inside a git repository\n"
-            "setuptools-scm will fall back to version 0.0.0.dev0",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    # 获取基础版本（当前分支最近标签）
+    base = get_current_base_version()
+
+    # 获取自定义信息
+    branch = get_git_branch()
+    commitid = get_git_short_commit()
+    ai_maca = get_maca_ai_version()
+
+    # 拼接自定义部分：分支名-commitid-maca版本号
+    result = f"{base}+{branch}-{commitid}-maca{ai_maca}"
+    # print("环境变量获取maca版本：",ai_result)
     print(result)
 
 
