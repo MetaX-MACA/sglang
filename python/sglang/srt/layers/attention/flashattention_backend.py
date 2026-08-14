@@ -1701,8 +1701,26 @@ class FlashAttentionBackend(AttentionBackend):
                         # **kwargs,
                     )
                 else:
+                    def is_one(x):
+                        if torch.is_tensor(x):
+                            if x.numel() == 1:
+                                return x.item() == 1
+                            else:
+                                return False
+                        elif isinstance(x, (int, float)):
+                            return x == 1
+                        else:
+                            return False
+                    tmp_q=q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                    max_seqlen_q_is_one = is_one(max_seqlen_q)
+                    if (max_seqlen_q_is_one):
+                        batch_size=cu_seqlens_q.size(0) - 1
+                        q_small=tmp_q[0:batch_size, :, :]
+                        padding_size=tmp_q.size(0) - q_small.size(0)
+                        #print(f"{q.shape=} {tmp_q.shape=} {q_small.shape=} {padding_size=}")
+                        tmp_q=q_small
                     result = flash_attn_varlen_func(
-                        q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        q=tmp_q,
                         k=key_cache,
                         v=value_cache,
                         block_table=page_table,
@@ -1716,6 +1734,8 @@ class FlashAttentionBackend(AttentionBackend):
                         softcap=layer.logit_cap,
                         s_aux=sinks,
                     )
+                    if (max_seqlen_q_is_one):
+                        result = F.pad(result, pad=(0, 0) * 2 + (0, padding_size), mode='constant', value=0)
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
