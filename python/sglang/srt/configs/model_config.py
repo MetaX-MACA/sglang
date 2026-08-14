@@ -399,9 +399,9 @@ class ModelConfig:
                 logger.info(
                     f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
                 )
-            elif self.hf_config.architectures[0] in MIMO_V2_MULTIMODAL_ARCHS and not (
-                hasattr(self.hf_config, "vision_config")
-                and hasattr(self.hf_config, "audio_config")
+            elif self.hf_config.architectures[0] in MIMO_V2_MULTIMODAL_ARCHS and (
+                (not hasattr(self.hf_config, "vision_config") or self.hf_config.vision_config is None) and 
+                (not hasattr(self.hf_config, "audio_config") or self.hf_config.audio_config is None)
             ):
                 enable_multimodal = False
                 logger.info(
