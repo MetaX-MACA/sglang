@@ -1313,6 +1313,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
+        is_idle_in_batch = 0 in global_num_tokens
 
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
@@ -1359,6 +1360,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
+
+        if dp_padding_mode.is_max_len() and self.is_extend_in_batch and is_idle_in_batch:
+            dp_padding_mode = DpPaddingMode.SUM_LEN
+
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():

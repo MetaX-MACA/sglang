@@ -1035,6 +1035,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             return batch_output
 
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
+        batch.spec_info.num_tokens_per_req = self.speculative_num_steps + 1
         return run_eagle_verify(
             batch,
             target_worker=self.target_worker,

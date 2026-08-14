@@ -116,7 +116,7 @@ class RotaryEmbedding(BaseFusedOp):
             # rotary_embedding from sglang.kernels.ops.attention.rope and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
             if _is_cuda:
-                from sglang.kernels.ops.attention.rope import rotary_embedding
+                from sgl_kernel import rotary_embedding
             elif _is_hip:
                 from sgl_kernel import rotary_embedding
             else:

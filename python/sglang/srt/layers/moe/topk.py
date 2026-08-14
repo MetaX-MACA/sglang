@@ -2395,7 +2395,10 @@ def select_experts(
                 if kimi or deepseek:
                     topk_ids = torch.empty((hidden_states.shape[0], top_k), dtype=torch.int, device=hidden_states.device)
                     topk_weights = torch.empty((hidden_states.shape[0], top_k), dtype=torch.float, device=hidden_states.device)
-                    bias_bf16 = correction_bias.to(torch.bfloat16)
+                    if correction_bias.dtype != router_logits.dtype:
+                        bias_bf16 = correction_bias.to(router_logits.dtype)
+                    else:
+                        bias_bf16 = correction_bias
                     fused_moe_gate_opt(
                         router_logits,
                         bias_bf16,
