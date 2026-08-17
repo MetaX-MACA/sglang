@@ -1317,6 +1317,9 @@ class Envs:
     # ===================================================================
     # Encoder pipeline and disaggregation
     # ===================================================================
+
+    SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(60)
+
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
