@@ -2628,45 +2628,59 @@ def grouped_gemm_triton_kernel(
     tl.store(c_ptr, c_tile, mask=c_mask)
 
 
+def _mcoplib_supports_gemm1_alpha():
+    if not hasattr(_mcoplib_supports_gemm1_alpha, "_cached"):
+        dummy_out = torch.empty((1, 1, 256), device="cuda", dtype=torch.bfloat16)
+        dummy_in = torch.empty((1, 1, 512), device="cuda", dtype=torch.bfloat16)
+        dummy_mask = torch.zeros(1, device="cuda", dtype=torch.int32)
+        try:
+            mcoplib.op.fused_silu_mul_dq_mask_quant(
+                dummy_out, dummy_in, dummy_mask,
+                gemm1_alpha=1.0, gemm1_limit=1.0,
+            )
+            _mcoplib_supports_gemm1_alpha._cached = True
+        except TypeError:
+            _mcoplib_supports_gemm1_alpha._cached = False
+    return _mcoplib_supports_gemm1_alpha._cached
+
+
 def silu_and_mul_masked(
     input: torch.Tensor,
     masked_m: torch.Tensor,
     swiglu_limit: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
 ):
-    if gemm1_alpha is not None and gemm1_alpha > 0 and swiglu_limit is not None and swiglu_limit > 0:
-        expert_num, token_num, two_inter = input.shape
-        inter = two_inter // 2
-
-        temp = torch.zeros(
-            (expert_num, token_num, inter),
-            device=input.device,
-            dtype=torch.bfloat16,
-        )
-        silu_and_mul_masked_fwd_no_pack(
-            input, temp, masked_m, gemm1_alpha, swiglu_limit
-        )
-
-        absmax = temp.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
-        scale = (absmax / 127.0).to(torch.float32).contiguous()
-
-        q = (temp / scale.to(temp.dtype)).round().clamp(-127, 127).to(torch.int8)
-
-        out_stride = (two_inter // 4 + 257) // 256 * 256
-        output = torch.zeros(
-            (expert_num, token_num, out_stride),
-            device=input.device,
-            dtype=input.dtype,
-        )
-        out_i8 = output.view(torch.int8)
-        out_i8[:, :, :inter] = q
-
-        scale_bytes = scale.view(torch.int8)
-        out_i8[:, :, inter : inter + 4] = scale_bytes
-
-        return output
-
     out_stride = (input.shape[-1] // 4 + 257) // 256 * 256
     output = torch.empty((input.shape[0], input.shape[1], out_stride), device=input.device, dtype=input.dtype)
-    mcoplib.op.fused_silu_mul_dq_mask_quant(output, input, masked_m, swiglu_limit)
+
+    use_alpha = (
+        gemm1_alpha is not None and gemm1_alpha > 0
+        and swiglu_limit is not None and swiglu_limit > 0
+    )
+    if use_alpha:
+        if _mcoplib_supports_gemm1_alpha():
+            mcoplib.op.fused_silu_mul_dq_mask_quant(
+                output, input, masked_m,
+                gemm1_alpha=gemm1_alpha, gemm1_limit=swiglu_limit,
+            )
+        else:
+            expert_num, token_num, two_inter = input.shape
+            inter = two_inter // 2
+            temp = torch.zeros(
+                (expert_num, token_num, inter),
+                device=input.device,
+                dtype=torch.bfloat16,
+            )
+            silu_and_mul_masked_fwd_no_pack(
+                input, temp, masked_m, gemm1_alpha, swiglu_limit
+            )
+            absmax = temp.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+            scale = (absmax / 127.0).to(torch.float32).contiguous()
+            q = (temp / scale.to(temp.dtype)).round().clamp(-127, 127).to(torch.int8)
+            out_i8 = output.view(torch.int8)
+            out_i8[:, :, :inter] = q
+            scale_bytes = scale.view(torch.int8)
+            out_i8[:, :, inter : inter + 4] = scale_bytes
+    else:
+        mcoplib.op.fused_silu_mul_dq_mask_quant(output, input, masked_m, swiglu_limit)
     return output
