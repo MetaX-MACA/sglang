@@ -473,7 +473,7 @@ class MiniMaxM3MoE(nn.Module):
 
         shared_output = None
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(tensor_scale_tuple if (self.use_fused_quant and tensor_scale_tuple is not None) else hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
             topk_output = self.topk(
                 hidden_states,
@@ -1419,16 +1419,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         if self.use_gemma_norm:
             self.input_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size, eps=config.rms_norm_eps,
             )
             self.post_attention_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size, eps=config.rms_norm_eps,
+                fused_quant=fused_quant,
+                packed_quant=packed_quant,
+                packed_size=align_packed_tensor_size(config.hidden_size),
             )
         else:
             self.input_layernorm = RMSNorm(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
-                fused_quant=fused_quant_pd,
             )
             self.post_attention_layernorm = RMSNorm(
                 config.hidden_size,
@@ -1514,7 +1516,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
             forward_batch
         )
 
-        if self.is_layer_sparse or hidden_states.shape[0] != 0:
+        hs = hidden_states[1] if isinstance(hidden_states, tuple) else hidden_states
+        if self.is_layer_sparse or hs.shape[0] != 0:
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
