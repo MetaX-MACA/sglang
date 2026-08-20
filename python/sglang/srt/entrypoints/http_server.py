@@ -1964,7 +1964,10 @@ def _execute_server_warmup(server_args: ServerArgs):
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
-            logger.info(f"Start of pd disaggregation warmup ...")
+            logger.info("Start of pd disaggregation warmup ...")
+            # PD bootstrap fields are supported by the native generate API,
+            # not by the OpenAI chat completion request schema.
+            request_name = "/generate"
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -1996,10 +1999,9 @@ def _execute_server_warmup(server_args: ServerArgs):
                 logger.info("End of disaggregation warmup")
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
-                logger.info(
-                    "Prefill disaggregation mode warm Up Failed, status code: {}".format(
-                        res.status_code
-                    )
+                logger.error(
+                    "PD disaggregation warmup failed, "
+                    f"status_code={res.status_code}, response={res.text}"
                 )
                 _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
 

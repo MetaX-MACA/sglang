@@ -694,7 +694,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
-            - 1
         ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,

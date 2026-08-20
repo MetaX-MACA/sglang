@@ -31,7 +31,9 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     group_concurrent_contiguous,
     pack_int_lists,
+    pack_nested_int_lists,
     unpack_int_lists,
+    unpack_nested_int_lists,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
@@ -129,6 +131,7 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
+    dst_state_shard_groups_per_tensor: List[List[List[int]]]
     # HiSparse: decode host pool stores KV at token granularity
     enable_hisparse: bool = False
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
@@ -153,11 +156,14 @@ class KVArgsRegisterInfo:
             dst_state_dim_per_tensor=(
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
             ),
+            dst_state_shard_groups_per_tensor=(
+                unpack_nested_int_lists(msg[12], "I") if len(msg) > 12 else []
+            ),
             enable_hisparse=(
-                msg[12].decode("ascii") == "1" if len(msg) > 12 else False
+                msg[13].decode("ascii") == "1" if len(msg) > 13 else False
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
 
 
@@ -985,6 +991,11 @@ class MooncakeKVManager(CommonKVManager):
                 if i < len(self.kv_args.state_dim_per_tensor)
                 else []
             )
+            src_shard_groups = (
+                getattr(self.kv_args, "state_shard_groups_per_tensor", [])[i]
+                if i < len(getattr(self.kv_args, "state_shard_groups_per_tensor", []))
+                else []
+            )
             if target_rank_registration_info is not None:
                 dst_data_ptrs = (
                     target_rank_registration_info.dst_state_data_ptrs[i]
@@ -1001,8 +1012,18 @@ class MooncakeKVManager(CommonKVManager):
                     if i < len(target_rank_registration_info.dst_state_dim_per_tensor)
                     else []
                 )
+                dst_shard_groups = (
+                    target_rank_registration_info.dst_state_shard_groups_per_tensor[i]
+                    if i
+                    < len(
+                        target_rank_registration_info.dst_state_shard_groups_per_tensor
+                    )
+                    else []
+                )
             else:
-                dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
+                dst_data_ptrs, dst_item_lens, dst_dim_per_tensor, dst_shard_groups = (
+                    [], [], [], []
+                )
             dst_indices = (
                 req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
             )
@@ -1026,6 +1047,8 @@ class MooncakeKVManager(CommonKVManager):
                             dst_dim_per_tensor,
                             target_rank_registration_info.dst_tp_rank,
                             target_rank_registration_info.dst_attn_tp_size,
+                            src_shard_groups,
+                            dst_shard_groups,
                         )
                         or rc
                     )
@@ -1145,16 +1168,10 @@ class MooncakeKVManager(CommonKVManager):
         dst_state_dim_per_tensor: list[int],
         dst_tp_rank: int,
         dst_attn_tp_size: int,
+        src_state_shard_groups: Optional[list[list[int]]] = None,
+        dst_state_shard_groups: Optional[list[list[int]]] = None,
     ):
-        """Transfer Mamba states with TP slice support.
-
-        Mamba state layout:
-        - conv_state: [num_layers, size+1, conv_dim/tp, conv_kernel-1]
-        - temporal_state: [num_layers, size+1, num_heads/tp, head_dim, state_size]
-
-        The 3rd dimension is sliced by TP. When prefill and decode have different
-        attn_tp_size, we need to slice the state accordingly.
-        """
+        """Transfer Mamba states across heterogeneous attention TP layouts."""
         logger.warning_once(
             "Using Mamba state slice transfer for different TP sizes between prefill and decode. "
             f"Prefill attn_tp_size={self.attn_tp_size}, Decode attn_tp_size={dst_attn_tp_size}. "
@@ -1162,7 +1179,6 @@ class MooncakeKVManager(CommonKVManager):
         )
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
 
-        # If no dimension info available, fall back to regular transfer
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
             return self._send_mamba_state(
                 req,
@@ -1173,51 +1189,105 @@ class MooncakeKVManager(CommonKVManager):
                 dst_mamba_index,
             )
 
-        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
-        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
+        local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+
+        src_dim_0 = src_state_dim_per_tensor[0]
+        dst_dim_0 = dst_state_dim_per_tensor[0]
+        if src_dim_0 > dst_dim_0 and dst_dim_0 > 0:
+            ratio = src_dim_0 // dst_dim_0
+            dst_engine_rank = dst_tp_rank % dst_attn_tp_size
+            if local_tp_rank != dst_engine_rank // ratio:
+                return 0
 
         transfer_blocks = []
         for src_i, dst_i in self._mamba_index_pairs(
             src_state_data_ptrs, dst_state_data_ptrs
         ):
-            dst_state_ptr = dst_state_data_ptrs[dst_i]
             src_item_len = src_state_item_lens[src_i]
             dst_item_len = dst_state_item_lens[dst_i]
             src_dim = src_state_dim_per_tensor[src_i]
             dst_dim = dst_state_dim_per_tensor[dst_i]
-
-            # item_len = dim * trailing_dims_size, so trailing_dims_size = item_len / dim
             src_bytes_per_dim = src_item_len // src_dim
             dst_bytes_per_dim = dst_item_len // dst_dim
+            if src_bytes_per_dim != dst_bytes_per_dim:
+                logger.error(
+                    "Mamba state byte size mismatch: src=%s dst=%s",
+                    src_bytes_per_dim,
+                    dst_bytes_per_dim,
+                )
+                return -1
 
-            if self.attn_tp_size > dst_attn_tp_size:
-                # Multiple prefill ranks send to 1 decode rank
-                src_dim_start = 0
-                num_dims_to_send = src_dim
-                writers_per_decode = self.attn_tp_size // dst_attn_tp_size
-                local_writer_idx = local_tp_rank_in_group % writers_per_decode
-                dst_dim_start = local_writer_idx * src_dim
-            else:
-                # 1 prefill rank sends to multiple decode ranks
-                src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
-                num_dims_to_send = dst_dim
-                dst_dim_start = 0
-
-            src_dim_offset = src_dim_start * src_bytes_per_dim
-            dst_dim_offset = dst_dim_start * dst_bytes_per_dim
-            bytes_to_send = num_dims_to_send * src_bytes_per_dim
-
-            src_addr = (
-                src_state_data_ptrs[src_i]
-                + src_item_len * int(prefill_mamba_index[0])
-                + src_dim_offset
+            src_groups = (
+                src_state_shard_groups[src_i]
+                if src_state_shard_groups and src_i < len(src_state_shard_groups)
+                else []
             )
-            dst_addr = (
-                dst_state_ptr + dst_item_len * int(dst_mamba_index[0]) + dst_dim_offset
+            dst_groups = (
+                dst_state_shard_groups[dst_i]
+                if dst_state_shard_groups and dst_i < len(dst_state_shard_groups)
+                else []
             )
+            if not src_groups or not dst_groups:
+                src_groups = [src_dim * self.attn_tp_size]
+                dst_groups = [dst_dim * dst_attn_tp_size]
+            if src_groups != dst_groups:
+                logger.error(
+                    "Mamba state shard groups mismatch: src=%s dst=%s",
+                    src_groups,
+                    dst_groups,
+                )
+                return -1
 
-            transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
+            src_base = src_state_data_ptrs[src_i] + src_item_len * int(
+                prefill_mamba_index[0]
+            )
+            dst_base = dst_state_data_ptrs[dst_i] + dst_item_len * int(
+                dst_mamba_index[0]
+            )
+            dst_engine_rank = dst_tp_rank % dst_attn_tp_size
+            src_local_offset = 0
+            dst_local_offset = 0
+            global_offset = 0
 
+            for group_dim in src_groups:
+                if (
+                    group_dim % self.attn_tp_size != 0
+                    or group_dim % dst_attn_tp_size != 0
+                ):
+                    logger.error(
+                        "Mamba state shard group %s is not divisible by TP %s/%s",
+                        group_dim,
+                        self.attn_tp_size,
+                        dst_attn_tp_size,
+                    )
+                    return -1
+
+                src_group_dim = group_dim // self.attn_tp_size
+                dst_group_dim = group_dim // dst_attn_tp_size
+                src_global_start = global_offset + local_tp_rank * src_group_dim
+                src_global_end = src_global_start + src_group_dim
+                dst_global_start = global_offset + dst_engine_rank * dst_group_dim
+                dst_global_end = dst_global_start + dst_group_dim
+                copy_start = max(src_global_start, dst_global_start)
+                copy_end = min(src_global_end, dst_global_end)
+
+                if copy_start < copy_end:
+                    src_dim_start = src_local_offset + copy_start - src_global_start
+                    dst_dim_start = dst_local_offset + copy_start - dst_global_start
+                    transfer_blocks.append(
+                        (
+                            src_base + src_dim_start * src_bytes_per_dim,
+                            dst_base + dst_dim_start * dst_bytes_per_dim,
+                            (copy_end - copy_start) * src_bytes_per_dim,
+                        )
+                    )
+
+                src_local_offset += src_group_dim
+                dst_local_offset += dst_group_dim
+                global_offset += group_dim
+
+        if not transfer_blocks:
+            return 0
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
     def sync_status_to_decode_endpoint(
@@ -1821,6 +1891,10 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_dim_per_tensor = pack_int_lists(
                 getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
             )
+            packed_state_shard_groups_per_tensor = pack_nested_int_lists(
+                getattr(self.kv_mgr.kv_args, "state_shard_groups_per_tensor", [])
+                or [], "I"
+            )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
@@ -1856,6 +1930,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_kv_item_len,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
+                        packed_state_shard_groups_per_tensor,
                         enable_hisparse,
                         packed_staging_base_ptr,
                         staging_total_size_str,

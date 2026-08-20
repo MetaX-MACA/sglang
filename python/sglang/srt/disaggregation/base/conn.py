@@ -41,6 +41,8 @@ class KVArgs:
     state_item_lens: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
+    # Global TP shard groups for each state tensor (for example Q/K/V).
+    state_shard_groups_per_tensor: List[List[List[int]]]
     # Mamba PP metadata, used when prefill/decode pp_size differ. Both describe
     # the local (this PP stage's) mamba state buffers: how many mamba layers this
     # stage owns, and where they start in the model's global mamba layer list.

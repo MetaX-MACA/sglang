@@ -244,6 +244,9 @@ class MambaPool:
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
+        self.conv_shard_groups = getattr(
+            cache_params.shape, "conv_shard_groups", [[] for _ in conv_state_shape]
+        )
         conv_dtype = cache_params.dtype.conv
         ssm_dtype = cache_params.dtype.temporal
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -483,6 +486,8 @@ class MambaPool:
         """
         state_tensors = []
         for field in vars(self.mamba_cache):
+            if field in ("intermediate_ssm", "intermediate_conv_window"):
+                continue
             value = getattr(self.mamba_cache, field)
             if isinstance(value, list):
                 state_tensors.extend(value)
@@ -497,6 +502,23 @@ class MambaPool:
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
+
+    def get_state_shard_groups_per_tensor(self):
+        """Return global shard groups for each transferable state tensor."""
+        shard_groups = []
+        for field in vars(self.mamba_cache):
+            if field in ("intermediate_ssm", "intermediate_conv_window"):
+                continue
+            value = getattr(self.mamba_cache, field)
+            if field == "conv":
+                tensor_groups = self.conv_shard_groups
+            elif isinstance(value, list):
+                tensor_groups = [[] for _ in value]
+            else:
+                tensor_groups = [[]]
+            for groups in tensor_groups:
+                shard_groups += [groups] * self.num_mamba_layers
+        return shard_groups
 
     def get_state_num_mamba_layers(self) -> int:
         """Number of mamba layers held by this PP stage."""
@@ -1539,6 +1561,9 @@ class HybridLinearKVPool(KVCache):
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_shard_groups_per_tensor(self):
+        return self.mamba_pool.get_state_shard_groups_per_tensor()
 
     def get_state_num_mamba_layers(self):
         return self.mamba_pool.get_state_num_mamba_layers()

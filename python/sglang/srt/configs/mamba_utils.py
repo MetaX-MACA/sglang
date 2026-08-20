@@ -129,6 +129,7 @@ class BaseLinearStateParams(ABC):
 class Mamba2StateShape:
     conv: list[tuple[int, int]]
     temporal: tuple[int, int, int]
+    conv_shard_groups: list[list[int]]
 
     intermediate_size: int
     conv_dim: int
@@ -148,6 +149,7 @@ class Mamba2StateShape:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
+        conv_shard_groups: Optional[list[int]] = None,
     ) -> "Mamba2StateShape":
         # if n_groups is not divisible by world_size, need to extend the shards
         # to ensure all groups needed by a head is sharded along with it
@@ -156,6 +158,25 @@ class Mamba2StateShape:
             n_groups += extra_groups
         # heads and n_groups are TP-ed
         conv_dim = intermediate_size + 2 * n_groups * state_size
+        if conv_shard_groups is None:
+            conv_shard_groups = [conv_dim]
+        elif sum(conv_shard_groups) != conv_dim:
+            extra_conv_dim = conv_dim - sum(conv_shard_groups)
+            if (
+                len(conv_shard_groups) == 3
+                and conv_shard_groups[0] == conv_shard_groups[1]
+                and extra_conv_dim > 0
+                and extra_conv_dim % 2 == 0
+            ):
+                conv_shard_groups = [
+                    conv_shard_groups[0] + extra_conv_dim // 2,
+                    conv_shard_groups[1] + extra_conv_dim // 2,
+                    conv_shard_groups[2],
+                ]
+        assert sum(conv_shard_groups) == conv_dim, (
+            f"conv_shard_groups must sum to conv_dim: "
+            f"{conv_shard_groups=} {conv_dim=}"
+        )
 
         # contiguous along 'dim' axis
         conv_state_shape = divide(conv_dim, tp_world_size), conv_kernel - 1
@@ -167,6 +188,7 @@ class Mamba2StateShape:
         return Mamba2StateShape(
             conv=[conv_state_shape],
             temporal=temporal_state_shape,
+            conv_shard_groups=[conv_shard_groups],
             intermediate_size=intermediate_size,
             conv_dim=conv_dim,
             ssm_state_size=state_size,

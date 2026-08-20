@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+import mcoplib.op as mcoplib_ops
 from mcoplib.custom_ops import fused_add_rms_norm_dynamic_per_token_quant_padding_output
 from sgl_kernel import rms_norm_dynamic_per_token_quant_custom
 _is_cuda = is_cuda()
@@ -674,6 +675,68 @@ class LayerNorm(MultiPlatformOp):
             return self.forward_native(x)
 
 
+def _gemma_fused_add_rmsnorm_quant(
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    weight: torch.Tensor,
+    pad_size: int,
+    eps: float,
+    need_pack: bool,
+):
+    """RMSNorm + dynamic per-token int8 quant with Gemma (1 + weight) semantics.
+
+    Bound here rather than in mcoplib.custom_ops: the op is registered in the
+    prebuilt wheel's pybind module but has no Python wrapper there, and the wheel
+    gets reinstalled by build.sh.
+
+    `weight` is the raw checkpoint delta. The kernel adds 1 in fp32 registers, so
+    w keeps full bf16 precision; a precomputed bf16 (1 + w) would instead round
+    onto the [1, 2) grid (ULP 2^-7) and cost w about 7 mantissa bits.
+
+    Returns (packed_out, residual_out, bf16_out, int8_out, int8_scale), matching
+    fused_add_rms_norm_dynamic_per_token_quant_padding_output. packed_out is
+    meaningless when need_pack is False.
+    """
+    assert x.is_contiguous() and weight.is_contiguous()
+    hidden_size = x.shape[-1]
+    num_tokens = x.numel() // hidden_size
+
+    if need_pack:
+        packed_shape = list(x.shape)
+        packed_shape[-1] = pad_size
+        packed_out = torch.empty(packed_shape, dtype=torch.bfloat16, device=x.device)
+        packed_view = packed_out.view(dtype=torch.int8)
+    else:
+        # bneed_pack=False writes a [num_tokens, hidden_size] int8 tile instead.
+        packed_view = torch.empty(
+            (num_tokens, hidden_size), dtype=torch.int8, device=x.device
+        )
+        packed_out = packed_view
+
+    bf16_out = torch.empty_like(x)
+    int8_out = torch.empty_like(x, dtype=torch.int8)
+    int8_scale = torch.empty((num_tokens, 1), device=x.device, dtype=torch.float32)
+    # The op takes a plain Tensor&, not an optional, so pass an empty tensor.
+    residual_arg = (
+        residual
+        if residual is not None
+        else torch.empty(0, dtype=x.dtype, device=x.device)
+    )
+    mcoplib_ops.add_gemma_rms_norm_dynamic_per_token_quant_padding_output(
+        packed_view,
+        bf16_out,
+        int8_out,
+        int8_scale,
+        x,
+        residual_arg,
+        weight,
+        pad_size,
+        eps,
+        need_pack,
+    )
+    return packed_out, residual, bf16_out, int8_out, int8_scale
+
+
 class GemmaRMSNorm(MultiPlatformOp):
     def __init__(
         self,
@@ -722,20 +785,23 @@ class GemmaRMSNorm(MultiPlatformOp):
             x = x.contiguous().reshape(-1, original_shape[-1])
 
         if self.fused_quant:
-            # The MetaX fused kernels implement standard RMSNorm semantics, while
-            # Gemma stores (weight - 1) in the checkpoint. Use the precomputed
-            # +1 weight so the fused and unfused paths are mathematically equal.
+            # Use the Gemma-semantics MetaX kernel and hand it the raw checkpoint
+            # delta: it forms (1 + w) in fp32 registers, so w keeps its full bf16
+            # precision. Passing the precomputed gemma_weight instead rounds
+            # (1 + w) onto the bf16 [1, 2) grid, whose ULP is 2^-7, and costs w
+            # about 7 mantissa bits.
             if residual is not None and post_residual_addition is not None:
                 residual = residual + post_residual_addition
 
             if self.packed_quant:
                 packed_out, residual_out, bf16_out, int8_out, int8_scale = (
-                    fused_add_rms_norm_dynamic_per_token_quant_padding_output(
+                    _gemma_fused_add_rmsnorm_quant(
                         x.contiguous(),
                         residual,
-                        self.gemma_weight.data,
+                        self.weight.data,
                         self.packed_size,
                         self.variance_epsilon,
+                        True,
                     )
                 )
                 outputs = (packed_out, bf16_out, (int8_out, int8_scale))
@@ -743,18 +809,19 @@ class GemmaRMSNorm(MultiPlatformOp):
                     return outputs, residual_out
                 return outputs
 
-            int8_out, bf16_out, int8_scale = (
-                rms_norm_dynamic_per_token_quant_custom(
+            _, residual_out, bf16_out, int8_out, int8_scale = (
+                _gemma_fused_add_rmsnorm_quant(
                     x.contiguous(),
-                    self.gemma_weight.data,
+                    residual,
+                    self.weight.data,
+                    x.shape[-1],
                     self.variance_epsilon,
-                    quant_dtype=torch.int8,
-                    residual=residual,
+                    False,
                 )
             )
             outputs = (int8_out, int8_scale, bf16_out)
             if residual is not None:
-                return outputs, residual
+                return outputs, residual_out
             return outputs
 
         if residual is not None:

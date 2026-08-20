@@ -40,6 +40,16 @@ def unpack_int_lists(buf: bytes, fmt: str) -> List[List[int]]:
     ]
 
 
+def pack_nested_int_lists(lists, fmt: str) -> bytes:
+    """Pack a three-level integer list while preserving empty inner lists."""
+    return pack_list_of_buffers([pack_int_lists(inner, fmt) for inner in lists])
+
+
+def unpack_nested_int_lists(buf: bytes, fmt: str) -> List[List[List[int]]]:
+    """Inverse of :func:`pack_nested_int_lists`."""
+    return [unpack_int_lists(inner, fmt) for inner in unpack_list_of_buffers(buf)]
+
+
 class FastQueue:
     def __init__(self):
         self._buf = deque()

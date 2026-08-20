@@ -583,6 +583,7 @@ def append_state_component(
     data_lens: List[int],
     item_lens: List[int],
     dim_per_tensor: Optional[List[int]] = None,
+    shard_groups_per_tensor: Optional[List[List[int]]] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
@@ -591,6 +592,7 @@ def append_state_component(
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
+    kv_args.state_shard_groups_per_tensor.append(shard_groups_per_tensor or [])
 
 
 def _set_mamba_pp_metadata(kv_args: KVArgs, pool) -> None:
@@ -624,6 +626,7 @@ def setup_state_kv_args(
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
+    kv_args.state_shard_groups_per_tensor = []
     kv_args.state_num_mamba_layers = 0
     kv_args.state_layer_global_start = 0
 
@@ -642,8 +645,19 @@ def setup_state_kv_args(
                 if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")
                 else None
             )
+            shard_groups = (
+                token_to_kv_pool.get_state_shard_groups_per_tensor()
+                if hasattr(token_to_kv_pool, "get_state_shard_groups_per_tensor")
+                else None
+            )
             append_state_component(
-                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+                kv_args,
+                StateType.MAMBA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                dim,
+                shard_groups,
             )
             _set_mamba_pp_metadata(kv_args, token_to_kv_pool)
         elif isinstance(token_to_kv_pool, (NSATokenToKVPool, NPUMLATokenToKVPool)):
@@ -680,8 +694,19 @@ def setup_state_kv_args(
                 if hasattr(req_to_token_pool, "get_state_dim_per_tensor")
                 else None
             )
+            shard_groups = (
+                req_to_token_pool.get_state_shard_groups_per_tensor()
+                if hasattr(req_to_token_pool, "get_state_shard_groups_per_tensor")
+                else None
+            )
             append_state_component(
-                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+                kv_args,
+                StateType.MAMBA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                dim,
+                shard_groups,
             )
             _set_mamba_pp_metadata(kv_args, req_to_token_pool)
 

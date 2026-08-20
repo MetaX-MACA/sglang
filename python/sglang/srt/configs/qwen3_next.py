@@ -295,6 +295,11 @@ class Qwen3NextConfig(PretrainedConfig):
             head_dim=self.linear_value_head_dim,
             state_size=self.linear_key_head_dim,
             conv_kernel=self.linear_conv_kernel_dim,
+            conv_shard_groups=[
+                self.linear_key_head_dim * self.linear_num_key_heads,
+                self.linear_key_head_dim * self.linear_num_key_heads,
+                self.linear_value_head_dim * self.linear_num_value_heads,
+            ],
         )
 
         return Mamba2CacheParams(
