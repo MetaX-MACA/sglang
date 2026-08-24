@@ -676,6 +676,11 @@ async def model_info():
         ) from exc
 
 
+@app.get("/get_model_info")
+async def get_model_info():
+    return await model_info()
+
+
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
     """
