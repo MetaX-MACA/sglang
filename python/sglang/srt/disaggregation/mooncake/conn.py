@@ -2436,7 +2436,7 @@ class MooncakeKVSender(CommonKVSender):
                     state_index_slices.append(None)
                 continue
 
-            if state_type in (StateType.SWA, StateType.NSA):
+            if state_type in (StateType.SWA, StateType.DSA):
                 indices_array = np.asarray(indices, dtype=np.int32)
                 filtered_indices, index_slice = filter_kv_indices_for_cp_rank(
                     self.kv_mgr,
