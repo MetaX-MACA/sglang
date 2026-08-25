@@ -50,9 +50,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._max_seqlen_q: int = 1
         self._max_seqlen_k: int = 1
 
-        self.block_size_q = 1
+        self.block_size_q = 8
         self.block_size_k = sparse_cfg["sparse_block_size"]
-        self.block_size_k = 64
+        self.block_size_k = 32
         if "sparse_init_block" in sparse_cfg:
             self.init_blocks = sparse_cfg["sparse_init_block"]
         else:
