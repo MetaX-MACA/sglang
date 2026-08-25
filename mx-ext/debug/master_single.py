@@ -360,7 +360,7 @@ class TaskScheduler:
             'MACA_PATH=/opt/maca',
             'MACA_CLANG_PATH=${MACA_PATH}/mxgpu_llvm/bin',
             # 'MXSHMEM_LIB_PATH=${MACA_PATH}/mxshmem/',
-            # 'DEVICE_MEM_CACHE_FLAG=0',
+            # 'MACA_DBG_DEVICE_MEM_CACHE_FLAG=0',
             # 'NVSHMEM_DISABLE_CUDA_VMM=1',
             # 'NVSHMEM_SYMMETRIC_SIZE=524288000',
             #'NVSHMEM_BOOTSTRAP_TWO_STAGE=1',',
