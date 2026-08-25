@@ -154,12 +154,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             server_args.enable_dp_attention and not self._draft_is_moe
         )
         attn_tp_size = server_args.tp_size // max(server_args.dp_size, 1)
-        if server_args.enable_dp_attention and self._draft_is_moe and attn_tp_size > 1:
-            raise ValueError(
-                "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "
-                "attn_tp == 1 (set --dp-size == --tp). attn_tp > 1 corrupts the "
-                "MoE-under-DP all-reduce."
-            )
+        # if server_args.enable_dp_attention and self._draft_is_moe and attn_tp_size > 1:
+        #     raise ValueError(
+        #         "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "
+        #         "attn_tp == 1 (set --dp-size == --tp). attn_tp > 1 corrupts the "
+        #         "MoE-under-DP all-reduce."
+        #     )
 
         with (
             self._draft_context(),

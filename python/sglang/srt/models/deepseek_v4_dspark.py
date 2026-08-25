@@ -205,17 +205,24 @@ class DSparkAttention(MqaAttentionBase):
         attn_backend = get_attn_backend()
         rd = self.rope_head_dim
 
+        # Fused RMSNorm can return a quantized tuple. Keep that tuple as the
+        # input to the quantized linear layers, but use its BF16 tensor for
+        # shape queries and temporary buffer allocation.
+        hidden_states_bf16 = (
+            hidden_states[2] if isinstance(hidden_states, tuple) else hidden_states
+        )
+
         enable_multi_stream = (
             self.alt_streams is not None
             and get_is_capture_mode()
-            and hidden_states.shape[0] <= self._multi_stream_bs_limit
+            and hidden_states_bf16.shape[0] <= self._multi_stream_bs_limit
         )
 
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
         if self.n_local_heads < _PAD_NUM_HEADS:
-            q_padded = hidden_states.new_empty(
-                hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
+            q_padded = hidden_states_bf16.new_empty(
+                hidden_states_bf16.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
             q_out = q_padded[:, : self.n_local_heads, :]
 
