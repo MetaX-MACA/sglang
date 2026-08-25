@@ -843,6 +843,12 @@ class Fp8LinearMethod(LinearMethodBase):
         ):
             x = (x[1], x[2])
 
+        if isinstance(x, tuple) and len(x) > 0 and isinstance(x[0], torch.Tensor):
+            assert x[0].dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ), f"FP8 linear received a non-FP8 quantized tuple: {x[0].dtype=}"
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
