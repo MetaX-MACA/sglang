@@ -27,7 +27,6 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.utils import is_hip, is_npu
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
-_SCORE_BLOCK_H: int = 256  # mcoplib _score_kernel H-chunk (C600-U tuned: NW=2, BH=256)
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 
 _FAST_SUPPORTED = None
@@ -215,7 +214,7 @@ def _mix_fused(
     score_norm: RMSNorm,
 ) -> torch.Tensor:
     """Triton score + combine pair: returns the pre-norm mixture."""
-    from mcoplib.triton_sglang_score_kernel import _score_kernel
+    from mcoplib.triton_sglang_score_kernel import _combine_kernel, _score_kernel
 
     T, H = prefix_sum.shape
     if T == 0:
