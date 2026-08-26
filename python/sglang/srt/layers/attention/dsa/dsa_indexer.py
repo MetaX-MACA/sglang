@@ -557,7 +557,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     dim=-1,
                 )
             with torch.cuda.stream(self.alt_stream):
-                # TODO we should also put DeepGEMM half SM here?
                 if self.use_dsa_indexer_fusion:
                     key, weights_raw = self._fused_k_weights(x)
                 else:
@@ -948,10 +947,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if use_dg_native:
             seqlens_32_2d = ctx_2d
+        elif ctx_2d is not None:
+            if ctx_2d.size(1) == 1:
+                seqlens_32_2d = ctx_2d
+            else:
+                seqlens_32_2d = ctx_2d.reshape(-1).contiguous().view(-1, 1)
         elif seqlens_32.dim() == 2:
-            seqlens_32_2d = seqlens_32
+            if seqlens_32.size(1) == 1:
+                seqlens_32_2d = seqlens_32.contiguous()
+            else:
+                seqlens_32_2d = seqlens_32.reshape(-1).contiguous().view(-1, 1)
         else:
-            seqlens_32_2d = seqlens_32.unsqueeze(-1)
+            seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(

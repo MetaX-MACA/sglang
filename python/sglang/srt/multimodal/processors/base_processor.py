@@ -57,6 +57,7 @@ from sglang.srt.utils import (
     load_image,
     load_video,
     logger,
+    smart_to_rgb,
 )
 
 _is_cpu = is_cpu()
@@ -210,6 +211,7 @@ def _tokenizer_of(processor):
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
+    smart_rgb_conversion = False
     prefer_tokenized_input = False
     precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
@@ -811,6 +813,14 @@ class BaseMultimodalProcessor(ABC):
             if processor_device is not None:
                 kwargs["device"] = processor_device
 
+        # Model families may keep video preprocessing off the GPU: the
+        # tokenizer process otherwise competes with the scheduler's pools for
+        # device memory on long videos.
+        if videos:
+            video_device = getattr(self, "video_preprocessing_device", None)
+            if video_device is not None:
+                kwargs["device"] = video_device
+
         # Avoid double BOS when the chat template already wrote one.
         if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
             bos = getattr(tokenizer, "bos_token", None)
@@ -895,8 +905,14 @@ class BaseMultimodalProcessor(ABC):
                 img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
-                if discard_alpha_channel and img.mode != "RGB":
-                    return img.convert("RGB")
+                # PIL decodes lazily; do it here in the io worker so the decode
+                # doesn't run later on the event-loop thread.
+                if discard_alpha_channel:
+                    if cls.smart_rgb_conversion:
+                        return smart_to_rgb(img)
+                    if img.mode != "RGB":
+                        return img.convert("RGB")
+                img.load()
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
