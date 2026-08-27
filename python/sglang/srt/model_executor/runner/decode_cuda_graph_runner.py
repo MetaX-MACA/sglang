@@ -335,11 +335,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
 
         # --- bucket sizes ---------------------------------------------
-        (
-            self.capture_bs,
-            self.compile_bs,
-            self.sum_len_bs,
-        ) = get_batch_sizes_to_capture(model_runner, self.captured_req_width)
+        self.capture_bs, self.compile_bs, self.sum_len_bs = get_batch_sizes_to_capture(
+            model_runner, self.captured_req_width
+        )
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 

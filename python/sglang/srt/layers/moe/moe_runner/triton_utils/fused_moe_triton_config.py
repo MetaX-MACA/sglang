@@ -348,6 +348,7 @@ def try_get_optimal_moe_config(
 def get_config_dtype_str(
     dtype: torch.dtype,
     use_int8_w8a16: Optional[bool] = False,
+    use_int4_w4a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int8_w8a8: Optional[bool] = False,
@@ -356,6 +357,8 @@ def get_config_dtype_str(
         return "fp8_w8a8"
     elif use_int8_w8a8:
         return "int8_w8a8"
+    elif use_int4_w4a8:
+        return "int4_w4a8"
     elif use_int4_w4a16:
         return "int4_w4a16"
     elif use_int8_w8a16:

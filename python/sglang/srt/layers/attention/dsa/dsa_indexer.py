@@ -162,6 +162,7 @@ if _is_cuda or _is_hip:
     )
 
 if _is_cuda:
+    from fast_hadamard_transform import hadamard_transform
     from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
     from sglang.kernels.ops.quantization.dsv32 import (
         fused_k_indexer_norm_rope,

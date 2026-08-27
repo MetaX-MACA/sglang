@@ -487,9 +487,7 @@ def recompute_cuda_graph_decode_max_bs(server_args: Any) -> None:
     adjusted_max_bs = original_max_bs
     if cfg.enable_dp_attention:
         if cfg.max_running_requests is not None:
-            adjusted_max_bs = min(
-                adjusted_max_bs, cfg.max_running_requests // cfg.dp_size
-            )
+            adjusted_max_bs = adjusted_max_bs
     elif cfg.max_running_requests is not None:
         adjusted_max_bs = min(adjusted_max_bs, cfg.max_running_requests)
 

@@ -822,6 +822,7 @@ def invoke_fused_moe_kernel(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int4_w4a8: bool,
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
@@ -885,7 +886,7 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
-    elif use_int8_w8a8:
+    elif use_int8_w8a8 or use_int4_w4a8:
         assert B_scale is not None
         if block_shape is None:
             # activation channel-wise int8 quantization
@@ -1025,7 +1026,7 @@ def invoke_fused_moe_kernel(
             filter_expert=filter_expert,
             **config,
         )
-    elif use_int8_w8a8  and enable_mctlass_fused_moe:
+    elif use_int8_w8a8 and enable_mctlass_fused_moe:
         if enable_mctlass_fused_moe_python_api:
             C1 = C.view(-1, C.size(-1)).contiguous()
             gemm(A.shape[0], B.shape[1], A.shape[1], B.shape[0], sorted_token_ids.shape[0], top_k, A, B, C1, A_scale, B_scale, None, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, mul_routed_weight, filter_expert = filter_expert)
@@ -1039,6 +1040,31 @@ def invoke_fused_moe_kernel(
                                 topk_ids.numel(), # num_valid_tokens
                                 top_k,
                                 mul_routed_weight)
+    elif use_int4_w4a8:
+        assert enable_mctlass_fused_moe_python_api, (
+            "int4_w4a8 only support enable_mctlass_fused_moe_python_api now"
+        )
+        EM = sorted_token_ids.shape[0]
+        B = B.view(dtype=torch.quint4x2)
+        gemm(
+            A.size(0),
+            B.size(1),
+            A.size(1),
+            B.size(0),
+            EM,
+            top_k,
+            A,
+            B,
+            C,
+            A_scale,
+            B_scale,
+            None,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+        )
     else:
         if a_use_tma or b_use_tma:
             _set_triton_tma_allocator()
