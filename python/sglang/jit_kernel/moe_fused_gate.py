@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 import triton
 import triton.language as tl
+from sglang.srt.environ import envs
 
 from sglang.jit_kernel.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernel_api_logging import debug_kernel_api
@@ -183,7 +184,7 @@ def _router_triton_kernel(
 
 
 @debug_kernel_api
-def moe_fused_gate(
+def moe_fused_gate_triton(
     scores: torch.Tensor,
     bias: torch.Tensor,
     topk: int,
@@ -249,3 +250,27 @@ def moe_fused_gate(
         **extra,
     )
     return weights, indices
+
+def moe_fused_gate(
+    scores: torch.Tensor,
+    bias: torch.Tensor,
+    topk: int,
+    scoring_func: str = "sigmoid",
+    num_fused_shared_experts: int = 0,
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
+    apply_routed_scaling_factor_on_output: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    moe_fused_gate_impl = moe_fused_gate_triton if envs.MX_MOE_FUSED_GATE_BACKEND.get() == 'triton' else moe_fused_gate_jit
+
+    return moe_fused_gate_impl(
+        scores,
+        bias,
+        topk,
+        scoring_func,
+        num_fused_shared_experts,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    )
