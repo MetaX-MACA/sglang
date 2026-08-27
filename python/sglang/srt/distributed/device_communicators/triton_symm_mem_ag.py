@@ -499,27 +499,28 @@ class MultimemAllGatherer:
             return self._UNINIT
         if x.shape[-1] % _NUMEL_PER_THREAD != 0:
             return None
-        try:
-            from sglang.srt.distributed import get_tp_group
+        # try:
+        #     from sglang.srt.distributed import get_tp_group
 
-            tp_group = get_tp_group()
-            if tp_group.world_size <= 1:
-                return None
-            state = create_state(
-                group=tp_group.device_group,
-                rank_in_group=tp_group.rank_in_group,
-                max_tokens=self._max_tokens,
-                hidden_size=x.shape[-1] * tp_group.world_size,
-            )
-            if state.symm_mem_hdl.multicast_ptr == 0:
-                # No multicast for this world size / arch; multimem.st would
-                # write nowhere. Fall back to NCCL.
-                logger.warning(
-                    "multimem all-gather disabled (no multicast for world_size=%d)",
-                    tp_group.world_size,
-                )
-                return None
-            return state
-        except Exception as e:
-            logger.warning("multimem all-gather disabled (%s)", e)
-            return None
+        #     tp_group = get_tp_group()
+        #     if tp_group.world_size <= 1:
+        #         return None
+        #     state = create_state(
+        #         group=tp_group.device_group,
+        #         rank_in_group=tp_group.rank_in_group,
+        #         max_tokens=self._max_tokens,
+        #         hidden_size=x.shape[-1] * tp_group.world_size,
+        #     )
+        #     if state.symm_mem_hdl.multicast_ptr == 0:
+        #         # No multicast for this world size / arch; multimem.st would
+        #         # write nowhere. Fall back to NCCL.
+        #         logger.warning(
+        #             "multimem all-gather disabled (no multicast for world_size=%d)",
+        #             tp_group.world_size,
+        #         )
+        #         return None
+        #     return state
+        # except Exception as e:
+        #     logger.warning("multimem all-gather disabled (%s)", e)
+        #     return None
+        return None
