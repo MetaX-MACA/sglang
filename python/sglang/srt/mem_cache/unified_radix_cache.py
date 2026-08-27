@@ -2097,6 +2097,44 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return True
 
+    def handle_prefetch_result(self, operation: PrefetchOperation) -> None:
+        req_id = operation.request_id
+        info = self.ongoing_prefetch.pop(req_id, None)
+        if info is None:
+            return
+        last_node, key, host_indices, _, lock_params, comp_xfers = info
+        completed = operation.completed_tokens
+        if operation.is_aborted():
+            self.cache_controller.append_host_mem_release(
+                host_indices=host_indices[:completed],
+                extra_pools=operation.pool_transfers,
+            )
+            self.dec_host_lock_ref(last_node, lock_params)
+            self.cache_controller.prefetch_tokens_occupied -= len(key)
+            return
+
+        result = self._insert_helper_host(
+            last_node,
+            key[:completed],
+            host_indices[:completed],
+            operation.hash_value[: completed // self.page_size],
+        )
+        for ct, transfers in comp_xfers.items():
+            self.components[ct].commit_hicache_transfer(
+                last_node,
+                CacheTransferPhase.PREFETCH,
+                transfers,
+                insert_result=result,
+                pool_storage_result=operation.pool_storage_result,
+            )
+        self.cache_controller.mem_pool_host.free(host_indices[: result.prefix_len])
+        self.dec_host_lock_ref(last_node, lock_params)
+        self.cache_controller.prefetch_tokens_occupied -= len(key)
+        loaded = completed - result.prefix_len
+        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded
+        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.log_prefetched_tokens(loaded)
+
     def terminate_prefetch(self, req_id: str) -> None:
         if req_id not in self.ongoing_prefetch:
             return
@@ -2177,17 +2215,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         for ack in drain(cc.ack_prefetch_queue, n_prefetch):
             operation = ack.operation
-            if operation.request_id not in self.ongoing_prefetch:
-                continue
             if ack.completed_tokens is not None:
-                operation.completed_tokens = max(
-                    operation.completed_tokens, ack.completed_tokens
-                )
+                if operation.request_id in self.ongoing_prefetch:
+                    operation.completed_tokens = max(
+                        operation.completed_tokens, ack.completed_tokens
+                    )
             if ack.pool_hits is not None:
-                operation.pool_storage_result.update_extra_pool_hit_pages(ack.pool_hits)
-                operation.pool_transfers_done = True
+                if operation.request_id in self.ongoing_prefetch:
+                    operation.pool_storage_result.update_extra_pool_hit_pages(
+                        ack.pool_hits
+                    )
+                    operation.pool_transfers_done = True
             if ack.completed_req:
-                self.handle_prefetch_result(operation)
+                if operation.request_id in self.ongoing_prefetch:
+                    self.handle_prefetch_result(operation)
+                tail = operation.host_indices[operation.completed_tokens :]
+                cc.mem_pool_host.free(tail)
 
         for operation in drain(cc.ack_backup_queue, n_backup):
             entry = self.ongoing_backup.pop(operation.id, None)
