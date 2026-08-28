@@ -29,11 +29,6 @@ import triton.language as tl
 import os
 from mctlassEx import MaskedGroupedGEMM, ContinuousGroupedGEMM
 import mcoplib
-# from mcoplib.sgl_grouped_gemm_mctlass_int8 import (
-from mcoplib.sgl_grouped_gemm_mctlass_int8 import (
-    get_block_size_m,
-    grouped_gemm_mctlass_kernel_int8
-)
 
 enable_maca_sglang_grouped_gemm_mctlass_int8 = bool(
     int(os.getenv("ENABLE_MACA_SGLANG_GROUPED_GEMM_MCTLASS_INT8", "1"))
@@ -2907,14 +2902,6 @@ def grouped_gemm_triton(
     }
 
     m_num_tiles_indptr = torch.zeros(batch_size + 1, device=a.device, dtype=torch.int64)
-    if enable_maca_sglang_grouped_gemm_mctlass_int8 and (a.dtype is not torch.int8) and (b.dtype == torch.int8):
-        kernel_m = get_block_size_m(batch_size, a.size(0), b.size(1), b.size(2))
-        assert kernel_m > 0, ("grouped_gemm_mctlass_int8 BLOCK_SIZE_M must greater than zero.")
-        config["BLOCK_SIZE_M"] = kernel_m
-
-    compute_m_num_tiles_indptr[(1,)](
-        m_num_tiles_indptr, seg_indptr, batch_size, config["BLOCK_SIZE_M"]
-    )
 
     grid = lambda META: (
         triton.cdiv(a.size(0), META["BLOCK_SIZE_M"]) + batch_size,
