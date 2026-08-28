@@ -56,8 +56,10 @@ constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 #endif
 
 constexpr uint32_t kClusterFloor = 65536;
+#if SGL_TOPK_HAS_CLUSTER
 constexpr uint32_t kClusterMaxBatch = 512;
 constexpr uint32_t kNumPersistentClusters = 15 * kOccupancy;
+#endif
 
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
@@ -126,6 +128,7 @@ struct TopKRaggedParams {
  * \brief Persistent cluster kernel for the long items. It will handle long inputs.
  * The short items are handled by the separate topk_kernel.
  */
+#if SGL_TOPK_HAS_CLUSTER
 template <bool kPDL>
 CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const   TopKPagedParams params) {
   device::enable_smem_spilling();
@@ -316,7 +319,7 @@ TOPK_KERNEL void topk_main_kernel(const   TopKPagedParams params) {
 
 #ifndef USE_ROCM
 template <bool kPDL, TopKMode kMode>
-CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const   TopKPagedParams params) {
+CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const TopKPagedParams params) {
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;

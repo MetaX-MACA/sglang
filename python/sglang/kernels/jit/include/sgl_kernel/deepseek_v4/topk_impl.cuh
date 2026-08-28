@@ -39,6 +39,15 @@ namespace device::topk {
 namespace cg = cooperative_groups;
 #endif
 
+// MACA's CUDA bridge does not implement CUDA thread-block clusters or
+// distributed shared memory. Keep the portable single-block implementations
+// available and omit the cluster-only implementation when compiling with it.
+#if defined(__MACA_ARCH__) || defined(__MACACC__) || defined(__MACA__) || defined(__MXCC__)
+#define SGL_TOPK_HAS_CLUSTER 0
+#else
+#define SGL_TOPK_HAS_CLUSTER 1
+#endif
+
 /// sgl_kernel names the warp size `kWarpThreads`; alias it locally as `kWarpSize`.
 inline constexpr uint32_t kWarpSize = kWarpThreads;
 
@@ -881,6 +890,7 @@ struct TopKCluster : TopKRadixBase<10> {
     }
   }
 };
+#endif
 
 #endif  // !USE_ROCM
 

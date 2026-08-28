@@ -1867,8 +1867,8 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
             )
 
-        self.skip_topk = None
-        self.next_skip_topk = None
+        self.skip_topk = False
+        self.next_skip_topk = False
         self.indexer = None
         if self.use_dsa:
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
@@ -3336,28 +3336,28 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
 
-# @register_custom_op(out_shape="hidden_states")
-# def dsv2_flashinfer_moe_dual_stream_graph(
-#     hidden_states: torch.Tensor,
-#     layer_id: int,
-#     fuse_mlp_allreduce: bool,
-#     mlp_reduce_scatter: bool,
-# ) -> torch.Tensor:
-#     forward_context = get_tc_piecewise_forward_context()
-#     assert forward_context is not None
-#     assert forward_context.moe_fusions is not None
+@register_custom_op(out_shape="hidden_states")
+def dsv2_flashinfer_moe_dual_stream_graph(
+    hidden_states: torch.Tensor,
+    layer_id: int,
+    fuse_mlp_allreduce: bool,
+    mlp_reduce_scatter: bool,
+) -> torch.Tensor:
+    forward_context = get_tc_piecewise_forward_context()
+    assert forward_context is not None
+    assert forward_context.moe_fusions is not None
 
-    # moe_fusion = forward_context.moe_fusions[layer_id]
-    # assert moe_fusion is not None
+    moe_fusion = forward_context.moe_fusions[layer_id]
+    assert moe_fusion is not None
     # Custom-op execution happens outside the caller's Python scope under
     # torch.compile. Carry graph-varying control state as scalar operands and
     # republish it for the nested MoE/linear consumers.
-    # with get_forward().scoped(
-    #     fuse_mlp_allreduce=fuse_mlp_allreduce,
-    #     mlp_reduce_scatter=mlp_reduce_scatter,
-    #     flashinfer_trtllm_bypass=True,
-    # ):
-    #     return moe_fusion.forward_normal_dual_stream(hidden_states)
+    with get_forward().scoped(
+        fuse_mlp_allreduce=fuse_mlp_allreduce,
+        mlp_reduce_scatter=mlp_reduce_scatter,
+        flashinfer_trtllm_bypass=True,
+    ):
+        return moe_fusion.forward_normal_dual_stream(hidden_states)
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]

@@ -1,0 +1,14 @@
+diff a/python/sglang/kernels/ops/quantization/fp8_kernel.py b/python/sglang/kernels/ops/quantization/fp8_kernel.py	(rejected hunks)
+@@ -572,8 +605,10 @@ def per_token_cast_to_fp8_3d(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
+ 
+     for x_group in x:
+         if use_mcoplib:
+-            x_group_quant = torch.empty(m, n, dtype=torch.float8_e4m3fn, device='cuda')
+-            x_group_scale = torch.empty(m,n//128, dtype=torch.float32, device='cuda')
++            x_group_quant = torch.empty(m, n, dtype=fp8_dtype, device=x.device)
++            x_group_scale = torch.empty(
++                m, n // 128, dtype=torch.float32, device=x.device
++            )
+             per_token_cast_to_fp8_opt(x_group_quant, x_group_scale, x_group)
+         else:
+             x_group_quant, x_group_scale = per_token_cast_to_fp8(x_group)

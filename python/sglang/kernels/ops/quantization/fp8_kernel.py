@@ -206,9 +206,24 @@ else:
     sgl_per_token_quant_fp8 = _native_sgl_per_token_quant_fp8
     sgl_per_tensor_quant_fp8 = _native_sgl_per_tensor_quant_fp8
 
-# if _is_musa:
-#     # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
-#     from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
+    def sgl_per_token_quant_fp8(
+        input: torch.Tensor,
+        output_q: torch.Tensor,
+        output_s: torch.Tensor,
+    ) -> None:
+        _sgl_per_token_quant_fp8(input, output_q, output_s)
+
+    def sgl_per_tensor_quant_fp8(
+        input: torch.Tensor,
+        output_q: torch.Tensor,
+        output_s: torch.Tensor,
+        is_static: bool,
+    ) -> None:
+        _sgl_per_tensor_quant_fp8(input, output_q, output_s, is_static)
+
+if _is_musa:
+    # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
+    from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
 
 @lru_cache()
 def is_fp8_fnuz() -> bool:
@@ -566,13 +581,6 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
 ):
-    if use_mcoplib:
-        return torch.empty(
-            x_shape[:-1] + (x_shape[-1] // group_size,),
-            device=device,
-            dtype=torch.float32,
-        )
-
     if scale_ue8m0:
         if column_major_scales and scale_tma_aligned:
             *x_batch, x_q_mn, x_q_k = x_shape

@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -34,10 +35,10 @@ s: scale, 1 item per token, fp32
 class GetK:
     @classmethod
     def execute(cls, *args, **kwargs):
-        buf = args[1]
-        if buf.dtype == torch.bfloat16:
+        if os.getenv("MX_ENABLE_NSA_INT8"):
+            return cls.triton(*args, **kwargs)
+        else:
             return cls.torch_fast(*args, **kwargs)
-        return cls.triton(*args, **kwargs)
 
     @classmethod
     def slow(
@@ -301,9 +302,9 @@ class SetKAndS:
     def triton(cls, pool, buf, loc, index_k, index_k_scale):
         loc = loc.to(torch.int64)
 
-        if buf.dtype == torch.bfloat16:
-            assert index_k_scale is None
-            _set_k_triton(
+        if os.getenv("MX_ENABLE_NSA_INT8"):
+            assert index_k_scale is not None
+            _set_k_and_s_triton(
                 buf=buf,
                 loc=loc,
                 index_k=index_k,
@@ -311,8 +312,8 @@ class SetKAndS:
                 page_size=pool.page_size,
             )
         else:
-            assert index_k_scale is not None
-            _set_k_and_s_triton(
+            assert index_k_scale is None
+            _set_k_triton(
                 buf=buf,
                 loc=loc,
                 index_k=index_k,
@@ -370,8 +371,7 @@ def _set_k_and_s_triton(
         assert buf.dtype == torch.uint8
         assert index_k.dtype == torch.float8_e4m3fnuz
     else:
-        assert buf.dtype == torch.uint8
-        assert index_k.dtype == torch.float8_e4m3fn
+        assert index_k.dtype in [torch.float8_e4m3fn, torch.int8]
     assert index_k_scale.dtype == torch.float32
 
     assert buf.is_contiguous()
@@ -383,8 +383,10 @@ def _set_k_and_s_triton(
         buf_fp8 = buf
     elif _is_fp8_fnuz:
         buf_fp8 = buf.view(torch.float8_e4m3fnuz)
-    else:
+    elif index_k.dtype is torch.float8_e4m3fn:
         buf_fp8 = buf.view(torch.float8_e4m3fn)
+    else:
+        buf_fp8 = buf.view(torch.int8)
     buf_fp32 = buf.view(torch.float32)
 
     _set_k_and_s_triton_kernel[(num_tokens_to_write,)](
@@ -401,6 +403,47 @@ def _set_k_and_s_triton(
         PRESHUFFLE_TILE=INDEXER_K_CACHE_PRESHUFFLE_TILE if _use_aiter_preshuffle else 0,
     )
 
+def _set_k_triton(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    index_k: torch.Tensor,
+    index_k_scale: torch.Tensor,
+    page_size: int,
+):
+    """
+    :param buf: (num_pages, page_size 64 * (128B data )), bf16
+    :param loc: (num_tokens_to_write,), int, element := the token index to write to
+    :param index_k: (num_tokens_to_write, 128 elem), bf16
+    :param index_k_scale: None
+    :return:
+    """
+    num_pages, buf_numel_per_page = buf.shape
+    (num_tokens_to_write,) = loc.shape
+    num_tokens_to_write_, index_head_dim = index_k.shape
+    assert buf_numel_per_page == 64 * (128)
+    assert num_tokens_to_write == num_tokens_to_write_
+    assert index_head_dim == 128
+    assert page_size == 64
+
+    assert buf.dtype == torch.bfloat16
+    assert loc.dtype == torch.int64, f"{loc.dtype=}"  # can be int32
+    assert index_k.dtype == torch.bfloat16
+
+    assert buf.is_contiguous()
+    assert loc.is_contiguous()
+    assert index_k.is_contiguous()
+
+    buf_bf16 = buf.view(torch.bfloat16)
+
+    _set_k_triton_kernel[(num_tokens_to_write,)](
+        buf_bf16,
+        loc,
+        index_k,
+        index_k.stride(0),
+        PAGE_SIZE=page_size,
+        BUF_NUMEL_PER_PAGE=buf_numel_per_page,
+        NUM_K_ELEMS_PER_TOKEN=index_head_dim,
+    )
 
 def _set_k_triton(
     buf: torch.Tensor,
