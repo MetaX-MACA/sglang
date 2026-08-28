@@ -403,6 +403,9 @@ class FutureMap:
             else:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
+        if batch.schedule_seq_lens_ready is None:
+            batch.schedule_seq_lens_ready = torch.get_device_module(self.device).Event()
+        batch.schedule_seq_lens_ready.record()
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);

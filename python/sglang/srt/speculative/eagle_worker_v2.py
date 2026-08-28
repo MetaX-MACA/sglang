@@ -1470,7 +1470,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
+        schedule_seq_lens_ready = getattr(batch, "schedule_seq_lens_ready", None)
         with self.plan_stream_ctx:
+            if schedule_seq_lens_ready is not None:
+                schedule_seq_lens_ready.wait()
             verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
                 verify_input,
                 self.req_to_token_pool,
