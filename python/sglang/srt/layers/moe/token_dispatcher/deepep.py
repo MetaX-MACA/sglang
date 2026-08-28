@@ -877,6 +877,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         # input_global_scale = self.quant_config.get("input_global_scale", None)
 
         bf16_dispatch = self.quant_config.get("bf16_dispatch", False)
+        packed_int8_dispatch = self.quant_config.get(
+            "per_token_quant_int8_pack", False
+        )
+        if packed_int8_dispatch:
+            from sglang.kernels.ops.quantization.int8_kernel import (
+                per_token_quant_int8_pack,
+            )
+
+            hidden_states = per_token_quant_int8_pack(hidden_states)
+            bf16_dispatch = True
         if input_global_scale is not None:
             use_nvfp4 = True
         else:

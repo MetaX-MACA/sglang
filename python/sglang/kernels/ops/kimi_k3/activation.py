@@ -87,3 +87,59 @@ def situ_and_mul(
         has_linear_beta,
     )
     return out
+
+
+def masked_situ_quant_int8_pack(
+    input: torch.Tensor,
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float],
+) -> torch.Tensor:
+    """Fuse masked SiTU, per-token INT8 quantization, and aligned packing.
+
+    ``input`` has shape ``[E, M, 2D]``. The BF16 output is a byte carrier
+    whose rows contain D INT8 values, one raw FP32 scale, then padding.
+    """
+    if input.dtype != torch.bfloat16:
+        raise TypeError(f"input must be BF16, got {input.dtype}")
+    if input.dim() != 3 or input.shape[-1] % 2 != 0:
+        raise ValueError(
+            f"input must have shape [E, M, 2D], got {tuple(input.shape)}"
+        )
+    if not input.is_contiguous():
+        raise ValueError("input must be contiguous")
+    if masked_m.dtype != torch.int32:
+        raise TypeError(f"masked_m must be INT32, got {masked_m.dtype}")
+    if masked_m.shape != (input.shape[0],):
+        raise ValueError(
+            f"masked_m must have shape {(input.shape[0],)}, "
+            f"got {tuple(masked_m.shape)}"
+        )
+    if not masked_m.is_contiguous():
+        raise ValueError("masked_m must be contiguous")
+    if masked_m.device != input.device:
+        raise ValueError(
+            "input and masked_m must be on one device, got "
+            f"input={input.device}, masked_m={masked_m.device}"
+        )
+
+    hidden_size = input.shape[-1] // 2
+    packed_size = (hidden_size // 2 + 257) // 256 * 256
+    output = torch.empty(
+        (*input.shape[:-1], packed_size),
+        dtype=torch.bfloat16,
+        device=input.device,
+    )
+
+    from mcoplib import op as mcoplib_op
+
+    has_linear_beta = linear_beta is not None
+    mcoplib_op.fused_situ_mul_dq_mask_quant_pack(
+        output,
+        input,
+        masked_m,
+        float(beta),
+        float(linear_beta) if has_linear_beta else 0.0,
+        int(has_linear_beta),
+    )
+    return output

@@ -29,6 +29,17 @@ def situ_and_mul(
     return impl(input, out, beta, linear_beta)
 
 
+def masked_situ_quant_int8_pack(
+    input: torch.Tensor,
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float],
+) -> torch.Tensor:
+    from .activation import masked_situ_quant_int8_pack as impl
+
+    return impl(input, masked_m, beta, linear_beta)
+
+
 def situ_and_mul_masked_post_quant(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -80,6 +91,7 @@ def kimi_k3_tiny_gemm(
 
 
 __all__ = [
+    "masked_situ_quant_int8_pack",
     "situ_and_mul",
     "situ_and_mul_masked_post_quant",
     "kimi_k3_tiny_gemm",

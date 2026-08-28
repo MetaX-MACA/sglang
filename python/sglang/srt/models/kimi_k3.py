@@ -133,6 +133,7 @@ from sglang.srt.utils.common import (
     require_mlp_sync,
     set_weight_attrs,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
@@ -551,6 +552,9 @@ class _AttnTpShardedLatentProj(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         n = x.shape[0]
+        if n == 0:
+            output = self._out_buf[:0].view(0, self.out_features)
+            return output, None
         gathered = self._all_gather(x)
         partial = self._partial(gathered)
         return self._reduce_partial(partial, n), None
@@ -738,7 +742,10 @@ class KimiK3MoE(nn.Module):
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
         self.experts = get_moe_impl_class(moe_quant_config)(
-            num_experts=getattr(config, "n_routed_experts", config.num_experts),
+            num_experts=(
+                getattr(config, "n_routed_experts", config.num_experts)
+                + get_exec().moe.ep_num_redundant_experts
+            ),
             top_k=config.num_experts_per_token,
             hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -2258,7 +2265,6 @@ class KimiK3DeltaAttention(nn.Module):
 
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     """MLA with output gate for K3. Gate is applied in TP-local space before o_proj."""
-
     def __init__(
         self,
         config,
@@ -2293,6 +2299,12 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
         )
+        # K3 checkpoints may leave q_b_proj unquantized.
+        # Its input must remain a Tensor rather than the fused INT8 tuple.
+        if self.q_lora_rank is not None and isinstance(
+            self.q_b_proj.quant_method, UnquantizedLinearMethod
+        ):
+            self.q_a_layernorm.fused_quant = False
         if split_gguf_kv_b:
             del self.fused_qkv_a_proj_with_mqa
             del self.kv_b_proj

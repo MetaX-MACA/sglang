@@ -52,8 +52,8 @@ def try_import_with_message(name: str):
 
 if try_import_with_message("mctlassEx") != None :
     backend_name = "mctlassEx" 
-    from deep_gemm import get_mctlass_op
-    mctlass_op = get_mctlass_op()
+    # from deep_gemm import get_mctlass_op
+    # mctlass_op = get_mctlass_op()
 
 else:
     backend_name = "torch_bf16"
@@ -152,6 +152,66 @@ def grouped_gemm_nt_int8int8bf16_masked(
         masked_m,
         expected_m,
     )
+
+
+def grouped_gemm_nt_int8int4bf16_masked(
+    lhs: Tuple[torch.Tensor, Optional[torch.Tensor]],
+    rhs: Tuple[torch.Tensor, Optional[torch.Tensor]],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+):
+    """Run the MetaX DeepGEMM W4A8 masked grouped GEMM.
+
+    ``lhs[0]`` contains each INT8 activation row followed by the four bytes of
+    its FP32 per-token scale, and ``lhs[1]`` must therefore be ``None``.
+    ``rhs[0]`` is the checkpoint's packed INT4 payload viewed as
+    ``torch.quint4x2``.
+    """
+    activation, activation_scale = lhs
+    weight, _ = rhs
+    assert activation.dtype == torch.int8, (
+        "DeepGEMM W4A8 packed activation must be INT8, got "
+        f"{activation.dtype}"
+    )
+    assert activation_scale is None, (
+        "DeepGEMM W4A8 expects the FP32 activation scale to be appended to "
+        "each INT8 activation row"
+    )
+    expected_packed_k = (
+        weight.shape[-1] * 2 + torch.finfo(torch.float32).bits // 8
+    )
+    assert activation.shape[-1] == expected_packed_k, (
+        "DeepGEMM W4A8 packed activation K mismatch: expected "
+        f"{expected_packed_k} bytes from weight K//2={weight.shape[-1]}, got "
+        f"{activation.shape[-1]}"
+    )
+
+    kernel = getattr(
+        deep_gemm, "m_grouped_gemm_int8_int4_bf16_nt_masked", None
+    )
+    if kernel is None:
+        try:
+            from deep_gemm.int4_gemm import (
+                m_grouped_gemm_int8_int4_bf16_nt_masked as kernel,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "The installed deep_gemm package does not provide "
+                "m_grouped_gemm_int8_int4_bf16_nt_masked. Install the MetaX "
+                "DeepGEMM build with W4A8 grouped-GEMM support."
+            ) from exc
+
+    return kernel(
+        lhs,
+        rhs,
+        out,
+        masked_m,
+        expected_m,
+        backend="mctlassEx" if backend_name == "mctlassEx" else "torch",
+    )
+
+
 
 def _ensure_cuda(
     pair: Tuple[torch.Tensor, torch.Tensor],

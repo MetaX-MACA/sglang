@@ -804,7 +804,11 @@ class LogitsProcessor(nn.Module):
                 "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
             )
             if self.use_attn_tp_group:
-                logits = self._gather_attn_tp_logits(logits)
+                if logits_metadata.forward_mode.is_idle():
+                    assert logits.shape[0] == 0
+                    logits = logits.new_empty((0, self.vocab_size))
+                else:
+                    logits = self._gather_attn_tp_logits(logits)
             elif self._can_use_tp_lm_head_all_to_all(
                 logits, local_hidden_states, lm_head, logits_metadata
             ):
