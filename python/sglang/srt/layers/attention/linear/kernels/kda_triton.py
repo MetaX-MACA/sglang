@@ -241,6 +241,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             beta=beta,
             initial_state=ssm_states,
             initial_state_indices=cache_indices,
+            initial_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=query_start_loc,
             A_log=A_log,
