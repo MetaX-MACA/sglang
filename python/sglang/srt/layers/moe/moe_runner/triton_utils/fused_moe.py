@@ -867,6 +867,10 @@ def _fused_moe_kernel_sequence(
 
             if filter_expert:
                 swiglu_limit_for_triton = swiglu_limit
+            elif _is_hip:
+                # The fused clamp kernel is CUDA/XPU-only; apply its gate/up
+                # contract before the regular HIP silu_and_mul kernel.
+                _clamp_swiglu_inputs_(intermediate_cache1, swiglu_limit)
             else:
                 assert (
                     _is_cuda or _is_xpu
