@@ -1702,6 +1702,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Batch configs
     model_config: ModelConfig = None
     enable_overlap: bool = False
+    # Overlap: schedule-stream event after seq_lens gather (plan_stream handoff).
+    schedule_seq_lens_ready: Optional[Any] = None
 
     # Device
     device: str = "cuda"
