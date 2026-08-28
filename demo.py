@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 import sglang as sgl
 import os
 # import sglang.srt.models.deepseek_v2

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 import math
 from functools import cache
 from typing import TYPE_CHECKING

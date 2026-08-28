@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 import math
 from typing import Any, List, Optional, Tuple
 

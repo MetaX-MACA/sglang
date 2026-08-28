@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # Mixin class for metadata management of Deepseek MHA forward (chunked prefix cache)
 # More details can be found in python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py
 

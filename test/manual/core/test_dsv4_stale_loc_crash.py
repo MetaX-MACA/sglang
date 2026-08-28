@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Crash regression for PR #25889: stale cached_loc after register_mapping().
 
 Bug:

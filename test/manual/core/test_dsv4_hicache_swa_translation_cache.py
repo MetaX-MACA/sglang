@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """E2E regression for PR #25889: DSV4 cached_loc stale after HiCache load-back.
 
 Bug (pre-fix):

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Per-query sparse-index combiner for the FlashMLA sparse prefill path.
 
 Adapts vllm's ``combine_topk_swa_indices`` to sglang's flat-workspace layout.

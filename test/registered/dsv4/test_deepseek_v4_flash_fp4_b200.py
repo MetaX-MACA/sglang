@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """B200 per-commit CI: DeepSeek-V4-Flash FP4 (LowLatency recipe).
 
 Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.

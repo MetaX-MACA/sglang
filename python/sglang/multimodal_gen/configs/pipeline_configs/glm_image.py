@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 from dataclasses import dataclass, field
 
 import torch

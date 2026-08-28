@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Regression test for PR #25889: DeepSeekV4TokenToKVPool.register_mapping()
 must clear cached_loc.
 

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 import torch
 import math
 from torch.profiler import profile, record_function, ProfilerActivity

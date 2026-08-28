@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 from typing import TYPE_CHECKING, Optional, Union
 import torch
 import os

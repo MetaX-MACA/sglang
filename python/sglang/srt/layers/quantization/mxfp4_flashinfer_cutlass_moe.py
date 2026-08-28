@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """DeepSeek-V4 MXFP4 expert backend backed by FlashInfer's SM90 cutlass
 mixed-input MoE GEMM (FlashInfer PR #3084).
 

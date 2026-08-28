@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Fused Q/K GemmaRMSNorm + NeoX RoPE + gate deinterleave (Triton).
 
 Single kernel launch fusing per-head GemmaRMSNorm, partial NeoX RoPE,

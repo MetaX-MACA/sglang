@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import Callable, List

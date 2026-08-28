@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Multi-step precompute utilities for Native Sparse Attention backend.
 
 This module provides optimization utilities for multi-step speculative decoding

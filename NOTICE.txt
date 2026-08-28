@@ -1,0 +1,246 @@
+The MetaX sglang project is modified from sglang (https://github.com/sgl-project/sglang).
+Please see the LICENSE for the license for this project.
+This project contains third-party components with separate copyright notices and license terms. Your
+use of the source code for these third-party components are subject to the terms and conditions
+of their licenses.
+The following files may have been modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. in 2026. Modification copyright 2026 MetaX Integrated Circuits (Shanghai) Co.,Ltd.
+  1. benchmark/hicache/data_processing.py
+  2. python/sglang/bench_serving.py
+  3. python/sglang/benchmark/datasets/random.py
+  4. python/sglang/jit_kernel/deepseek_v4.py
+  5. python/sglang/jit_kernel/dsv4/compress.py
+  6. python/sglang/jit_kernel/utils.py
+  7. python/sglang/launch_server.py
+  8. python/sglang/multimodal_gen/benchmarks/bench_serving.py
+  9. python/sglang/multimodal_gen/configs/pipeline_configs/glm_image.py
+ 10. python/sglang/multimodal_gen/envs.py
+ 11. python/sglang/multimodal_gen/runtime/layers/activation.py
+ 12. python/sglang/multimodal_gen/runtime/layers/attention/backends/sparse_linear_attn.py
+ 13. python/sglang/multimodal_gen/runtime/layers/layernorm.py
+ 14. python/sglang/multimodal_gen/runtime/layers/visual_embedding.py
+ 15. python/sglang/multimodal_gen/runtime/loader/utils.py
+ 16. python/sglang/multimodal_gen/runtime/models/dits/zimage.py
+ 17. python/sglang/multimodal_gen/runtime/models/encoders/clip.py
+ 18. python/sglang/multimodal_gen/runtime/models/encoders/mistral_3.py
+ 19. python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/glm_image.py
+ 20. python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/wan_ti2v.py
+ 21. python/sglang/multimodal_gen/runtime/pipelines_core/stages/text_encoding.py
+ 22. python/sglang/multimodal_gen/runtime/platforms/__init__.py
+ 23. python/sglang/multimodal_gen/utils.py
+ 24. python/sglang/srt/arg_groups/deepseek_v4_hook.py
+ 25. python/sglang/srt/batch_overlap/single_batch_overlap.py
+ 26. python/sglang/srt/batch_overlap/two_batch_overlap.py
+ 27. python/sglang/srt/compilation/piecewise_context_manager.py
+ 28. python/sglang/srt/configs/__init__.py
+ 29. python/sglang/srt/configs/kimi_k25.py
+ 30. python/sglang/srt/configs/mamba_utils.py
+ 31. python/sglang/srt/configs/model_config.py
+ 32. python/sglang/srt/configs/qwen3_next.py
+ 33. python/sglang/srt/constrained/triton_ops/bitmask_ops.py
+ 34. python/sglang/srt/disaggregation/base/conn.py
+ 35. python/sglang/srt/disaggregation/common/conn.py
+ 36. python/sglang/srt/disaggregation/common/utils.py
+ 37. python/sglang/srt/disaggregation/decode.py
+ 38. python/sglang/srt/disaggregation/mooncake/conn.py
+ 39. python/sglang/srt/disaggregation/nixl/conn.py
+ 40. python/sglang/srt/disaggregation/prefill.py
+ 41. python/sglang/srt/disaggregation/utils.py
+ 42. python/sglang/srt/distributed/communication_op.py
+ 43. python/sglang/srt/distributed/device_communicators/custom_all_reduce_utils.py
+ 44. python/sglang/srt/distributed/device_communicators/pynccl_allocator.py
+ 45. python/sglang/srt/distributed/device_communicators/pynccl_wrapper.py
+ 46. python/sglang/srt/distributed/parallel_state.py
+ 47. python/sglang/srt/entrypoints/engine.py
+ 48. python/sglang/srt/entrypoints/http_server.py
+ 49. python/sglang/srt/environ.py
+ 50. python/sglang/srt/eplb/eplb_manager.py
+ 51. python/sglang/srt/eplb/expert_distribution.py
+ 52. python/sglang/srt/hardware_backend/gpu/quantization/awq_kernels.py
+ 53. python/sglang/srt/layers/activation.py
+ 54. python/sglang/srt/layers/attention/attention_registry.py
+ 55. python/sglang/srt/layers/attention/base_attn_backend.py
+ 56. python/sglang/srt/layers/attention/deepseek_v4_backend.py
+ 57. python/sglang/srt/layers/attention/dsv4/compressor.py
+ 58. python/sglang/srt/layers/attention/dsv4/compressor_v2.py
+ 59. python/sglang/srt/layers/attention/dsv4/index_buf_accessor.py
+ 60. python/sglang/srt/layers/attention/dsv4/indexer.py
+ 61. python/sglang/srt/layers/attention/dsv4/metadata.py
+ 62. python/sglang/srt/layers/attention/fla/chunk_delta_h.py
+ 63. python/sglang/srt/layers/attention/fla/fused_sigmoid_gating_recurrent.py
+ 64. python/sglang/srt/layers/attention/fla/utils.py
+ 65. python/sglang/srt/layers/attention/flashattention_backend.py
+ 66. python/sglang/srt/layers/attention/flashinfer_backend.py
+ 67. python/sglang/srt/layers/attention/flashinfer_mla_backend.py
+ 68. python/sglang/srt/layers/attention/flashmla_backend.py
+ 69. python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+ 70. python/sglang/srt/layers/attention/nsa/index_buf_accessor.py
+ 71. python/sglang/srt/layers/attention/nsa/nsa_backend_mtp_precompute.py
+ 72. python/sglang/srt/layers/attention/nsa/nsa_indexer.py
+ 73. python/sglang/srt/layers/attention/nsa/triton_kernel.py
+ 74. python/sglang/srt/layers/attention/nsa/utils.py
+ 75. python/sglang/srt/layers/attention/nsa_backend.py
+ 76. python/sglang/srt/layers/attention/triton_backend.py
+ 77. python/sglang/srt/layers/attention/triton_ops/decode_attention.py
+ 78. python/sglang/srt/layers/attention/triton_ops/extend_attention.py
+ 79. python/sglang/srt/layers/attention/utils.py
+ 80. python/sglang/srt/layers/attention/vision.py
+ 81. python/sglang/srt/layers/communicator.py
+ 82. python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py
+ 83. python/sglang/srt/layers/deep_gemm_wrapper/configurer.py
+ 84. python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py
+ 85. python/sglang/srt/layers/dp_attention.py
+ 86. python/sglang/srt/layers/layernorm.py
+ 87. python/sglang/srt/layers/linear.py
+ 88. python/sglang/srt/layers/logits_processor.py
+ 89. python/sglang/srt/layers/mhc.py
+ 90. python/sglang/srt/layers/moe/ep_moe/kernels.py
+ 91. python/sglang/srt/layers/moe/ep_moe/layer.py
+ 92. python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+ 93. python/sglang/srt/layers/moe/hash_topk.py
+ 94. python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+ 95. python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py
+ 96. python/sglang/srt/layers/moe/moe_runner/triton.py
+ 97. python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
+ 98. python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_config.py
+ 99. python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_kernels.py
+100. python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+101. python/sglang/srt/layers/moe/token_dispatcher/flashinfer.py
+102. python/sglang/srt/layers/moe/token_dispatcher/flashinfer_utils.py
+103. python/sglang/srt/layers/moe/token_dispatcher/standard.py
+104. python/sglang/srt/layers/moe/topk.py
+105. python/sglang/srt/layers/quantization/__init__.py
+106. python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+107. python/sglang/srt/layers/quantization/compressed_tensors/schemes/__init__.py
+108. python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxint4_moe.py
+109. python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a8_int8_moe.py
+110. python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8.py
+111. python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8_moe.py
+112. python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16.py
+113. python/sglang/srt/layers/quantization/fp8.py
+114. python/sglang/srt/layers/quantization/fp8_kernel.py
+115. python/sglang/srt/layers/quantization/fp8_utils.py
+116. python/sglang/srt/layers/quantization/gptq.py
+117. python/sglang/srt/layers/quantization/int8_kernel.py
+118. python/sglang/srt/layers/quantization/marlin_utils.py
+119. python/sglang/srt/layers/quantization/marlin_utils_fp8.py
+120. python/sglang/srt/layers/quantization/modelopt_quant.py
+121. python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
+122. python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+123. python/sglang/srt/layers/quantization/qoq.py
+124. python/sglang/srt/layers/quantization/w8a8_int8.py
+125. python/sglang/srt/layers/radix_attention.py
+126. python/sglang/srt/layers/rotary_embedding/base.py
+127. python/sglang/srt/layers/sampler.py
+128. python/sglang/srt/layers/utils/cp_utils.py
+129. python/sglang/srt/layers/utils/multi_platform.py
+130. python/sglang/srt/layers/vocab_parallel_embedding.py
+131. python/sglang/srt/managers/data_parallel_controller.py
+132. python/sglang/srt/managers/multimodal_processor.py
+133. python/sglang/srt/managers/schedule_batch.py
+134. python/sglang/srt/managers/schedule_policy.py
+135. python/sglang/srt/managers/scheduler.py
+136. python/sglang/srt/managers/scheduler_dp_attn_mixin.py
+137. python/sglang/srt/managers/scheduler_pp_mixin.py
+138. python/sglang/srt/managers/scheduler_profiler_mixin.py
+139. python/sglang/srt/managers/tokenizer_manager.py
+140. python/sglang/srt/managers/utils.py
+141. python/sglang/srt/mem_cache/allocator.py
+142. python/sglang/srt/mem_cache/common.py
+143. python/sglang/srt/mem_cache/deepseek_v4_compress_state.py
+144. python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+145. python/sglang/srt/mem_cache/memory_pool.py
+146. python/sglang/srt/mem_cache/memory_pool_host.py
+147. python/sglang/srt/mem_cache/swa_memory_pool.py
+148. python/sglang/srt/mem_cache/utils.py
+149. python/sglang/srt/model_executor/cuda_graph_runner.py
+150. python/sglang/srt/model_executor/forward_batch_deepseek_mha_mixin.py
+151. python/sglang/srt/model_executor/forward_batch_info.py
+152. python/sglang/srt/model_executor/model_runner.py
+153. python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+154. python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py
+155. python/sglang/srt/model_executor/pool_configurator.py
+156. python/sglang/srt/model_loader/weight_utils.py
+157. python/sglang/srt/models/deepseek_common/attention_backend_handler.py
+158. python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py
+159. python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
+160. python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla_fused_rope_cpu.py
+161. python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla_fused_rope_rocm.py
+162. python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
+163. python/sglang/srt/models/deepseek_common/utils.py
+164. python/sglang/srt/models/deepseek_nextn.py
+165. python/sglang/srt/models/deepseek_v2.py
+166. python/sglang/srt/models/deepseek_v4.py
+167. python/sglang/srt/models/deepseek_v4_nextn.py
+168. python/sglang/srt/models/glm4_moe.py
+169. python/sglang/srt/models/glm4_moe_lite.py
+170. python/sglang/srt/models/kimi_k25.py
+171. python/sglang/srt/models/mimo_v2.py
+172. python/sglang/srt/models/minicpm3.py
+173. python/sglang/srt/models/minimax_m2.py
+174. python/sglang/srt/models/qwen2_moe.py
+175. python/sglang/srt/models/qwen3.py
+176. python/sglang/srt/models/qwen3_5.py
+177. python/sglang/srt/models/qwen3_5_mtp.py
+178. python/sglang/srt/models/qwen3_moe.py
+179. python/sglang/srt/models/qwen3_next.py
+180. python/sglang/srt/models/registry.py
+181. python/sglang/srt/server_args.py
+182. python/sglang/srt/speculative/draft_utils.py
+183. python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+184. python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py
+185. python/sglang/srt/speculative/eagle_info.py
+186. python/sglang/srt/speculative/eagle_info_v2.py
+187. python/sglang/srt/speculative/eagle_utils.py
+188. python/sglang/srt/speculative/eagle_worker.py
+189. python/sglang/srt/speculative/eagle_worker_v2.py
+190. python/sglang/srt/speculative/multi_layer_eagle_draft_extend_cuda_graph_runner.py
+191. python/sglang/srt/speculative/multi_layer_eagle_utils.py
+192. python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py
+193. python/sglang/srt/speculative/ngram_info.py
+194. python/sglang/srt/speculative/spec_utils.py
+195. python/sglang/srt/utils/common.py
+196. python/sglang/srt/utils/hf_transformers/common.py
+197. python/sglang/srt/utils/hf_transformers/config.py
+198. python/sglang/srt/utils/numa_utils.py
+199. python/sglang/utils.py
+200. sgl-kernel/python/sgl_kernel/__init__.py
+201. sgl-kernel/python/sgl_kernel/allreduce.py
+202. sgl-kernel/python/sgl_kernel/attention.py
+203. sgl-kernel/python/sgl_kernel/elementwise.py
+204. sgl-kernel/python/sgl_kernel/flash_attn.py
+205. sgl-kernel/python/sgl_kernel/gemm.py
+206. sgl-kernel/python/sgl_kernel/load_utils.py
+207. sgl-kernel/python/sgl_kernel/moe.py
+208. sgl-kernel/python/sgl_kernel/quantization/__init__.py
+209. sgl-kernel/python/sgl_kernel/sampling.py
+210. sgl-kernel/tests/test_int8_gemm.py
+211. sgl-model-gateway/bindings/python/src/sglang_router/launch_router.py
+212. sgl-model-gateway/bindings/python/src/sglang_router/mini_lb.py
+213. sgl-model-gateway/bindings/python/src/sglang_router/router.py
+214. sgl-model-gateway/bindings/python/src/sglang_router/router_args.py
+215. sgl-model-gateway/e2e_test/infra/gpu_allocator.py
+216. test/registered/dsv4/test_deepseek_v4_flash_fp4_b200.py
+217. test/registered/radix_cache/test_unified_radix_cache_kl_hicache.py
+The following files are newly added by MetaX Integrated Circuits (Shanghai) Co., Ltd. in 2026. All rights reserved.
+ 1. demo.py
+ 2. python/setup.py
+ 3. python/sglang/jit_kernel/tests/test_fused_norm_rope_v2_bf16.py
+ 4. python/sglang/jit_kernel/tests/test_main_norm_rope_bf16.py
+ 5. python/sglang/jit_kernel/triton/sigmoid_gate_mul.py
+ 6. python/sglang/srt/eplb/mock_balance_tensor.py
+ 7. python/sglang/srt/function_profiler.py
+ 8. python/sglang/srt/layers/attention/dsv4/dequant_k_cache.py
+ 9. python/sglang/srt/layers/attention/dsv4/sparse_prefill_utils.py
+10. python/sglang/srt/layers/fused_qk_rmsnorm_rope_gate.py
+11. python/sglang/srt/layers/mhc_vllm.py
+12. python/sglang/srt/managers/input_truncation.py
+13. python/sglang/srt/models/joyai_llm_flash_nextn.py
+14. python/sglang/srt/utils/csv_logger.py
+15. python/sglang/test/example_fused_moe_blockwise_fp8_1d2d.py
+16. python/sglang/test/example_fused_moe_blockwise_fp8_1d2d_acc.py
+17. sgl-kernel/python/sgl_kernel/cutlass_mm.py
+18. sgl-kernel/python/sgl_kernel/quantization/quantization.py
+19. sgl-kernel/setup.py
+20. test/manual/core/test_dsv4_cached_loc_invalidation.py
+21. test/manual/core/test_dsv4_hicache_swa_translation_cache.py
+22. test/manual/core/test_dsv4_stale_loc_crash.py
