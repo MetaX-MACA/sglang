@@ -41,7 +41,6 @@ from .fused_moe_triton_kernels import (
 )
 from .moe_align_block_size import moe_align_block_size
 from sgl_kernel import cutlass_moe_mm_gemm_kernel_m_w8a8
-from mcoplib.sgl_moe_fused_w4a16 import mctlass_moe_w4a16_gemm_kernel_mnk
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -551,12 +550,9 @@ def _fused_moe_kernel_sequence(
         stage1_config["BLOCK_SIZE_M"] = kernel_m
         stage2_config["BLOCK_SIZE_M"] = kernel_m
         
-    elif enable_maca_sglang_fused_moe_mctlass_w4a16 and use_int4_w4a16:
-        if enable_mctlass_fused_moe_python_api and w1_zp is None:
-            kernel_m = gemm.get_kernel_m(
-                hidden_states, w1.view(dtype=torch.quint4x2), intermediate_cache1, w1.shape[0], hidden_states.shape[0], w1.shape[1], hidden_states.shape[1], topk_ids.shape[1],  is_blockwise=True, group_size=32)
-        else:
-            kernel_m = mctlass_moe_w4a16_gemm_kernel_mnk(topk_ids.numel(), N, hidden_states.shape[1], E)
+    elif enable_maca_sglang_fused_moe_mctlass_w4a16 and use_int4_w4a16 and enable_mctlass_fused_moe_python_api and w1_zp is None:
+        kernel_m = gemm.get_kernel_m(
+            hidden_states, w1.view(dtype=torch.quint4x2), intermediate_cache1, w1.shape[0], hidden_states.shape[0], w1.shape[1], hidden_states.shape[1], topk_ids.shape[1],  is_blockwise=True, group_size=32)
         assert kernel_m > 0, ("cutlass_fused_moe_w4a16 BLOCK_SIZE_M must greater than zero.")
         stage1_config["BLOCK_SIZE_M"] = kernel_m
         stage2_config["BLOCK_SIZE_M"] = kernel_m
