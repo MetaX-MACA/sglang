@@ -2012,6 +2012,10 @@ class DeepseekV4AttnBackend(
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
                 )
+
+            if forward_batch.forward_mode.is_extend_without_speculative() and (
+                q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
             ):
                 if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
                     return self._forward_prefill_sparse_q8kv8(

@@ -1,2392 +1,2136 @@
-diff --git a/python/sglang/kernels/jit/csrc/deepseek_v4/topk_v2.cuh b/python/sglang/kernels/jit/csrc/deepseek_v4/topk_v2.cuh
-index 05d05d81fa..19f42a169c 100644
---- a/python/sglang/kernels/jit/csrc/deepseek_v4/topk_v2.cuh
-+++ b/python/sglang/kernels/jit/csrc/deepseek_v4/topk_v2.cuh
-@@ -37,21 +37,29 @@ enum class TopKMode {
- using Register2 = impl::TopKRegister<2>;  // <= 8192, register-resident, 1 read
- using Register4 = impl::TopKRegister<4>;  // <= 16384, register-resident, 1 read
- using Streaming = impl::TopKStreaming;
-+#if SGL_TOPK_HAS_CLUSTER
- using Cluster = impl::TopKCluster<8>;
-+#endif
- 
- constexpr uint32_t kBlockSize = impl::TopKConfig::kBlockSize;
- constexpr uint32_t kOccupancy = impl::TopKConfig::kOccupancy;
- constexpr uint32_t kMaxTopK = impl::TopKConfig::kMaxTopK;
-+#if SGL_TOPK_HAS_CLUSTER
- constexpr uint32_t kClusterSize = Cluster::kClusterSize;
-+#endif
- constexpr uint32_t kReg2MaxSeqLen = Register2::kMaxSeqLen;  // 8192
- constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
- 
- #define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kOccupancy)
-+#if SGL_TOPK_HAS_CLUSTER
- #define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
-+#endif
- 
- constexpr uint32_t kClusterFloor = 65536;
-+#if SGL_TOPK_HAS_CLUSTER
- constexpr uint32_t kClusterMaxBatch = 512;
- constexpr uint32_t kNumPersistentClusters = 15 * kOccupancy;
-+#endif
- 
- /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
- /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
-@@ -119,6 +127,7 @@ struct TopKRaggedParams {
-  * \brief Persistent cluster kernel for the long items. It will handle long inputs.
-  * The short items are handled by the separate topk_kernel.
-  */
-+#if SGL_TOPK_HAS_CLUSTER
- template <bool kPDL>
- CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const   TopKPagedParams params) {
-   device::enable_smem_spilling();
-@@ -134,6 +143,7 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const   TopKPagedParams
-     __syncthreads();
-   }
- }
-+#endif
- 
- template <typename F>
- SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
-@@ -306,8 +316,9 @@ TOPK_KERNEL void topk_main_kernel(const   TopKPagedParams params) {
-   }
- }
- 
-+#if SGL_TOPK_HAS_CLUSTER
- template <bool kPDL, TopKMode kMode>
--CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const   TopKPagedParams params) {
-+CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const TopKPagedParams params) {
-   device::enable_smem_spilling();
-   auto problem = params.problem(blockIdx.x);
-   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
-@@ -353,6 +364,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const   TopKPagedParams params)
-     problem_transform(problem, params.get_output_ptr(blockIdx.x));
-   }
- }
-+#endif
- 
- // --- Plan: choose cluster_threshold from the seq_len distribution -----------
- __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
-@@ -547,8 +559,12 @@ struct TopKKernel {
-         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
-     };
- 
-+    // MACA targets the portable streaming path and does not support CUDA's
-+    // programmatic dependent-launch attribute.
-+    constexpr bool kUsePDL = SGL_TOPK_HAS_CLUSTER;
-+#if SGL_TOPK_HAS_CLUSTER
-     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
--    constexpr bool kUsePDL = true;
-+#endif
-     const auto mode = page_table.has_value() ? TopKMode::PAGE_TABLE : TopKMode::INDICES;
-     const auto dispatch = [&]<typename F>(F&& f) {
-       switch (mode) {
-@@ -559,6 +575,7 @@ struct TopKKernel {
-       }
-     };
-     dispatch([&]<TopKMode kMode>() {
-+#if SGL_TOPK_HAS_CLUSTER
-       if (use_cluster) {
-         if (batch_size <= kNumPersistentClusters) {
-           LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
-@@ -573,7 +590,10 @@ struct TopKKernel {
-               .config({.use_pdl = kUsePDL})
-               .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, kMode>, params);
-         }
--      } else if (max_seq_len <= kReg2MaxSeqLen) {
-+        return;
-+      }
-+#endif
-+      if (max_seq_len <= kReg2MaxSeqLen) {
-         LaunchKernel(batch_size, kBlockSize, device)
-             .config({.use_pdl = kUsePDL})
-             .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0, kMode>, params);
-diff --git a/python/sglang/kernels/jit/csrc/elementwise/concat_mla.cuh b/python/sglang/kernels/jit/csrc/elementwise/concat_mla.cuh
-index 53bd085536..194a93169c 100644
---- a/python/sglang/kernels/jit/csrc/elementwise/concat_mla.cuh
-+++ b/python/sglang/kernels/jit/csrc/elementwise/concat_mla.cuh
-@@ -14,33 +14,57 @@ namespace sglang {
- // Adapted from DeepEP: https://github.com/deepseek-ai/DeepEP/blob/main/csrc/kernels/utils.cuh
- 
- SGL_DEVICE int get_lane_id() {
-+#if defined(__MACA_ARCH__) || defined(__MACACC__) || defined(__MACA__) || defined(__MXCC__)
-+  // MACA does not accept PTX special-register syntax (for example,
-+  // ``%laneid``) in inline assembly.  The kernels below use 32-thread
-+  // warps explicitly, so the lane can be derived portably from threadIdx.
-+  return threadIdx.x & 31;
-+#else
-   int lane_id;
-   asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
-   return lane_id;
-+#endif
- }
- 
--SGL_DEVICE void st_na_global_v1(const int* ptr, int v) {
-+SGL_DEVICE void st_na_global_v1(int* ptr, int v) {
-+#if defined(__MACA_ARCH__) || defined(__MACACC__) || defined(__MACA__) || defined(__MXCC__)
-+  *ptr = v;
-+#else
-   asm volatile("st.global.L1::no_allocate.s32 [%0], %1;" ::"l"(ptr), "r"(v) : "memory");
-+#endif
- }
- 
--SGL_DEVICE void st_na_global_v2(const int2* ptr, const int2& v) {
-+SGL_DEVICE void st_na_global_v2(int2* ptr, const int2& v) {
-+#if defined(__MACA_ARCH__) || defined(__MACACC__) || defined(__MACA__) || defined(__MXCC__)
-+  *ptr = v;
-+#else
-   asm volatile("st.global.L1::no_allocate.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(v.x), "r"(v.y) : "memory");
-+#endif
- }
- 
- SGL_DEVICE int ld_na_global_v1(const int* ptr) {
-+#if defined(__MACA_ARCH__) || defined(__MACACC__) || defined(__MACA__) || defined(__MXCC__)
-+  return *ptr;
-+#else
-   int r;
-   asm volatile("ld.global.nc.L1::no_allocate.s32 %0, [%1];" : "=r"(r) : "l"(ptr));
-   return r;
-+#endif
- }
- 
- SGL_DEVICE int2 ld_na_global_v2(const int2* ptr) {
-+#if defined(__MACA_ARCH__) || defined(__MACACC__) || defined(__MACA__) || defined(__MXCC__)
-+  return *ptr;
-+#else
-   int2 r;
-   asm volatile("ld.global.nc.L1::no_allocate.v2.s32 {%0, %1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(ptr));
-   return r;
-+#endif
- }
- 
- SGL_DEVICE void prefetch_L2(const void* p) {
--#if defined(ENABLE_L2_PREFETCH)
-+#if defined(ENABLE_L2_PREFETCH) && !defined(__MACA_ARCH__) && !defined(__MACACC__) && !defined(__MACA__) && \
-+    !defined(__MXCC__)
-   asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
- #endif
- }
-diff --git a/python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/topk_impl.cuh b/python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/topk_impl.cuh
-index 68390e0e68..bacaf38909 100644
---- a/python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/topk_impl.cuh
-+++ b/python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/topk_impl.cuh
-@@ -34,6 +34,15 @@ namespace device::topk {
- 
- namespace cg = cooperative_groups;
- 
-+// MACA's CUDA bridge does not implement CUDA thread-block clusters or
-+// distributed shared memory. Keep the portable single-block implementations
-+// available and omit the cluster-only implementation when compiling with it.
-+#if defined(__MACA_ARCH__) || defined(__MACACC__) || defined(__MACA__) || defined(__MXCC__)
-+#define SGL_TOPK_HAS_CLUSTER 0
-+#else
-+#define SGL_TOPK_HAS_CLUSTER 1
-+#endif
+diff --git a/infer_transfomers_dsv4.py b/infer_transfomers_dsv4.py
+new file mode 100644
+index 0000000000..e82bc88f4d
+--- /dev/null
++++ b/infer_transfomers_dsv4.py
+@@ -0,0 +1,58 @@
++from typing import Union
 +
- /// sgl_kernel names the warp size `kWarpThreads`; alias it locally as `kWarpSize`.
- inline constexpr uint32_t kWarpSize = kWarpThreads;
++import psutil
++import torch
++from transformers import AutoModelForCausalLM, AutoTokenizer
++
++
++MODEL_PATH = (
++    "/mxstorage/pde_ai/models/model_quant_opt/DeepSeek/"
++    "DeepSeek-V4-Flash_FlexSMQ-AWQ_W8A8/vllm_quant_model/"
++)
++
++
++def get_device_max_memory() -> dict[Union[int, str], str]:
++    max_memory: dict[Union[int, str], str] = {}
++    for device_id in range(torch.cuda.device_count()):
++        torch.empty(1, device=f"cuda:{device_id}")
++        available_bytes = torch.cuda.mem_get_info(device_id)[0]
++        available_gb = available_bytes / 10**9
++        if device_id == 0:
++            ratio = 0.5 if available_gb > 30 else 0.3
++        else:
++            ratio = 0.875 if available_gb > 30 else 0.7
++        max_memory[device_id] = f"{available_gb * ratio:.1f}GB"
++
++    cpu_available_gb = psutil.virtual_memory().available / 10**9
++    max_memory["cpu"] = f"{cpu_available_gb * 0.875:.1f}GB"
++    return max_memory
++
++
++def infer() -> None:
++    print(f"MODEL_PATH: {MODEL_PATH}")
++    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
++    max_memory = get_device_max_memory()
++    print(f"max_memory: {max_memory}")
++
++    model = AutoModelForCausalLM.from_pretrained(
++        MODEL_PATH,
++        trust_remote_code=True,
++        dtype="auto",
++        device_map="auto",
++        max_memory=max_memory,
++    )
++    inputs = tokenizer.apply_chat_template(
++        [{"role": "user", "content": "Explain the current state of China's economy."}],
++        add_generation_prompt=True,
++        tokenize=True,
++        return_dict=True,
++        return_tensors="pt",
++    ).to(model.device)
++
++    outputs = model.generate(**inputs, max_new_tokens=512)
++    generated_ids = outputs[0][inputs["input_ids"].shape[-1] :]
++    print(tokenizer.decode(generated_ids, skip_special_tokens=True))
++
++
++if __name__ == "__main__":
++    infer()
+diff --git a/infer_transfomers_glm5.py b/infer_transfomers_glm5.py
+new file mode 100644
+index 0000000000..f271b0bd39
+--- /dev/null
++++ b/infer_transfomers_glm5.py
+@@ -0,0 +1,87 @@
++# Load model directly
++
++import psutil
++import torch
++from typing import Union
++from easydict import EasyDict
++
++from transformers import AutoModelForCausalLM
++from transformers import AutoProcessor
++
++
++def get_device_max_memory() -> dict[Union[int, str], Union[int, str]]:
++    memory_rate = EasyDict({"gpu0_ratio": 0.5, "other_ratio": 0.875})
++    # memory_rate = EasyDict({"gpu0_ratio": 0.85, "other_ratio": 0.95})
++
++    for i in range(torch.cuda.device_count()):
++        _ = torch.tensor([0], device=i)
++        cuda_avail_memory = {
++            i: torch.cuda.mem_get_info(i)[0] for i in range(torch.cuda.device_count())
++        }
++        cpu_avail_memory = psutil.virtual_memory().available
++        max_memory = {}
++        for cuda_num, cuda_memory in cuda_avail_memory.items():
++            cuda_memory_gb = cuda_memory / (10**9)
++            # print(f"GPU{cuda_num} cuda_avail_memory: {cuda_memory_gb:.1f}GB")
++            if cuda_num == 0:
++                # The ratio is an experience value that you can manually adjust yourself.
++                gpu0_ratio = memory_rate.gpu0_ratio if cuda_memory_gb > 30 else 0.3
++                max_memory[cuda_num] = f"{cuda_memory_gb * gpu0_ratio:.1f}GB"
++            else:
++                other_ratio = memory_rate.other_ratio if cuda_memory_gb > 30 else 0.7
++                max_memory[cuda_num] = f"{cuda_memory_gb * other_ratio:.1f}GB"
++        print(f"cpu_avail_memory: {cpu_avail_memory / (10**9):.1f}GB")
++        cpu_ratio = 0.875
++        max_memory["cpu"] = f"{cpu_avail_memory / (10**9) * cpu_ratio:.1f}GB"
++        print("final_use_model_kwargs: ", max_memory)
++        # max_memory =  {0: '0.1GB', 'cpu': '100GB'}
++
++    return max_memory
++
++
++def infer():
++    MODEL_PATH = "/mxstorage/pde_ai/models/llm/ChatGLM/GLM-5-W8A8"
++
++    print(f"MODEL_PATH: {MODEL_PATH}")
++
++    processor = AutoProcessor.from_pretrained(MODEL_PATH)
++    max_memory = get_device_max_memory()
++
++    print(f"max_memory: {max_memory}")
++    model = AutoModelForCausalLM.from_pretrained(
++        MODEL_PATH,
++        trust_remote_code=True,
++        dtype="auto",
++        device_map="auto",
++        max_memory=max_memory,
++        attn_implementation="flash_attention_2",  # 或 "sdpa"
++    )
++    messages = [
++        {
++            "role": "user",
++            "content": [
++                # {"type": "image", "url": "/sw_home/diwang/workspace/inference_engine/LightCompress/examples/GLM-4.5V/candy.JPG"},
++                # {"type": "text", "text": "What animal is on the candy?"}
++                # {"type": "text", "text": "What animal is the king of forest?"}
++                {"type": "text", "text": "评价中国经济现状"}
++            ],
++        },
++    ]
++    inputs = processor.apply_chat_template(
++        messages,
++        add_generation_prompt=True,
++        tokenize=True,
++        return_dict=True,
++        return_tensors="pt",
++    ).to("cpu")
++
++    outputs = model.generate(**inputs, max_new_tokens=512)
++    print(processor.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
++
++
++if __name__ == "__main__":
++    import debugpy
++
++    debugpy.connect(5678)
++    debugpy.wait_for_client()
++    infer()
+diff --git a/infer_transfomers_k3.py b/infer_transfomers_k3.py
+new file mode 100644
+index 0000000000..a390a4012a
+--- /dev/null
++++ b/infer_transfomers_k3.py
+@@ -0,0 +1,86 @@
++# Load model directly
++
++import psutil
++import torch
++from typing import Union
++from easydict import EasyDict
++from transformers import AutoModel
++from transformers import AutoProcessor
++
++
++def get_device_max_memory() -> dict[Union[int, str], Union[int, str]]:
++    memory_rate = EasyDict({"gpu0_ratio": 0.5, "other_ratio": 0.875})
++    # memory_rate = EasyDict({"gpu0_ratio": 0.85, "other_ratio": 0.95})
++
++    for i in range(torch.cuda.device_count()):
++        _ = torch.tensor([0], device=i)
++        cuda_avail_memory = {
++            i: torch.cuda.mem_get_info(i)[0] for i in range(torch.cuda.device_count())
++        }
++        cpu_avail_memory = psutil.virtual_memory().available
++        max_memory = {}
++        for cuda_num, cuda_memory in cuda_avail_memory.items():
++            cuda_memory_gb = cuda_memory / (10**9)
++            # print(f"GPU{cuda_num} cuda_avail_memory: {cuda_memory_gb:.1f}GB")
++            if cuda_num == 0:
++                # The ratio is an experience value that you can manually adjust yourself.
++                gpu0_ratio = memory_rate.gpu0_ratio if cuda_memory_gb > 30 else 0.3
++                max_memory[cuda_num] = f"{cuda_memory_gb * gpu0_ratio:.1f}GB"
++            else:
++                other_ratio = memory_rate.other_ratio if cuda_memory_gb > 30 else 0.7
++                max_memory[cuda_num] = f"{cuda_memory_gb * other_ratio:.1f}GB"
++        print(f"cpu_avail_memory: {cpu_avail_memory / (10**9):.1f}GB")
++        cpu_ratio = 0.875
++        max_memory["cpu"] = f"{cpu_avail_memory / (10**9) * cpu_ratio:.1f}GB"
++        print("final_use_model_kwargs: ", max_memory)
++        # max_memory =  {0: '0.1GB', 'cpu': '100GB'}
++
++    return max_memory
++
++
++def infer():
++    MODEL_PATH = "/mxstorage/pde_ai/models/llm/ChatGLM/GLM-5-W8A8"
++
++    print(f"MODEL_PATH: {MODEL_PATH}")
++
++    processor = AutoProcessor.from_pretrained(MODEL_PATH)
++    max_memory = get_device_max_memory()
++
++    print(f"max_memory: {max_memory}")
++    model = AutoModel.from_pretrained(
++        MODEL_PATH,
++        trust_remote_code=True,
++        dtype="auto",
++        device_map="auto",
++        max_memory=max_memory,
++        attn_implementation="flash_attention_2",  # 或 "sdpa"
++    )
++    messages = [
++        {
++            "role": "user",
++            "content": [
++                # {"type": "image", "url": "/sw_home/diwang/workspace/inference_engine/LightCompress/examples/GLM-4.5V/candy.JPG"},
++                # {"type": "text", "text": "What animal is on the candy?"}
++                # {"type": "text", "text": "What animal is the king of forest?"}
++                {"type": "text", "text": "评价中国经济现状"}
++            ],
++        },
++    ]
++    inputs = processor.apply_chat_template(
++        messages,
++        add_generation_prompt=True,
++        tokenize=True,
++        return_dict=True,
++        return_tensors="pt",
++    ).to("cpu")
++
++    outputs = model.generate(**inputs, max_new_tokens=512)
++    print(processor.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
++
++
++if __name__ == "__main__":
++    import debugpy
++
++    debugpy.connect(5678)
++    debugpy.wait_for_client()
++    infer()
+diff --git a/python/sglang/kernels/jit/csrc/deepseek_v4/fused_norm_rope_v2.cuh b/python/sglang/kernels/jit/csrc/deepseek_v4/fused_norm_rope_v2.cuh
+index 968dd93959..97fa2c2775 100644
+--- a/python/sglang/kernels/jit/csrc/deepseek_v4/fused_norm_rope_v2.cuh
++++ b/python/sglang/kernels/jit/csrc/deepseek_v4/fused_norm_rope_v2.cuh
+@@ -12,7 +12,9 @@
  
-@@ -692,6 +701,7 @@ struct TopKStreaming : TopKRegister<2> {
- // on one batch element via distributed shared memory (one cluster per element).
- // ---------------------------------------------------------------------------
+ #include <tvm/ffi/container/tensor.h>
  
-+#if SGL_TOPK_HAS_CLUSTER
- template <uint32_t kClusterSize_>
- struct TopKCluster : TopKRadixBase<10> {
-  public:
-@@ -858,6 +868,7 @@ struct TopKCluster : TopKRadixBase<10> {
++#include <bit>
+ #include <cstdint>
++#include <type_traits>
+ 
+ namespace sglang {
+ 
+@@ -36,6 +38,19 @@ SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
+   return idx;
+ }
+ 
++
++// Clamp to [INT8_MIN, INT8_MAX].
++SGL_DEVICE int8_t int8_clip(float val) {
++  namespace math = device::math;
++  return static_cast<int8_t>(math::max(math::min(val, 127.0f), -128.0f));
++}
++
++// Pack two fp32 values into a single int8x2 with clamping.
++SGL_DEVICE char2 pack_int8(float x, float y) {
++  return char2{int8_clip(x), int8_clip(y)};
++}
++
++
+ constexpr uint32_t kBlockSize = 256;
+ constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
+ 
+@@ -45,7 +60,7 @@ struct FusedNormRopeStoreParams {
+   const void* __restrict__ weight;
+   const float* __restrict__ freqs_cis;
+   const int64_t* __restrict__ out_loc;
+-  uint8_t* __restrict__ kvcache;
++  void* __restrict__ kvcache;  // uint8 fp8 cache or bf16 cache
+   float eps;
+   uint32_t compress_ratio;
+   uint32_t num_tokens;
+@@ -64,8 +79,14 @@ enum class ForwardMode : bool {
+ // Each warp's 32 lanes cover the full 128-elem head_dim (kVecSize = 4 each).
+ // Cache layout: 132 bytes/token (128 fp8 nope + 4 fp32 scale).
+ // ----------------------------------------------------------------------------
+-template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL, int32_t kPreshuffleSize = 0>
+-INDEXER_KERNEL void fused_norm_rope_indexer(const  FusedNormRopeStoreParams params) {
++template <
++    typename DType,
++    typename CacheDType,
++    ForwardMode kMode,
++    int32_t kPageBits,
++    bool kUsePDL,
++    int32_t kPreshuffleSize = 0>
++INDEXER_KERNEL void fused_norm_rope_indexer(const FusedNormRopeStoreParams params) {
+   using namespace device;
+   using enum ForwardMode;
+ 
+@@ -73,10 +94,14 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const  FusedNormRopeStoreParams para
+   constexpr int64_t kRopeDim = 64;
+   constexpr int64_t kVecSize = 4;
+   constexpr uint32_t kRopeSize = kRopeDim / kVecSize;
+-  constexpr int64_t kPageBytes = 132ll << kPageBits;
++  constexpr bool kUseFp8Cache = std::is_same_v<CacheDType, uint8_t>;
++  constexpr bool kUseInt8Cache = std::is_same_v<CacheDType, int8_t>;
++  constexpr int64_t kFp8PageBytes = 132ll << kPageBits;
++  constexpr int64_t kBf16PageElems = kHeadDim << kPageBits;
+   static_assert(kHeadDim == kWarpThreads * kVecSize);
+   static_assert(kRopeDim == kWarpThreads * 2);
+   static_assert(kRopeSize <= kWarpThreads);
++  static_assert(kUseFp8Cache || kUseInt8Cache || std::is_same_v<CacheDType, bf16_t>, "CacheDType must be uint8_t or bf16_t or int8");
+   using Storage = AlignedVector<DType, kVecSize>;
+   using Float4 = AlignedVector<float, kVecSize>;
+ 
+@@ -191,43 +216,89 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const  FusedNormRopeStoreParams para
+       data[i] *= kHadamardScale;
+   }
+ 
+-  // part 4: per-warp UE8M0 quant + store. The whole warp emits one fp8 group
+-  // (= 128 elements) plus a single fp32 scale, matching the indexer cache
+-  // layout (`fused_store_indexer_cache`).
++  // part 4: store. The original path keeps indexer cache in fp8 + fp32 scale;
++  // the bf16 path stores the whole 128-dim normalized/rotated/hadamard vector
++  // directly without quantization.
+   {
+-    using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
+-    float local_max = math::abs(data[0]);
+-#pragma unroll
+-    for (int i = 1; i < kVecSize; ++i) {
+-      local_max = math::max(local_max, math::abs(data[i]));
+-    }
+-    const auto abs_max = warp::reduce_max(local_max);
+-    const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
+-    const auto inv_scale = 1.0f / scale;
+     const int64_t page = out_loc >> kPageBits;
+     const int64_t offset = out_loc & ((1 << kPageBits) - 1);
+-    const auto page_ptr = params.kvcache + page * kPageBytes;
+-    const auto value_ptr = page_ptr + offset * 128;
+-    const auto scale_ptr = page_ptr + (128 << kPageBits) + offset * 4;
+-    OutStorage result;
+-    result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
+-    result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
+-    PDLTriggerSecondary<kUsePDL>();
+-    if constexpr (kPreshuffleSize != 0) {
+-      constexpr int32_t kTile = kPreshuffleSize;
+-      const int32_t dim_base = lane_id * kVecSize;
+-      const int32_t token_tile_id = offset / kTile;
+-      const int32_t token_in_tile = offset % kTile;
+-      const int32_t col_tile_id = dim_base / kTile;
+-      const int32_t col_in_tile = dim_base % kTile;
+-      const int32_t value_offset = token_tile_id * (kTile * static_cast<int32_t>(kHeadDim)) +
+-                                   col_tile_id * (kTile * kTile) + token_in_tile * kTile + col_in_tile;
+-      result.store(page_ptr + value_offset, 0);
++
++    if constexpr (kUseFp8Cache) {
++      using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
++      float local_max = math::abs(data[0]);
++#pragma unroll
++      for (int i = 1; i < kVecSize; ++i) {
++        local_max = math::max(local_max, math::abs(data[i]));
++      }
++      const auto abs_max = warp::reduce_max(local_max);
++      const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
++      const auto inv_scale = 1.0f / scale;
++      const auto page_ptr = static_cast<uint8_t*>(params.kvcache) + page * kFp8PageBytes;
++      const auto value_ptr = page_ptr + offset * 128;
++      const auto scale_ptr = page_ptr + (128 << kPageBits) + offset * 4;
++      OutStorage result;
++      result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
++      result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
++      PDLTriggerSecondary<kUsePDL>();
++      if constexpr (kPreshuffleSize != 0) {
++        constexpr int32_t kTile = kPreshuffleSize;
++        const int32_t dim_base = lane_id * kVecSize;
++        const int32_t token_tile_id = offset / kTile;
++        const int32_t token_in_tile = offset % kTile;
++        const int32_t col_tile_id = dim_base / kTile;
++        const int32_t col_in_tile = dim_base % kTile;
++        const int32_t value_offset = token_tile_id * (kTile * static_cast<int32_t>(kHeadDim)) +
++                                     col_tile_id * (kTile * kTile) + token_in_tile * kTile + col_in_tile;
++        result.store(page_ptr + value_offset, 0);
++      } else {
++        result.store(value_ptr, lane_id);
++      }
++      // The single fp32 scale is identical across all lanes -- write from any lane.
++      if (lane_id == 0) reinterpret_cast<float*>(scale_ptr)[0] = scale;
++    } else if constexpr (kUseInt8Cache) {
++      using OutStorage = AlignedVector<char2, 2>;
++      float local_max = math::abs(data[0]);
++#pragma unroll
++      for (int i = 1; i < kVecSize; ++i) {
++        local_max = math::max(local_max, math::abs(data[i]));
++      }
++      const auto abs_max = warp::reduce_max(local_max);
++      const auto scale = fmaxf(1e-4f, abs_max) / 127.0f;
++      const auto inv_scale = 1.0f / scale;
++      const auto page_ptr = static_cast<int8_t*>(params.kvcache) + page * kFp8PageBytes;
++      const auto value_ptr = page_ptr + offset * 128;
++      const auto scale_ptr = page_ptr + (128 << kPageBits) + offset * 4;
++      OutStorage result;
++      result[0] = pack_int8(data[0] * inv_scale, data[1] * inv_scale);
++      result[1] = pack_int8(data[2] * inv_scale, data[3] * inv_scale);
++      PDLTriggerSecondary<kUsePDL>();
++      if constexpr (kPreshuffleSize != 0) {
++        constexpr int32_t kTile = kPreshuffleSize;
++        const int32_t dim_base = lane_id * kVecSize;
++        const int32_t token_tile_id = offset / kTile;
++        const int32_t token_in_tile = offset % kTile;
++        const int32_t col_tile_id = dim_base / kTile;
++        const int32_t col_in_tile = dim_base % kTile;
++        const int32_t value_offset = token_tile_id * (kTile * static_cast<int32_t>(kHeadDim)) +
++                                     col_tile_id * (kTile * kTile) + token_in_tile * kTile + col_in_tile;
++        result.store(page_ptr + value_offset, 0);
++      } else {
++        result.store(value_ptr, lane_id);
++      }
++      // The single fp32 scale is identical across all lanes -- write from any lane.
++      if (lane_id == 0) reinterpret_cast<float*>(scale_ptr)[0] = scale;
+     } else {
+-      result.store(value_ptr, lane_id);
++      using CacheStorage = AlignedVector<CacheDType, kVecSize>;
++      auto cache_ptr =
++          static_cast<CacheDType*>(params.kvcache) + page * kBf16PageElems + offset * kHeadDim;
++      CacheStorage result;
++#pragma unroll
++      for (int i = 0; i < kVecSize; ++i) {
++        result[i] = cast<CacheDType>(data[i]);
++      }
++      PDLTriggerSecondary<kUsePDL>();
++      result.store(cache_ptr, lane_id);
+     }
+-    // The single fp32 scale is identical across all lanes -- write from any lane.
+-    if (lane_id == 0) reinterpret_cast<float*>(scale_ptr)[0] = scale;
+   }
+ }
+ 
+@@ -365,7 +436,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const FusedNormRopeStoreParams p
+ 
+     const int64_t page = out_loc >> kPageBits;
+     const int64_t offset = out_loc & ((1 << kPageBits) - 1);
+-    const auto page_ptr = params.kvcache + page * kPageBytes;
++    const auto page_ptr = static_cast<uint8_t*>(params.kvcache) + page * kPageBytes;
+     const auto value_ptr = page_ptr + offset * 64;
+     const auto scale_ptr = page_ptr + (64 << kPageBits) + offset * 4;
+ 
+@@ -380,7 +451,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const FusedNormRopeStoreParams p
+ // Each thread loads kVecSize=2 BF16, so 256 threads cover the full 512 elems.
+ // Cache layout: 584 bytes/token = 448 fp8 nope + 64 (=32 bf16x2) rope + 8 scale.
+ // ----------------------------------------------------------------------------
+-template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL, bool kBf16Store = false>
++template <typename DType, typename CacheDType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL>
+ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const FusedNormRopeStoreParams params) {
+   using namespace device;
+   using enum ForwardMode;
+@@ -391,13 +462,13 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const FusedNormRopeStoreParams par
+   // Last warp owns the rope tail. The remaining 7 warps each emit one
+   // 64-element fp8 group (own UE8M0 scale).
+   constexpr uint32_t kRopeWarp = kNumWarps - 1;
+-  // kBf16Store: write the whole head_dim as plain BF16 (no fp8 / no scale) into a
+-  // [num_slots, head_dim] bf16 cache (page_size==1) at row out_loc
+-  constexpr int64_t kPageBytes =
+-      kBf16Store ? ((kHeadDim * 2ll) << kPageBits) : host::div_ceil(584ll << kPageBits, 576) * 576;
++  constexpr bool kUseFp8Cache = std::is_same_v<CacheDType, uint8_t>;
++  constexpr int64_t kFp8PageBytes = host::div_ceil(584ll << kPageBits, 576) * 576;
++  constexpr int64_t kBf16PageElems = kHeadDim << kPageBits;
+   static_assert(kHeadDim == kBlockSize * kVecSize);
+   static_assert(kRopeDim == kWarpThreads * kVecSize);
+   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
++  static_assert(kUseFp8Cache || std::is_same_v<CacheDType, bf16_t>, "CacheDType must be uint8_t or bf16_t");
+   using Storage = AlignedVector<DType, kVecSize>;
+   using Float2 = AlignedVector<float, kVecSize>;
+ 
+@@ -464,80 +535,95 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const FusedNormRopeStoreParams par
+ 
+   const int64_t page = out_loc >> kPageBits;
+   const int64_t offset = out_loc & ((1 << kPageBits) - 1);
+-  const auto page_ptr = params.kvcache + page * kPageBytes;
+-  const auto value_ptr = page_ptr + offset * (kBf16Store ? (kHeadDim * 2) : 576);
+ 
+   PDLTriggerSecondary<kUsePDL>();
+ 
+-  // part 2: rope on the rope warp (BF16 store), or per-warp FP8 quant + store.
+-  if constexpr (kBf16Store) {
+-    Float2 d = data;
++  // part 2: store. The original FlashMLA layout stores nope as fp8 + scale and
++  // rope as bf16; the bf16 cache path stores the full 512-dim normalized/rotated
++  // key without quantization.
++  if constexpr (!kUseFp8Cache) {
+     if (warp_id == kRopeWarp) {
+       const auto x_real = data[0];
+       const auto x_imag = data[1];
+       const auto freq_real = freq[0];
+       const auto freq_imag = freq[1];
+-      d[0] = x_real * freq_real - x_imag * freq_imag;
+-      d[1] = x_real * freq_imag + x_imag * freq_real;
++      data[0] = x_real * freq_real - x_imag * freq_imag;
++      data[1] = x_real * freq_imag + x_imag * freq_real;
+     }
+-    reinterpret_cast<bf16x2_t*>(value_ptr)[tx] = cast<bf16x2_t>(fp32x2_t{d[0], d[1]});
+-  } else if (warp_id == kRopeWarp) {
+-    // Each rope-warp lane owns exactly one (real, imag) pair within the rope
+-    // tail. Apply rotation, downcast to BF16, write to the slot's rope region.
+-    const auto x_real = data[0];
+-    const auto x_imag = data[1];
+-    const auto freq_real = freq[0];
+-    const auto freq_imag = freq[1];
+-    data[0] = x_real * freq_real - x_imag * freq_imag;
+-    data[1] = x_real * freq_imag + x_imag * freq_real;
+-    const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
+-    const auto rope_ptr = value_ptr + 448;
+-    reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
++    using CacheStorage = AlignedVector<CacheDType, kVecSize>;
++    auto cache_ptr = static_cast<CacheDType*>(params.kvcache) + page * kBf16PageElems + offset * kHeadDim;
++    CacheStorage result;
++#pragma unroll
++    for (int i = 0; i < kVecSize; ++i) {
++      result[i] = cast<CacheDType>(data[i]);
++    }
++    result.store(cache_ptr, tx);
+   } else {
+-    // Non-rope warp: per-warp UE8M0 group (64 elems -> 64 fp8 + 1 scale byte).
+-    // BF16 round-trip to match the precision of the non-fused path
+-    // (which goes through quant_to_nope_fp8_rope_bf16_pack_triton with bf16 input).
+-    const auto x = cast<float>(cast<bf16_t>(data[0]));
+-    const auto y = cast<float>(cast<bf16_t>(data[1]));
+-    const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
+-    const auto scale_raw = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
+-    const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
+-    const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
+-    const auto result = pack_fp8(x * inv_scale, y * inv_scale);
+-    const auto scale_ptr = page_ptr + (576 << kPageBits) + offset * 8;
+-    reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = result;
+-    // All lanes in this warp produce the same scale byte; let lane 0 publish.
+-    if (lane_id == 0) static_cast<uint8_t*>(scale_ptr)[warp_id] = scale_ue8m0;
++    const auto page_ptr = static_cast<uint8_t*>(params.kvcache) + page * kFp8PageBytes;
++    const auto value_ptr = page_ptr + offset * 576;
++    if (warp_id == kRopeWarp) {
++      // Each rope-warp lane owns exactly one (real, imag) pair within the rope
++      // tail. Apply rotation, downcast to BF16, write to the slot's rope region.
++      const auto x_real = data[0];
++      const auto x_imag = data[1];
++      const auto freq_real = freq[0];
++      const auto freq_imag = freq[1];
++      data[0] = x_real * freq_real - x_imag * freq_imag;
++      data[1] = x_real * freq_imag + x_imag * freq_real;
++      const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
++      const auto rope_ptr = value_ptr + 448;
++      reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
++    } else {
++      // Non-rope warp: per-warp UE8M0 group (64 elems -> 64 fp8 + 1 scale byte).
++      // BF16 round-trip to match the precision of the non-fused path
++      // (which goes through quant_to_nope_fp8_rope_bf16_pack_triton with bf16 input).
++      const auto x = cast<float>(cast<bf16_t>(data[0]));
++      const auto y = cast<float>(cast<bf16_t>(data[1]));
++      const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
++      const auto scale_raw = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
++      const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
++      const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
++      const auto result = pack_fp8(x * inv_scale, y * inv_scale);
++      const auto scale_ptr = page_ptr + (576 << kPageBits) + offset * 8;
++      reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = result;
++      // All lanes in this warp produce the same scale byte; let lane 0 publish.
++      if (lane_id == 0) static_cast<uint8_t*>(scale_ptr)[warp_id] = scale_ue8m0;
++    }
+   }
+ }
+ 
+ template <
+     typename DType,
++    typename CacheDType,
+     int64_t kHeadDim,
+     int64_t kRopeDim,
+     uint32_t kPageSize,
+     bool kUsePDL,
+-    int32_t kPreshuffleSize = 0,
+-    bool kBf16Store = false>
++    int32_t kPreshuffleSize = 0>
+ struct FusedNormRopeKernel {
+   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
+   static constexpr bool kIsIndexer = (kHeadDim == 128);
+-  static_assert(!(kIsIndexer && kBf16Store), "bf16 store only for flashmla head_dim=512");
+-  static constexpr int64_t kIndexerBytes = 132 * kPageSize;
+-  static constexpr int64_t kFlashMLABytes = host::div_ceil(584 * kPageSize, 576) * 576;
+-  static constexpr int64_t kBf16Bytes = kHeadDim * 2 * kPageSize;  // plain bf16 cache
+-  static constexpr int64_t kPageBytes = kBf16Store ? kBf16Bytes : (kIsIndexer ? kIndexerBytes : kFlashMLABytes);
++  static constexpr bool kUseFp8Cache = std::is_same_v<CacheDType, uint8_t>;
++  static constexpr bool kUseInt8Cache = std::is_same_v<CacheDType, int8_t>;
++  static constexpr int64_t kIndexerFp8Bytes = 132 * kPageSize;
++  static constexpr int64_t kIndexerBf16Elems = 128 * kPageSize;
++  static constexpr int64_t kFlashMLAFp8Bytes = host::div_ceil(584 * kPageSize, 576) * 576;
++  static constexpr int64_t kFlashMLABf16Elems = 512 * kPageSize;
++  static constexpr int64_t kPageStride =
++      kIsIndexer ? ((kUseFp8Cache || kUseInt8Cache) ? kIndexerFp8Bytes : kIndexerBf16Elems)
++                 : (kUseFp8Cache ? kFlashMLAFp8Bytes : kFlashMLABf16Elems);
+ 
+   /// TODO: Let's fix the config for now.
+   static_assert(kRopeDim == 64 && (kHeadDim == 128 || kHeadDim == 512));
+   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
++  static_assert(kUseFp8Cache || kUseInt8Cache || std::is_same_v<CacheDType, bf16_t>, "CacheDType must be uint8_t or int8 or bf16_t");
+ 
+   template <ForwardMode kMode>
+   static constexpr auto select_kernel() {
+     if constexpr (kIsIndexer) {
+-      return fused_norm_rope_indexer<DType, kMode, kLogPageSize, kUsePDL, kPreshuffleSize>;
++      return fused_norm_rope_indexer<DType, CacheDType, kMode, kLogPageSize, kUsePDL, kPreshuffleSize>;
+     } else {
+-      return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, kBf16Store>;
++      return fused_norm_rope_flashmla<DType, CacheDType, kMode, kLogPageSize, kUsePDL>;
      }
    }
+ 
+@@ -583,8 +669,8 @@ struct FusedNormRopeKernel {
+         .with_device(device_)
+         .verify(out_loc);
+     TensorMatcher({-1, -1})  // cache
+-        .with_strides({kPageBytes, 1})
+-        .with_dtype<uint8_t>()
++        .with_strides({kPageStride, 1})
++        .with_dtype<CacheDType>()
+         .with_device(device_)
+         .verify(kvcache);
+ 
+@@ -607,7 +693,7 @@ struct FusedNormRopeKernel {
+         .weight = weight.data_ptr(),
+         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+         .out_loc = static_cast<const int64_t*>(out_loc.data_ptr()),
+-        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
++        .kvcache = kvcache.data_ptr(),
+         .eps = eps,
+         .compress_ratio = compress_ratio,
+         .num_tokens = num_tokens,
+diff --git a/python/sglang/kernels/jit/csrc/deepseek_v4/store.cuh b/python/sglang/kernels/jit/csrc/deepseek_v4/store.cuh
+index 2ff0a9147f..bbc22ad920 100644
+--- a/python/sglang/kernels/jit/csrc/deepseek_v4/store.cuh
++++ b/python/sglang/kernels/jit/csrc/deepseek_v4/store.cuh
+@@ -15,6 +15,7 @@
+ #include <bit>
+ #include <cstdint>
+ #include <cuda_fp8.h>
++#include <type_traits>
+ 
+ namespace sglang {
+ 
+@@ -22,6 +23,15 @@ using deepseek_v4::fp8::cast_to_ue8m0;
+ using deepseek_v4::fp8::inv_scale_ue8m0;
+ using deepseek_v4::fp8::pack_fp8;
+ 
++SGL_DEVICE int8_t int8_clip(float val) {
++  namespace math = device::math;
++  return static_cast<int8_t>(math::max(math::min(val, 127.0f), -128.0f));
++}
++
++SGL_DEVICE char2 pack_int8(float x, float y) {
++  return char2{int8_clip(x), int8_clip(y)};
++}
++
+ struct FusedStoreCacheParam {
+   const void* __restrict__ input;
+   void* __restrict__ cache;
+@@ -29,7 +39,7 @@ struct FusedStoreCacheParam {
+   uint32_t num_tokens;
  };
-+#endif
  
- }  // namespace device::topk
+-template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
++template <typename Float, typename IndicesT, typename StoreT, uint32_t kPageBits, bool kUsePDL>
+ __global__ void fused_store_flashmla_cache(const  FusedStoreCacheParam param) {
+   using namespace device;
  
+@@ -75,9 +85,11 @@ __global__ void fused_store_flashmla_cache(const  FusedStoreCacheParam param) {
+   PDLTriggerSecondary<kUsePDL>();
+ }
+ 
+-template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
++template <typename Float, typename IndicesT, typename StoreT, uint32_t kPageBits, bool kUsePDL>
+ __global__ void fused_store_indexer_cache(const  FusedStoreCacheParam param) {
+   using namespace device;
++  constexpr bool kStoreFp8 = std::is_same_v<StoreT, uint8_t>;
++  static_assert(kStoreFp8 || std::is_same_v<StoreT, int8_t>);
+ 
+   /// NOTE: 132 = 128 + 4
+   constexpr int64_t kPageBytes = 132 << kPageBits;
+@@ -97,34 +109,44 @@ __global__ void fused_store_indexer_cache(const  FusedStoreCacheParam param) {
+   // always load the value from input (don't store if invalid)
+   using Float2 = packed_t<Float>;
+   using InStorage = AlignedVector<Float2, 2>;
+-  using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
+   const auto elems = static_cast<const InStorage*>(input)[global_tid];
+   const auto [x0, x1] = cast<fp32x2_t>(elems[0]);
+   const auto [y0, y1] = cast<fp32x2_t>(elems[1]);
+   const auto local_max = fmaxf(fmaxf(fabs(x0), fabs(x1)), fmaxf(fabs(y0), fabs(y1)));
+   const auto abs_max = warp::reduce_max(local_max);
+-  // use normal fp32 scale
+-  const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
+-  const auto inv_scale = 1.0f / scale;
+   const int32_t page = index >> kPageBits;
+   const int32_t offset = index & ((1 << kPageBits) - 1);
+   const auto page_ptr = pointer::offset(cache, page * kPageBytes);
+   const auto value_ptr = pointer::offset(page_ptr, offset * 128);
+   const auto scale_ptr = pointer::offset(page_ptr, 128 << kPageBits, offset * 4);
+-  OutStorage result;
+-  result[0] = pack_fp8(x0 * inv_scale, x1 * inv_scale);
+-  result[1] = pack_fp8(y0 * inv_scale, y1 * inv_scale);
+-  static_cast<OutStorage*>(value_ptr)[lane_id] = result;
+-  static_cast<float*>(scale_ptr)[0] = scale;
++  if constexpr (kStoreFp8) {
++    using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
++    const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
++    const auto inv_scale = 1.0f / scale;
++    OutStorage result;
++    result[0] = pack_fp8(x0 * inv_scale, x1 * inv_scale);
++    result[1] = pack_fp8(y0 * inv_scale, y1 * inv_scale);
++    static_cast<OutStorage*>(value_ptr)[lane_id] = result;
++    static_cast<float*>(scale_ptr)[0] = scale;
++  } else {
++    using OutStorage = AlignedVector<char2, 2>;
++    const auto scale = fmaxf(1e-4f, abs_max) / 127.0f;
++    const auto inv_scale = 1.0f / scale;
++    OutStorage result;
++    result[0] = pack_int8(x0 * inv_scale, x1 * inv_scale);
++    result[1] = pack_int8(y0 * inv_scale, y1 * inv_scale);
++    static_cast<OutStorage*>(value_ptr)[lane_id] = result;
++    static_cast<float*>(scale_ptr)[0] = scale;
++  }
+ 
+   PDLTriggerSecondary<kUsePDL>();
+ }
+ 
+-template <typename Float, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
++template <typename Float, typename IndicesT, typename StoreT, uint32_t kPageSize, bool kUsePDL>
+ struct FusedStoreCacheFlashMLAKernel {
+   static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
+   static constexpr int64_t kPageBytes = host::div_ceil(584 * kPageSize, 576) * 576;
+-  static constexpr auto kernel = fused_store_flashmla_cache<Float, IndicesT, kLogSize, kUsePDL>;
++  static constexpr auto kernel = fused_store_flashmla_cache<Float, IndicesT, StoreT, kLogSize, kUsePDL>;
+ 
+   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
+   static_assert(1 << kLogSize == kPageSize);
+@@ -161,11 +183,11 @@ struct FusedStoreCacheFlashMLAKernel {
+   }
+ };
+ 
+-template <typename Float, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
++template <typename Float, typename IndicesT, typename StoreT, uint32_t kPageSize, bool kUsePDL>
+ struct FusedStoreCacheIndexerKernel {
+   static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
+   static constexpr int64_t kPageBytes = 132 * kPageSize;
+-  static constexpr auto kernel = fused_store_indexer_cache<Float, IndicesT, kLogSize, kUsePDL>;
++  static constexpr auto kernel = fused_store_indexer_cache<Float, IndicesT, StoreT, kLogSize, kUsePDL>;
+ 
+   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
+   static_assert(1 << kLogSize == kPageSize);
+@@ -182,7 +204,7 @@ struct FusedStoreCacheIndexerKernel {
+         .verify(input);
+     TensorMatcher({-1, -1})  // cache
+         .with_strides({kPageBytes, 1})
+-        .with_dtype<uint8_t>()
++        .with_dtype<StoreT>()
+         .with_device(device_)
+         .verify(cache);
+     TensorMatcher({N})  // indices
+diff --git a/python/sglang/kernels/jit/csrc/deepseek_v4/topk.cuh b/python/sglang/kernels/jit/csrc/deepseek_v4/topk.cuh
+index 1c9e73d182..bdab6ba827 100644
+--- a/python/sglang/kernels/jit/csrc/deepseek_v4/topk.cuh
++++ b/python/sglang/kernels/jit/csrc/deepseek_v4/topk.cuh
+@@ -13,7 +13,7 @@ namespace {
+ 
+ constexpr uint32_t kTopK = 512;
+ constexpr uint32_t kTopKBlockSize = 512;
+-constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
++constexpr uint32_t kSMEM = 12 * 1024 * sizeof(uint32_t);  // 48KB (bytes)
+ 
+ struct TopK512Params {
+   const float* __restrict__ scores;
+diff --git a/python/sglang/kernels/jit/csrc/deepseek_v4/topk_v1.cuh b/python/sglang/kernels/jit/csrc/deepseek_v4/topk_v1.cuh
+index b9dcab691e..48e8e5bd97 100644
+--- a/python/sglang/kernels/jit/csrc/deepseek_v4/topk_v1.cuh
++++ b/python/sglang/kernels/jit/csrc/deepseek_v4/topk_v1.cuh
+@@ -24,7 +24,7 @@ constexpr uint32_t kMaxTopK = 1024;
+ // init below index up to RADIX + 1 == 257 threads, so a block sized after a
+ // small topk would silently skip part of the histogram.
+ constexpr uint32_t kTopKBlockSize = kMaxTopK;
+-constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
++constexpr uint32_t kSMEM = 12 * 1024 * sizeof(uint32_t);  // 48KB (bytes)
+ 
+ struct TopKParams {
+   const float* __restrict__ scores;
 diff --git a/python/sglang/kernels/ops/attention/dsa/index_buf_accessor.py b/python/sglang/kernels/ops/attention/dsa/index_buf_accessor.py
-index 2cd4dd5394..4affc7cde0 100644
+index 4affc7cde0..2b34366fb8 100644
 --- a/python/sglang/kernels/ops/attention/dsa/index_buf_accessor.py
 +++ b/python/sglang/kernels/ops/attention/dsa/index_buf_accessor.py
-@@ -1,5 +1,6 @@
+@@ -1,6 +1,5 @@
  from typing import TYPE_CHECKING
  
-+import os
+-import os
  import torch
  import triton
  import triton.language as tl
-@@ -34,7 +35,10 @@ s: scale, 1 item per token, fp32
+@@ -35,10 +34,10 @@ s: scale, 1 item per token, fp32
  class GetK:
      @classmethod
      def execute(cls, *args, **kwargs):
--        return cls.triton(*args, **kwargs)
-+        if os.getenv("MX_ENABLE_NSA_INT8"):
-+            return cls.triton(*args, **kwargs)
-+        else:
-+            return cls.torch_fast(*args, **kwargs)
+-        if os.getenv("MX_ENABLE_NSA_INT8"):
+-            return cls.triton(*args, **kwargs)
+-        else:
++        buf = args[1]
++        if buf.dtype == torch.bfloat16:
+             return cls.torch_fast(*args, **kwargs)
++        return cls.triton(*args, **kwargs)
  
      @classmethod
      def slow(
-@@ -255,6 +259,39 @@ class GetKAndS:
-             index_head_dim=pool.index_head_dim,
-         )
- 
-+class GetBatchedK:
-+    @classmethod
-+    def execute(cls, *args, **kwargs):
-+        return cls.triton(*args, **kwargs)
-+
-+    @classmethod
-+    def triton(
-+        cls,
-+        pool: "DSATokenToKVPool",
-+        buf: torch.Tensor,
-+        page_indices: torch.Tensor,
-+        seq_len_tensor: torch.Tensor,
-+        seq_len_sum: int,
-+        max_seq_len: int,
-+    ):
-+        """
-+        Triton implementation for gathering both K data from paged buffer in a single call, support multi-batch.
-+        :param page_indices: (num_pages,), int32/int64
-+        :param seq_len_tensor: (num_pages,), int32/int64
-+        :param seq_len_sum: sum of all sequence len, int32
-+        :param max_seq_len: max of all sequence len, int32
-+        :return: k_fp8: (seq_len, index_head_dim) dtype is same to buf
-+        """
-+        return _get_batched_k_triton(
-+            buf=buf,
-+            page_indices=page_indices,
-+            seq_lens=seq_len_tensor,
-+            seq_len_sum=seq_len_sum,
-+            max_seq_len=max_seq_len,
-+            page_size=pool.page_size,
-+            index_head_dim=pool.index_head_dim,
-+        )
-+
- 
- class SetKAndS:
-     @classmethod
-@@ -265,13 +302,24 @@ class SetKAndS:
+@@ -302,9 +301,9 @@ class SetKAndS:
      def triton(cls, pool, buf, loc, index_k, index_k_scale):
          loc = loc.to(torch.int64)
  
--        _set_k_and_s_triton(
--            buf=buf,
--            loc=loc,
--            index_k=index_k,
--            index_k_scale=index_k_scale,
--            page_size=pool.page_size,
--        )
-+        if os.getenv("MX_ENABLE_NSA_INT8"):
-+            assert index_k_scale is not None
-+            _set_k_and_s_triton(
-+                buf=buf,
-+                loc=loc,
-+                index_k=index_k,
-+                index_k_scale=index_k_scale,
-+                page_size=pool.page_size,
-+            )
-+        else:
+-        if os.getenv("MX_ENABLE_NSA_INT8"):
+-            assert index_k_scale is not None
+-            _set_k_and_s_triton(
++        if buf.dtype == torch.bfloat16:
 +            assert index_k_scale is None
 +            _set_k_triton(
-+                buf=buf,
-+                loc=loc,
-+                index_k=index_k,
-+                index_k_scale=index_k_scale,
-+                page_size=pool.page_size,
+                 buf=buf,
+                 loc=loc,
+                 index_k=index_k,
+@@ -312,8 +311,8 @@ class SetKAndS:
+                 page_size=pool.page_size,
+             )
+         else:
+-            assert index_k_scale is None
+-            _set_k_triton(
++            assert index_k_scale is not None
++            _set_k_and_s_triton(
+                 buf=buf,
+                 loc=loc,
+                 index_k=index_k,
+@@ -356,18 +355,21 @@ def _set_k_and_s_triton(
+     assert scale_dim == 1
+     if _is_hip:
+         if _use_aiter_preshuffle:
+-            assert (
+-                page_size % 16 == 0
+-            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
++            assert page_size % 16 == 0, (
++                f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
 +            )
+     else:
+         assert page_size == 64
  
- 
- def _set_k_and_s_triton(
-@@ -319,7 +367,7 @@ def _set_k_and_s_triton(
-     if _is_fp8_fnuz:
+-    assert buf.dtype == torch.uint8
+     assert loc.dtype == torch.int64, f"{loc.dtype=}"  # can be int32
+-    if _is_fp8_fnuz:
++    if index_k.dtype == torch.int8:
++        assert buf.dtype == torch.int8
++    elif _is_fp8_fnuz:
++        assert buf.dtype == torch.uint8
          assert index_k.dtype == torch.float8_e4m3fnuz
      else:
--        assert index_k.dtype == torch.float8_e4m3fn
-+        assert index_k.dtype in [torch.float8_e4m3fn, torch.int8]
+-        assert index_k.dtype in [torch.float8_e4m3fn, torch.int8]
++        assert buf.dtype == torch.uint8
++        assert index_k.dtype == torch.float8_e4m3fn
      assert index_k_scale.dtype == torch.float32
  
      assert buf.is_contiguous()
-@@ -329,8 +377,10 @@ def _set_k_and_s_triton(
+@@ -375,12 +377,12 @@ def _set_k_and_s_triton(
+     assert index_k.is_contiguous()
+     assert index_k_scale.is_contiguous()
  
-     if _is_fp8_fnuz:
+-    if _is_fp8_fnuz:
++    if index_k.dtype == torch.int8:
++        buf_fp8 = buf
++    elif _is_fp8_fnuz:
          buf_fp8 = buf.view(torch.float8_e4m3fnuz)
--    else:
-+    elif index_k.dtype is torch.float8_e4m3fn:
-         buf_fp8 = buf.view(torch.float8_e4m3fn)
-+    else:
-+        buf_fp8 = buf.view(torch.int8)
+-    elif index_k.dtype is torch.float8_e4m3fn:
+-        buf_fp8 = buf.view(torch.float8_e4m3fn)
+     else:
+-        buf_fp8 = buf.view(torch.int8)
++        buf_fp8 = buf.view(torch.float8_e4m3fn)
      buf_fp32 = buf.view(torch.float32)
  
      _set_k_and_s_triton_kernel[(num_tokens_to_write,)](
-@@ -347,6 +397,47 @@ def _set_k_and_s_triton(
+@@ -397,6 +399,7 @@ def _set_k_and_s_triton(
          PRESHUFFLE_TILE=INDEXER_K_CACHE_PRESHUFFLE_TILE if _use_aiter_preshuffle else 0,
      )
  
-+def _set_k_triton(
++
+ def _set_k_triton(
+     buf: torch.Tensor,
+     loc: torch.Tensor,
+diff --git a/python/sglang/kernels/ops/attention/dsv4/attn.py b/python/sglang/kernels/ops/attention/dsv4/attn.py
+index f973bf9162..465b7fdc1a 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/attn.py
++++ b/python/sglang/kernels/ops/attention/dsv4/attn.py
+@@ -29,10 +29,17 @@ def _jit_fused_store_module(
+     name: Literal["flashmla", "indexer"],
+     input_dtype: torch.dtype,
+     index_dtype: torch.dtype,
++    store_dtype: torch.dtype,
+     page_size: int,
+ ):
+-    args = make_cpp_args(input_dtype, index_dtype, page_size, is_arch_support_pdl())
++    args = make_cpp_args(
++        input_dtype, index_dtype, store_dtype, page_size, is_arch_support_pdl()
++    )
+     cname = "FlashMLA" if name == "flashmla" else "Indexer"
++    if name == "flashmla":
++        assert store_dtype is torch.uint8
++    else:
++        assert store_dtype in (torch.uint8, torch.int8)
+     kernel_class = f"FusedStoreCache{cname}Kernel<{args}>"
+     return load_jit(
+         make_name("store_" + name),
+@@ -79,6 +86,7 @@ def fused_store_cache(
+             name=type,
+             input_dtype=input.dtype,
+             index_dtype=indices.dtype,
++            store_dtype=cache.dtype,
+             page_size=page_size,
+         )
+         module.run(input, cache, indices)
+diff --git a/python/sglang/kernels/ops/attention/dsv4/compress.py b/python/sglang/kernels/ops/attention/dsv4/compress.py
+index 99b9597c99..8a87c455b0 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/compress.py
++++ b/python/sglang/kernels/ops/attention/dsv4/compress.py
+@@ -45,19 +45,22 @@ if TYPE_CHECKING:
+ @cache_once
+ def _jit_compress_norm_rope_module(
+     dtype: torch.dtype,
++    cache_dtype: torch.dtype,
+     head_dim: int,
+     rope_dim: int,
+     page_size: int,
+     bf16_store: bool = False,
+ ) -> Module:
++    if bf16_store:
++        assert cache_dtype is torch.bfloat16
+     args = make_cpp_args(
+         dtype,
++        cache_dtype,
+         head_dim,
+         rope_dim,
+         page_size,
+         is_arch_support_pdl(),
+         INDEXER_K_CACHE_PRESHUFFLE_TILE if aiter_can_use_preshuffle_paged_mqa() else 0,
+-        bf16_store,
+     )
+     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
+     if head_dim == 128:
+@@ -450,7 +453,12 @@ def compress_norm_rope_store(
+         )
+     else:
+         module = _jit_compress_norm_rope_module(
+-            kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
++            kv.dtype,
++            kvcache.dtype,
++            kv.shape[-1],
++            freq_cis.shape[-1],
++            page_size,
++            bf16_store,
+         )
+         fn = module.forward_fp4 if use_fp4 else module.forward
+         if norm_weight.dtype != kv.dtype:
+diff --git a/python/sglang/kernels/ops/attention/dsv4/index_buf_accessor.py b/python/sglang/kernels/ops/attention/dsv4/index_buf_accessor.py
+index 8536e18a90..1c7274a7c0 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/index_buf_accessor.py
++++ b/python/sglang/kernels/ops/attention/dsv4/index_buf_accessor.py
+@@ -74,7 +74,7 @@ def _set_k_and_s_triton(
+     assert buf.dtype == torch.uint8
+     assert loc.dtype in [torch.int64, torch.int32], f"{loc.dtype=}"
+ 
+-    assert k_nope.dtype == fp8_dtype
++    assert k_nope.dtype in (fp8_dtype, torch.int8)
+     assert k_rope.dtype == torch.bfloat16
+     assert scale_k_nope.dtype == torch.uint8, f"{scale_k_nope.dtype=}"
+ 
+@@ -84,7 +84,7 @@ def _set_k_and_s_triton(
+     assert k_rope.is_contiguous()
+     assert scale_k_nope.is_contiguous()
+ 
+-    buf_fp8 = buf.view(fp8_dtype)
++    buf_quant = buf.view(k_nope.dtype)
+     buf_bf16 = buf.view(torch.bfloat16)
+     buf_uint8 = buf.view(torch.uint8)
+ 
+@@ -92,7 +92,7 @@ def _set_k_and_s_triton(
+     s_offset_nbytes_in_page = page_size * (nope_dim + rope_dim * 2)
+ 
+     _set_k_and_s_triton_kernel[(num_tokens_to_write,)](
+-        buf_fp8,
++        buf_quant,
+         buf_bf16,
+         buf_uint8,
+         loc,
+@@ -217,7 +217,7 @@ def _set_k_and_s_torch(
+         torch.int32,
+     ], f"{loc.dtype=}"
+ 
+-    assert k_nope.dtype == fp8_dtype
++    assert k_nope.dtype in (fp8_dtype, torch.int8)
+     assert k_rope.dtype == torch.bfloat16
+     assert scale_k_nope.dtype == torch.uint8
+ 
+@@ -227,7 +227,7 @@ def _set_k_and_s_torch(
+     assert k_rope.is_contiguous()
+     assert scale_k_nope.is_contiguous()
+ 
+-    buf_fp8 = buf.view(fp8_dtype).flatten()
++    buf_quant = buf.view(k_nope.dtype).flatten()
+     buf_bf16 = buf.view(torch.bfloat16).flatten()
+     buf_scale = buf.view(torch.uint8).flatten()
+ 
+@@ -252,6 +252,120 @@ def _set_k_and_s_torch(
+     )
+ 
+     for i in range(num_tokens_to_write):
+-        buf_fp8[nope_offset[i] : nope_offset[i] + nope_dim] = k_nope[i]
++        buf_quant[nope_offset[i] : nope_offset[i] + nope_dim] = k_nope[i]
+         buf_bf16[rope_offset[i] : rope_offset[i] + rope_dim] = k_rope[i]
+         buf_scale[s_offset[i] : s_offset[i] + scale_dim] = scale_k_nope[i]
++
++
++def _set_k_bf16_triton(
 +    buf: torch.Tensor,
 +    loc: torch.Tensor,
-+    index_k: torch.Tensor,
-+    index_k_scale: torch.Tensor,
++    k_cache: torch.Tensor,
 +    page_size: int,
 +):
-+    """
-+    :param buf: (num_pages, page_size 64 * (128B data )), bf16
-+    :param loc: (num_tokens_to_write,), int, element := the token index to write to
-+    :param index_k: (num_tokens_to_write, 128 elem), bf16
-+    :param index_k_scale: None
-+    :return:
-+    """
 +    num_pages, buf_numel_per_page = buf.shape
 +    (num_tokens_to_write,) = loc.shape
-+    num_tokens_to_write_, index_head_dim = index_k.shape
-+    assert buf_numel_per_page == 64 * (128)
-+    assert num_tokens_to_write == num_tokens_to_write_
-+    assert index_head_dim == 128
-+    assert page_size == 64
++    num_tokens_to_write_k, nope_rope_dim = k_cache.shape
++
++    assert num_tokens_to_write == num_tokens_to_write_k, (
++        f"{num_tokens_to_write=} {num_tokens_to_write_k=}"
++    )
++    assert buf.dtype == torch.bfloat16
++    assert loc.dtype in [torch.int64, torch.int32], f"{loc.dtype=}"
++    assert k_cache.dtype == torch.bfloat16
++    assert buf.is_contiguous()
++    assert loc.is_contiguous()
++    assert k_cache.is_contiguous()
++
++    block_size = triton.next_power_of_2(nope_rope_dim)
++    _set_k_bf16_triton_kernel[(num_tokens_to_write,)](
++        buf,
++        loc,
++        k_cache,
++        k_cache.stride(0),
++        PAGE_SIZE=page_size,
++        BUF_NUMEL_PER_PAGE=buf_numel_per_page,
++        NOPE_ROPE_DIM=nope_rope_dim,
++        BLOCK_SIZE=block_size,
++    )
++
++
++@triton.jit
++def _set_k_bf16_triton_kernel(
++    buf_ptr,
++    loc_ptr,
++    k_cache_ptr,
++    k_cache_stride: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    BUF_NUMEL_PER_PAGE: tl.constexpr,
++    NOPE_ROPE_DIM: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    token_idx = tl.program_id(0)
++    offsets = tl.arange(0, BLOCK_SIZE)
++    mask = offsets < NOPE_ROPE_DIM
++
++    loc = tl.load(loc_ptr + token_idx)
++    loc_page_index = loc // PAGE_SIZE
++    loc_token_offset_in_page = loc % PAGE_SIZE
++    out_offset = (
++        loc_page_index * BUF_NUMEL_PER_PAGE
++        + loc_token_offset_in_page * NOPE_ROPE_DIM
++        + offsets
++    )
++    in_offset = token_idx * k_cache_stride + offsets
++    values = tl.load(k_cache_ptr + in_offset, mask=mask)
++    tl.store(buf_ptr + out_offset, values, mask=mask)
++
++
++class SetK:
++    @classmethod
++    def execute(cls, pool, buf, loc, k_cache):
++        cls.triton(pool, buf, loc, k_cache)
++
++    @classmethod
++    def torch(cls, pool, buf, loc, k_cache):
++        _set_k_bf16_torch(buf, loc, k_cache, pool.page_size)
++
++    @classmethod
++    def triton(cls, pool, buf, loc, k_cache):
++        _set_k_bf16_triton(buf, loc, k_cache, pool.page_size)
++
++
++def _set_k_bf16_torch(
++    buf: torch.Tensor,
++    loc: torch.Tensor,
++    k_cache: torch.Tensor,
++    page_size: int,
++):
++    _, buf_numel_per_page = buf.shape
++    (num_tokens_to_write,) = loc.shape
++    num_tokens_to_write_k, nope_rope_dim = k_cache.shape
++
++    assert num_tokens_to_write == num_tokens_to_write_k, (
++        f"{num_tokens_to_write=} {num_tokens_to_write_k=}"
++    )
 +
 +    assert buf.dtype == torch.bfloat16
-+    assert loc.dtype == torch.int64, f"{loc.dtype=}"  # can be int32
-+    assert index_k.dtype == torch.bfloat16
++    assert loc.dtype in [
++        torch.int64,
++        torch.int32,
++    ], f"{loc.dtype=}"
++
++    assert k_cache.dtype == torch.bfloat16
 +
 +    assert buf.is_contiguous()
 +    assert loc.is_contiguous()
-+    assert index_k.is_contiguous()
++    assert k_cache.is_contiguous()
 +
-+    buf_bf16 = buf.view(torch.bfloat16)
++    buf_bf16 = buf.flatten()
 +
-+    _set_k_triton_kernel[(num_tokens_to_write,)](
-+        buf_bf16,
-+        loc,
-+        index_k,
-+        index_k.stride(0),
-+        PAGE_SIZE=page_size,
-+        BUF_NUMEL_PER_PAGE=buf_numel_per_page,
-+        NUM_K_ELEMS_PER_TOKEN=index_head_dim,
++    loc_page_index = loc // page_size
++    loc_token_offset_in_page = loc % page_size
++
++    offset = loc_page_index * buf_numel_per_page + loc_token_offset_in_page * (
++        nope_rope_dim
 +    )
++
++    for i in range(num_tokens_to_write):
++        buf_bf16[offset[i] : offset[i] + nope_rope_dim] = k_cache[i]
+diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
+index ebe4e3a8ad..deb6605e6f 100644
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -453,7 +453,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
+             if ENABLE_PDL:
+                 T.pdl_sync()
  
- @triton.jit
- def _set_k_and_s_triton_kernel(
-@@ -406,6 +497,35 @@ def _set_k_and_s_triton_kernel(
-     tl.store(buf_fp8_ptr + out_k_offsets, k)
-     tl.store(buf_fp32_ptr + out_s_offset, k_scale)
+-            for pz in T.Pipelined(split_size // hidden_block, num_stages=2):
++            for pz in T.Pipelined(split_size // hidden_block, num_stages=1):
+                 x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
+                 fn_smem = T.alloc_shared((32, hidden_block), T.float32)
  
-+@triton.jit
-+def _set_k_triton_kernel(
-+    buf_bf16_ptr,
-+    loc_ptr,
-+    index_k_ptr,
-+    index_k_ptr_stride_0,
-+    PAGE_SIZE: tl.constexpr,
-+    BUF_NUMEL_PER_PAGE: tl.constexpr,
-+    NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
-+):
-+    token_id = tl.program_id(0)
-+
-+    loc = tl.load(loc_ptr + token_id)
-+
-+    in_k_offsets = token_id * index_k_ptr_stride_0 + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
-+
-+    # no need for `mask`, since we read 128B for k, both pow of 2
-+    k = tl.load(index_k_ptr + in_k_offsets)
-+
-+    loc_page_index = loc // PAGE_SIZE
-+    loc_token_offset_in_page = loc % PAGE_SIZE
-+
-+    out_k_offsets = (
-+        loc_page_index * BUF_NUMEL_PER_PAGE
-+        + loc_token_offset_in_page * NUM_K_ELEMS_PER_TOKEN
-+        + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
-+    )
-+
-+    tl.store(buf_bf16_ptr + out_k_offsets, k)
+@@ -549,6 +549,16 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
+     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
  
- def _get_k_triton(
-     buf: torch.Tensor,
-@@ -711,3 +831,145 @@ def _get_k_and_s_triton_kernel(
-     s_dst_base_offset = s_dst_token_offset * 4
-     s_store_addr = s_out_ptr + s_dst_base_offset[:, None] + s_offsets[None, :]
-     tl.store(s_store_addr, s_data, mask=s_mask)
-+
-+def _get_batched_k_triton(
-+    buf: torch.Tensor,
-+    page_indices: torch.Tensor,
-+    seq_lens: torch.Tensor,
-+    seq_len_sum: int,
-+    max_seq_len: int,
-+    page_size: int,
-+    index_head_dim: int,
-+):
-+    """
-+    Fused gather of both K (key) and S (scale) data from paged buffer using Triton.
-+    This is more efficient than calling GetK and GetS separately.
-+
-+    :param buf: (num_pages, page_size * 128 + page_size * 4), uint8
-+    :param page_indices: (num_pages,), int32/int64
-+    :param seq_lens: tensor of sequence lens, int64
-+    :param seq_len_sum: sum of all sequence len, int32
-+    :param max_seq_len: max of sequence len, int32
-+    :param page_size: int, typically 64
-+    :param index_head_dim: int, typically 128
-+    :return: tuple of (k_out, s_out) where
-+             k_out: (seq_len, index_head_dim), uint8
-+             s_out: (seq_len, 4), uint8
-+    """
-+    # Allocate outputs
-+    k_out = torch.empty(
-+        (seq_len_sum, index_head_dim), dtype=buf.dtype, device=buf.device
-+    )
-+    # s_out = torch.empty((seq_len_sum, 4), dtype=torch.uint8, device=buf.device)
-+
-+    _, buf_numel_per_page = buf.shape
-+    _, page_indice_batch_offset = page_indices.shape
-+
-+    # Launch kernel with one thread per token
-+    BLOCK_SIZE = 256
-+    BLOCK_SIZE_K = 128
-+
-+    num_token_blocks = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-+    num_k_threads = (index_head_dim + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
-+
-+    seq_num = seq_lens.shape[0]
-+    grid = (seq_num, num_token_blocks, num_k_threads)
-+    seq_num_pow2 = 1
-+    while seq_num_pow2 < seq_num:
-+        seq_num_pow2 *= 2
-+
-+    _get_k_batched_triton_kernel[grid](
-+        buf_ptr=buf,
-+        page_indices_ptr=page_indices,
-+        k_out_ptr=k_out,
-+        seq_len_ptr=seq_lens,
-+        seq_len_num_pow=seq_num_pow2,
-+        page_size=page_size,
-+        buf_numel_per_page=buf_numel_per_page,
-+        index_head_dim=index_head_dim,
-+        page_indice_batch_offset=page_indice_batch_offset,
-+        BLOCK_SIZE=BLOCK_SIZE,
-+        BLOCK_SIZE_K=BLOCK_SIZE_K,
-+    )
-+
-+    return k_out
-+
-+
-+@triton.jit
-+def _get_k_batched_triton_kernel(
-+    buf_ptr,
-+    page_indices_ptr,
-+    k_out_ptr,
-+    seq_len_ptr,
-+    seq_len_num_pow: tl.constexpr,
-+    page_size: tl.constexpr,
-+    buf_numel_per_page: tl.constexpr,
-+    index_head_dim: tl.constexpr,
-+    page_indice_batch_offset: tl.constexpr,
-+    BLOCK_SIZE: tl.constexpr,
-+    BLOCK_SIZE_K: tl.constexpr,
-+):
-+    """
-+    Fused kernel that gathers both K and S data in a single pass.
-+    Each program handles one token (seq_len tokens total).
-+    Loads 128 bytes (K) + 4 bytes (S) from the appropriate page.
-+    """
-+    batch_id = tl.program_id(0)
-+    block_token_start = tl.program_id(1) * BLOCK_SIZE
-+    thread_idx = tl.program_id(2)
-+
-+    # Define the token range within the block and the K dimension range handled by the thread.
-+    token_ids_in_block = tl.arange(0, BLOCK_SIZE)
-+    token_ids = block_token_start + token_ids_in_block
-+    k_offsets = thread_idx * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-+
-+    seq_len = tl.load(seq_len_ptr + batch_id)
-+    token_valid_mask = token_ids < seq_len
-+
-+    pre_batch_idx = tl.arange(0, seq_len_num_pow)
-+    mask_pre_batch_idx = pre_batch_idx < batch_id
-+    prev_seq_lens = tl.load(seq_len_ptr + pre_batch_idx, mask=mask_pre_batch_idx)
-+    batch_token_offset = tl.sum(prev_seq_lens)
-+
-+    # Batch calculate the page index and in-page offset of each token.
-+    page_idx = token_ids // page_size
-+    token_offset_in_page = token_ids % page_size
-+    page_indices_base = batch_id * page_indice_batch_offset
-+    page_idx_valid_mask = page_idx < page_indice_batch_offset
-+    page_index = tl.load(
-+        page_indices_ptr + page_idx + page_indices_base,
-+        mask=token_valid_mask & page_idx_valid_mask,
-+    )
-+
-+    # ===== Load K data =====
-+    # The address calculation logic for K: page_index * total number of elements in a single page + K offset of the token within the page.
-+    k_src_token_offset = token_offset_in_page * index_head_dim
-+    k_src_base_offset = page_index * buf_numel_per_page + k_src_token_offset
-+
-+    k_load_addr = buf_ptr + k_src_base_offset[:, None] + k_offsets[None, :]
-+    k_dim_mask = k_offsets[None, :] < index_head_dim
-+    k_mask = token_valid_mask[:, None] & k_dim_mask
-+
-+    k_data = tl.load(k_load_addr, mask=k_mask, other=0)
-+
-+    # Store K to output
-+    k_dst_token_offset = batch_token_offset + token_ids
-+    k_dst_base_offset = k_dst_token_offset * index_head_dim
-+    k_store_addr = k_out_ptr + k_dst_base_offset[:, None] + k_offsets[None, :]
-+    tl.store(k_store_addr, k_data, mask=k_mask)
-+
-+    # # ===== Load S data =====
-+    # # The address calculation logic for S: page_index * total number of elements in a single page + starting offset of S within the page + offset of token within S in the page
-+    # s_src_token_offset = s_offset_in_page + token_offset_in_page * 4
-+    # s_src_base_offset = page_index * buf_numel_per_page + s_src_token_offset
-+
-+    # s_offsets = tl.arange(0, 4)
-+    # s_load_addr = buf_ptr + s_src_base_offset[:, None] + s_offsets[None, :]
-+    # s_mask = token_valid_mask[:, None] & (s_offsets[None, :] < 4)
-+    # s_data = tl.load(s_load_addr, mask=s_mask, other=0)
-+
-+    # # Store S to output
-+    # s_dst_token_offset = batch_token_offset + token_ids
-+    # s_dst_base_offset = s_dst_token_offset * 4
-+    # s_store_addr = s_out_ptr + s_dst_base_offset[:, None] + s_offsets[None, :]
-+    # tl.store(s_store_addr, s_data, mask=s_mask)
-diff --git a/python/sglang/kernels/ops/attention/dsa/triton_kernel.py b/python/sglang/kernels/ops/attention/dsa/triton_kernel.py
-index 0d29698040..d838e4f58d 100644
---- a/python/sglang/kernels/ops/attention/dsa/triton_kernel.py
-+++ b/python/sglang/kernels/ops/attention/dsa/triton_kernel.py
-@@ -194,3 +194,126 @@ def get_valid_kv_indices(
-         bs,
-         topk,
-     )
-+
-+
-+
-+#  Triton kernel int8
-+@triton.jit
-+def _act_quant_int8_kernel(
-+    X_ptr, Y_ptr, S_ptr,
-+    M, N,
-+    group_size: tl.constexpr,
-+    round_scale:tl.constexpr,
-+    BLOCK_M: tl.constexpr,
-+    BLOCK_N: tl.constexpr,
-+):
-+    """
-+    Triton kernel for activation quantization.
-+
-+    Each block processes BLOCK_M rows and group_size columns.
-+    """
-+    # Get block IDs
-+    pid_m = tl.program_id(0)
-+    pid_n = tl.program_id(1)
-+
-+    int8_min = -128
-+    int8_max = 127
-+    int8_max_inv = 1.0 / int8_max
-+
-+    row_start = pid_m * BLOCK_M
-+    col_start = pid_n * group_size
-+
-+    rows = row_start + tl.arange(0, BLOCK_M)
-+    cols = col_start + tl.arange(0, BLOCK_N)
-+
-+    # mask = (rows < M)[:, None] & (cols < N)[None, :]
-+    row_mask = rows < M
-+    col_mask = cols < N
-+    mask = row_mask[:, None] & col_mask[None, :]
-+
-+    x_ptrs = X_ptr + rows[:, None] * N + cols[None, :]
-+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
-+
-+    amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)  # [BLOCK_M]
-+
-+    # scale▒~HINT8 not need pow2▒~Lbut still stay round_scale api)
-+    if round_scale:
-+        log_val = tl.log2(amax * int8_max_inv)
-+        log_ceil = tl.ceil(log_val)
-+        scale = tl.exp2(log_ceil)
-+    else:
-+        scale = amax * int8_max_inv
-+    # scale = amax * int8_max_inv
-+
-+    scale_broadcast = scale[:,None]
-+
-+    # Quantize: y = clamp(x / scale, int8_min, int8_max)
-+    y = x / scale_broadcast
-+    # y = tl.round(tl.clamp(y, min=-128, max=127))
-+    y = tl.where(y >= 0, tl.floor(y + 0.5), tl.ceil(y - 0.5))
-+    y = tl.minimum(tl.maximum(y, int8_min), int8_max)
-+    y_int8 = y.to(tl.int8)
-+
-+    y_ptrs = Y_ptr + rows[:, None] * N + cols[None, :]
-+    tl.store(y_ptrs, y_int8, mask=mask)
-+
-+    s_ptrs = S_ptr + rows * (N // group_size) + pid_n
-+    tl.store(s_ptrs, scale, mask=rows < M)
-+
-+
-+#launch
-+def act_quant_int8(
-+    x: torch.Tensor,
-+    block_size: int = 128,
-+    scale_fmt: Optional[str] = None
-+) -> Tuple[torch.Tensor, torch.Tensor]:
-+    """
-+    Quantizes the input tensor `x` using block-wise quantization with Triton.
-+
-+    Args:
-+        x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
-+        block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
-+        scale_fmt (Optional[str], optional): The format of the scale. Default is None.
-+    Returns:
-+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-+            - The quantized tensor with dtype `torch.int8`.
-+            - A tensor of scaling factors with dtype `torch.float32`.
-+    """
-+
-+    assert x.is_contiguous(), "Input tensor must be contiguous"
-+    # assert x.size(-1) % block_size == 0
-+    assert (
-+        x.size(-1) % block_size == 0
-+    ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
-+
-+    N = x.size(-1)
-+    x_flat = x.view(-1, N)
-+    M = x_flat.size(0)
-+
-+    y = torch.empty_like(x_flat, dtype=torch.int8)
-+    y_flat = y.view(-1, N)
-+    # scale shape
-+    # s = torch.empty((*x.size()[:-1], N // block_size), dtype=torch.float32, device=x.device)
-+    s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
-+    s_flat = s.view(-1, N // block_size)
-+
-+    BLOCK_M = 32
-+    BLOCK_N = block_size
-+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-+    round_scale = scale_fmt is not None
-+
-+    _act_quant_int8_kernel[grid](
-+        X_ptr=x_flat,
-+        Y_ptr=y_flat,
-+        S_ptr=s_flat,
-+        M=M, N=N,
-+        group_size=block_size,
-+        round_scale=scale_fmt is not None,
-+        BLOCK_M=BLOCK_M,
-+        BLOCK_N=block_size,
-+        num_stages=0 if round_scale else 2,
-+    )
-+
-+    y = y.view(*x.shape)
-+    s = s.view(*x.shape[:-1], N // block_size)
-+    return y, s
-\ No newline at end of file
-diff --git a/python/sglang/kernels/ops/quantization/fp8_kernel.py b/python/sglang/kernels/ops/quantization/fp8_kernel.py
-index 653e3d899d..4564735e94 100644
---- a/python/sglang/kernels/ops/quantization/fp8_kernel.py
-+++ b/python/sglang/kernels/ops/quantization/fp8_kernel.py
-@@ -47,24 +47,40 @@ _is_cpu = is_cpu()
- _is_musa = is_musa()
- _is_xpu = is_xpu()
- _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-+logger = logging.getLogger(__name__)
  
-+_mcoplib_loaded = False
- if _is_cuda:
-     # Loading mcoplib._C registers the vLLM-compatible FP8 quantization ops
-     # under torch.ops._C. mcoplib does not export
-     # sgl_kernel::sgl_per_token_quant_fp8.
--    import mcoplib._C  # noqa: F401
-+    try:
-+        import mcoplib._C  # noqa: F401
++@functools.cache
++def compute_num_split(num_tokens: int, hc_hidden_size: int) -> int:
++    n_split = 16 if num_tokens >= 512 else 64
++    # deep_gemm.tf32_hc_prenorm_gemm requirement
++    assert hc_hidden_size % 8 == 0
++    assert hc_hidden_size % n_split == 0
++    assert (hc_hidden_size // n_split) % 8 == 0
++    return n_split
++
++
+ def get_mhc_pre_token_count_representatives(
+     max_num_tokens: int, hc_hidden_size: int
+ ) -> Tuple[int, ...]:
+@@ -836,7 +846,7 @@ def mhc_pre(
+         )
  
--    _mcoplib_per_token_quant_fp8 = (
--        torch.ops._C.dynamic_per_token_scaled_fp8_quant.default
--    )
--    _mcoplib_dynamic_per_tensor_quant_fp8 = (
--        torch.ops._C.dynamic_scaled_fp8_quant.default
--    )
--    _mcoplib_static_per_tensor_quant_fp8 = (
--        torch.ops._C.static_scaled_fp8_quant.default
--    )
-+        _mcoplib_per_token_quant_fp8 = (
-+            torch.ops._C.dynamic_per_token_scaled_fp8_quant.default
+     if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
++        n_splits = compute_num_split(num_tokens, hc_hidden_size)
+ 
+         gemm_out_mul = torch.empty(
+             n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
+@@ -845,7 +855,9 @@ def mhc_pre(
+             n_splits, num_tokens, dtype=torch.float32, device=residual.device
+         )
+ 
+-        from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
++        from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
++            tf32_hc_prenorm_gemm,
 +        )
-+        _mcoplib_dynamic_per_tensor_quant_fp8 = (
-+            torch.ops._C.dynamic_scaled_fp8_quant.default
-+        )
-+        _mcoplib_static_per_tensor_quant_fp8 = (
-+            torch.ops._C.static_scaled_fp8_quant.default
-+        )
-+        _mcoplib_loaded = True
-+    except (
-+        ImportError,
-+        ModuleNotFoundError,
-+        OSError,
-+        AttributeError,
-+        RuntimeError,
-+    ):
-+        logger.warning(
-+            "mcoplib._C is unavailable; using SGLang FP8 quantization kernels"
-+        )
-+
-+from sglang.kernels.ops.quantization import per_token_group_quant
  
--    from sglang.kernels.ops.quantization import per_token_group_quant
-+if _is_cuda and _mcoplib_loaded:
+         tf32_hc_prenorm_gemm(
+             residual_flat.view(num_tokens, hc_hidden_size),
+@@ -1399,7 +1411,7 @@ def mhc_fused_post_pre(
+         tile_n = 2 if num_tokens < 8 else 3
+         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
+     else:
+-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
++        n_splits = compute_num_split(num_tokens, hc_hidden_size)
  
-     def sgl_per_token_quant_fp8(
-         input: torch.Tensor,
-@@ -85,10 +101,34 @@ if _is_cuda:
-             _mcoplib_static_per_tensor_quant_fp8(output_q, input, output_s, None)
-         else:
-             _mcoplib_dynamic_per_tensor_quant_fp8(output_q, input, output_s)
-+elif _is_cuda:
-+    # mcoplib is an optional acceleration library. Keep the same public
-+    # interface and route to the registered SGLang kernels when it is absent.
-+    from sglang.kernels.ops.quantization import (
-+        sgl_per_token_quant_fp8 as _sgl_per_token_quant_fp8,
-+    )
-+    from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
-+        per_tensor_quant_fp8 as _sgl_per_tensor_quant_fp8,
-+    )
-+
-+    def sgl_per_token_quant_fp8(
-+        input: torch.Tensor,
-+        output_q: torch.Tensor,
-+        output_s: torch.Tensor,
-+    ) -> None:
-+        _sgl_per_token_quant_fp8(input, output_q, output_s)
-+
-+    def sgl_per_tensor_quant_fp8(
-+        input: torch.Tensor,
-+        output_q: torch.Tensor,
-+        output_s: torch.Tensor,
-+        is_static: bool,
-+    ) -> None:
-+        _sgl_per_tensor_quant_fp8(input, output_q, output_s, is_static)
- 
--# if _is_musa:
--#     # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
--#     from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
-+if _is_musa:
-+    # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
-+    from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
- 
- if _is_hip:
-     _has_vllm = False
-@@ -128,14 +168,14 @@ if _is_musa:
-         return
- 
- 
--logger = logging.getLogger(__name__)
--
- use_mcoplib = False
--try:
--    from  mcoplib.op import per_token_cast_to_fp8 as per_token_cast_to_fp8_opt
--    use_mcoplib = True
--except:
--    logger.warning("please pip install mcoplib")
-+if _mcoplib_loaded:
-+    try:
-+        from mcoplib.op import per_token_cast_to_fp8 as per_token_cast_to_fp8_opt
-+
-+        use_mcoplib = True
-+    except (ImportError, ModuleNotFoundError, AttributeError):
-+        pass
- 
- 
- @lru_cache()
-@@ -494,13 +534,6 @@ def create_per_token_group_quant_fp8_output_scale(
-     scale_tma_aligned: bool,
-     scale_ue8m0: bool,
- ):
--    if use_mcoplib:
--        return torch.empty(
--            x_shape[:-1] + (x_shape[-1] // group_size,),
--            device=device,
--            dtype=torch.float32,
--        )
--
-     if scale_ue8m0:
-         if column_major_scales and scale_tma_aligned:
-             *x_batch, x_q_mn, x_q_k = x_shape
-@@ -556,9 +589,9 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-     m, n = x.shape
-     x_view = x.view(m, -1, 128)
-     x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
--    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(
--        m, n
--    ), (x_amax / 448.0).view(m, -1)
-+    return (x_view * (fp8_max / x_amax.unsqueeze(2))).to(fp8_dtype).view(m, n), (
-+        x_amax / fp8_max
-+    ).view(m, -1)
- 
- 
- def per_token_cast_to_fp8_3d(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-@@ -572,8 +605,10 @@ def per_token_cast_to_fp8_3d(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
- 
-     for x_group in x:
-         if use_mcoplib:
--            x_group_quant = torch.empty(m, n, dtype=torch.float8_e4m3fn, device='cuda')
--            x_group_scale = torch.empty(m,n//128, dtype=torch.float32, device='cuda')
-+            x_group_quant = torch.empty(m, n, dtype=fp8_dtype, device=x.device)
-+            x_group_scale = torch.empty(
-+                m, n // 128, dtype=torch.float32, device=x.device
-+            )
-             per_token_cast_to_fp8_opt(x_group_quant, x_group_scale, x_group)
-         else:
-             x_group_quant, x_group_scale = per_token_cast_to_fp8(x_group)
-@@ -708,24 +743,31 @@ def sglang_per_token_group_quant_fp8(
-         scale_ue8m0=scale_ue8m0,
-     )
- 
--    if use_mcoplib:
--        per_token_cast_to_fp8_opt(x_q, x_s, x)
--    else:
--        x_q, x_s = per_token_cast_to_fp8(x)
--        
--    # if x.shape[0] > 0:
--    #     _run_per_token_group_quant_8bit_kernel(
--    #         x,
--    #         x_q,
--    #         x_s,
--    #         group_size,
--    #         eps,
--    #         fp8_min,
--    #         fp8_max,
--    #         scale_ue8m0=scale_ue8m0,
--    #         fuse_silu_and_mul=fuse_silu_and_mul,
--    #         masked_m=masked_m,
--    #     )
-+    if x.shape[0] > 0:
-+        if (
-+            use_mcoplib
-+            and x.dim() == 2
-+            and group_size == 128
-+            and not column_major_scales
-+            and not scale_tma_aligned
-+            and not scale_ue8m0
-+            and not fuse_silu_and_mul
-+            and masked_m is None
-+        ):
-+            per_token_cast_to_fp8_opt(x_q, x_s, x)
-+        else:
-+            _run_per_token_group_quant_8bit_kernel(
-+                x,
-+                x_q,
-+                x_s,
-+                group_size,
-+                eps,
-+                fp8_min,
-+                fp8_max,
-+                scale_ue8m0=scale_ue8m0,
-+                fuse_silu_and_mul=fuse_silu_and_mul,
-+                masked_m=masked_m,
-+            )
- 
-     return x_q, x_s
- 
+     gemm_out_mul = torch.empty(
+         n_splits,
 diff --git a/python/sglang/srt/arg_groups/overrides.py b/python/sglang/srt/arg_groups/overrides.py
-index 6163dfa583..9eac6eee6c 100644
+index 9eac6eee6c..7030025932 100644
 --- a/python/sglang/srt/arg_groups/overrides.py
 +++ b/python/sglang/srt/arg_groups/overrides.py
-@@ -2009,6 +2009,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
-         if not user_set_decode:
-             declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
+@@ -2187,6 +2187,8 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
+         logger.warning(f"Setting KV cache dtype to {kv_cache_dtype} for {model_arch}.")
+     if view.device == "npu":
+         kv_cache_dtype = "bfloat16"
++    if kv_cache_dtype == "bf16":
++        kv_cache_dtype = "bfloat16"
+     assert kv_cache_dtype in [
+         "fp8_e4m3",
+         "bfloat16",
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 1ab737a1fa..ea23f52200 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1080,7 +1080,7 @@ class Envs:
+     # the tuned production path); the Triton path is bit-exact on DeepSeek-V3.2 e2e
+     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
+     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
+-    SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
++    SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)
  
-+    declared["dsa_prefill_backend"] = "flashmla_sparse"
-+    declared["dsa_decode_backend"] = "flashmla_kv"
-     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
-     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
-     _check_tilelang_dsa_fp8_kv(kv_cache_dtype, prefill, decode, hip=is_hip())
-diff --git a/python/sglang/srt/layers/attention/dsa/dsa_backend_mtp_precompute.py b/python/sglang/srt/layers/attention/dsa/dsa_backend_mtp_precompute.py
-index e4b90b7efe..4fd14ddac5 100644
---- a/python/sglang/srt/layers/attention/dsa/dsa_backend_mtp_precompute.py
-+++ b/python/sglang/srt/layers/attention/dsa/dsa_backend_mtp_precompute.py
-@@ -17,6 +17,7 @@ from sglang.srt.utils import is_cuda, is_hip
+     # ===================================================================
+     # Kernel selection and fused backends
+@@ -1302,13 +1302,13 @@ class Envs:
+     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
+     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
+-    SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
++    SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
+     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
+     # Per-rank local query rows (after DP-attention sharding when enabled),
+     # not request ISL.
+     SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
+-    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
++    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)
+     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
+     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+@@ -1316,14 +1316,16 @@ class Envs:
+     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+ 
+     # cache, GEMM, and distributed
+-    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
++    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
+     # Route the decode wo_a bf16 batched matmul off rocBLAS/Tensile onto aiter's
+     # tuned batched_gemm_bf16 (gfx95). Off by default; see deepseek_v4.py
+     # _apply_wo_a_bf16_matmul.
+     SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
+     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
+     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
+-    SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
++    SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(False)
++    # Storage format for the DSV4 index cache.
++    SGLANG_DSV4_INDEX_CACHE_TYPE = EnvStr("int8")
+ 
+     # ===================================================================
+     # Inkling
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index 315496a167..5be177de84 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -17,6 +17,8 @@ from typing import (
+ 
+ import torch
+ import torch.nn.functional as F
++import triton
++import triton.language as tl
+ 
+ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+     cast_q_fp8_for_q8kv8_prefill,
+@@ -82,7 +84,7 @@ from sglang.srt.speculative.ragged_verify import (
+     resolve_ragged_verify_layout,
+ )
+ from sglang.srt.utils import ceil_align, is_cuda, is_sm90_supported, is_xpu
+-from sglang.srt.utils.common import is_sm120_supported
++from sglang.srt.utils.common import is_maca, is_sm120_supported
  
  if TYPE_CHECKING:
-     from sglang.srt.model_executor.forward_batch_info import ForwardMode
-+    from sglang.srt.speculative.spec_info import SpecInput
+     from sgl_kernel.flash_mla import FlashMLASchedMeta
+@@ -94,6 +96,7 @@ if TYPE_CHECKING:
+ _is_sm120 = is_sm120_supported()
+ _is_cuda = is_cuda()
+ _is_xpu = is_xpu()
++_is_maca = is_maca()
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -146,10 +149,251 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
+     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
+ 
+ 
++def _dsv4_topk_length_2d(
++    topk_length: Optional[torch.Tensor],
++) -> Optional[torch.Tensor]:
++    if topk_length is None:
++        return None
++    if topk_length.ndim == 1:
++        return topk_length.unsqueeze(1)
++    if topk_length.ndim == 2:
++        return topk_length
++    if topk_length.ndim == 3 and topk_length.shape[-1] == 1:
++        return topk_length.squeeze(-1)
++    raise AssertionError(f"unsupported topk_length shape: {tuple(topk_length.shape)}")
++
++
++@triton.jit
++def _dsv4_build_unified_prefill_indices_kernel(
++    swa_indices_ptr,
++    extra_indices_ptr,
++    swa_lengths_ptr,
++    extra_lengths_ptr,
++    out_ptr,
++    swa_stride_0: tl.constexpr,
++    swa_stride_1: tl.constexpr,
++    swa_stride_2: tl.constexpr,
++    extra_stride_0: tl.constexpr,
++    extra_stride_1: tl.constexpr,
++    extra_stride_2: tl.constexpr,
++    swa_len_stride_0: tl.constexpr,
++    swa_len_stride_1: tl.constexpr,
++    extra_len_stride_0: tl.constexpr,
++    extra_len_stride_1: tl.constexpr,
++    out_stride_0: tl.constexpr,
++    out_stride_1: tl.constexpr,
++    out_stride_2: tl.constexpr,
++    H_KV: tl.constexpr,
++    SWA_TOPK: tl.constexpr,
++    EXTRA_TOPK: tl.constexpr,
++    OUT_TOPK: tl.constexpr,
++    SWA_LENGTH_H: tl.constexpr,
++    EXTRA_LENGTH_H: tl.constexpr,
++    EXTRA_OFFSET: tl.constexpr,
++    HAS_EXTRA: tl.constexpr,
++    HAS_SWA_LENGTH: tl.constexpr,
++    HAS_EXTRA_LENGTH: tl.constexpr,
++    BLOCK_TOPK: tl.constexpr,
++):
++    row_id = tl.program_id(0)
++    q_id = row_id // H_KV
++    h_id = row_id - q_id * H_KV
++    block_id = tl.program_id(1)
++    offsets = block_id * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
++
++    values = tl.full((BLOCK_TOPK,), -1, dtype=tl.int32)
++
++    swa_mask = offsets < SWA_TOPK
++    swa_raw = tl.load(
++        swa_indices_ptr
++        + q_id * swa_stride_0
++        + h_id * swa_stride_1
++        + offsets * swa_stride_2,
++        mask=swa_mask,
++        other=-1,
++    )
++    swa_length_valid = swa_mask
++    if HAS_SWA_LENGTH:
++        swa_len_h_id = tl.minimum(h_id, SWA_LENGTH_H - 1)
++        swa_len = tl.load(
++            swa_lengths_ptr + q_id * swa_len_stride_0 + swa_len_h_id * swa_len_stride_1
++        )
++        swa_length_valid = swa_mask & (offsets < swa_len)
++    values = tl.where(swa_length_valid, swa_raw, values)
++
++    if HAS_EXTRA:
++        extra_offsets = offsets - SWA_TOPK
++        extra_mask = (offsets >= SWA_TOPK) & (extra_offsets < EXTRA_TOPK)
++        extra_raw = tl.load(
++            extra_indices_ptr
++            + q_id * extra_stride_0
++            + h_id * extra_stride_1
++            + extra_offsets * extra_stride_2,
++            mask=extra_mask,
++            other=-1,
++        )
++        extra_length_valid = extra_mask
++        if HAS_EXTRA_LENGTH:
++            extra_len_h_id = tl.minimum(h_id, EXTRA_LENGTH_H - 1)
++            extra_len = tl.load(
++                extra_lengths_ptr
++                + q_id * extra_len_stride_0
++                + extra_len_h_id * extra_len_stride_1
++            )
++            extra_length_valid = extra_mask & (extra_offsets < extra_len)
++        extra_shifted = tl.where(extra_raw >= 0, extra_raw + EXTRA_OFFSET, extra_raw)
++        values = tl.where(extra_length_valid, extra_shifted, values)
++
++    out_mask = offsets < OUT_TOPK
++    tl.store(
++        out_ptr + q_id * out_stride_0 + h_id * out_stride_1 + offsets * out_stride_2,
++        values,
++        mask=out_mask,
++    )
++
++
++def _dsv4_build_unified_prefill_indices_triton(
++    *,
++    swa_page_indices: torch.Tensor,
++    extra_indices: Optional[torch.Tensor] = None,
++    swa_topk_lengths: Optional[torch.Tensor] = None,
++    extra_topk_lengths: Optional[torch.Tensor] = None,
++    extra_offset: int,
++) -> torch.Tensor:
++    assert swa_page_indices.ndim == 3
++    num_q, h_kv, swa_topk = swa_page_indices.shape
++    has_extra = extra_indices is not None
++    extra_topk = 0
++    if has_extra:
++        assert extra_indices is not None
++        assert extra_indices.ndim == 3
++        assert extra_indices.shape[:2] == (num_q, h_kv)
++        extra_topk = extra_indices.shape[-1]
++
++    out_topk = ceil_align(swa_topk + extra_topk, 128)
++    out = torch.empty(
++        (num_q, h_kv, out_topk),
++        dtype=swa_page_indices.dtype,
++        device=swa_page_indices.device,
++    )
++
++    swa_lengths_2d = _dsv4_topk_length_2d(swa_topk_lengths)
++    extra_lengths_2d = _dsv4_topk_length_2d(extra_topk_lengths)
++    empty_lengths = torch.empty(
++        (1, 1), dtype=torch.int32, device=swa_page_indices.device
++    )
++    extra_indices_arg = extra_indices if extra_indices is not None else swa_page_indices
++    swa_lengths_arg = swa_lengths_2d if swa_lengths_2d is not None else empty_lengths
++    extra_lengths_arg = (
++        extra_lengths_2d if extra_lengths_2d is not None else empty_lengths
++    )
++
++    block_topk = 128
++    grid = (num_q * h_kv, triton.cdiv(out_topk, block_topk))
++    _dsv4_build_unified_prefill_indices_kernel[grid](
++        swa_page_indices,
++        extra_indices_arg,
++        swa_lengths_arg,
++        extra_lengths_arg,
++        out,
++        swa_page_indices.stride(0),
++        swa_page_indices.stride(1),
++        swa_page_indices.stride(2),
++        extra_indices_arg.stride(0),
++        extra_indices_arg.stride(1),
++        extra_indices_arg.stride(2),
++        swa_lengths_arg.stride(0),
++        swa_lengths_arg.stride(1),
++        extra_lengths_arg.stride(0),
++        extra_lengths_arg.stride(1),
++        out.stride(0),
++        out.stride(1),
++        out.stride(2),
++        H_KV=h_kv,
++        SWA_TOPK=swa_topk,
++        EXTRA_TOPK=extra_topk,
++        OUT_TOPK=out_topk,
++        SWA_LENGTH_H=swa_lengths_arg.shape[1],
++        EXTRA_LENGTH_H=extra_lengths_arg.shape[1],
++        EXTRA_OFFSET=extra_offset,
++        HAS_EXTRA=has_extra,
++        HAS_SWA_LENGTH=swa_lengths_2d is not None,
++        HAS_EXTRA_LENGTH=extra_lengths_2d is not None,
++        BLOCK_TOPK=block_topk,
++    )
++    return out
++
++
++def _dsv4_build_unified_prefill_inputs_from_real_decode(
++    q: torch.Tensor,
++    swa_k_cache: torch.Tensor,
++    extra_k_cache: Optional[torch.Tensor],
++    swa_page_indices: torch.Tensor,
++    extra_indices: Optional[torch.Tensor],
++    swa_topk_lengths: Optional[torch.Tensor],
++    extra_topk_lengths: Optional[torch.Tensor],
++) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    assert q.ndim == 4 and q.shape[1] == 1
++    assert q.shape[-1] == 512
++    assert swa_k_cache.dtype == torch.bfloat16
++    assert swa_k_cache.shape[-1] == q.shape[-1]
++
++    q_prefill = q.squeeze(1).contiguous()
++    swa_num_tokens = swa_k_cache.shape[0] * swa_k_cache.shape[1]
++    kv_parts = [swa_k_cache.reshape(-1, 1, q.shape[-1])]
++    if extra_k_cache is not None:
++        assert extra_indices is not None
++        assert extra_k_cache.dtype == torch.bfloat16
++        assert extra_k_cache.shape[-1] == q.shape[-1]
++        kv_parts.append(extra_k_cache.reshape(-1, 1, q.shape[-1]))
++    kv_unified = torch.cat(kv_parts, dim=0).contiguous()
++
++    indices_unified = _dsv4_build_unified_prefill_indices_triton(
++        swa_page_indices=swa_page_indices,
++        extra_indices=extra_indices,
++        swa_topk_lengths=swa_topk_lengths,
++        extra_topk_lengths=extra_topk_lengths,
++        extra_offset=swa_num_tokens,
++    )
++    return q_prefill, kv_unified, indices_unified
++
++
++def _dsv4_run_bf16_sparse_prefill_attention(
++    *,
++    q_prefill: torch.Tensor,
++    kv_unified: torch.Tensor,
++    indices_unified: torch.Tensor,
++    sm_scale: float,
++    d_v: int,
++    attn_sink: Optional[torch.Tensor],
++) -> torch.Tensor:
++    if _is_xpu:
++        from sgl_kernel import flash_mla_sparse_fwd
++    elif _is_maca:
++        from flash_mla import flash_mla_sparse_fwd
++    else:
++        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
++
++    assert q_prefill.ndim == 3 and kv_unified.ndim == 3
++    assert q_prefill.shape[-1] == kv_unified.shape[-1]
++    return flash_mla_sparse_fwd(
++        q_prefill,
++        kv_unified,
++        indices_unified,
++        sm_scale=sm_scale,
++        d_v=d_v,
++        attn_sink=attn_sink,
++        topk_length=None,
++    )[0]
++
++
+ def _create_flashmla_metadata():
+     if _is_sm120 or _is_xpu:
+         return None
+-    import sgl_kernel.flash_mla as flash_mla
++    if _is_maca:
++        import flash_mla
++    else:
++        import sgl_kernel.flash_mla as flash_mla
+ 
+     return flash_mla.get_mla_metadata()[0]
+ 
+@@ -355,9 +599,9 @@ class DSV4AttnMetadata:
+             num_tokens = pre_global_len
+         for field_name in self._CP_REINDEX_FIELDS:
+             val = getattr(self, field_name, None)
+-            assert isinstance(
+-                val, torch.Tensor
+-            ), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
++            assert isinstance(val, torch.Tensor), (
++                f"CP reindex: {field_name} is {type(val)}, expected Tensor"
++            )
+             setattr(self, field_name, val[idx].contiguous())
+ 
+         for field_name in self._CP_REINDEX_FIELDS:
+@@ -543,9 +787,9 @@ class DeepseekV4AttnBackend(
+         self.device = torch.device(model_runner.device)
+         self.max_context_len = model_runner.model_config.context_len
+         head_dim = model_runner.model_config.head_dim
+-        assert (
+-            head_dim == 512
+-        ), "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
++        assert head_dim == 512, (
++            "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
++        )
+         self.softmax_scale: float = head_dim**-0.5
+         self.head_dim_v: int = model_runner.model_config.v_head_dim
+         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
+@@ -1750,22 +1994,17 @@ class DeepseekV4AttnBackend(
+ 
+             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
+ 
+-            assert (
+-                swa_page_indices.shape[-1] % 64 == 0
+-            ), f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
++            assert swa_page_indices.shape[-1] % 64 == 0, (
++                f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
++            )
+             if extra_indices is not None:
+-                assert (
+-                    extra_indices.shape[-1] % 64 == 0
+-                ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
+-
+-            # sparse_prefill_fwd does not support SM120.
+-            if (
+-                forward_batch.forward_mode.is_extend_without_speculative()
+-                and not _is_sm120
+-                and (
+-                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+-                    or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
++                assert extra_indices.shape[-1] % 64 == 0, (
++                    f"{extra_indices.shape=}'s last dimension is not aligned to 64"
+                 )
++
++            if forward_batch.forward_mode.is_extend_without_speculative() and (
++                q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
++                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+             ):
+                 if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
+                     return self._forward_prefill_sparse_q8kv8(
+@@ -1777,15 +2016,37 @@ class DeepseekV4AttnBackend(
+                         core_attn_metadata=core_attn_metadata,
+                         attn_sink=attn_sink,
+                     )
+-                return self._forward_prefill_sparse(
+-                    q=q,
+-                    layer_id=layer_id,
+-                    compress_ratio=compress_ratio,
+-                    forward_batch=forward_batch,
+-                    token_to_kv_pool=token_to_kv_pool,
+-                    core_attn_metadata=core_attn_metadata,
+-                    attn_sink=attn_sink,
+-                )
++
++                if swa_k_cache.dtype == torch.bfloat16:
++                    q_prefill, kv_unified, indices_unified = (
++                        _dsv4_build_unified_prefill_inputs_from_real_decode(
++                            q=q,
++                            swa_k_cache=swa_k_cache,
++                            extra_k_cache=extra_k_cache,
++                            swa_page_indices=swa_page_indices,
++                            extra_indices=extra_indices,
++                            swa_topk_lengths=swa_topk_lengths,
++                            extra_topk_lengths=extra_topk_lengths,
++                        )
++                    )
++                    return _dsv4_run_bf16_sparse_prefill_attention(
++                        q_prefill=q_prefill,
++                        kv_unified=kv_unified,
++                        indices_unified=indices_unified,
++                        sm_scale=self.softmax_scale,
++                        d_v=self.head_dim_v,
++                        attn_sink=attn_sink,
++                    )
++                if not _is_sm120:
++                    return self._forward_prefill_sparse(
++                        q=q,
++                        layer_id=layer_id,
++                        compress_ratio=compress_ratio,
++                        forward_batch=forward_batch,
++                        token_to_kv_pool=token_to_kv_pool,
++                        core_attn_metadata=core_attn_metadata,
++                        attn_sink=attn_sink,
++                    )
+ 
+             if _is_sm120:
+                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
+@@ -1807,6 +2068,8 @@ class DeepseekV4AttnBackend(
+             else:
+                 if _is_xpu:
+                     from sgl_kernel import flash_mla_with_kvcache
++                elif _is_maca:
++                    from flash_mla import flash_mla_with_kvcache
+                 else:
+                     from sgl_kernel.flash_mla import flash_mla_with_kvcache
+ 
+@@ -1818,7 +2081,12 @@ class DeepseekV4AttnBackend(
+                     cache_seqlens=None,
+                     tile_scheduler_metadata=flashmla_metadata,
+                     softmax_scale=self.softmax_scale,
+-                    is_fp8_kvcache=True,
++                    is_fp8_kvcache=self.token_to_kv_pool.dtype
++                    in (
++                        torch.float8_e5m2,
++                        torch.float8_e4m3fn,
++                        torch.float8_e4m3fnuz,
++                    ),
+                     indices=swa_page_indices,
+                     topk_length=swa_topk_lengths,
+                     attn_sink=attn_sink,
+@@ -1852,6 +2120,8 @@ class DeepseekV4AttnBackend(
+         """
+         if _is_xpu:
+             from sgl_kernel import flash_mla_sparse_fwd
++        elif _is_maca:
++            from flash_mla import flash_mla_sparse_fwd
+         else:
+             from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+ 
+diff --git a/python/sglang/srt/layers/attention/dsv4/compressor_v2.py b/python/sglang/srt/layers/attention/dsv4/compressor_v2.py
+index b9268e8c6e..a598f3cd81 100644
+--- a/python/sglang/srt/layers/attention/dsv4/compressor_v2.py
++++ b/python/sglang/srt/layers/attention/dsv4/compressor_v2.py
+@@ -248,7 +248,16 @@ class CompressorBackendMixin:
+             head_dim=compressor.head_dim,
+             norm=compressor.norm,
+             freqs_cis_cache=compressor.freqs_cis,
+-            kv_cache=kv_cache.view(dtype=torch.uint8),
++            kv_cache=(
++                kv_cache.view(dtype=torch.uint8)
++                if kv_cache.dtype
++                in (
++                    torch.float8_e5m2,
++                    torch.float8_e4m3fn,
++                    torch.float8_e4m3fnuz,
++                )
++                else kv_cache
++            ),
+             is_indexer=compressor.is_in_indexer,
+             rotate=compressor.rotate,
+             compress_ratio=compressor.ratio,
+diff --git a/python/sglang/srt/layers/attention/dsv4/indexer.py b/python/sglang/srt/layers/attention/dsv4/indexer.py
+index 774b2729b3..6231801281 100644
+--- a/python/sglang/srt/layers/attention/dsv4/indexer.py
++++ b/python/sglang/srt/layers/attention/dsv4/indexer.py
+@@ -725,7 +725,10 @@ class C4IndexerBackendMixin:
+ 
+             fn = fp8_paged_mqa_logits_triton
+         else:
+-            from deep_gemm import fp8_paged_mqa_logits as fn
++            if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":
++                from deep_gemm import fp8_paged_mqa_logits as fn
++            else:
++                from deep_gemm import int8_paged_mqa_logits as fn
+ 
+         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
+ 
+diff --git a/python/sglang/srt/layers/deep_gemm_wrapper/configurer.py b/python/sglang/srt/layers/deep_gemm_wrapper/configurer.py
+index 09e14f69df..d1b33ded24 100644
+--- a/python/sglang/srt/layers/deep_gemm_wrapper/configurer.py
++++ b/python/sglang/srt/layers/deep_gemm_wrapper/configurer.py
+@@ -4,6 +4,7 @@ from sglang.srt.environ import envs
+ from sglang.srt.utils import (
+     get_device_sm,
+     is_cuda,
++    is_maca,
+     is_musa,
+     is_sm100_supported,
+ )
+@@ -11,17 +12,22 @@ from sglang.srt.utils import (
+ logger = logging.getLogger(__name__)
  
  _is_cuda = is_cuda()
- _is_hip = is_hip()
-@@ -50,9 +51,6 @@ class PrecomputedMetadata:
-     max_len: int  # for decode/draft_extend
-     max_seqlen_k: int  # for target_verify
- 
--    # FlashMLA (optional)
--    flashmla_metadata: Optional[torch.Tensor] = None
--
- 
- def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
-     """Compute cumulative sequence lengths with padding."""
-@@ -163,12 +161,12 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
-             seqlens_expanded = cache_seqlens
-             seqlens_expanded_size = bs
- 
--            flashmla_metadata = None
--            if self.dsa_decode_impl == "flashmla_kv":
--                flashmla_metadata = self._compute_flashmla_metadata(
--                    cache_seqlens=dsa_cache_seqlens,
--                    seq_len_q=1,
--                )
-+            # flashmla_metadata = None
-+            # if self.dsa_decode_impl == "flashmla_kv":
-+            #     flashmla_metadata = self._compute_flashmla_metadata(
-+            #         cache_seqlens=dsa_cache_seqlens,
-+            #         seq_len_q=1,
-+            #     )
- 
-             return PrecomputedMetadata(
-                 cache_seqlens=cache_seqlens,
-@@ -181,7 +179,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
-                 seqlens_expanded_size=seqlens_expanded_size,
-                 max_len=max_len,
-                 max_seqlen_k=max_len,
--                flashmla_metadata=flashmla_metadata,
-+                # flashmla_metadata=flashmla_metadata,
-             )
- 
-         # Convert to int32 and compute cumsum
-@@ -207,13 +205,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
-         else:
-             real_page_table = None  # Will use page_indices directly
- 
--        # Compute FlashMLA metadata if needed
--        flashmla_metadata = None
--        if self.dsa_decode_impl == "flashmla_kv":
--            flashmla_metadata = self._compute_flashmla_metadata(
--                cache_seqlens=dsa_cache_seqlens,
--                seq_len_q=1,
--            )
- 
-         return PrecomputedMetadata(
-             cache_seqlens=cache_seqlens,
-@@ -226,7 +217,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
-             seqlens_expanded_size=seqlens_expanded_size,
-             max_len=max_len,
-             max_seqlen_k=max_len,
--            flashmla_metadata=flashmla_metadata,
-         )
- 
-     def _precompute_target_verify_mode(
-@@ -295,13 +285,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
-                 next_n=self.speculative_num_draft_tokens,
-             )
- 
--            flashmla_metadata = None
--            if self.dsa_decode_impl == "flashmla_kv":
--                flashmla_metadata = self._compute_flashmla_metadata(
--                    cache_seqlens=dsa_cache_seqlens,
--                    seq_len_q=1,
--                )
--
-             return PrecomputedMetadata(
-                 cache_seqlens=cache_seqlens,
-                 cu_seqlens_k=cu_seqlens_k,
-@@ -313,7 +296,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
-                 seqlens_expanded_size=seqlens_expanded_size,
-                 max_len=-1,
-                 max_seqlen_k=max_seqlen_k,
--                flashmla_metadata=flashmla_metadata,
-             )
- 
-         # Cache seqlens with draft tokens
-@@ -354,13 +336,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
-         else:
-             real_page_table = None
- 
--        # FlashMLA metadata
--        flashmla_metadata = None
--        if self.dsa_decode_impl == "flashmla_kv":
--            flashmla_metadata = self._compute_flashmla_metadata(
--                cache_seqlens=dsa_cache_seqlens,
--                seq_len_q=1,
--            )
- 
-         return PrecomputedMetadata(
-             cache_seqlens=cache_seqlens,
-@@ -373,7 +348,76 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
-             seqlens_expanded_size=seqlens_expanded_size,
-             max_len=-1,  # Not used in this mode
-             max_seqlen_k=max_seqlen_k,
--            flashmla_metadata=flashmla_metadata,
-+        )
-+
-+    def _precompute_draft_extend_mode(
-+        self,
-+        bs: int,
-+        req_pool_indices: torch.Tensor,
-+        seq_lens: torch.Tensor,
-+        seq_lens_cpu: torch.Tensor,
-+        spec_info: "SpecInput",
-+    ) -> PrecomputedMetadata:
-+        """Precompute metadata for draft extend mode."""
-+        max_seqlen_k = int(seq_lens_cpu.max().item())
-+
-+        # Cache seqlens
-+        cache_seqlens = seq_lens.to(torch.int32)
-+        cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
-+
-+        # Extend seqlens from spec_info: num_accept_tokens already includes
-+        # the bonus token (drafts + 1).
-+        extend_seq_lens = spec_info.num_accept_tokens[:bs]
-+        extend_seq_lens_cpu = extend_seq_lens.tolist()
-+
-+        # Page indices (repeated per accept length)
-+        page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
-+        page_indices = torch.repeat_interleave(
-+            page_indices, repeats=extend_seq_lens, dim=0
-+        ).contiguous()
-+
-+        # Generate expanded seqlens
-+        seqlens_expanded = torch.cat(
-+            [
-+                torch.arange(
-+                    kv_len - qo_len + 1,
-+                    kv_len + 1,
-+                    dtype=torch.int32,
-+                    device=self.device,
-+                )
-+                for qo_len, kv_len in zip(
-+                    extend_seq_lens_cpu,
-+                    seq_lens_cpu.tolist(),
-+                    strict=True,
-+                )
-+            ]
-+        )
-+
-+        # Compute DSA seqlens
-+        dsa_cache_seqlens = compute_dsa_seqlens(seqlens_expanded, self.dsa_index_topk)
-+        seqlens_expanded_size = seqlens_expanded.shape[0]
-+
-+        # DSA cumsum
-+        dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
-+
-+        # Transform page table
-+        if self.real_page_size > 1:
-+            real_page_table = self._transform_table_1_to_real(page_indices)
-+        else:
-+            real_page_table = None
-+
-+
-+        return PrecomputedMetadata(
-+            cache_seqlens=cache_seqlens,
-+            cu_seqlens_k=cu_seqlens_k,
-+            page_indices=page_indices,
-+            real_page_table=real_page_table,
-+            seqlens_expanded=seqlens_expanded,
-+            dsa_cache_seqlens=dsa_cache_seqlens,
-+            dsa_cu_seqlens_k=dsa_cu_seqlens_k,
-+            seqlens_expanded_size=seqlens_expanded_size,
-+            max_len=max_seqlen_k,
-+            max_seqlen_k=max_seqlen_k,
-         )
++_is_maca = is_maca()
+ _is_musa = is_musa()
  
  
-diff --git a/python/sglang/srt/layers/attention/dsa/dsa_indexer.py b/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
-index c1b3234033..f464dc55ad 100644
---- a/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
-+++ b/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
-@@ -4,13 +4,14 @@ import contextlib
- import logging
- from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
- 
-+import os
-+
- import torch
- from einops import rearrange
- 
- from sglang.kernels.fused_op import BaseFusedOp
- from sglang.kernels.ops.attention.fused_store_index_cache import (
-     can_use_dsa_fused_store,
--    fused_store_index_k_cache,
- )
- from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
- from sglang.srt.compilation.compilation_config import register_split_op
-@@ -144,6 +145,12 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
- if TYPE_CHECKING:
-     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
- 
-+FLOAT8_TYPES = {
-+    torch.float8_e4m3fn,
-+    torch.float8_e5m2,
-+    torch.float8_e4m3fnuz,
-+    torch.float8_e5m2fnuz
-+}
- 
- DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
- 
-@@ -197,7 +204,6 @@ def _broadcast_indexer_topk_from_rank0(
- 
- 
- def rotate_activation(x: torch.Tensor) -> torch.Tensor:
--    # from sgl_kernel import hadamard_transform
-     if _is_hip:
-         from fast_hadamard_transform import hadamard_transform
-     elif _is_xpu:
-@@ -257,6 +263,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-         )
-         self.alt_stream = alt_stream
-         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-+        self.int8_cache = True if os.getenv("MX_ENABLE_NSA_INT8") else False
-         if self.dsa_enable_prefill_cp:
-             self.cp_size = get_parallel().attn_cp_size
-         else:
-@@ -320,6 +327,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-         )
-         self.block_size = block_size
-         self.scale_fmt = scale_fmt
-+        if self.int8_cache:
-+            self.scale_fmt = None
-         self.softmax_scale = self.head_dim**-0.5
-         self.num_init_tokens = self.num_local_tokens = 0
-         if config is not None:
-@@ -358,7 +367,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
-             x = x[2]
-         if _is_cuda:
--            return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
-+            return torch.mm(x.float(), self.weights_proj.weight.t().float())
- 
-         weights, _ = self.weights_proj(x)
-         if _is_hip:
-@@ -376,11 +385,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
- 
-     @torch.compile(dynamic=True)
-     def _get_logits_head_gate(
--        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: torch.Tensor
-+        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: Optional[torch.Tensor] = None
-     ):
-         weights = self._weights_proj_bf16_in_fp32_out(x)
-         weights = weights * self.n_heads**-0.5
--        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
-+        if q_scale is None:  # bf16
-+            assert self.int8_cache is False
-+            weights = weights.unsqueeze(-1) * self.softmax_scale
-+        else:
-+            assert self.int8_cache
-+            weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
-         return weights
- 
-     @torch.compile(dynamic=True)
-@@ -390,8 +404,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
- 
-     @torch.compile(dynamic=True)
--    def _scale_head_gates(self, weights_raw: torch.Tensor, q_scale: torch.Tensor):
-+    def _scale_head_gates(
-+        self, weights_raw: torch.Tensor, q_scale: Optional[torch.Tensor]
+ def _compute_enable_deep_gemm():
+     sm_version = get_device_sm()
+-    if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
++    # MACA ships a platform-specific DeepGEMM implementation and may expose
++    # CUDA compatibility metadata that does not satisfy NVIDIA SM checks.
++    if ((_is_cuda and not _is_maca) and sm_version < 90) or (
++        _is_musa and sm_version < 31
 +    ):
-         weights = weights_raw * self.n_heads**-0.5
-+        if q_scale is None:
-+            assert not self.int8_cache
-+            return weights.unsqueeze(-1) * self.softmax_scale
-         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
+         return False
+     # DeepGEMM requires TMEM/tcgen05 (SM100+datacenter), not available on SM120
+-    if sm_version == 120:
++    if _is_cuda and not _is_maca and sm_version == 120:
+         return False
+-    if not (_is_cuda or _is_musa):
++    if not (_is_cuda or _is_maca or _is_musa):
+         return False
  
-     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-@@ -620,7 +639,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
-             return
-         if (
--            not _is_fp8_fnuz
-+            act_quant is not None
-+            and not self.int8_cache
-+            and not _is_fp8_fnuz
-             and out_cache_loc is not None
-             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
-         ):
-@@ -897,13 +918,32 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-         assert len(kv_cache_fp8.shape) == 2
-         block_kv = page_size
-         num_heads_kv = 1
--        head_dim_with_sf = 132
-+        # The cache buffer, rather than Q's dtype, is authoritative for the
-+        # physical row layout. Quantized index-K rows are 128 bytes plus a
-+        # four-byte scale; BF16 rows contain 128 BF16 elements.
-+        cache_is_quantized = kv_cache_fp8.dtype is torch.uint8
-+        if cache_is_quantized:
-+            assert self.int8_cache or q_fp8.dtype in FLOAT8_TYPES
-+            head_dim_with_sf = 132
-+        else:
-+            assert kv_cache_fp8.dtype is torch.bfloat16
-+            assert q_fp8.dtype is torch.bfloat16
-+            head_dim_with_sf = 128
-         kv_cache_fp8 = kv_cache_fp8.view(
-             kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-         )
-         assert len(weights.shape) == 3
-         weights = weights.squeeze(2)
+     try:
+@@ -36,4 +42,6 @@ ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
  
-+        if q_fp8.dtype in FLOAT8_TYPES:
-+            paged_mqa_logits_fn = deep_gemm.fp8_paged_mqa_logits
-+        elif q_fp8.dtype is torch.int8:
-+            assert self.int8_cache
-+            paged_mqa_logits_fn = deep_gemm.int8_paged_mqa_logits
-+        else:
-+            assert q_fp8.dtype is torch.bfloat16
-+            paged_mqa_logits_fn = deep_gemm.bf16_paged_mqa_logits
-+
-         if self.paged_mqa_logits_backend.is_aiter():
-             logits = aiter_paged_mqa_logits(
-                 q_fp8,
-@@ -936,7 +976,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-             )
-         elif use_dg_native:
-             logits = deepgemm_paged_mqa_logits_native(
--                deep_gemm.fp8_paged_mqa_logits,
-+                paged_mqa_logits_fn,
-                 q_fp8,
-                 kv_cache_fp8,
-                 weights,
-@@ -949,8 +989,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-                 next_n=next_n,
-             )
-         else:
-+            # DeepGEMM's paged kernels require q=[batch, next_n, heads, dim].
-+            # This split path represents every flattened query token as a
-+            # one-token batch and keeps its matching expanded context length.
-             logits = deepgemm_paged_mqa_logits_split(
--                deep_gemm.fp8_paged_mqa_logits,
-+                paged_mqa_logits_fn,
-                 q_fp8,
-                 kv_cache_fp8,
-                 weights,
-@@ -1092,20 +1135,37 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
-         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
-         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
--        k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
--            layer_id,
--            metadata.get_indexer_seq_len(),
--            block_tables,
--            seq_len_sum,
--            max_seq_len,
--        )
--        if _is_fp8_fnuz:
-+        if q_fp8.dtype in FLOAT8_TYPES or q_fp8.dtype is torch.int8:
-+            k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
-+                layer_id,
-+                metadata.get_indexer_seq_len(),
-+                block_tables,
-+                seq_len_sum,
-+                max_seq_len,
-+            )
-+        else:
-+            k_fp8 = get_token_to_kv_pool().get_index_batched_k_buffer(
-+                layer_id,
-+                metadata.get_indexer_seq_len(),
-+                block_tables,
-+                seq_len_sum,
-+                max_seq_len,
-+            )
-+            k_scale = None
-+        if self.int8_cache:
-+            k_fp8 = k_fp8.view(torch.int8)
-+        elif _is_fp8_fnuz:
-             k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
-+        elif q_fp8.dtype is torch.bfloat16:
-+            kv_fp8 = k_fp8.view(torch.bfloat16)
-         else:
-             k_fp8 = k_fp8.view(torch.float8_e4m3fn)
- 
--        k_scale = k_scale.view(torch.float32).squeeze(-1)
--        kv_fp8 = (k_fp8, k_scale)
-+        if k_scale is not None:
-+            k_scale = k_scale.view(torch.float32).squeeze(-1)
-+            kv_fp8 = (k_fp8, k_scale)
-+        else:
-+            kv_fp8 = k_fp8
- 
-         # Check if we need to chunk to avoid OOM
-         seq_lens_expanded = metadata.get_seqlens_expanded()
-@@ -1140,14 +1200,36 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                         q_fp8[:q_offset], weights[:q_offset]
-                     )
--                    logits = deep_gemm.fp8_mqa_logits(
--                        q_padded,
--                        kv_fp8,
--                        w_padded,
--                        ks,
--                        ke,
--                        clean_logits=False,
--                    )
-+                    if q_fp8.dtype in FLOAT8_TYPES:
-+                        logits = deep_gemm.fp8_mqa_logits(
-+                            q_fp8[:q_offset],
-+                            kv_fp8,
-+                            weights[:q_offset],
-+                            ks,
-+                            ke,
-+                            clean_logits=False,
-+                        )
-+
-+                    elif q_fp8.dtype is torch.int8:
-+                        assert self.int8_cache
-+                        logits = deep_gemm.int8_mqa_logits(
-+                            q_fp8[:q_offset],
-+                            kv_fp8,
-+                            weights[:q_offset],
-+                            ks,
-+                            ke,
-+                            clean_logits=False,
-+                        )
-+                    else:
-+                        assert q_fp8.dtype is torch.bfloat16
-+                        logits = deep_gemm.bf16_mqa_logits(
-+                            q_fp8[:q_offset],
-+                            kv_fp8,
-+                            weights[:q_offset],
-+                            ks,
-+                            ke,
-+                            clean_logits=False,
-+                        )
-             assert logits.shape[0] == len(seq_lens_expanded)
-             assert logits.shape[1] == k_offset
- 
-@@ -1196,14 +1278,35 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                         q_fp8[start:end], weights[start:end]
-                     )
--                    logits_chunk = deep_gemm.fp8_mqa_logits(
--                        q_padded,
--                        kv_fp8,
--                        w_padded,
--                        ks[start:end],
--                        ke[start:end],
--                        clean_logits=False,
--                    )
-+                    if q_fp8.dtype in FLOAT8_TYPES:
-+                        logits_chunk = deep_gemm.fp8_mqa_logits(
-+                            q_padded,
-+                            kv_fp8,
-+                            w_padded,
-+                            ks[start:end],
-+                            ke[start:end],
-+                            clean_logits=False,
-+                        )
-+                    elif q_fp8.dtype is torch.int8:
-+                        assert self.int8_cache
-+                        logits_chunk = deep_gemm.int8_mqa_logits(
-+                            q_fp8[start:end],
-+                            kv_fp8,
-+                            weights[start:end],
-+                            ks[start:end],
-+                            ke[start:end],
-+                            clean_logits=False,
-+                        )
-+                    else:
-+                        assert q_fp8.dtype is torch.bfloat16
-+                        logits_chunk = deep_gemm.bf16_mqa_logits(
-+                            q_fp8[start:end],
-+                            kv_fp8,
-+                            weights[start:end],
-+                            ks[start:end],
-+                            ke[start:end],
-+                            clean_logits=False,
-+                        )
- 
-             lengths_chunk = seq_lens_expanded[start:end]
-             self._mask_init_and_local_tokens(logits_chunk, lengths_chunk, ks[start:end])
-@@ -1501,24 +1604,24 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
-             return
- 
--        if (
--            _is_cuda
--            and (not _is_fp8_fnuz)
--            and can_use_dsa_fused_store(
--                key.dtype,
--                out_cache_loc.dtype,
--                pool.page_size,
--            )
--        ):
--            # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
--            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
--            fused_store_index_k_cache(
--                key,
--                buf,
--                out_cache_loc,
--                pool.page_size,
--            )
--            return
-+        # if (
-+        #     _is_cuda
-+        #     and (not _is_fp8_fnuz)
-+        #     and can_use_dsa_fused_store(
-+        #         key.dtype,
-+        #         out_cache_loc.dtype,
-+        #         pool.page_size,
-+        #     )
-+        # ):
-+        #     # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-+        #     buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-+        #     fused_store_index_k_cache(
-+        #         key,
-+        #         buf,
-+        #         out_cache_loc,
-+        #         pool.page_size,
-+        #     )
-+        #     return
- 
-         # Fast path: AITER fused quant + cache store
-         # When _use_aiter_preshuffle is True we use the new MFMA 16x16 preshuffle
-@@ -1543,8 +1646,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-             return
- 
-         # Fallback: original path
--        assert act_quant is not None
--        k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
-+        if act_quant is not None:
-+            k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
-+        else:
-+            k_fp8, k_scale = key, None
- 
-         if not out_cache_loc.is_contiguous():
-             out_cache_loc = out_cache_loc.contiguous()
-@@ -1583,10 +1688,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-         layer_id: int,
-         return_indices: bool = True,
-     ) -> Optional[torch.Tensor]:
--        if _is_hip:
--            from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
--        elif not _is_npu:
--            from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
-+        # if _is_hip:
-+        #     from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
-+        # elif not _is_npu:
-+        #     from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
-+
-+        if self.int8_cache:
-+            from sglang.kernels.ops.attention.dsa.triton_kernel import (
-+                act_quant_int8 as act_quant,
-+            )
-+        else:
-+            act_quant = None
- 
-         if TYPE_CHECKING:
-             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
-@@ -1649,6 +1761,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
- 
-         if (
-             self.use_dsa_indexer_fusion
-+            # This fused Q kernel always emits FP8. BF16 and MetaX INT8 caches
-+            # must use the general preparation path below so Q and K retain
-+            # matching formats.
-+            and act_quant is not None
-+            and not self.int8_cache
-             and not in_piecewise_or_breakable_cuda_graph
-             and forward_batch.attn_cp_metadata is None
-         ):
-@@ -1704,7 +1821,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-             query, key, weights_raw = self._get_q_k_bf16(
-                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
-             )
--            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-+            if act_quant is not None:
-+                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-+            else:
-+                q_fp8, q_scale = query, None
-             with torch.cuda.stream(self.alt_stream):
-                 self._store_index_k_cache(
-                     forward_batch=forward_batch,
-@@ -1716,7 +1836,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-             if self.use_dsa_indexer_fusion:
-                 weights = self._scale_head_gates(weights_raw, q_scale)
-             else:
--                weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
-+                if q_scale is not None:
-+                   weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
-+                else:
-+                   weights = weights.unsqueeze(-1) * self.softmax_scale
-         else:
-             query, key, weights_raw = self._get_q_k_bf16(
-                 q_lora,
-@@ -1730,7 +1853,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-                 current_stream = torch.cuda.current_stream()
-                 self.alt_stream.wait_stream(current_stream)
- 
--                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-+                if act_quant is not None:
-+                    q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-+                else:
-+                    q_fp8, q_scale = query, None
-                 with torch.cuda.stream(self.alt_stream):
-                     self._store_index_k_cache(
-                         forward_batch=forward_batch,
-@@ -1740,7 +1866,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-                     )
-                 current_stream.wait_stream(self.alt_stream)
-             elif not in_piecewise_or_breakable_cuda_graph:
--                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-+                if act_quant is not None:
-+                    q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-+                else:
-+                    q_fp8, q_scale = query, None
-                 self._store_index_k_cache(
-                     forward_batch=forward_batch,
-                     layer_id=layer_id,
-@@ -1752,7 +1881,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-                 # still need q_fp8 for paged topk and q_scale for
-                 # logits_head_gate_graph. K-cache storage is handled by the
-                 # full graph split path when prefill requires it.
--                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-+                if act_quant is not None:
-+                    q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-+                else:
-+                    q_fp8, q_scale = query, None
- 
-             # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
-             # fused_rms_fp8_group_quant is passed directly to _get_logits_head_gate,
-@@ -1796,7 +1928,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-                 x_for_gate = x
- 
-             if in_piecewise_or_breakable_cuda_graph:
--                if self.use_dsa_indexer_fusion:
-+                if q_scale is None:
-+                    if self.use_dsa_indexer_fusion:
-+                        weights = weights_raw * self.n_heads**-0.5
-+                    else:
-+                        if weights_proj_lora:
-+                            raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
-+                        weights = (
-+                            torch.mm(x_for_gate, self.weights_proj.weight.t()).float()
-+                            * self.n_heads**-0.5
-+                        )
-+                    weights = weights.unsqueeze(-1) * self.softmax_scale
-+                elif self.use_dsa_indexer_fusion:
-                     weights = scale_head_gate_graph(
-                         weights_raw,
-                         self.n_heads**-0.5,
-@@ -1817,7 +1960,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
-                 weights = self._scale_head_gates(weights_raw, q_scale)
-             elif weights_proj_lora:
-                 weights = self.weights_proj(x_for_gate)[0].float() * self.n_heads**-0.5
--                weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
-+                if q_scale is not None:
-+                    weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
-+                else:
-+                    weights = weights.unsqueeze(-1) * self.softmax_scale
-             else:
-                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
- 
-diff --git a/python/sglang/srt/layers/attention/dsa_backend.py b/python/sglang/srt/layers/attention/dsa_backend.py
-index 3ac2ae68e5..3e5f634901 100644
---- a/python/sglang/srt/layers/attention/dsa_backend.py
-+++ b/python/sglang/srt/layers/attention/dsa_backend.py
-@@ -224,7 +224,6 @@ class DSAMetadata:
-     dsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
-     dsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
- 
--    flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
-     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
-     # Precomputed once per forward batch and reused across layers.
-     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
-@@ -308,7 +307,7 @@ class DeepseekSparseAttnBackend(
-         seed_dsa_topk_from_draft_extend: bool = False,
-     ):
-         super().__init__()
--        self.forward_metadata: DSAMetadata
-+        self.forward_metadata: Optional[DSAMetadata] = None
-         self.device = model_runner.device
-         assert isinstance(model_runner.page_size, int)
-         self.real_page_size = model_runner.page_size
-@@ -805,16 +804,6 @@ class DeepseekSparseAttnBackend(
- 
-         # Centralized dispatch: decide all strategies for this batch
-         self.set_dsa_prefill_impl(forward_batch)
--        dsa_impl_for_batch = (
--            self.dsa_decode_impl
--            if (
--                forward_batch.forward_mode.is_decode_or_idle()
--                or forward_batch.forward_mode.is_target_verify()
--                or forward_batch.forward_mode.is_draft_extend_v2()
--            )
--            else self.dsa_prefill_impl
--        )
--        use_flashmla_kv = (not self.use_mha) and dsa_impl_for_batch == "flashmla_kv"
-         topk_transform_method = self.get_topk_transform_method(
-             forward_batch.forward_mode
-         )
-@@ -1048,14 +1037,6 @@ class DeepseekSparseAttnBackend(
-             seq_lens_sum=forward_batch.seq_lens_sum,
-             page_table_1=page_table,
-             page_table_1_flattened=page_table_1_flattened,
--            flashmla_metadata=(
--                self._compute_flashmla_metadata(
--                    cache_seqlens=dsa_cache_seqlens_int32,
--                    seq_len_q=1,
--                )
--                if use_flashmla_kv
--                else None
--            ),
-             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
-             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
-             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
-@@ -1226,16 +1207,6 @@ class DeepseekSparseAttnBackend(
-                     device=self.device,
-                 )
-             ),
--            "flashmla_metadata": (
--                self._compute_flashmla_metadata(
--                    cache_seqlens=torch.ones(
--                        max_num_tokens, dtype=torch.int32, device=self.device
--                    ),
--                    seq_len_q=1,
--                )
--                if self.dsa_decode_impl == "flashmla_kv"
--                else None
--            ),
-         }
- 
-     def _build_forward_metadata_cuda_graph(
-@@ -1280,18 +1251,6 @@ class DeepseekSparseAttnBackend(
- 
-             seqlens_expanded = cache_seqlens_int32
-             dsa_extend_seq_lens_list = [1] * bs
--            if self.dsa_decode_impl == "flashmla_kv":
--                flashmla_metadata = self.decode_cuda_graph_metadata[
--                    "flashmla_metadata"
--                ].slice(slice(0, bs + 1))
--                flashmla_metadata.copy_(
--                    self._compute_flashmla_metadata(
--                        cache_seqlens=dsa_cache_seqlens_int32,
--                        seq_len_q=1,
--                    )
--                )
--            else:
--                flashmla_metadata = None
-         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
-             cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
-                 torch.int32
-@@ -1342,19 +1301,6 @@ class DeepseekSparseAttnBackend(
-             )
-             dsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
- 
--            if self.dsa_decode_impl == "flashmla_kv":
--                flashmla_metadata = self.decode_cuda_graph_metadata[
--                    "flashmla_metadata"
--                ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
--
--                flashmla_metadata.copy_(
--                    self._compute_flashmla_metadata(
--                        cache_seqlens=dsa_cache_seqlens_int32,
--                        seq_len_q=1,
--                    )
--                )
--            else:
--                flashmla_metadata = None
- 
-         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
-         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
-@@ -1389,7 +1335,6 @@ class DeepseekSparseAttnBackend(
-             cu_seqlens_q=cu_seqlens_q,
-             cu_seqlens_k=cu_seqlens_k,
-             page_table_1=page_table_1,
--            flashmla_metadata=flashmla_metadata,
-             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
-             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
-             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
-@@ -1696,16 +1641,6 @@ class DeepseekSparseAttnBackend(
-         else:
-             assert metadata.real_page_table is metadata.page_table_1
- 
--        if self.dsa_decode_impl == "flashmla_kv":
--            flashmla_metadata = metadata.flashmla_metadata.slice(
--                slice(0, seqlens_expanded_size + 1)
--            )
--            flashmla_metadata.copy_(
--                self._compute_flashmla_metadata(
--                    cache_seqlens=dsa_cache_seqlens,
--                    seq_len_q=1,
--                )
--            )
- 
-         self.forward_metadata = metadata
- 
-@@ -1746,18 +1681,6 @@ class DeepseekSparseAttnBackend(
-                 else:
-                     raise ValueError(f"Unsupported forward_mode: {forward_mode}")
- 
--                # Prepare FlashMLA tensors if needed
--                flashmla_num_splits_src = None
--                flashmla_num_splits_dst = None
--                flashmla_metadata_src = None
--                flashmla_metadata_dst = None
--                if precomputed.flashmla_metadata is not None:
--                    flashmla_num_splits_src = precomputed.flashmla_metadata.num_splits
--                    flashmla_num_splits_dst = metadata.flashmla_metadata.num_splits
--                    flashmla_metadata_src = (
--                        precomputed.flashmla_metadata.flashmla_metadata
--                    )
--                    flashmla_metadata_dst = metadata.flashmla_metadata.flashmla_metadata
- 
-                 # Call fused kernel
-                 fused_metadata_copy_cuda(
-@@ -1769,8 +1692,10 @@ class DeepseekSparseAttnBackend(
-                     precomputed.seqlens_expanded,
-                     precomputed.dsa_cu_seqlens_k,
-                     precomputed.real_page_table,
--                    flashmla_num_splits_src,
--                    flashmla_metadata_src,
-+                    # FlashMLA metadata is generated at execution time on MACA,
-+                    # but the fused-copy API keeps these optional source slots.
-+                    None,
-+                    None,
-                     # Destination tensors
-                     metadata.cache_seqlens_int32,
-                     metadata.cu_seqlens_k,
-@@ -1783,8 +1708,9 @@ class DeepseekSparseAttnBackend(
-                         if precomputed.real_page_table is not None
-                         else None
-                     ),
--                    flashmla_num_splits_dst,
--                    flashmla_metadata_dst,
-+                    # Matching optional FlashMLA destination slots.
-+                    None,
-+                    None,
-                     # Parameters
-                     mode_int,
-                     bs,
-@@ -1842,11 +1768,6 @@ class DeepseekSparseAttnBackend(
-                     precomputed.real_page_table
-                 )
- 
--            # Copy FlashMLA metadata in fallback path
--            if precomputed.flashmla_metadata is not None:
--                size = precomputed.seqlens_expanded_size
--                flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
--                flashmla_metadata.copy_(precomputed.flashmla_metadata)
- 
-         # Refresh DeepGEMM paged MQA schedule metadata for the actual seqlens of
-         # this replay (the captured graph holds stale data otherwise, which can
-@@ -1953,6 +1874,7 @@ class DeepseekSparseAttnBackend(
-         # Do absorbed multi-latent attention (MLA path)
-         assert q_rope is not None
-         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-+        assert kv_cache.dtype == q.dtype
- 
-         if q_rope is not None:
-             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-@@ -2398,7 +2320,7 @@ class DeepseekSparseAttnBackend(
-         sm_scale: float,
-         topk_length: Optional[torch.Tensor] = None,
-     ) -> torch.Tensor:
--        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
-+        from flash_mla import flash_mla_sparse_fwd
- 
-         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
-         # When using TP, num_heads might be smaller (e.g., 256//8=32)
-@@ -2437,14 +2359,26 @@ class DeepseekSparseAttnBackend(
-             # they ever diverge.
-             topk_length = None
- 
--        o, _, _ = flash_mla_sparse_fwd(
--            q=q_input,
--            kv=kv_cache,
--            indices=indices_input,
--            sm_scale=sm_scale,
--            d_v=v_head_dim,
--            topk_length=topk_length,
--        )
-+        flashmla_opt = get_bool_env_var("MX_ENABLE_FLASH_MLA_OPT", default="true")
-+        if flashmla_opt:
-+            prefill_mask = (page_table_1 != -1).all(dim=-1, keepdim=True)
-+            o, _, _ = flash_mla_sparse_fwd(
-+                q=q_input,
-+                kv=kv_cache,
-+                indices=indices_input,
-+                sm_scale=sm_scale,
-+                d_v=v_head_dim,
-+                indices_all_valid_per_q=prefill_mask,
-+            )
-+        else:
-+            o, _, _ = flash_mla_sparse_fwd(
-+                q=q_input,
-+                kv=kv_cache,
-+                indices=indices_input,
-+                sm_scale=sm_scale,
-+                d_v=v_head_dim,
-+                topk_length=topk_length,
-+            )
- 
-         # Trim output back to original num_heads if we padded
-         if need_padding:
-@@ -2802,13 +2736,18 @@ class DeepseekSparseAttnBackend(
-         metadata: DSAMetadata,
-         page_table_1,
-     ) -> torch.Tensor:
--        from sgl_kernel.flash_mla import flash_mla_with_kvcache
-+        from flash_mla import flash_mla_with_kvcache, get_mla_metadata
- 
-         cache_seqlens = metadata.dsa_cache_seqlens_int32
--        assert metadata.flashmla_metadata is not None
-+        sched_meta, _ = get_mla_metadata()
- 
-         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
-         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
-+        if self.dsa_kv_cache_store_fp8:
-+            # The xcore1600 FlashMLA FP8 KV sparse-decode path expects only the
-+            # absorbed NoPE query part (512 dims for DeepSeek V3.2), not q_nope
-+            # concatenated with the 64-dim RoPE query.
-+            q_all = q_all[..., : self.kv_lora_rank]
-         num_q_heads = q_all.shape[2]
-         target_q_heads = self.flashmla_kv_num_q_heads
-         if target_q_heads != num_q_heads:
-@@ -2823,30 +2762,51 @@ class DeepseekSparseAttnBackend(
-         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
-         assert self.real_page_size == 64, "only page size 64 is supported"
- 
--        if not self.dsa_kv_cache_store_fp8:
--            # inefficiently quantize the whole cache
--            kv_cache = quantize_k_cache(kv_cache)
-+        # if not self.dsa_kv_cache_store_fp8:
-+        #     # inefficiently quantize the whole cache
-+        #     kv_cache = quantize_k_cache(kv_cache)
- 
-         indices = page_table_1.unsqueeze(1)
-         assert (
-             indices.shape[-1] == self.dsa_index_topk
-         )  # requirement of FlashMLA decode kernel
- 
--        o, _ = flash_mla_with_kvcache(
--            q=q_input,
--            k_cache=kv_cache,
--            cache_seqlens=cache_seqlens,
--            head_dim_v=v_head_dim,
--            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
--            num_splits=metadata.flashmla_metadata.num_splits,
--            softmax_scale=sm_scale,
--            indices=indices,
--            # doc says it is not used, but if pass in None then error
--            block_table=torch.empty(
--                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
--            ),
--            is_fp8_kvcache=True,
--        )
-+        flashmla_opt = get_bool_env_var("MX_ENABLE_FLASH_MLA_OPT", default="true")
-+
-+        if flashmla_opt:
-+            decode_mask = (indices != -1).all(dim=-1, keepdim=True)
-+            o, _ = flash_mla_with_kvcache(
-+                q=q_input,
-+                k_cache=kv_cache,
-+                cache_seqlens=cache_seqlens,
-+                head_dim_v=v_head_dim,
-+                tile_scheduler_metadata=sched_meta,
-+                num_splits=None,
-+                softmax_scale=sm_scale,
-+                indices=indices,
-+                indices_all_valid_per_q=decode_mask,
-+                # doc says it is not used, but if pass in None then error
-+                block_table=torch.empty(
-+                    (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
-+                ),
-+                is_fp8_kvcache=self.dsa_kv_cache_store_fp8,
-+            )
-+        else:
-+            o, _ = flash_mla_with_kvcache(
-+                q=q_input,
-+                k_cache=kv_cache,
-+                cache_seqlens=cache_seqlens,
-+                head_dim_v=v_head_dim,
-+                tile_scheduler_metadata=sched_meta,
-+                num_splits=None,
-+                softmax_scale=sm_scale,
-+                indices=indices,
-+                # doc says it is not used, but if pass in None then error
-+                block_table=torch.empty(
-+                    (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
-+                ),
-+                is_fp8_kvcache=self.dsa_kv_cache_store_fp8,
-+            )
- 
-         if target_q_heads != num_q_heads:
-             o = o[:, :, :num_q_heads, :]
-@@ -2908,6 +2868,8 @@ class DeepseekSparseAttnBackend(
-             )
- 
-         # Use FA3 for SM90 (Hopper/H200)
-+        from flash_attn import flash_attn_varlen_func
-+
-         return flash_attn_varlen_func(
-             q=q,
-             k=k,
-@@ -3386,42 +3348,33 @@ class DeepseekSparseAttnBackend(
- 
-     def get_indexer_metadata(
-         self, layer_id: int, forward_batch: ForwardBatch
--    ) -> DSAIndexerMetadata:
-+    ) -> Optional[DSAIndexerMetadata]:
-+        metadata = self.forward_metadata
-+        if metadata is None:
-+            # Unpadded DP-attention idle ranks deliberately clear stale
-+            # metadata in EagerRunner._execute_idle. Returning None uses the
-+            # indexer's existing no-work path for this empty companion rank.
-+            if forward_batch.forward_mode.is_idle():
-+                return None
-+            raise RuntimeError(
-+                "DSA forward metadata is missing for a non-idle indexer forward"
-+            )
-+
-         force_unfused = not self.use_fused_topk or (
-             self.hisparse_coordinator is not None
-             and forward_batch.forward_mode.is_decode_or_idle()
-         )
-         return DSAIndexerMetadata(
--            attn_metadata=self.forward_metadata,
-+            attn_metadata=metadata,
-             topk_transform_method=self.get_topk_transform_method(
-                 forward_batch.forward_mode
-             ),
-             topk_backend=self.dsa_topk_backend,
--            paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
--            paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
-+            paged_mqa_schedule_metadata=metadata.paged_mqa_schedule_metadata,
-+            paged_mqa_ctx_lens_2d=metadata.paged_mqa_ctx_lens_2d,
-             force_unfused_topk=force_unfused,
-         )
- 
--    def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
--        from sgl_kernel.flash_mla import get_mla_metadata
--
--        num_heads_q = self.flashmla_kv_num_q_heads
--
--        flashmla_metadata, num_splits = get_mla_metadata(
--            cache_seqlens=cache_seqlens,
--            # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
--            #      but the name looks like need seq_len_q?
--            num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
--            num_heads_k=1,
--            num_heads_q=num_heads_q,
--            is_fp8_kvcache=True,
--            topk=self.dsa_index_topk,
--        )
--
--        return DSAFlashMLAMetadata(
--            flashmla_metadata=flashmla_metadata,
--            num_splits=num_splits,
--        )
- 
- 
- class DeepseekSparseAttnMultiStepBackend:
-@@ -3504,34 +3457,6 @@ class DeepseekSparseAttnMultiStepBackend:
-                 for i in range(3):
-                     self.attn_backends[i].set_dsa_prefill_impl(forward_batch=None)
- 
--                # Prepare FlashMLA tensors if needed
--                flashmla_num_splits_src = None
--                flashmla_metadata_src = None
--                flashmla_num_splits_dst0 = None
--                flashmla_num_splits_dst1 = None
--                flashmla_num_splits_dst2 = None
--                flashmla_metadata_dst0 = None
--                flashmla_metadata_dst1 = None
--                flashmla_metadata_dst2 = None
--
--                if precomputed.flashmla_metadata is not None:
--                    flashmla_num_splits_src = precomputed.flashmla_metadata.num_splits
--                    flashmla_metadata_src = (
--                        precomputed.flashmla_metadata.flashmla_metadata
--                    )
--                    flashmla_num_splits_dst0 = metadata0.flashmla_metadata.num_splits
--                    flashmla_num_splits_dst1 = metadata1.flashmla_metadata.num_splits
--                    flashmla_num_splits_dst2 = metadata2.flashmla_metadata.num_splits
--                    flashmla_metadata_dst0 = (
--                        metadata0.flashmla_metadata.flashmla_metadata
--                    )
--                    flashmla_metadata_dst1 = (
--                        metadata1.flashmla_metadata.flashmla_metadata
--                    )
--                    flashmla_metadata_dst2 = (
--                        metadata2.flashmla_metadata.flashmla_metadata
--                    )
--
-                 # Call the multi-backend fused kernel for first 3 backends
-                 fused_metadata_copy_multi_cuda(
-                     # Source tensors
-@@ -3541,8 +3466,9 @@ class DeepseekSparseAttnMultiStepBackend:
-                     precomputed.dsa_cache_seqlens,
-                     precomputed.dsa_cu_seqlens_k,
-                     precomputed.real_page_table,
--                    flashmla_num_splits_src,
--                    flashmla_metadata_src,
-+                    # Optional FlashMLA source slots retained by the fused API.
-+                    None,
-+                    None,
-                     # Destination tensors for backend 0
-                     metadata0.cache_seqlens_int32,
-                     metadata0.cu_seqlens_k,
-@@ -3554,8 +3480,8 @@ class DeepseekSparseAttnMultiStepBackend:
-                         if precomputed.real_page_table is not None
-                         else None
-                     ),
--                    flashmla_num_splits_dst0,
--                    flashmla_metadata_dst0,
-+                    None,
-+                    None,
-                     # Destination tensors for backend 1
-                     metadata1.cache_seqlens_int32,
-                     metadata1.cu_seqlens_k,
-@@ -3567,8 +3493,8 @@ class DeepseekSparseAttnMultiStepBackend:
-                         if precomputed.real_page_table is not None
-                         else None
-                     ),
--                    flashmla_num_splits_dst1,
--                    flashmla_metadata_dst1,
-+                    None,
-+                    None,
-                     # Destination tensors for backend 2
-                     metadata2.cache_seqlens_int32,
-                     metadata2.cu_seqlens_k,
-@@ -3580,8 +3506,8 @@ class DeepseekSparseAttnMultiStepBackend:
-                         if precomputed.real_page_table is not None
-                         else None
-                     ),
--                    flashmla_num_splits_dst2,
--                    flashmla_metadata_dst2,
-+                    None,
-+                    None,
-                     # Parameters
-                     bs,
-                     precomputed.max_len,
-@@ -3635,5 +3561,4 @@ class DeepseekSparseAttnMultiStepBackend:
- DeepseekSparseAttnBackend = DeepseekSparseAttnBackend
- DeepseekSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
- DSAMetadata = DSAMetadata
--DSAFlashMLAMetadata = DSAFlashMLAMetadata
- DSAIndexerMetadata = DSAIndexerMetadata
-diff --git a/python/sglang/srt/layers/attention/flashmla_backend.py b/python/sglang/srt/layers/attention/flashmla_backend.py
-index 92fa2bf29e..0c629d2563 100644
---- a/python/sglang/srt/layers/attention/flashmla_backend.py
-+++ b/python/sglang/srt/layers/attention/flashmla_backend.py
-@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
- 
- import torch
- import triton
--from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
-+from flash_mla import flash_mla_with_kvcache, get_mla_metadata
- 
- from sglang.kernels.ops.attention.utils import (
-     create_flashmla_kv_indices_triton,
+ DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_sm100_supported()
+ DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
+-DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
++DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (
++    DEEPGEMM_SCALE_UE8M0 or _is_maca or _is_musa
++)
 diff --git a/python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py b/python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py
-index a277e7694b..c04c833aae 100644
+index c04c833aae..a9a3228d8b 100644
 --- a/python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py
 +++ b/python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py
-@@ -282,12 +282,9 @@ def configure_deep_gemm_num_sms(num_sms):
-     if num_sms is None or not ENABLE_JIT_DEEPGEMM:
-         yield
-     else:
--        original_num_sms = deep_gemm.get_num_sms()
--        deep_gemm.set_num_sms(num_sms)
--        try:
--            yield
--        finally:
--            deep_gemm.set_num_sms(original_num_sms)
-+        # The MetaX DeepGEMM bridge does not expose set_num_sms. Keep this
-+        # context manager as a no-op while preserving the call-site contract.
-+        yield
+@@ -19,25 +19,22 @@ logger = logging.getLogger(__name__)
  
- 
- def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
-diff --git a/python/sglang/srt/layers/layernorm.py b/python/sglang/srt/layers/layernorm.py
-index c1a65f5f1c..607e98657a 100644
---- a/python/sglang/srt/layers/layernorm.py
-+++ b/python/sglang/srt/layers/layernorm.py
-@@ -60,17 +60,17 @@ _flashinfer_rmsnorm_quant_available = False
- if _is_cuda or _is_xpu or _is_musa:
-     if _is_flashinfer_available:
-         try:
--            import flashinfer.norm
-+            from flashinfer.norm import layernorm
- 
--            from sglang.srt.utils.custom_op import register_custom_op
-+            # from sglang.srt.utils.custom_op import register_custom_op
- 
--            def _layernorm_fake_impl(
--                input: torch.Tensor,
--                gamma: torch.Tensor,
--                beta: torch.Tensor,
--                eps: float = 1e-6,
--            ) -> torch.Tensor:
--                return torch.empty_like(input)
-+            # def _layernorm_fake_impl(
-+            #     input: torch.Tensor,
-+            #     gamma: torch.Tensor,
-+            #     beta: torch.Tensor,
-+            #     eps: float = 1e-6,
-+            # ) -> torch.Tensor:
-+            #     return torch.empty_like(input)
- 
-             # @register_custom_op(fake_impl=_layernorm_fake_impl)
-             # def layernorm(
-@@ -80,7 +80,7 @@ if _is_cuda or _is_xpu or _is_musa:
-             #     eps: float = 1e-6,
-             # ) -> torch.Tensor:
-             #     return flashinfer.norm.layernorm(input, gamma, beta, eps)
--            _flashinfer_layernorm_available = True
-+            _flashinfer_layernorm_available = False
-         except (ImportError, AttributeError):
-             _flashinfer_layernorm_available = False
- 
-diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 82f9f7ff9c..b6137c69bd 100644
---- a/python/sglang/srt/managers/scheduler.py
-+++ b/python/sglang/srt/managers/scheduler.py
-@@ -496,6 +496,13 @@ class Scheduler(
-         # Init model configs
-         self.init_model_config()
- 
+ if ENABLE_JIT_DEEPGEMM:
+     import deep_gemm
+-    from deep_gemm.utils.layout import (
+-        get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
+-    )
 +
-+        # if tp_rank == 0:
-+        #     import debugpy
-+        #     debugpy.connect(5678)
-+        #     debugpy.wait_for_client()
-+        #     #debugpy.breakpoint()
-+
-         # Init metrics stats
-         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
- 
-diff --git a/python/sglang/srt/mem_cache/index_key_cache.py b/python/sglang/srt/mem_cache/index_key_cache.py
-index 166d5d222d..316b482b69 100644
---- a/python/sglang/srt/mem_cache/index_key_cache.py
-+++ b/python/sglang/srt/mem_cache/index_key_cache.py
-@@ -1,7 +1,7 @@
- from __future__ import annotations
- 
- from contextlib import nullcontext
--from typing import TYPE_CHECKING
-+from typing import TYPE_CHECKING, Optional
- 
- import torch
- 
-@@ -31,6 +31,8 @@ class IndexKeyCache:
- 
-     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
-         pool = self.pool
-+        if not pool.int8_cache:
-+            return (num_pages, pool.page_size * pool.index_head_dim)
-         return (
-             num_pages,
-             pool.page_size
-@@ -102,7 +104,7 @@ class IndexKeyCache:
-         layer_id: int,
-         loc: torch.Tensor,
-         index_k: torch.Tensor,
--        index_k_scale: torch.Tensor,
-+        index_k_scale: Optional[torch.Tensor],
-     ) -> None:
-         buf = self.buffer[layer_id - self.pool.start_layer]
-         index_buf_accessor.SetKAndS.execute(
-diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index d22929db46..b9c7adff10 100644
---- a/python/sglang/srt/mem_cache/memory_pool.py
-+++ b/python/sglang/srt/mem_cache/memory_pool.py
-@@ -42,6 +42,7 @@ from sglang.kernels.ops.attention.dsa.quant_k_cache import (
-     quantize_k_cache,
-     quantize_k_cache_separate,
- )
-+from sglang.kernels.ops.attention.dsa import index_buf_accessor
- from sglang.kernels.ops.kvcache.cache_move import (
-     copy_all_layer_kv_cache_func,
-     set_kv_buffer_prefix_valid_tiled,
-@@ -4477,7 +4478,8 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
- 
- class DSATokenToKVPool(MLATokenToKVPool):
-     quant_block_size = 128
--    index_k_with_scale_buffer_dtype = torch.uint8
-+    int8_cache = True if os.getenv("MX_ENABLE_NSA_INT8") else False
-+    index_k_with_scale_buffer_dtype = torch.uint8 if os.getenv("MX_ENABLE_NSA_INT8") else torch.bfloat16
-     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
- 
-     def __init__(
-@@ -4595,12 +4597,41 @@ class DSATokenToKVPool(MLATokenToKVPool):
-             layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
-         )
- 
-+    def get_index_batched_k_buffer(
-+        self,
-+        layer_id: int,
-+        seq_len_tensor: torch.Tensor,
-+        page_indices: torch.Tensor,
-+        seq_len_sum: int,
-+        max_seq_len: int,
-+    ):
-+        """
-+        Fused method to get multi batch index K in a single call using Triton.
-+        More efficient than calling get_index_k_continuous separately.
-+
-+        :param layer_id: Layer index
-+        :param seq_len_tensor: multi-bacth Sequence length
-+        :param page_indices: Page indices tensor
-+        :param seq_len_sum: sum of multi-batch seq len
-+        :param max_seq_len: max len of multi-batch seq
-+        :return: k_fp8: (seq_len, index_head_dim), dtype is same to buf
-+        """
-+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-+        return index_buf_accessor.GetBatchedK.execute(
-+            self,
-+            buf,
-+            page_indices=page_indices,
-+            seq_len_tensor=seq_len_tensor,
-+            seq_len_sum=seq_len_sum,
-+            max_seq_len=max_seq_len,
++    if DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
++        from deep_gemm.utils.layout import (
++            get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
 +        )
+ 
+     def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
+-        """Transform ``sf`` into an MN-major, TMA-aligned layout for DeepGEMM.
+-
+-        When ``sf`` is already in that layout, sgl-deep-gemm's fast path
+-        (<= 0.1.4.post1) returns a NON-OWNING ``torch::from_blob`` alias of
+-        ``sf`` across the TVM-FFI boundary. Callers rebind the result over
+-        their only reference (``x = get_mn_major_tma_aligned_tensor(x)``),
+-        which frees the storage while the GEMM still reads through the alias
+-        -- a use-after-free that surfaces as NaN logits or "pointer resides
+-        on host memory" during CUDA graph capture once the allocator reuses
+-        the block. Hand back ``sf`` itself in that case so ownership is
+-        preserved.
+-        """
++        """Return the scale layout required by the active DeepGEMM backend."""
++        if not DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
++            # MetaX and other non-TMA paths consume the native scale layout.
++            return sf
 +
-     def set_index_k_scale_buffer(
-         self,
-         layer_id: int,
-         loc: torch.Tensor,
-         index_k: torch.Tensor,
--        index_k_scale: torch.Tensor,
-+        index_k_scale: Optional[torch.Tensor] = None,
-     ) -> None:
-         self.index_key_cache.store_quantized(layer_id, loc, index_k, index_k_scale)
- 
-diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
-index 7c504656fd..1202cdaea2 100644
---- a/python/sglang/srt/model_executor/forward_batch_info.py
-+++ b/python/sglang/srt/model_executor/forward_batch_info.py
-@@ -862,6 +862,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
- 
-         ret.init_mlp_sync_metadata(batch, device)
- 
-+        #check nsa ds-v3.2
-+        from sglang.srt.configs.model_config import is_deepseek_dsa
-+        ret.is_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
+         out = _get_mn_major_tma_aligned_tensor(sf)
+         if out.data_ptr() == sf.data_ptr():
++            # Some versions return a non-owning alias. Preserve the input
++            # tensor so its storage remains alive for the GEMM.
+             assert out.shape == sf.shape and out.stride() == sf.stride()
+             return sf
+         return out
+@@ -265,6 +262,13 @@ def tf32_hc_prenorm_gemm(
+ ):
+     if x.shape[0] == 0:
+         return
 +
-         if ret.forward_mode.is_idle():
-             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
-             if model_runner.lora_manager is not None:
-@@ -1379,11 +1383,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
- 
-         bs = self.batch_size
- 
-+        is_idle = False
-+        if self.forward_mode.is_idle() and not self.is_dsa:
-+            is_idle = True
++    # The MetaX MHC prenorm op is provided by the installed deep_gemm package
++    # even when the JIT wrapper is disabled.  Import it at the call site instead
++    # of relying on the module-level ENABLE_JIT_DEEPGEMM guard; otherwise the
++    # default-enabled MHC prenorm path fails with an undefined `deep_gemm` name.
++    import deep_gemm
 +
-         if (
-             self.forward_mode.is_decode()
-             or self.forward_mode.is_target_verify()
-             or self.forward_mode.is_draft_extend_v2()
--            or self.forward_mode.is_idle()
-+            or is_idle
-+            # or self.forward_mode.is_idle()
-         ):
-             # Mamba-hybrid families need the fabricated-row idle conversion
-             # below; this includes their MTP draft workers, whose mamba-less
-diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
-index fb6d4af6c4..27f90360f5 100644
---- a/python/sglang/srt/model_executor/pool_configurator.py
-+++ b/python/sglang/srt/model_executor/pool_configurator.py
-@@ -295,19 +295,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
-             )
+     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
  
-             local_dense_layer_ids = [
--                l
--                for l in dense_layer_ids
--                if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
-+                layer_id
-+                for layer_id in dense_layer_ids
-+                if kvc.layer_info.start_layer <= layer_id < kvc.layer_info.end_layer
-             ]
-             local_sparse_layer_ids = [
--                l
--                for l in sparse_layer_ids
--                if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
-+                layer_id
-+                for layer_id in sparse_layer_ids
-+                if kvc.layer_info.start_layer <= layer_id < kvc.layer_info.end_layer
-             ]
-             num_dense = len(local_dense_layer_ids)
-             num_sparse = len(local_sparse_layer_ids)
-             num_indexer_k_only = sum(
--                1 for l in local_sparse_layer_ids if l in indexer_k_only_layer_ids
-+                1
-+                for layer_id in local_sparse_layer_ids
-+                if layer_id in indexer_k_only_layer_ids
-             )
-             num_indexer_kv = num_sparse - num_indexer_k_only
  
-@@ -361,9 +363,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
-         allocate_all_layers: bool = False,
-     ) -> int:
-         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
--        indexer_size_per_token = (
--            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+diff --git a/python/sglang/srt/layers/moe/hash_topk.py b/python/sglang/srt/layers/moe/hash_topk.py
+index 271344732a..b69b86be9f 100644
+--- a/python/sglang/srt/layers/moe/hash_topk.py
++++ b/python/sglang/srt/layers/moe/hash_topk.py
+@@ -221,6 +221,7 @@ class HashTopK(nn.Module):
+         assert (
+             input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0]
+         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
++        assert input_ids.dtype is torch.int64
+ 
+         if _is_xpu:
+             topk_weights, topk_ids = self._forward_xpu(router_logits, input_ids)
+diff --git a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+index 54eabcb7e8..93c4e6ff74 100644
+--- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
++++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+@@ -20,7 +20,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+ from sglang.srt.environ import envs
+ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+ from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+-from sglang.srt.mem_cache.memory_pool import KVCache
++from sglang.srt.mem_cache.memory_pool import KVCache, get_tensor_size_bytes
+ from sglang.srt.runtime_context import get_exec, get_spec
+ from sglang.srt.utils import ceil_div, is_hip
+ 
+@@ -86,7 +86,10 @@ class DeepSeekV4SingleKVPool(KVCache):
+         self.scale_pad = 1
+         self.quantize_block_size = 64
+         self.rope_storage_dtype = torch.bfloat16
+-        self.k_with_scale_buffer_dtype = torch.int8
++        if self.dtype is not torch.bfloat16:
++            self.k_with_scale_buffer_dtype = torch.int8
++        else:
++            self.k_with_scale_buffer_dtype = torch.bfloat16
+         self._create_buffers()
+ 
+     def _create_buffers(self):
+@@ -104,25 +107,40 @@ class DeepSeekV4SingleKVPool(KVCache):
+                 ]
+ 
+     def get_bytes_per_token(self) -> int:
+-        dim_per_token = (
+-            self.qk_nope_head_dim
+-            + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
+-            + self.qk_nope_head_dim // self.quantize_block_size
+-            + self.scale_pad
 -        )
-+        if DSATokenToKVPool.int8_cache:
-+            indexer_size_per_token = (
-+                index_head_dim
-+                + index_head_dim // DSATokenToKVPool.quant_block_size * 4
++        if self.dtype in (
++            torch.float8_e5m2,
++            torch.float8_e4m3fn,
++            torch.float8_e4m3fnuz,
++        ):
++            dim_per_token = (
++                self.qk_nope_head_dim
++                + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
++                + self.qk_nope_head_dim // self.quantize_block_size
++                + self.scale_pad
 +            )
 +        else:
-+            indexer_size_per_token = index_head_dim
-         element_size = torch._utils._element_size(
-             DSATokenToKVPool.index_k_with_scale_buffer_dtype
++            dim_per_token = (self.qk_nope_head_dim + self.qk_rope_head_dim)
++
+         return dim_per_token
+ 
+     def create_buffer(self, *, num_pages: int):
+         bytes_per_token = self.get_bytes_per_token()
+         self.kv_cache_total_dim = bytes_per_token
+         bytes_per_page_non_padded = self.page_size * bytes_per_token
+-        self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
++        if self.dtype in (
++            torch.float8_e5m2,
++            torch.float8_e4m3fn,
++            torch.float8_e4m3fnuz,
++        ):
++            self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
+ 
+-        assert bytes_per_token == 448 + 64 * 2 + 8, (
+-            "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
+-            "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+-        )
+-        assert self.store_dtype == torch.uint8
++            assert bytes_per_token == 448 + 64 * 2 + 8, (
++                "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
++                "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
++            )
++            assert self.store_dtype == torch.uint8
++        else:
++            self.bytes_per_page_padded = bytes_per_page_non_padded
+ 
+         return torch.zeros(
+             num_pages,
+@@ -131,6 +149,12 @@ class DeepSeekV4SingleKVPool(KVCache):
+             device=self.device,
          )
-diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
-index a61135e7ea..c77e7a4750 100644
---- a/python/sglang/srt/models/deepseek_v2.py
-+++ b/python/sglang/srt/models/deepseek_v2.py
-@@ -1841,8 +1841,8 @@ class DeepseekV2AttentionMLA(
-                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
+ 
++    def get_kv_size_bytes(self):
++        kv_size_bytes = 0
++        for kv_cache in self.kv_buffer:
++            kv_size_bytes += get_tensor_size_bytes(kv_cache)
++        return kv_size_bytes
++
+     def set_key_buffer(
+         self,
+         layer_id: int,
+@@ -150,12 +174,26 @@ class DeepSeekV4SingleKVPool(KVCache):
+         loc: torch.Tensor,
+         cache_k: torch.Tensor,
+     ) -> None:
+-        return fused_store_cache(
+-            input=cache_k,
+-            cache=self.kv_buffer[layer_id],
+-            indices=loc,
+-            page_size=self.page_size,
+-            type="flashmla",
++        if self.dtype in (
++            torch.float8_e5m2,
++            torch.float8_e4m3fn,
++            torch.float8_e4m3fnuz,
++        ):
++            return fused_store_cache(
++                input=cache_k,
++                cache=self.kv_buffer[layer_id],
++                indices=loc,
++                page_size=self.page_size,
++                type="flashmla",
++            )
++
++        if cache_k.dtype != self.store_dtype:
++            cache_k = cache_k.to(self.store_dtype)
++        dsv4_index_buf_accessor.SetK.execute(
++            pool=self,
++            buf=self.kv_buffer[layer_id],
++            loc=loc,
++            k_cache=cache_k,
+         )
+ 
+     def get_key_buffer(self, layer_id: int):
+@@ -259,7 +297,11 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
+ 
+ class DeepSeekV4IndexerPool(KVCache):
+     quant_block_size = 128
+-    index_k_with_scale_buffer_dtype = torch.uint8
++    index_k_with_scale_buffer_dtype = (
++        torch.uint8
++        if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8"
++        else torch.int8
++    )
+ 
+     def __init__(
+         self,
+@@ -311,6 +353,12 @@ class DeepSeekV4IndexerPool(KVCache):
+                     for _ in range(self.layer_num)
+                 ]
+ 
++    def get_kv_size_bytes(self):
++        kv_size_bytes = 0
++        for kv_cache in self.index_k_with_scale_buffer:
++            kv_size_bytes += get_tensor_size_bytes(kv_cache)
++        return kv_size_bytes
++
+     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+         raise NotImplementedError()
+ 
+@@ -453,6 +501,9 @@ class DeepSeekV4UnifiedKVPool:
+     def get_unified_kv(self, local_layer_id: int) -> torch.Tensor:
+         return self.kv_buffer[local_layer_id]
+ 
++    def get_kv_size_bytes(self) -> int:
++        return sum(get_tensor_size_bytes(buf) for buf in self.kv_buffer)
++
+     def get_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+         data_ptrs = [b.data_ptr() for b in self.kv_buffer]
+         data_lens = [b.nbytes for b in self.kv_buffer]
+@@ -661,6 +712,22 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+         self.wait_layer_transfer(layer_id)
+         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
+ 
++    def get_kv_size_bytes(self):
++        attention_pool = (
++            self.unified_kv_pool
++            if self._unified_kv
++            else (self.swa_kv_pool, self.c4_kv_pool, self.c128_kv_pool)
++        )
++        if isinstance(attention_pool, tuple):
++            attention_size = sum(
++                pool.get_kv_size_bytes()
++                for pool in attention_pool
++                if pool is not None
++            )
++        else:
++            attention_size = attention_pool.get_kv_size_bytes()
++        return attention_size + self.c4_indexer_kv_pool.get_kv_size_bytes()
++
+     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
+         self.full_to_swa_index_mapping = full_to_swa_index_mapping
+ 
+diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
+index 27f90360f5..4d36b8337d 100644
+--- a/python/sglang/srt/model_executor/pool_configurator.py
++++ b/python/sglang/srt/model_executor/pool_configurator.py
+@@ -816,6 +816,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+         self.num_layers_total = len(self.compression_ratios)
+         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
+         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
++        self.kv_cache_dtype = kvc.kv_cache_dtype
+ 
+         if self.is_speculative:
+             # Ring is sized once here, so it must serve the largest adaptive tier.
+@@ -884,12 +885,23 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
              )
  
--        self.skip_topk = None
--        self.next_skip_topk = None
-+        self.skip_topk = False
-+        self.next_skip_topk = False
-         self.indexer = None
-         if self.use_dsa:
-             # Refer: https://arxiv.org/abs/2603.12201 for more details.
-@@ -3281,28 +3281,28 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
-     pass
+     def _get_bytes_per_full_token(self) -> float:
+-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
++        if self.kv_cache_dtype in (
++            torch.float8_e5m2,
++            torch.float8_e4m3fn,
++            torch.float8_e4m3fnuz,
++        ):
++            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
++        else:
++            assert self.kv_cache_dtype is torch.bfloat16
++            kv_bytes = (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
  
+         quant_block_size = 128
+-        indexer_bytes = (
+-            self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
+-        )
++        if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() in ("fp8", "int8"):
++            indexer_bytes = (
++                self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
++            )
++        else:
++            raise NotImplementedError("DSV4 index cache only supports fp8 or int8")
  
--# @register_custom_op(out_shape="hidden_states")
--# def dsv2_flashinfer_moe_dual_stream_graph(
--#     hidden_states: torch.Tensor,
--#     layer_id: int,
--#     fuse_mlp_allreduce: bool,
--#     mlp_reduce_scatter: bool,
--# ) -> torch.Tensor:
--#     forward_context = get_tc_piecewise_forward_context()
--#     assert forward_context is not None
--#     assert forward_context.moe_fusions is not None
-+@register_custom_op(out_shape="hidden_states")
-+def dsv2_flashinfer_moe_dual_stream_graph(
-+    hidden_states: torch.Tensor,
-+    layer_id: int,
-+    fuse_mlp_allreduce: bool,
-+    mlp_reduce_scatter: bool,
-+) -> torch.Tensor:
-+    forward_context = get_tc_piecewise_forward_context()
-+    assert forward_context is not None
-+    assert forward_context.moe_fusions is not None
+         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+         c4_state_dtype_size, c128_state_dtype_size = (
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index c77e7a4750..93b377eaff 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -1187,17 +1187,13 @@ class DeepseekV2MoE(nn.Module):
+                 gemm_output_zero_allocator,
+                 pre_quant_input=pre_quant_input,
+             )
+-        if self.is_deepseek_v4:
+-            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+-                self.experts,
+-                final_hidden_states,
+-                None if self._shared_expert_tp1 else shared_output,
+-                self.routed_scaling_factor,
+-            )
++        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
++            self.experts,
++            final_hidden_states,
++            None if self._shared_expert_tp1 else shared_output,
++            self.routed_scaling_factor,
++        )
  
--    # moe_fusion = forward_context.moe_fusions[layer_id]
--    # assert moe_fusion is not None
-+    moe_fusion = forward_context.moe_fusions[layer_id]
-+    assert moe_fusion is not None
-     # Custom-op execution happens outside the caller's Python scope under
-     # torch.compile. Carry graph-varying control state as scalar operands and
-     # republish it for the nested MoE/linear consumers.
--    # with get_forward().scoped(
--    #     fuse_mlp_allreduce=fuse_mlp_allreduce,
--    #     mlp_reduce_scatter=mlp_reduce_scatter,
--    #     flashinfer_trtllm_bypass=True,
--    # ):
--    #     return moe_fusion.forward_normal_dual_stream(hidden_states)
-+    with get_forward().scoped(
-+        fuse_mlp_allreduce=fuse_mlp_allreduce,
-+        mlp_reduce_scatter=mlp_reduce_scatter,
-+        flashinfer_trtllm_bypass=True,
-+    ):
-+        return moe_fusion.forward_normal_dual_stream(hidden_states)
- 
- 
- EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]
+-        if shared_output is not None:
+-            final_hidden_states+=shared_output
+-        
+         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+             is_tp_path=True,
+         ):
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index 8052e150d4..53c7c6dd29 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -1787,8 +1787,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+             config=config,
+             layer_id=layer_id,
+             quant_config=quant_config,
+-            prefix=add_prefix("self_attn", prefix),
+-            alt_streams=alt_streams,
++            prefix=add_prefix("attn", prefix),
++            alt_streams=None if _is_npu else alt_streams,
+             compress_ratio_override=compress_ratio_override,
+         )
+         moe_alt_stream = (
+@@ -2200,7 +2200,6 @@ class DeepseekV4DecoderLayer(nn.Module):
+                     self.hc_ffn_fn,
+                     self.hc_ffn_scale,
+                     self.hc_ffn_base,
+-                    norm=self.post_attention_layernorm,
+                     forward_batch=forward_batch,
+                 )
+                 if not norm_fused:
+@@ -2213,7 +2212,6 @@ class DeepseekV4DecoderLayer(nn.Module):
+                 self.hc_ffn_fn,
+                 self.hc_ffn_scale,
+                 self.hc_ffn_base,
+-                norm=self.post_attention_layernorm,
+                 forward_batch=forward_batch,
+             )
+             if not norm_fused:
+@@ -2507,7 +2505,6 @@ class DeepseekV4DecoderLayer(nn.Module):
+             self.hc_ffn_fn,
+             self.hc_ffn_scale,
+             self.hc_ffn_base,
+-            norm=self.post_attention_layernorm,
+             forward_batch=state.forward_batch,
+         )
+         if not norm_fused:
+@@ -3805,8 +3802,10 @@ class DeepseekV4ForCausalLM(nn.Module):
+                             elif fuse_wqa_wkv and (
+                                 name.endswith(".wq_a.weight")
+                                 or name.endswith(".wq_a.weight_scale_inv")
++                                or name.endswith(".wq_a.weight_scale")
+                                 or name.endswith(".wkv.weight")
+                                 or name.endswith(".wkv.weight_scale_inv")
++                                or name.endswith(".wkv.weight_scale")
+                                 or name.endswith(".wq_a.qweight")
+                                 or name.endswith(".wkv.qweight")
+                                 or name.endswith(".wq_a.qweight_type")
