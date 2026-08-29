@@ -90,6 +90,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
+from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
@@ -4107,3 +4108,23 @@ def _fuse_deepseek_v4_wqkv_a_pair(
             )
         return q
     return torch.cat([q, kv], dim=0)
+
+
+def _block_dequant_fp8_wo_a(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    block_size: List[int],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    weights_dict = dict(weights)
+
+    for name in list(weights_dict.keys()):
+        if name not in weights_dict:
+            continue
+        if not name.endswith(".wo_a.weight"):
+            continue
+        scale_name = name.replace(".wo_a.weight", ".wo_a.weight_scale_inv")
+        assert scale_name in weights_dict
+        weight = weights_dict.pop(name)
+        scale = weights_dict.pop(scale_name)
+        yield name, block_quant_dequant(weight, scale, block_size, torch.bfloat16)
+
+    yield from weights_dict.items()

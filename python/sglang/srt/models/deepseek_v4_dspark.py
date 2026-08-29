@@ -735,7 +735,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     num_stages=self.num_stages,
                     num_target_layers=self.num_target_features,
                     quant_config=quant_config,
-                    prefix=add_prefix(f"stages.{stage_id}", prefix),
+                    prefix=add_prefix(f"mtp.{stage_id}", prefix),
                     alt_streams=self.alt_streams,
                 )
                 for stage_id in range(self.num_stages)
