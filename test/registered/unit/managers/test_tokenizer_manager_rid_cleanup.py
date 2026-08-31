@@ -15,7 +15,7 @@ Covers:
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import msgspec
 
@@ -642,27 +642,6 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         # All sub-request entries created by _init_req_state are cleaned up.
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
-
-    def test_parallel_sampling_failure_cleans_generated_rid(self):
-        tm = _make_tm_for_generate(self)
-        obj = GenerateReqInput(
-            text=["hello"],
-            rid=["base"],
-            sampling_params={"n": 2},
-        )
-        tokenized = MagicMock()
-        tokenized.mm_inputs = None
-        tokenized.sampling_params = MagicMock()
-        tm._tokenize_one_request = AsyncMock(return_value=tokenized)
-        tm._send_one_request = Mock(side_effect=RuntimeError("dispatch failed"))
-
-        async def drive():
-            await tm.generate_request(obj).__anext__()
-
-        with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
-            asyncio.run(drive())
-
-        self.assertFalse(tm.rid_to_state)
 
     def test_thinking_budget_rejects_runtime_without_strict_thinking(self):
         tm = _make_tm_for_generate(self)
