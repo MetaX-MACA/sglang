@@ -4,6 +4,12 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_maca
+
+
+_IS_MACA = is_maca()
+_QUANT_NUM_STAGES = 1 if _IS_MACA else 2
+
 
 # Triton implementation
 @triton.jit
@@ -130,7 +136,7 @@ def act_quant(
         round_scale=round_scale,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        num_stages=0 if round_scale else 2,
+        num_stages=0 if round_scale else _QUANT_NUM_STAGES,
     )
 
     return y, s
@@ -311,7 +317,7 @@ def act_quant_int8(
         round_scale=scale_fmt is not None,
         BLOCK_M=BLOCK_M,
         BLOCK_N=block_size,
-        num_stages=0 if round_scale else 2,
+        num_stages=0 if round_scale else _QUANT_NUM_STAGES,
     )
 
     y = y.view(*x.shape)
