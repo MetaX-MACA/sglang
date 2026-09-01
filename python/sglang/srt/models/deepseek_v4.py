@@ -1641,11 +1641,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_base,
                 # Keep RMSNorm outside hc_pre only when it needs to return the
                 # FP8 tuple; otherwise preserve the fused MHC pre-norm path.
-                norm=(
-                    None
-                    if envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get() or envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
-                    else self.input_layernorm
-                ),
+                # norm=(
+                #     None
+                #     if envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get() or envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+                #     else self.input_layernorm
+                # ),
                 forward_batch=forward_batch,
             )
             if not norm_fused:
