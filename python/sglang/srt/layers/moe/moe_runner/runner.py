@@ -146,13 +146,17 @@ class MoeRunner:
             # Import here (not at module top, to avoid a circular import) to
             # register the hpc_ops fused func before the pool lookup.
             from sglang.srt.layers.moe.moe_runner import hpc_ops  # noqa: F401
+        elif runner_backend.is_mxfp4_w4a8():
+            self.runner_core = None  # MCTlass MXFP4 W4A8 requires the fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
         # Skip fused func if LoRA is enabled (LoRA requires non-fused path)
         if not lora_enabled:
             a2a_backend_name = get_moe_a2a_backend().value
-            runner_backend_name = runner_backend.value
+            runner_backend_name = (
+                "triton" if runner_backend.is_mxfp4_w4a8() else runner_backend.value
+            )
 
             # TODO(cwan): add a server argument to disable fused func
             self.fused_func = FusedOpPool.get_fused_func(

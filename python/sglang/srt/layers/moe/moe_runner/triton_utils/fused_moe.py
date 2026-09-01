@@ -175,6 +175,11 @@ def inplace_fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     is_fp4_experts: bool = False,
+    use_fp4_w4a8: bool = False,
+    w13_scale_b: Optional[torch.Tensor] = None,
+    w13_scale_t: Optional[torch.Tensor] = None,
+    w2_scale_b: Optional[torch.Tensor] = None,
+    w2_scale_t: Optional[torch.Tensor] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -211,6 +216,11 @@ def inplace_fused_experts(
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         is_fp4_experts=is_fp4_experts,
+        use_fp4_w4a8=use_fp4_w4a8,
+        w13_scale_b=w13_scale_b,
+        w13_scale_t=w13_scale_t,
+        w2_scale_b=w2_scale_b,
+        w2_scale_t=w2_scale_t,
     )
 
 
@@ -248,6 +258,12 @@ def outplace_fused_experts(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    use_fp4_w4a8: bool = False,
+    w13_scale_b: Optional[torch.Tensor] = None,
+    w13_scale_t: Optional[torch.Tensor] = None,
+    w2_scale_b: Optional[torch.Tensor] = None,
+    w2_scale_t: Optional[torch.Tensor] = None,
+    is_fp4_experts: bool = False,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -283,6 +299,12 @@ def outplace_fused_experts(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        use_fp4_w4a8=use_fp4_w4a8,
+        w13_scale_b=w13_scale_b,
+        w13_scale_t=w13_scale_t,
+        w2_scale_b=w2_scale_b,
+        w2_scale_t=w2_scale_t,
+        is_fp4_experts=is_fp4_experts,
     )
 
 
@@ -310,6 +332,11 @@ def fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     is_fp4_experts: bool = False,
+    use_fp4_w4a8: bool = False,
+    w13_scale_b: Optional[torch.Tensor] = None,
+    w13_scale_t: Optional[torch.Tensor] = None,
+    w2_scale_b: Optional[torch.Tensor] = None,
+    w2_scale_t: Optional[torch.Tensor] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -351,6 +378,11 @@ def fused_experts(
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
             is_fp4_experts=is_fp4_experts,
+            use_fp4_w4a8=use_fp4_w4a8,
+            w13_scale_b=w13_scale_b,
+            w13_scale_t=w13_scale_t,
+            w2_scale_b=w2_scale_b,
+            w2_scale_t=w2_scale_t,
         )
         return hidden_states
     else:
@@ -387,6 +419,12 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            use_fp4_w4a8=use_fp4_w4a8,
+            w13_scale_b=w13_scale_b,
+            w13_scale_t=w13_scale_t,
+            w2_scale_b=w2_scale_b,
+            w2_scale_t=w2_scale_t,
+            is_fp4_experts=is_fp4_experts,
         )
 
 
@@ -543,6 +581,11 @@ def _fused_moe_kernel_sequence(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     is_fp4_experts: bool = False,
+    use_fp4_w4a8: bool = False,
+    w13_scale_b: Optional[torch.Tensor] = None,
+    w13_scale_t: Optional[torch.Tensor] = None,
+    w2_scale_b: Optional[torch.Tensor] = None,
+    w2_scale_t: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -556,6 +599,12 @@ def _fused_moe_kernel_sequence(
     ``num_tokens`` due to 4-row padding). ``hidden_states`` stays bf16 and is
     still used for output dtype/shape and the inplace combine.
     """
+    if use_fp4_w4a8:
+        assert is_fp4_experts and block_shape == [128, 128]
+        assert (
+            enable_mctlass_fused_moe_python_api
+        ), "MXFP4 W4A8 requires the MCTlass Python API"
+        down_moe_use_tma = up_moe_use_tma = False
     num_tokens = hidden_states.shape[0]
     E, N, _ = w1.shape
     topk = topk_ids.shape[1]
@@ -610,6 +659,7 @@ def _fused_moe_kernel_sequence(
         and (topk > 2)
         and (not use_int8_w8a16)
         and (not use_int4_w4a16)
+        and (not use_fp4_w4a8)
     )
 
     if fuse_swiglu_interleaved:
@@ -734,7 +784,32 @@ def _fused_moe_kernel_sequence(
         stage1_config["BLOCK_SIZE_M"] = kernel_m
         stage2_config["BLOCK_SIZE_M"] = kernel_m
         del hidden_states_fp8
-    elif is_fp4_experts and enable_mctlass_fused_moe_python_api:
+    elif is_fp4_experts and use_fp4_w4a8 and enable_mctlass_fused_moe_python_api:
+        hidden_states_fp8 = torch.empty_strided(
+            hidden_states.shape,
+            hidden_states.stride(),
+            dtype=torch.float8_e4m3fn,
+            device=hidden_states.device,
+        )
+        kernel_m = gemm.get_kernel_m(
+            hidden_states_fp8,
+            w1.view(dtype=torch.quint4x2),
+            intermediate_cache1,
+            w1.shape[0],
+            hidden_states_fp8.shape[0],
+            w1.shape[1],
+            hidden_states_fp8.shape[1],
+            topk_ids.shape[1],
+            is_blockwise=True,
+            group_size=block_shape[0],
+            is_b_e2m1fp4x2=True,
+            use_hier_scale=True,
+        )
+        assert kernel_m > 0, "FusedMoeGEMM.get_kernel_m kernel_m  must greater than zero."
+        stage1_config["BLOCK_SIZE_M"] = kernel_m
+        stage2_config["BLOCK_SIZE_M"] = kernel_m
+        del hidden_states_fp8
+    elif is_fp4_experts and not use_fp4_w4a8 and enable_mctlass_fused_moe_python_api:
         kernel_m = gemm.get_kernel_m(hidden_states, w1.view(dtype=torch.quint4x2), intermediate_cache1, w1.shape[0], hidden_states.shape[0], w1.shape[1], hidden_states.shape[1],
                                         topk_ids.shape[1], is_blockwise=True, group_size=32, is_scale_ue8m0=True, is_b_e2m1fp4x2=True)
         assert kernel_m > 0, ("FusedMoeGEMM.get_kernel_m kernel_m  must greater than zero.")
@@ -805,6 +880,9 @@ def _fused_moe_kernel_sequence(
         filter_expert=filter_expert,
         fuse_swiglu=fuse_swiglu_interleaved,
         is_fp4_experts=is_fp4_experts,
+        use_fp4_w4a8=use_fp4_w4a8,
+        scale_b=w13_scale_b,
+        scale_t=w13_scale_t,
     )
 
     if hooks and hooks.after_gate_up:
@@ -1019,6 +1097,9 @@ def _fused_moe_kernel_sequence(
         fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
         router_topk=topk,
         is_fp4_experts=is_fp4_experts,
+        use_fp4_w4a8=use_fp4_w4a8,
+        scale_b=w2_scale_b,
+        scale_t=w2_scale_t,
     )
 
     if hooks and hooks.after_down:
@@ -1152,6 +1233,11 @@ def fused_experts_impl(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     is_fp4_experts: bool = False,
+    use_fp4_w4a8: bool = False,
+    w13_scale_b: Optional[torch.Tensor] = None,
+    w13_scale_t: Optional[torch.Tensor] = None,
+    w2_scale_b: Optional[torch.Tensor] = None,
+    w2_scale_t: Optional[torch.Tensor] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1231,6 +1317,11 @@ def fused_experts_impl(
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         is_fp4_experts=is_fp4_experts,
+        use_fp4_w4a8=use_fp4_w4a8,
+        w13_scale_b=w13_scale_b,
+        w13_scale_t=w13_scale_t,
+        w2_scale_b=w2_scale_b,
+        w2_scale_t=w2_scale_t,
     )
 
 

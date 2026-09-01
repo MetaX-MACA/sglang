@@ -113,6 +113,9 @@ class _MoeRunnerBackendPredicates:
     def is_deep_gemm(self):
         return self.value == MoeRunnerBackend.DEEP_GEMM.value
 
+    def is_mxfp4_w4a8(self):
+        return self.value == MoeRunnerBackend.MXFP4_W4A8.value
+
     def is_triton(self):
         return self.value == MoeRunnerBackend.TRITON.value
 
@@ -171,6 +174,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
 
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
+    MXFP4_W4A8 = "mxfp4_w4a8"
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
     ASCEND = "ascend"

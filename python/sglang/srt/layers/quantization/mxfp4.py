@@ -310,6 +310,53 @@ def quant_dequant_mxfp4(
     return mx.qdq_mxfp4(x, scale_calculation_mode)
 
 
+def cast_e2m1fn_to_e4m3fn(
+    x: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Factor MXFP4 E8M0 scales into relative g32 and hierarchical 128x128 scales.
+
+    Packed FP4 weights remain unchanged; both outputs use contiguous N-major layout."""
+    assert x.dtype in (torch.int8, torch.uint8)
+    assert x.ndim == 3 and scale.ndim == 3
+    E, out_dim, in_dim_packed = x.size()
+    in_dim = in_dim_packed * 2
+    fp8_block_size = 128
+    fp4_block_size = 32
+    assert in_dim % fp8_block_size == 0 and out_dim % fp8_block_size == 0
+    assert scale.size(0) == E and scale.size(1) == out_dim
+    assert scale.size(2) == in_dim // fp4_block_size
+    MAX_OFFSET_BITS = 6
+    bOut = out_dim // fp8_block_size
+    bIn = in_dim // fp8_block_size
+    scale_Q = (
+        torch.where(scale == 0, 0, torch.pow(2.0, scale.to(torch.float32) - 127))
+        .view(E, bOut, fp8_block_size, bIn, -1)
+        .transpose(2, 3)
+        .flatten(3)
+    )
+    scale_T = scale_Q.amax(dim=-1, keepdim=True) / 2**MAX_OFFSET_BITS
+    scale_B = scale_Q / scale_T.clamp(min=2**-127)
+    scale_B = (
+        scale_B.unflatten(-1, (fp8_block_size, -1))
+        .transpose(2, 3)
+        .reshape(E, out_dim, -1)
+    )
+
+    def to_e8m0(t):
+        return (
+            (torch.log2(t.clamp(min=2 ** (-127))).round() + 127)
+            .clamp(0, 255)
+            .to(torch.uint8)
+        )
+
+    out_scale_t = to_e8m0(scale_T.squeeze(-1))
+    out_scale_b = to_e8m0(scale_B)
+    return (
+        out_scale_b.transpose(1, 2).contiguous(),
+        out_scale_t.transpose(1, 2).contiguous(),
+    )
+
+
 class Mxfp4Config(QuantizationConfig):
 
     def __init__(
@@ -401,6 +448,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.prefix = prefix
         self.topk_indices_dtype = None
+        self.use_mxfp4_w4a8 = get_moe_runner_backend().is_mxfp4_w4a8()
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -1078,6 +1126,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
             return
         else:
+            if self.use_mxfp4_w4a8:
+                layer.w13_weight_scale_b, layer.w13_weight_scale_t = cast_e2m1fn_to_e4m3fn(
+                    layer.w13_weight, layer.w13_weight_scale
+                )
+                layer.w2_weight_scale_b, layer.w2_weight_scale_t = cast_e2m1fn_to_e4m3fn(
+                    layer.w2_weight, layer.w2_weight_scale
+                )
             layer.w13_weight_scale.data = (
                 layer.w13_weight_scale.data.transpose(1, 2).contiguous()
             )
@@ -1408,6 +1463,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_marlin()
             or moe_runner_backend.is_deep_gemm()
+            or moe_runner_backend.is_mxfp4_w4a8()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         elif moe_runner_backend.is_flashinfer_mxfp4() and self._fi_kernel in (
@@ -1844,6 +1900,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_bias=getattr(layer, "w2_weight_bias", None),
                 w13_precision_config=getattr(self, "w13_precision_config", None),
                 w2_precision_config=getattr(self, "w2_precision_config", None),
+            )
+        elif backend.is_mxfp4_w4a8():
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                block_shape=[128, 128],
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                is_fp4_experts=True,
+                use_fp4_w4a8=True,
+                w13_scale_b=layer.w13_weight_scale_b,
+                w13_scale_t=layer.w13_weight_scale_t,
+                w2_scale_b=layer.w2_weight_scale_b,
+                w2_scale_t=layer.w2_weight_scale_t,
             )
         else:
             quant_info = TritonMoeQuantInfo(

@@ -74,6 +74,11 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     # must be applied by the fused up-GEMM epilogue (see fused_moe_kernel).
     fuse_swiglu_interleaved: bool = False
     is_fp4_experts: bool = False
+    use_fp4_w4a8: bool = False
+    w13_scale_b: Optional[torch.Tensor] = None
+    w13_scale_t: Optional[torch.Tensor] = None
+    w2_scale_b: Optional[torch.Tensor] = None
+    w2_scale_t: Optional[torch.Tensor] = None
 
 
 class TritonRunnerCore(MoeRunnerCore):
@@ -172,6 +177,11 @@ class TritonRunnerCore(MoeRunnerCore):
             swiglu_limit=self.config.swiglu_limit,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
             is_fp4_experts=quant_info.is_fp4_experts,
+            use_fp4_w4a8=quant_info.use_fp4_w4a8,
+            w13_scale_b=quant_info.w13_scale_b,
+            w13_scale_t=quant_info.w13_scale_t,
+            w2_scale_b=quant_info.w2_scale_b,
+            w2_scale_t=quant_info.w2_scale_t,
         )
 
         return TritonRunnerOutput(hidden_states=out)
@@ -259,6 +269,11 @@ def fused_experts_none_to_triton(
             a1_q=a1_q,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
             is_fp4_experts=quant_info.is_fp4_experts,
+            use_fp4_w4a8=quant_info.use_fp4_w4a8,
+            w13_scale_b=quant_info.w13_scale_b,
+            w13_scale_t=quant_info.w13_scale_t,
+            w2_scale_b=quant_info.w2_scale_b,
+            w2_scale_t=quant_info.w2_scale_t,
         )
 
     return StandardCombineInput(

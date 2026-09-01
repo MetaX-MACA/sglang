@@ -830,6 +830,9 @@ def invoke_fused_moe_kernel(
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
     is_fp4_experts: bool = False,
+    use_fp4_w4a8: bool = False,
+    scale_b: Optional[torch.Tensor] = None,
+    scale_t: Optional[torch.Tensor] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -852,7 +855,7 @@ def invoke_fused_moe_kernel(
         swap_ab = False
     group_size = 0
     padded_size = 0
-    if use_fp8_w8a8:
+    if use_fp8_w8a8 or use_fp4_w4a8:
         assert B_scale is not None
         if block_shape is None:
             # activation tensor-wise fp8 quantization, dynamic or static
@@ -877,8 +880,9 @@ def invoke_fused_moe_kernel(
             else:
                 A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
-            assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
-            assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
+            if not use_fp4_w4a8:
+                assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
+                assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
     elif use_int8_w8a8 or use_int4_w4a8:
         assert B_scale is not None
         if block_shape is None:
@@ -1078,7 +1082,41 @@ def invoke_fused_moe_kernel(
             num_tokens_post_padded,
             mul_routed_weight,
         )
-    elif is_fp4_experts and enable_mctlass_fused_moe_python_api:
+    elif is_fp4_experts and use_fp4_w4a8 and enable_mctlass_fused_moe_python_api:
+        C1 = C.view(-1, C.size(-1)).contiguous()
+        A_scale = A_scale.T.contiguous()
+
+        gemm(
+            A.shape[0],
+            B.shape[1],
+            A.shape[1],
+            B.shape[0],
+            sorted_token_ids.shape[0],
+            top_k,
+            A,
+            B.view(dtype=torch.quint4x2),
+            C1,
+            A_scale,
+            scale_b,
+            None,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            is_blockwise=True,
+            group_size=128,
+            filter_expert=filter_expert,
+            use_fp8=True,
+            is_scale_a_1d=True,
+            is_scale_b_1d=False,
+            scale_a_layout="m-major",
+            scale_b_layout="n-major",
+            scale_t=scale_t,
+            is_b_e2m1fp4x2=True,
+            use_hier_scale=True,
+        )
+    elif is_fp4_experts and not use_fp4_w4a8 and enable_mctlass_fused_moe_python_api:
         C1 = C.view(-1, C.size(-1)).contiguous()
         gemm(
             A.shape[0],

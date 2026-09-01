@@ -289,6 +289,7 @@ SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 # --- MoE and GEMM runners ---
 
 MOE_RUNNER_BACKEND_CHOICES = [
+    "mxfp4_w4a8",
     "auto",
     "deep_gemm",
     "triton",
