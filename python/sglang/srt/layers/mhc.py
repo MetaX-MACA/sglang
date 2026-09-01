@@ -812,6 +812,22 @@ def _mhc_pre_impl(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    if norm_weight is None:
+        from sglang.srt.layers.mhc_vllm import mhc_pre_vllm
+        post_mix, comb_mix, layer_input = mhc_pre_vllm(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+        return post_mix, comb_mix, layer_input
+    
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
