@@ -26,15 +26,16 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
-_RAGGED_SCRATCH_K_U8: Optional[torch.Tensor] = None
+__RAGGED_SCRATCH_K_U8_OR_I8: Optional[torch.Tensor] = None
 _RAGGED_SCRATCH_K_SCALE: Optional[torch.Tensor] = None
-
+INDEX_BUFFER_DTYPE = {"fp8": torch.uint8,
+                      "int8": torch.int8,}
 
 def _get_ragged_scratch(
     total_k_rows: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    global _RAGGED_SCRATCH_K_U8, _RAGGED_SCRATCH_K_SCALE
-    cur = _RAGGED_SCRATCH_K_U8
+    global __RAGGED_SCRATCH_K_U8_OR_I8, _RAGGED_SCRATCH_K_SCALE
+    cur = __RAGGED_SCRATCH_K_U8_OR_I8
     grow = (
         cur is None
         or cur.device.type != device.type
@@ -42,13 +43,13 @@ def _get_ragged_scratch(
         or cur.shape[0] < total_k_rows
     )
     if grow:
-        _RAGGED_SCRATCH_K_U8 = torch.empty(
-            (total_k_rows, INDEX_HEAD_DIM), dtype=torch.uint8, device=device
+        __RAGGED_SCRATCH_K_U8_OR_I8 = torch.empty(
+            (total_k_rows, INDEX_HEAD_DIM), dtype=INDEX_BUFFER_DTYPE[envs.SGLANG_DSA_INDEX_CACHE_TYPE.get()], device=device
         )
         _RAGGED_SCRATCH_K_SCALE = torch.empty(
             (total_k_rows,), dtype=torch.float32, device=device
         )
-    return _RAGGED_SCRATCH_K_U8[:total_k_rows], _RAGGED_SCRATCH_K_SCALE[:total_k_rows]
+    return __RAGGED_SCRATCH_K_U8_OR_I8[:total_k_rows], _RAGGED_SCRATCH_K_SCALE[:total_k_rows]
 
 
 @dataclass(frozen=True)
@@ -95,7 +96,7 @@ class KPoolExtendPlan:
     ragged_q_ks: torch.Tensor
     ragged_q_ke: torch.Tensor
     ragged_total_k_rows: int
-    ragged_k_u8: Optional[torch.Tensor]
+    ragged_k_u8_or_i8: Optional[torch.Tensor]
     ragged_k_scale: Optional[torch.Tensor]
     ragged_paged_page_table: Optional[torch.Tensor]
     ragged_paged_page_table_row_index: Optional[torch.Tensor]
@@ -422,9 +423,9 @@ def _kpool_plan_to_gpu(
         ragged_paged_page_table = req_to_token
 
     if ragged_total_k_rows > 0:
-        ragged_k_u8, ragged_k_scale = _get_ragged_scratch(ragged_total_k_rows, device)
+        ragged_k_u8_or_i8, ragged_k_scale = _get_ragged_scratch(ragged_total_k_rows, device)
     else:
-        ragged_k_u8 = None
+        ragged_k_u8_or_i8 = None
         ragged_k_scale = None
 
     return KPoolExtendPlan(
@@ -448,7 +449,7 @@ def _kpool_plan_to_gpu(
         ragged_q_ks=ragged_q_ks,
         ragged_q_ke=ragged_q_ke,
         ragged_total_k_rows=ragged_total_k_rows,
-        ragged_k_u8=ragged_k_u8,
+        ragged_k_u8_or_i8=ragged_k_u8_or_i8,
         ragged_k_scale=ragged_k_scale,
         ragged_paged_page_table=ragged_paged_page_table,
         ragged_paged_page_table_row_index=ragged_paged_page_table_row_index,

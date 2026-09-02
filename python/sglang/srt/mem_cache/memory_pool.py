@@ -4882,6 +4882,10 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_rope_fp4_sf,
             )
 
+INDEX_BUFFER_DTYPE = {"fp8": torch.uint8,
+                      "int8": torch.int8,
+                      "bf16": torch.bfloat16,
+                      "bfloat16": torch.bfloat16}
 
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
