@@ -1973,7 +1973,7 @@ class DeepseekV4Model(nn.Module):
                     if key.startswith("pd_aux_hidden_states_")
                 )
             ]
-            if hidden_states.shape[0] != positions.shape[0]:
+            if hidden_states.shape[0] != positions.shape[0] and not dsa_use_prefill_cp(forward_batch):
                 rids = getattr(forward_batch, "rids", None)
                 raise RuntimeError(
                     "PP proxy hidden token count does not match current positions: "
