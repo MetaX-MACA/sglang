@@ -1905,8 +1905,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         if not user_set_decode:
             declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
 
-    declared["dsa_prefill_backend"] = "flashmla_sparse"
-    declared["dsa_decode_backend"] = "flashmla_kv"
+    # declared["dsa_prefill_backend"] = "flashmla_sparse"       # hzb
+    # declared["dsa_decode_backend"] = "flashmla_kv"
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
     _check_tilelang_dsa_fp8_kv(

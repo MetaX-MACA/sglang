@@ -269,7 +269,7 @@ def sparse_attention_fwd_kernel_v1(
     sm_scale=None,
     is_causal=True,
     block_I=64,
-    num_stages=2,
+    num_stages=1,
     threads=256,
     return_lse=False,
 ):
@@ -304,7 +304,7 @@ def sparse_attention_fwd_kernel_v1(
     accum_dtype = "float"
 
     H = head_kv
-    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
+    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)  # 8 -> 16
     if padded_H != H:
         assert kv_group == 1
     BI = block_I
@@ -318,7 +318,7 @@ def sparse_attention_fwd_kernel_v1(
     else:
         REPLICATE_H = 1
 
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    H_per_block = padded_H if REPLICATE_H == 1 else 64  # 16 
 
     @T.prim_func
     def main(

@@ -228,7 +228,7 @@ __device__ __forceinline__ int32_t transform_kpool_token(
 
 template <int K>
 __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
-    const __grid_constant__ FastTopKParams params,
+    const FastTopKParams params,
     int32_t* __restrict__ dst_token_indices,
     const int64_t dst_stride,
     const int32_t pool_size,

@@ -873,7 +873,7 @@ class IndexerKPool(MultiPlatformOp):
         self,
         forward_batch: ForwardBatch,
         layer_id: int,
-        q_fp8: torch.Tensor,
+        q: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
@@ -887,7 +887,7 @@ class IndexerKPool(MultiPlatformOp):
 
         block_tables = metadata.get_page_table_64()
 
-        kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
+        kv_cache = self._get_index_k_read_buffer(pool, layer_id)
 
         blocksize = page_size
         if (
@@ -897,25 +897,28 @@ class IndexerKPool(MultiPlatformOp):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
-        assert len(q_fp8.shape) == 3
-        num_q_padded = q_fp8.shape[0]
+        assert len(q.shape) == 3
+        num_q_padded = q.shape[0]
         n_real = seqlens_32.shape[0]
         if n_real < num_q_padded:
-            q_fp8 = q_fp8[:n_real]
+            q = q[:n_real]
             weights = weights[:n_real]
-        assert len(kv_cache_fp8.shape) == 2
+        assert len(kv_cache.shape) == 2
         block_kv = 64
         num_heads_kv = 1
-        head_dim_with_sf = 132
-        kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+        if kv_cache.dtype in [torch.int8, torch.uint8]:
+            head_dim_with_sf = 132
+        else:
+            head_dim_with_sf = 128
+        kv_cache = kv_cache.view(
+            kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
         use_aiter_paged_mqa = is_hip()
         use_tilelang_paged_mqa = (
             not use_aiter_paged_mqa
-            and self._should_use_tilelang_paged_mqa_logits(q_fp8)
+            and self._should_use_tilelang_paged_mqa_logits(q)
         )
 
         pool_seqlens, pool_context_lens, pool_block_tables, pool_schedule_metadata = (
@@ -938,8 +941,8 @@ class IndexerKPool(MultiPlatformOp):
             from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits
 
             logits = aiter_paged_mqa_logits(
-                q_fp8,
-                kv_cache_fp8,
+                q,
+                kv_cache,
                 weights,
                 pool_seqlens,
                 pool_block_tables,
@@ -953,8 +956,8 @@ class IndexerKPool(MultiPlatformOp):
             )
 
             logits = tilelang_fp8_paged_mqa_logits(
-                q_fp8.unsqueeze(1),
-                kv_cache_fp8,
+                q.unsqueeze(1),
+                kv_cache,
                 weights,
                 pool_seqlens,
                 pool_block_tables,
@@ -963,9 +966,17 @@ class IndexerKPool(MultiPlatformOp):
                 clean_logits=False,
             )
         else:
-            logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8.unsqueeze(1),
-                kv_cache_fp8,
+            if kv_cache.dtype == torch.uint8:
+                from deep_gemm import fp8_paged_mqa_logits as fn
+            elif kv_cache.dtype == torch.int8:
+                from deep_gemm import int8_paged_mqa_logits as fn
+            else:
+                assert kv_cache.dtype == torch.bfloat16
+                from deep_gemm import bf16_paged_mqa_logits  as fn
+            
+            logits = fn(
+                q.unsqueeze(1),
+                kv_cache,
                 weights,
                 pool_context_lens,
                 pool_block_tables,
@@ -1614,7 +1625,12 @@ class IndexerKPool(MultiPlatformOp):
         if is_hip():
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not is_npu():
-            from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+            if envs.SGLANG_DSA_INDEX_CACHE_TYPE.get() == "fp8":
+                from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+            elif envs.SGLANG_DSA_INDEX_CACHE_TYPE.get() == "int8":
+                from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant_int8 as act_quant
+            else:
+                raise NotImplementedError("index cache only support fp8 and int8")
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -1715,11 +1731,11 @@ class IndexerKPool(MultiPlatformOp):
                     metadata=metadata,
                     gate_score=gate_score,
                 )
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            q_quant, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             weights = self._get_logits_head_gate(x, q_scale)
             current_stream.wait_stream(self.alt_stream)
         else:
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            q_quant, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             has_kpool_extend_plan = metadata.attn_metadata.kpool_extend_plan is not None
             defer_kpool_cache_write = (
                 forward_batch.forward_mode.is_extend_without_speculative()
@@ -1756,7 +1772,7 @@ class IndexerKPool(MultiPlatformOp):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 topk_result = self._get_topk_paged(
-                    forward_batch, layer_id, q_fp8, weights, metadata
+                    forward_batch, layer_id, q_quant, weights, metadata
                 )
             else:
                 if (
@@ -1773,7 +1789,7 @@ class IndexerKPool(MultiPlatformOp):
                         forward_batch.attn_cp_metadata.actual_seq_q_next_list[0]
                     )
                     q_fp8_prev, q_fp8_next = torch.split(
-                        q_fp8, (q_fp8.shape[0] + 1) // 2, dim=0
+                        q_quant, (q_quant.shape[0] + 1) // 2, dim=0
                     )
                     weights_prev, weights_next = torch.split(
                         weights, (weights.shape[0] + 1) // 2, dim=0
@@ -1801,7 +1817,7 @@ class IndexerKPool(MultiPlatformOp):
                     topk_result = self._get_topk_ragged_kpool_plan(
                         forward_batch,
                         layer_id,
-                        q_fp8,
+                        q_quant,
                         weights,
                         metadata,
                     )
@@ -1809,7 +1825,7 @@ class IndexerKPool(MultiPlatformOp):
                     topk_result = self._get_topk_ragged(
                         forward_batch,
                         layer_id,
-                        q_fp8,
+                        q_quant,
                         weights,
                         metadata,
                         kpool_extend_cache=kpool_extend_cache,

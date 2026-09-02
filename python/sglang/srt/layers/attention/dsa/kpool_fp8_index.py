@@ -888,7 +888,6 @@ def kpool_decode_update_and_maybe_write_cache(
     assert tail_score.dtype in KPOOL_SCORE_DTYPES
     assert slot_score.dtype == tail_score.dtype
     assert ape.dtype == torch.float32
-    assert buf.dtype == torch.uint8
     assert pool.page_size == BLOCK_SIZE_K
     assert pool.index_head_dim == INDEX_HEAD_DIM
     assert tail_k.is_contiguous()
@@ -913,43 +912,83 @@ def kpool_decode_update_and_maybe_write_cache(
     assert block_tables.ndim == 2
     assert block_tables.shape[0] >= batch
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
-    buf_fp32 = buf.view(torch.float32)
-    _kpool_decode_update_and_maybe_write_cache_kernel[(batch,)](
-        buf_fp8,
-        buf_fp32,
-        tail_k,
-        tail_score,
-        key,
-        slot_score,
-        ape,
-        block_tables,
-        req_pool_indices,
-        positions,
-        seq_lens,
-        out_cache_loc,
-        tail_k.stride(0),
-        tail_k.stride(1),
-        tail_score.stride(0),
-        tail_score.stride(1),
-        key.stride(0),
-        slot_score.stride(0),
-        ape.stride(0),
-        block_tables.stride(0),
-        block_tables.stride(1),
-        REQ_POOL_SIZE=tail_k.shape[0],
-        PAGE_SIZE=pool.page_size,
-        BUF_NUMEL_PER_PAGE=buf.shape[1],
-        POOL_SIZE=pool.index_kpool,
-        TAIL_SIZE=tail_k.shape[1],
-        HEAD_DIM=tail_k.shape[2],
-        BLOCK_TABLE_COLS=block_tables.shape[1],
-        S_OFFSET_NBYTES_IN_PAGE=pool.slots_per_page * pool.index_head_dim,
-        PRESHUFFLE_TILE=_preshuffle_tile(),
-        ROUND_SCALE=round_scale,
-        BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
-        SLOTS_PER_PAGE=pool.slots_per_page,
-    )
+    if buf.dtype == torch.uint8:
+        buf_fp8 = buf.view(torch.float8_e4m3fn)
+        buf_fp32 = buf.view(torch.float32)
+        _kpool_decode_update_and_maybe_write_cache_kernel[(batch,)](
+            buf_fp8,
+            buf_fp32,
+            tail_k,
+            tail_score,
+            key,
+            slot_score,
+            ape,
+            block_tables,
+            req_pool_indices,
+            positions,
+            seq_lens,
+            out_cache_loc,
+            tail_k.stride(0),
+            tail_k.stride(1),
+            tail_score.stride(0),
+            tail_score.stride(1),
+            key.stride(0),
+            slot_score.stride(0),
+            ape.stride(0),
+            block_tables.stride(0),
+            block_tables.stride(1),
+            REQ_POOL_SIZE=tail_k.shape[0],
+            PAGE_SIZE=pool.page_size,
+            BUF_NUMEL_PER_PAGE=buf.shape[1],
+            POOL_SIZE=pool.index_kpool,
+            TAIL_SIZE=tail_k.shape[1],
+            HEAD_DIM=tail_k.shape[2],
+            BLOCK_TABLE_COLS=block_tables.shape[1],
+            S_OFFSET_NBYTES_IN_PAGE=pool.slots_per_page * pool.index_head_dim,
+            PRESHUFFLE_TILE=_preshuffle_tile(),
+            ROUND_SCALE=round_scale,
+            BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
+            SLOTS_PER_PAGE=pool.slots_per_page,
+        )
+    else:
+        assert buf.dtype == torch.int8
+        buf_int8 = buf.view(torch.int8)
+        buf_fp32 = buf.view(torch.float32)
+        _kpool_decode_update_and_maybe_write_cache_int8_kernel[(batch,)](
+            buf_int8,
+            buf_fp32,
+            tail_k,
+            tail_score,
+            key,
+            slot_score,
+            ape,
+            block_tables,
+            req_pool_indices,
+            positions,
+            seq_lens,
+            out_cache_loc,
+            tail_k.stride(0),
+            tail_k.stride(1),
+            tail_score.stride(0),
+            tail_score.stride(1),
+            key.stride(0),
+            slot_score.stride(0),
+            ape.stride(0),
+            block_tables.stride(0),
+            block_tables.stride(1),
+            REQ_POOL_SIZE=tail_k.shape[0],
+            PAGE_SIZE=pool.page_size,
+            BUF_NUMEL_PER_PAGE=buf.shape[1],
+            POOL_SIZE=pool.index_kpool,
+            TAIL_SIZE=tail_k.shape[1],
+            HEAD_DIM=tail_k.shape[2],
+            BLOCK_TABLE_COLS=block_tables.shape[1],
+            S_OFFSET_NBYTES_IN_PAGE=pool.slots_per_page * pool.index_head_dim,
+            PRESHUFFLE_TILE=_preshuffle_tile(),
+            ROUND_SCALE=round_scale,
+            BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
+            SLOTS_PER_PAGE=pool.slots_per_page,
+        )
 
 
 @triton.jit
@@ -1255,6 +1294,177 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
         )
 
         tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+        tl.store(buf_fp32_ptr + out_s_offset, scale)
+
+    tail_k_offset = req * tail_k_stride_0 + phys_slot * tail_k_stride_1 + offs
+    tail_score_offset = (
+        req * tail_score_stride_0 + phys_slot * tail_score_stride_1 + offs
+    )
+    update_mask = dim_mask & pos_valid
+    tl.store(tail_k_ptr + tail_k_offset, key, mask=update_mask)
+    tl.store(tail_score_ptr + tail_score_offset, score_current, mask=update_mask)
+
+
+@triton.jit
+def _kpool_decode_update_and_maybe_write_cache_int8_kernel(
+    buf_int8_ptr,
+    buf_fp32_ptr,
+    tail_k_ptr,
+    tail_score_ptr,
+    key_ptr,
+    slot_score_ptr,
+    ape_ptr,
+    block_tables_ptr,
+    req_pool_indices_ptr,
+    positions_ptr,
+    seq_lens_ptr,
+    out_cache_loc_ptr,
+    tail_k_stride_0,
+    tail_k_stride_1,
+    tail_score_stride_0,
+    tail_score_stride_1,
+    key_stride_0,
+    slot_score_stride_0,
+    ape_stride_0,
+    block_tables_stride_0,
+    block_tables_stride_1,
+    REQ_POOL_SIZE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    POOL_SIZE: tl.constexpr,
+    TAIL_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_TABLE_COLS: tl.constexpr,
+    S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
+    ROUND_SCALE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    SLOTS_PER_PAGE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_D)
+    dim_mask = offs < HEAD_DIM
+
+    req_raw = tl.load(req_pool_indices_ptr + row)
+    req_valid = (req_raw >= 0) & (req_raw < REQ_POOL_SIZE)
+    req = tl.minimum(tl.maximum(req_raw, 0), REQ_POOL_SIZE - 1)
+
+    pos = tl.load(positions_ptr + row)
+    safe_pos = tl.maximum(pos, 0)
+    seq_len = tl.load(seq_lens_ptr + row)
+    cache_loc = tl.load(out_cache_loc_ptr + row)
+    pos_valid = req_valid & (cache_loc != 0) & (pos >= 0) & (pos < seq_len)
+
+    slot = safe_pos % POOL_SIZE
+    phys_slot = safe_pos % TAIL_SIZE
+
+    key = tl.load(
+        key_ptr + row * key_stride_0 + offs,
+        mask=dim_mask,
+        other=0.0,
+    ).to(tl.float32)
+    score_current = tl.load(
+        slot_score_ptr + row * slot_score_stride_0 + offs,
+        mask=dim_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    if pos_valid & (slot == POOL_SIZE - 1):
+        pool_logical_start = safe_pos - slot
+        max_score = tl.full((BLOCK_D,), -float("inf"), tl.float32)
+        for pool_slot in tl.static_range(0, POOL_SIZE):
+            is_current = pool_slot == slot
+            phys = (pool_logical_start + pool_slot) % TAIL_SIZE
+            score_buf = tl.load(
+                tail_score_ptr
+                + req * tail_score_stride_0
+                + phys * tail_score_stride_1
+                + offs,
+                mask=dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            score = tl.where(is_current, score_current, score_buf)
+            score += tl.load(
+                ape_ptr + pool_slot * ape_stride_0 + offs,
+                mask=dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            max_score = tl.maximum(max_score, score)
+
+        acc = tl.full((BLOCK_D,), 0.0, tl.float32)
+        denom = tl.full((BLOCK_D,), 0.0, tl.float32)
+        for pool_slot in tl.static_range(0, POOL_SIZE):
+            is_current = pool_slot == slot
+            phys = (pool_logical_start + pool_slot) % TAIL_SIZE
+            score_buf = tl.load(
+                tail_score_ptr
+                + req * tail_score_stride_0
+                + phys * tail_score_stride_1
+                + offs,
+                mask=dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            score = tl.where(is_current, score_current, score_buf)
+            score += tl.load(
+                ape_ptr + pool_slot * ape_stride_0 + offs,
+                mask=dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            prob = tl.exp(score - max_score)
+            denom += prob
+            k_buf = tl.load(
+                tail_k_ptr + req * tail_k_stride_0 + phys * tail_k_stride_1 + offs,
+                mask=dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            k = tl.where(is_current, key, k_buf)
+            acc += k * prob
+
+        x = (acc / denom).to(tl.bfloat16).to(tl.float32)
+        x = _hadamard128(x).to(tl.bfloat16).to(tl.float32)
+
+        int8_min = -128.0
+        int8_max = 127.0
+        int8_max_inv = 1.0 / int8_max
+        absmax = tl.max(tl.abs(x), axis=0)
+        absmax = tl.maximum(absmax, 1e-4)
+
+        if ROUND_SCALE:
+            log_val = tl.log2(absmax * int8_max_inv)
+            scale = tl.exp2(tl.ceil(log_val))
+        else:
+            scale = absmax * int8_max_inv
+
+        quantized = x / scale
+        quantized = tl.minimum(tl.maximum(quantized, int8_min), int8_max)
+        quantized = quantized.to(tl.int8)
+
+        pool_id = safe_pos // POOL_SIZE
+        pool_page_group = pool_id // SLOTS_PER_PAGE
+        token_page_row = pool_page_group * POOL_SIZE
+        token_page_row = tl.minimum(tl.maximum(token_page_row, 0), BLOCK_TABLE_COLS - 1)
+        packed_page = tl.load(
+            block_tables_ptr
+            + row * block_tables_stride_0
+            + token_page_row * block_tables_stride_1,
+        )
+        loc_page_index = packed_page.to(tl.int64)
+        loc_token_offset_in_page = pool_id % SLOTS_PER_PAGE
+        out_k_offsets = _kpool_cache_k_offsets(
+            loc_page_index,
+            loc_token_offset_in_page,
+            offs,
+            BUF_NUMEL_PER_PAGE,
+            HEAD_DIM,
+            PRESHUFFLE_TILE,
+        )
+        out_s_offset = (
+            loc_page_index * BUF_NUMEL_PER_PAGE // 4
+            + S_OFFSET_NBYTES_IN_PAGE // 4
+            + loc_token_offset_in_page
+        )
+
+        tl.store(buf_int8_ptr + out_k_offsets, quantized, mask=dim_mask)
         tl.store(buf_fp32_ptr + out_s_offset, scale)
 
     tail_k_offset = req * tail_k_stride_0 + phys_slot * tail_k_stride_1 + offs

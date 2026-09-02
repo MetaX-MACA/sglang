@@ -85,7 +85,7 @@ def load_jit(
             if flag not in ("--use_fast_math", "-use_fast_math")
         ]
 
-    includes = list(DEFAULT_INCLUDE) + (extra_include_paths or [])
+    includes = list(DEFAULT_INCLUDE) + (extra_include_paths or ["/opt/maca/tools/cu-bridge/include/"])
     for dep in sorted(set(extra_dependencies or [])):
         if dep not in REGISTERED_DEPENDENCIES:
             raise ValueError(f"Dependency {dep} is not registered.")
