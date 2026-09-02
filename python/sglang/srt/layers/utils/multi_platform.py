@@ -27,10 +27,6 @@ try:
 except ImportError as e:
     print("Failed to import from sgl_grouped_gemm_cuda with %r", e)
 
-try:
-    import mcoplib.sgl_moe_fused_w4a16
-except ImportError as e:
-    print("Failed to import from sgl_moe_fused_w4a16 with %r", e)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
