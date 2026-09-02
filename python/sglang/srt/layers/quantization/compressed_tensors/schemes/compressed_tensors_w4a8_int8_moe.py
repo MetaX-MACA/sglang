@@ -9,6 +9,7 @@ from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A8Int8DynamicMoEMethod,
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
@@ -106,7 +107,10 @@ class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        backend = get_moe_runner_backend()
+        if backend == MoeRunnerBackend.AUTO:
+            backend = MoeRunnerBackend.TRITON
+        self.runner = MoeRunner(backend, moe_runner_config)
 
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -117,18 +121,27 @@ class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEScheme):
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_triton import fused_experts
-        quant_info = TritonMoeQuantInfo(
-            w13_weight=layer.w13_weight_packed,
-            w2_weight=layer.w2_weight_packed,
-            use_int4_w4a8=True,
-            per_channel_quant=True,
-            w13_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a13_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale
-        )
+    ) -> CombineInput:
+        if self.runner.runner_backend.is_deep_gemm():
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=layer.w13_weight_packed,
+                w2_weight=layer.w2_weight_packed,
+                use_fp8=False,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+            )
+        else:
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight_packed,
+                w2_weight=layer.w2_weight_packed,
+                use_int4_w4a8=True,
+                per_channel_quant=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
         return self.runner.run(dispatch_output, quant_info)
 
 class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):

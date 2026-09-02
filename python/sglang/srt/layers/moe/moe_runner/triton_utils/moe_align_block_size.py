@@ -97,6 +97,7 @@ def moe_align_block_size(
             num_tokens_post_pad,
             cumsum_buffer,
             True,
+            True,
         )
     # ===== END TO BE REFACTORED ====
     else:
@@ -108,6 +109,7 @@ def moe_align_block_size(
             expert_ids,
             num_tokens_post_pad,
             cumsum_buffer,
+            True,
             True,
         )
     return sorted_ids, expert_ids, num_tokens_post_pad

@@ -2104,16 +2104,22 @@ def m_grouped_gemm_nt_masked(
     excepted_m: int,
     scale_b: torch.Tensor = None,
     use_triton_kernel: bool = True,
-    unpack_tensor: bool = False
+    unpack_tensor: bool = False,
+    use_fused_quant: bool = False,
 ):
     assert a.dim() == 3 and b.dim() == 3
     num_groups, m, k = a.shape
     _, n, _ = b.shape
-    
-    a_quant_val, a_quant_scale, _ = scaled_int8_quant(a)
-    A_packed = torch.cat([a_quant_val, a_quant_scale.view(num_groups,m,-1).view(torch.int8)], dim=-1)
-    # a_quant_val, a_quant_scale = per_token_quant_int8(a)
-    # A_packed = torch.cat([a_quant_val, a_quant_scale.view(torch.int8)], dim=-1)
+
+    # W4A8: weight is int32 packed (8×int4 → 1×int32), view as quint4x2 for mctlass
+    if b.dtype == torch.int32:
+        b = b.view(dtype=torch.quint4x2)
+
+    if use_fused_quant:
+        A_packed = a.view(torch.int8)
+    else:
+        a_quant_val, a_quant_scale, _ = scaled_int8_quant(a)
+        A_packed = torch.cat([a_quant_val, a_quant_scale.view(num_groups,m,-1).view(torch.int8)], dim=-1)
     gemm = MaskedGroupedGEMM()
     gemm([m, n, k],
         A_packed,

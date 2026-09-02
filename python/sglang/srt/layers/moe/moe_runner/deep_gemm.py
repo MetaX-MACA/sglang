@@ -751,13 +751,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.ep_moe.kernels import (
             silu_and_mul_masked,
+            silu_and_mul_masked_fwd_no_pack,
+            m_grouped_gemm_nt_masked,
         )
         from sglang.srt.layers.quantization.int8_kernel import (
             per_token_quant_int8,
         )
         
         hidden_states = runner_input.hidden_states
-        # hidden_states_scale = runner_input.hidden_states_scale
         masked_m = runner_input.masked_m
         expected_m = runner_input.expected_m
 
@@ -766,6 +767,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         w13_scale = quant_info.w13_scale
         w2_scale = quant_info.w2_scale
 
+        use_w4a8 = w13_weight.dtype == torch.int32
+
         hidden_states_device = running_state["hidden_states_device"]
 
         num_groups, m, k = hidden_states.shape
@@ -773,22 +776,51 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
-            hidden_states if self.use_fused_quant 
-            else per_token_quant_int8(hidden_states),
-            (w13_weight, w13_scale),
-            gateup_output,
-            masked_m,
-            expected_m,
-        )
+        if use_w4a8:
+            m_grouped_gemm_nt_masked(
+                hidden_states,
+                w13_weight,
+                gateup_output,
+                masked_m,
+                expected_m,
+                w13_scale,
+                use_triton_kernel=False,
+                use_fused_quant=self.use_fused_quant,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
+                hidden_states if self.use_fused_quant 
+                else per_token_quant_int8(hidden_states),
+                (w13_weight, w13_scale),
+                gateup_output,
+                masked_m,
+                expected_m,
+            )
         dispose_tensor(hidden_states)
         
         # Act
-        down_input = silu_and_mul_masked(
-            gateup_output, masked_m,
-            gemm1_alpha=getattr(self.config, 'gemm1_alpha', 0.0) or 0.0,
-            swiglu_limit=getattr(self.config, 'gemm1_clamp_limit', None) or getattr(self.config, 'swiglu_limit', None) or 0.0,
-        )
+        gemm1_alpha = getattr(self.config, 'gemm1_alpha', 0.0) or 0.0
+        gemm1_limit = getattr(self.config, 'gemm1_clamp_limit', None) or getattr(self.config, 'swiglu_limit', None) or 0.0
+
+        if use_w4a8:
+            if self.use_fused_quant:
+                down_input = silu_and_mul_masked(
+                    gateup_output, masked_m,
+                    gemm1_alpha=gemm1_alpha,
+                    swiglu_limit=gemm1_limit,
+                )
+            else:
+                down_input = torch.empty(
+                    (num_groups, m, n // 2),
+                    device=hidden_states_device, dtype=torch.bfloat16,
+                )
+                silu_and_mul_masked_fwd_no_pack(gateup_output, down_input, masked_m)
+        else:
+            down_input = silu_and_mul_masked(
+                gateup_output, masked_m,
+                gemm1_alpha=gemm1_alpha,
+                swiglu_limit=gemm1_limit,
+            )
         del gateup_output
 
         # GroupGemm-2
@@ -796,34 +828,43 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
-        if down_gemm_overlap_args is None:
-            gemm_overlap_args_dict = {}
+        if use_w4a8:
+            m_grouped_gemm_nt_masked(
+                down_input,
+                w2_weight,
+                down_output,
+                masked_m,
+                expected_m,
+                w2_scale,
+                use_triton_kernel=False,
+                use_fused_quant=self.use_fused_quant,
+            )
         else:
-            down_gemm_overlap_args.start_event.record()
-            max_block_n = 128
-            gemm_overlap_args_dict = {
-                "overlap_args": down_gemm_overlap_args,
-                "max_block_n": max_block_n,
-            }
-        # if self.config.gemm1_clamp_limit is not None:
-        #     gemm_overlap_args_dict["clamp_limit"] = self.config.gemm1_clamp_limit
-        #     down_input = per_token_quant_int8(down_input)
+            down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
+            if down_gemm_overlap_args is None:
+                gemm_overlap_args_dict = {}
+            else:
+                down_gemm_overlap_args.start_event.record()
+                max_block_n = 128
+                gemm_overlap_args_dict = {
+                    "overlap_args": down_gemm_overlap_args,
+                    "max_block_n": max_block_n,
+                }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
-            down_input,
-            (w2_weight, w2_scale),
-            down_output,
-            masked_m,
-            expected_m,
-            **gemm_overlap_args_dict,
-        )
+            deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
+                down_input,
+                (w2_weight, w2_scale),
+                down_output,
+                masked_m,
+                expected_m,
+                **gemm_overlap_args_dict,
+            )
 
-        meta_overlap_args = running_state.get("meta_overlap_args", None)
-        if meta_overlap_args is not None:
-            block_m, threshold = deep_gemm_return_value
-            meta_overlap_args["block_m"] = block_m
-            meta_overlap_args["threshold"] = threshold
+            meta_overlap_args = running_state.get("meta_overlap_args", None)
+            if meta_overlap_args is not None:
+                block_m, threshold = deep_gemm_return_value
+                meta_overlap_args["block_m"] = block_m
+                meta_overlap_args["threshold"] = threshold
         return down_output
     
     @property
