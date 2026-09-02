@@ -40,8 +40,12 @@ def platform_key() -> str:
     """
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    for name in ("cuda", "hip", "npu", "mps", "musa"):
-        if getattr(current_platform, f"is_{name}")():
+    # Some torch-musa builds expose CUDA-compatible APIs (including
+    # ``torch.cuda.is_available`` and ``Tensor.is_cuda``).  Check MUSA first so
+    # those compatibility shims do not accidentally select a Triton CUDA path.
+    for name in ("musa", "cuda", "hip", "npu", "mps"):
+        predicate = is_musa if name == "musa" else getattr(current_platform, f"is_{name}")
+        if predicate():
             return name
     return "cpu"
 
@@ -64,6 +68,34 @@ def is_hip() -> bool:
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
     return current_platform.is_hip()
+
+
+def is_musa() -> bool:
+    """Return whether the runtime is MUSA, including CUDA-compatible shims."""
+    # Some torch-musa builds expose ``torch.version.musa`` without adding a
+    # ``torch.musa`` namespace.  Check the version marker before consulting
+    # the platform plugin so those builds are not mistaken for CUDA.
+    try:
+        import torch
+
+        if getattr(torch.version, "musa", None) is not None:
+            return True
+    except Exception:
+        pass
+
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    return current_platform.is_musa()
+
+
+def is_maca() -> bool:
+    """Return whether the runtime uses the MetaX (MACA) compiler stack."""
+    try:
+        import torch
+
+        return "metax" in torch.__version__.lower()
+    except Exception:
+        return False
 
 
 def has_triton() -> bool:

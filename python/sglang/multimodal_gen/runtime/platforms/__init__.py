@@ -227,6 +227,13 @@ def resolve_current_platform_cls_qualname() -> str:
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 
+    # MUSA builds may expose CUDA-compatible APIs, so detect MUSA before the
+    # CUDA fallback. Otherwise torch.cuda.is_available() can classify a MUSA
+    # host as CUDA and select CUDA-only diffusion kernels.
+    platform_cls_qualname = musa_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
     # Fall back to CUDA
     platform_cls_qualname = cuda_platform_plugin()
     if platform_cls_qualname is not None:
@@ -234,11 +241,6 @@ def resolve_current_platform_cls_qualname() -> str:
 
     # Fall back to NPU
     platform_cls_qualname = npu_platform_plugin()
-    if platform_cls_qualname is not None:
-        return platform_cls_qualname
-
-    # Fall back to MUSA
-    platform_cls_qualname = musa_platform_plugin()
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 
