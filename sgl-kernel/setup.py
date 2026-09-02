@@ -40,20 +40,11 @@ def get_platform_info():
     return f"{system}_{arch}"
 
 
-def get_maca_version():
+def get_maca_ai_version() -> str:
     """
-    Returns the MACA SDK Version
+    Extract the MACA version from the environment variable.
     """
-    maca_path = str(os.getenv('MACA_PATH'))
-    if not os.path.exists(maca_path):
-        return None
-    file_full_path = os.path.join(maca_path, 'Version.txt')
-    if not os.path.isfile(file_full_path):
-        return None
-    
-    with open(file_full_path, 'r', encoding='utf-8') as file:
-        first_line = file.readline().strip()
-    return first_line.split(":")[-1]
+    return os.environ.get('MACA_AI_VERSION', '0.0.0.0')
 
 # def get_maca_version_list():
 #     version_str = get_maca_version()
@@ -64,7 +55,7 @@ def get_maca_version():
 
 # This is to make sure that the package supports editable installs
 version = "0.4.4"
-maca_ai_version = get_maca_version()
+maca_ai_version = get_maca_ai_version()
 version += "+maca"+maca_ai_version
 version += "."+get_torch_version()
 setuptools.setup(version=version
