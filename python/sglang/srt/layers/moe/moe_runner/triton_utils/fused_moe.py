@@ -952,7 +952,11 @@ def fused_experts_impl(
 
     # Check constraints.
     if use_int4_w4a8:
-        assert hidden_states.size(1) // 8 == w1.size(2), "hidden size mismatch"
+        if hidden_states.size(1) != w1.size(2) * 8:
+            raise AssertionError(
+                f"hidden size mismatch: hidden_states.shape={hidden_states.shape}, "
+                f"w1.shape={w1.shape}, w1.size(2)*8={w1.size(2)*8}"
+            )
     elif use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:

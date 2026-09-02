@@ -199,13 +199,16 @@ class CompressedTensorsConfig(QuantizationConfig):
         targeting 'Linear' needs to also match
         FusedMoE modules.
         """
-        if (
-            "Linear" not in self.target_scheme_map
-            or "FusedMoE" in self.target_scheme_map
-        ):
+        if "Linear" not in self.target_scheme_map:
             return
-        self.target_scheme_map["FusedMoE"] = self.target_scheme_map["Linear"]
-        self.target_scheme_map["DeepEPMoE"] = self.target_scheme_map["Linear"]
+        if "FusedMoE" not in self.target_scheme_map:
+            self.target_scheme_map["FusedMoE"] = self.target_scheme_map["Linear"]
+        if "DeepEPMoE" not in self.target_scheme_map:
+            self.target_scheme_map["DeepEPMoE"] = self.target_scheme_map["Linear"]
+        # When FusedMoE has its own explicit scheme (e.g. W4A8), DeepEPMoE
+        # should inherit that scheme rather than Linear's (e.g. W8A8).
+        if "FusedMoE" in self.target_scheme_map:
+            self.target_scheme_map["DeepEPMoE"] = self.target_scheme_map["FusedMoE"]
 
     @property
     def weight_block_size(self) -> Optional[List[int]]:

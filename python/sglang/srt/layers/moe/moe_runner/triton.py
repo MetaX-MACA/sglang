@@ -19,6 +19,10 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLCombineInput,
+        DeepEPLLDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -144,6 +148,7 @@ class TritonRunnerCore(MoeRunnerCore):
             use_fp8_w8a8=quant_info.use_fp8_w8a8,
             use_int8_w8a8=quant_info.use_int8_w8a8,
             use_int8_w8a16=quant_info.use_int8_w8a16,
+            use_int4_w4a8=quant_info.use_int4_w4a8,
             use_int4_w4a16=quant_info.use_int4_w4a16,
             per_channel_quant=quant_info.per_channel_quant,
             w1_scale=quant_info.w13_scale,
@@ -318,4 +323,59 @@ def post_permute_triton_to_standard(
 
     return StandardCombineInput(
         hidden_states=runner_output.hidden_states,
+    )
+
+
+@register_fused_func("deepep", "triton")
+def fused_experts_deepep_to_triton(
+    dispatch_output: "DeepEPLLDispatchOutput",
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> "DeepEPLLCombineInput":
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+        fused_experts_impl,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+
+    output = fused_experts_impl(
+        dispatch_output.hidden_states,
+        quant_info.w13_weight,
+        quant_info.w2_weight,
+        dispatch_output.topk_weights,
+        dispatch_output.topk_ids,
+        b1=quant_info.b13,
+        b2=quant_info.b2,
+        inplace=runner_config.inplace,
+        activation=runner_config.activation,
+        is_gated=runner_config.is_gated,
+        apply_router_weight_on_input=runner_config.apply_router_weight_on_input,
+        use_fp8_w8a8=quant_info.use_fp8_w8a8,
+        use_int8_w8a8=quant_info.use_int8_w8a8,
+        use_int8_w8a16=quant_info.use_int8_w8a16,
+        use_int4_w4a8=quant_info.use_int4_w4a8,
+        use_int4_w4a16=quant_info.use_int4_w4a16,
+        per_channel_quant=quant_info.per_channel_quant,
+        w1_scale=quant_info.w13_scale,
+        w2_scale=quant_info.w2_scale,
+        w1_zp=quant_info.w13_zp,
+        w2_zp=quant_info.w2_zp,
+        a1_scale=quant_info.a13_scale,
+        a2_scale=quant_info.a2_scale,
+        block_shape=quant_info.block_shape,
+        no_combine=runner_config.no_combine,
+        routed_scaling_factor=runner_config.routed_scaling_factor,
+        gemm1_alpha=runner_config.gemm1_alpha,
+        gemm1_limit=runner_config.gemm1_clamp_limit,
+        filter_expert=(
+            runner_config.num_experts is None
+            or runner_config.num_experts != runner_config.num_local_experts
+        ),
+        swiglu_limit=runner_config.swiglu_limit,
+        gate_up_interleaved=runner_config.gate_up_interleaved,
+    )
+
+    return DeepEPLLCombineInput(
+        hidden_states=output,
+        topk_ids=dispatch_output.topk_ids,
+        topk_weights=dispatch_output.topk_weights,
     )
