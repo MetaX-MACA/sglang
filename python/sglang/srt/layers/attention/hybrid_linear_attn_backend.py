@@ -103,6 +103,14 @@ class MambaAttnBackendBase(AttentionBackend):
         # skips the per-cycle method dispatch.
         self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
 
+    @property
+    def mamba_chunk_size(self) -> int:
+        if self._mamba_chunk_size is None:
+            self._mamba_chunk_size = getattr(
+                self._model_runner.model_config.hf_text_config, "mamba_chunk_size", 64
+            )
+        return self._mamba_chunk_size
+
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (identity for the non-unified
         pool). Must run everywhere mamba ids feed the SSM/conv kernels or mamba-pool
