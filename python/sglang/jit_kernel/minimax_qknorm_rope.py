@@ -67,12 +67,7 @@ def _fused_gemma_qknorm_rope(
     num_groups: int,
     eps: float,
 ) -> None:
-    # Wrap the tvm-ffi kernel as a custom op so torch.compile / piecewise CUDA
-    # graph can trace past the otherwise-opaque FFI call. The launch is
-    # graph-capturable (host-side constant offsets/counts), so it stays inside
-    # the captured region.
-    module = _jit_module(positions.dtype, 128, 64)
-    module.fused_gemma_qknorm_rope(
+    torch.ops.sgl_kernel.fused_gemma_qknorm_rope(
         qkv,
         w0,
         w1,
