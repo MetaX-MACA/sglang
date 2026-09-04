@@ -24,14 +24,14 @@ else:
 
     from sgl_kernel.allreduce import *
     from sgl_kernel.attention import (
-        cutlass_mla_decode,
-        cutlass_mla_get_workspace_size,
+        # cutlass_mla_decode,
+        # cutlass_mla_get_workspace_size,
         merge_state_v2,
     )
-    from sgl_kernel.cutlass_moe import (
-        cutlass_w4a8_moe_mm,
-        get_cutlass_w4a8_moe_mm_data,
-    )
+    # from sgl_kernel.cutlass_moe import (
+    #     cutlass_w4a8_moe_mm,
+    #     get_cutlass_w4a8_moe_mm_data,
+    # )
     from sgl_kernel.elementwise import (
         concat_mla_absorb_q,
         concat_mla_k,
@@ -42,9 +42,9 @@ else:
         fused_add_rmsnorm,
         gelu_and_mul,
         gelu_tanh_and_mul,
-        gemma_fused_add_rmsnorm,
-        gemma_rmsnorm,
-        rmsnorm,
+        # gemma_fused_add_rmsnorm,
+        # gemma_rmsnorm,
+        # rmsnorm,
         rotary_embedding,
         silu_and_mul,
     )
@@ -55,21 +55,21 @@ else:
     )
     from sgl_kernel.gemm import (
         awq_dequantize,
-        fp8_scaled_mm,
-        gptq_gemm,
-        gptq_shuffle,
-        int8_scaled_mm,
-        sgl_per_token_group_quant_8bit,
-        sgl_per_token_group_quant_fp8,
-        sgl_per_token_group_quant_int8,
-        sgl_per_token_quant_fp8,
+        # fp8_scaled_mm,
+        # gptq_gemm,
+        # gptq_shuffle,
+        # int8_scaled_mm,
+        # sgl_per_token_group_quant_8bit,
+        # sgl_per_token_group_quant_fp8,
+        # sgl_per_token_group_quant_int8,
+        # sgl_per_token_quant_fp8,
         shuffle_rows,
     )
     from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
-    from sgl_kernel.infllm_v2 import (
-        infllmv2_attn_stage1,
-        max_pooling_1d_varlen,
-    )
+    # from sgl_kernel.infllm_v2 import (
+    #     infllmv2_attn_stage1,
+    #     max_pooling_1d_varlen,
+    # )
     from sgl_kernel.kvcacheio import (
         copy_all_layer_kv_cache_cpu,
         transfer_kv_all_layer,
@@ -87,7 +87,7 @@ else:
     from sgl_kernel.memory import weak_ref_tensor
     from sgl_kernel.moe import (
         apply_shuffle_mul_sum,
-        fp8_blockwise_scaled_grouped_mm,
+        # fp8_blockwise_scaled_grouped_mm,
         fused_qk_norm_rope,
         moe_align_block_size,
         moe_sum,
@@ -103,11 +103,12 @@ else:
         ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
+        scaled_int8_quant,   
     )
-    from sgl_kernel.sampling import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-    )
+    # from sgl_kernel.sampling import (
+    #     top_k_renorm_prob,
+    #     top_p_renorm_prob,
+    # )
     from sgl_kernel.speculative import (
         assign_draft_cache_locs_contiguous_cpu,
         assign_extend_cache_locs_cpu,
@@ -224,9 +225,15 @@ else:
     def create_greenctx_stream_by_value(*args, **kwargs):
         from sgl_kernel.spatial import create_greenctx_stream_by_value as _impl
 
-        return _impl(*args, **kwargs)
+    #     return _impl(*args, **kwargs)
 
-    def get_sm_available(*args, **kwargs):
-        from sgl_kernel.spatial import get_sm_available as _impl
+    # def get_sm_available(*args, **kwargs):
+    #     from sgl_kernel.spatial import get_sm_available as _impl
 
-        return _impl(*args, **kwargs)
+    #     return _impl(*args, **kwargs)
+
+from sgl_kernel.cutlass_mm import (
+    cutlass_scaled_batch_mm,
+    cutlass_scaled_mm,
+    cutlass_scaled_mm_azp,
+)

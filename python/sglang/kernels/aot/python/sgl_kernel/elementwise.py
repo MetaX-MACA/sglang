@@ -73,53 +73,54 @@ def _gemma_fused_add_rmsnorm_internal(
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
 # Kudos to @yzh119
-def rmsnorm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-6,
-    out: Optional[torch.Tensor] = None,
-    enable_pdl: Optional[bool] = None,
-) -> torch.Tensor:
-    r"""Root mean square normalization.
+# def rmsnorm(
+#     input: torch.Tensor,
+#     weight: torch.Tensor,
+#     eps: float = 1e-6,
+#     out: Optional[torch.Tensor] = None,
+#     enable_pdl: Optional[bool] = None,
+# ) -> torch.Tensor:
+#     r"""Root mean square normalization.
 
-    ``out[i] = (input[i] / RMS(input)) * weight[i]``
+# #     ``out[i] = (input[i] / RMS(input)) * weight[i]``
 
-    Parameters
-    ----------
-    input: torch.Tensor
-        Input tensor, shape (batch_size, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
-    eps: float
-        Epsilon for numerical stability.
-    out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
-    enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+# #     Parameters
+# #     ----------
+# #     input: torch.Tensor
+# #         Input tensor, shape (batch_size, hidden_size).
+# #     weight: torch.Tensor
+# #         Weight tensor, shape (hidden_size,).
+# #     eps: float
+# #         Epsilon for numerical stability.
+# #     out: Optional[torch.Tensor]
+# #         The output tensor, if specified, the kernel will update this tensor inplace.
+# #     enable_pdl: Optional[bool]
+# #         Whether to enable `programmatic dependent launch
+# #         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+# #         If None, will be automatically enabled on Hopper architecture.
 
-    Returns
-    -------
-    output: torch.Tensor
-        Normalized tensor, shape (batch_size, hidden_size).
-    """
-    # torch.compiler.is_dynamo_compiling(): FlashInfer norm paths are not safe under
-    # torch.compile(..., fullgraph=True). Dynamo traces into FlashInfer's JIT module
-    # loading path, which calls Path.exists() / os.stat() — both untraceable — causing
-    # the entire compilation to fail. We fall back to the internal implementation while
-    # tracing as a temporary workaround. Once the upstream fix is merged and we upgrade
-    # FlashInfer, this check can be removed.
-    # See: https://github.com/flashinfer-ai/flashinfer/issues/2734
-    #      https://github.com/flashinfer-ai/flashinfer/pull/2733
-    if (
-        _has_flashinfer
-        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        and not torch.compiler.is_dynamo_compiling()
-    ):
-        return _flashinfer_norm.rmsnorm(input, weight, eps, out, enable_pdl)
-    else:
-        return _rmsnorm_internal(input, weight, eps, out, enable_pdl)
+#     Returns
+#     -------
+#     output: torch.Tensor
+#         Normalized tensor, shape (batch_size, hidden_size).
+#     """
+#     # torch.compiler.is_dynamo_compiling(): FlashInfer norm paths are not safe under
+#     # torch.compile(..., fullgraph=True). Dynamo traces into FlashInfer's JIT module
+#     # loading path, which calls Path.exists() / os.stat() — both untraceable — causing
+#     # the entire compilation to fail. We fall back to the internal implementation while
+#     # tracing as a temporary workaround. Once the upstream fix is merged and we upgrade
+#     # FlashInfer, this check can be removed.
+#     # See: https://github.com/flashinfer-ai/flashinfer/issues/2734
+#     #      https://github.com/flashinfer-ai/flashinfer/pull/2733
+#     if (
+#         input.device.type == "musa"
+#         or not _has_flashinfer
+#         or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
+#         or torch.compiler.is_dynamo_compiling()
+#     ):
+#         return _rmsnorm_internal(input, weight, eps, out, enable_pdl)
+#     else:
+#         return _flashinfer_norm.rmsnorm(input, weight, eps, out, enable_pdl)
 
 
 def fused_add_rmsnorm(
@@ -162,87 +163,91 @@ def fused_add_rmsnorm(
         _fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
 
 
-def gemma_rmsnorm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-6,
-    out: Optional[torch.Tensor] = None,
-    enable_pdl: Optional[bool] = None,
-) -> torch.Tensor:
-    r"""Gemma-style root mean square normalization.
+# def gemma_rmsnorm(
+#     input: torch.Tensor,
+#     weight: torch.Tensor,
+#     eps: float = 1e-6,
+#     out: Optional[torch.Tensor] = None,
+#     enable_pdl: Optional[bool] = None,
+# ) -> torch.Tensor:
+#     r"""Gemma-style root mean square normalization.
 
-    ``out[i] = (input[i] / RMS(input)) * (weight[i] + 1)``
+#     ``out[i] = (input[i] / RMS(input)) * (weight[i] + 1)``
 
-    Parameters
-    ----------
-    input: torch.Tensor
-        Input tensor, shape (batch_size, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
-    eps: float
-        Epsilon for numerical stability.
-    out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
-    enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+#     Parameters
+#     ----------
+#     input: torch.Tensor
+#         Input tensor, shape (batch_size, hidden_size).
+#     weight: torch.Tensor
+#         Weight tensor, shape (hidden_size,).
+#     eps: float
+#         Epsilon for numerical stability.
+#     out: Optional[torch.Tensor]
+#         The output tensor, if specified, the kernel will update this tensor inplace.
+#     enable_pdl: Optional[bool]
+#         Whether to enable `programmatic dependent launch
+#         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+#         If None, will be automatically enabled on Hopper architecture.
 
-    Returns
-    -------
-    output: torch.Tensor
-        Gemma Normalized tensor, shape (batch_size, hidden_size).
-    """
-    if (
-        _has_flashinfer
-        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        and not torch.compiler.is_dynamo_compiling()
-    ):
-        return _flashinfer_norm.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
-    else:
-        return _gemma_rmsnorm_internal(input, weight, eps, out, enable_pdl)
+    # Returns
+    # -------
+    # output: torch.Tensor
+    #     Gemma Normalized tensor, shape (batch_size, hidden_size).
+    # """
+    # # See is_dynamo_compiling() comment in rmsnorm() above.
+    # if (
+    #     input.device.type == "musa"
+    #     or not _has_flashinfer
+    #     or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
+    #     or torch.compiler.is_dynamo_compiling()
+    # ):
+    #     return _gemma_rmsnorm_internal(input, weight, eps, out, enable_pdl)
+    # else:
+    #     return _flashinfer_norm.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
 
 
-def gemma_fused_add_rmsnorm(
-    input: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-6,
-    enable_pdl: Optional[bool] = None,
-) -> None:
-    r"""Gemma-style fused add root mean square normalization.
+# def gemma_fused_add_rmsnorm(
+#     input: torch.Tensor,
+#     residual: torch.Tensor,
+#     weight: torch.Tensor,
+#     eps: float = 1e-6,
+#     enable_pdl: Optional[bool] = None,
+# ) -> None:
+#     r"""Gemma-style fused add root mean square normalization.
 
-    Step 1:
-    ``residual[i] += input[i]``
+#     Step 1:
+#     ``residual[i] += input[i]``
 
-    Step 2:
-    ``input[i] = (residual[i] / RMS(residual)) * (weight + 1)``
+#     Step 2:
+#     ``input[i] = (residual[i] / RMS(residual)) * (weight + 1)``
 
-    Parameters
-    ----------
-    input: torch.Tensor
-        Input tensor, shape (batch_size, hidden_size).
-    residual: torch.Tensor
-        Residual tensor, shape (batch_size, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
-    eps: float
-        Epsilon for numerical stability.
-    enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
-    """
-    if (
-        _has_flashinfer
-        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        and not torch.compiler.is_dynamo_compiling()
-    ):
-        _flashinfer_norm.gemma_fused_add_rmsnorm(
-            input, residual, weight, eps, enable_pdl
-        )
-    else:
-        _gemma_fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
+    # Parameters
+    # ----------
+    # input: torch.Tensor
+    #     Input tensor, shape (batch_size, hidden_size).
+    # residual: torch.Tensor
+    #     Residual tensor, shape (batch_size, hidden_size).
+    # weight: torch.Tensor
+    #     Weight tensor, shape (hidden_size,).
+    # eps: float
+    #     Epsilon for numerical stability.
+    # enable_pdl: Optional[bool]
+    #     Whether to enable `programmatic dependent launch
+    #     <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+    #     If None, will be automatically enabled on Hopper architecture.
+    # """
+    # # See is_dynamo_compiling() comment in rmsnorm() above.
+    # if (
+    #     input.device.type == "musa"
+    #     or not _has_flashinfer
+    #     or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
+    #     or torch.compiler.is_dynamo_compiling()
+    # ):
+    #     _gemma_fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
+    # else:
+    #     _flashinfer_norm.gemma_fused_add_rmsnorm(
+    #         input, residual, weight, eps, enable_pdl
+    #     )
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:

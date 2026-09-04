@@ -21,6 +21,7 @@ limitations under the License.
 #include <torch/all.h>
 #include <torch/library.h>
 #include <torch/torch.h>
+#include <torch/extension.h>
 
 #include <optional>
 #include <tuple>
@@ -96,51 +97,51 @@ void register_graph_buffers(
  */
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
-void cutlass_mla_decode(
-    torch::Tensor const& out,
-    torch::Tensor const& q_nope,
-    torch::Tensor const& q_pe,
-    torch::Tensor const& kv_c_and_k_pe_cache,
-    torch::Tensor const& seq_lens,
-    torch::Tensor const& page_table,
-    torch::Tensor const& workspace,
-    double sm_scale,
-    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
-int64_t cutlass_mla_get_workspace_size(
-    int64_t max_seq_len,
-    int64_t num_batches,
-    int64_t sm_count = 0,
-    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
+// void cutlass_mla_decode(
+//     torch::Tensor const& out,
+//     torch::Tensor const& q_nope,
+//     torch::Tensor const& q_pe,
+//     torch::Tensor const& kv_c_and_k_pe_cache,
+//     torch::Tensor const& seq_lens,
+//     torch::Tensor const& page_table,
+//     torch::Tensor const& workspace,
+//     double sm_scale,
+//     int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
+// int64_t cutlass_mla_get_workspace_size(
+//     int64_t max_seq_len,
+//     int64_t num_batches,
+//     int64_t sm_count = 0,
+//     int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
 
-/*
- * From csrc/infllm_v2
- */
-void infllm_v2_max_pooling_1d_varlen(
-    at::Tensor input,
-    at::Tensor output,
-    at::Tensor cu_seqlens_q,
-    at::Tensor cu_seqlens_k,
-    at::Tensor cache_lens,
-    int64_t max_seqlen_q,
-    int64_t max_seqlen_k,
-    int64_t kernel_size,
-    int64_t stride,
-    int64_t padding,
-    int64_t block_size,
-    int64_t local_blocks,
-    int64_t init_blocks,
-    int64_t total_q);
+// /*
+//  * From csrc/infllm_v2
+//  */
+// void infllm_v2_max_pooling_1d_varlen(
+//     at::Tensor input,
+//     at::Tensor output,
+//     at::Tensor cu_seqlens_q,
+//     at::Tensor cu_seqlens_k,
+//     at::Tensor cache_lens,
+//     int64_t max_seqlen_q,
+//     int64_t max_seqlen_k,
+//     int64_t kernel_size,
+//     int64_t stride,
+//     int64_t padding,
+//     int64_t block_size,
+//     int64_t local_blocks,
+//     int64_t init_blocks,
+//     int64_t total_q);
 
 /*
  * From csrc/elementwise
  */
-void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
+// void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void sgl_fused_add_rmsnorm(
     torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl);
-void musa_fused_add_rms_norm(
-    torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double epsilon, bool enable_pdl);
-void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
-void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
+// void musa_fused_add_rms_norm(
+//     torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double epsilon, bool enable_pdl);
+// void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
+// void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
 void silu_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input);
@@ -221,52 +222,52 @@ void dsv4_fused_q_indexer_rope_hadamard_quant(
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
-torch::Tensor int8_scaled_mm(
-    const torch::Tensor& mat_a,
-    const torch::Tensor& mat_b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Dtype& out_dtype,
-    const c10::optional<torch::Tensor>& bias);
-torch::Tensor fp8_scaled_mm(
-    const torch::Tensor& mat_a,
-    const torch::Tensor& mat_b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Dtype& out_dtype,
-    const c10::optional<torch::Tensor>& bias);
-void sgl_per_token_group_quant_8bit(
-    at::Tensor input,
-    at::Tensor output_q,
-    at::Tensor output_s,
-    int64_t group_size,
-    double eps,
-    double fp8_min,
-    double fp8_max,
-    bool scale_ue8m0);
-void sgl_per_token_group_quant_8bit_v2(
-    at::Tensor input,
-    at::Tensor output_q,
-    at::Tensor output_s,
-    int64_t group_size,
-    double eps,
-    double min_8bit,
-    double max_8bit,
-    bool scale_ue8m0,
-    bool fuse_silu_and_mul,
-    const std::optional<torch::Tensor>& masked_m);
-void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
+// torch::Tensor int8_scaled_mm(
+//     const torch::Tensor& mat_a,
+//     const torch::Tensor& mat_b,
+//     const torch::Tensor& scales_a,
+//     const torch::Tensor& scales_b,
+//     const torch::Dtype& out_dtype,
+//     const c10::optional<torch::Tensor>& bias);
+// torch::Tensor fp8_scaled_mm(
+//     const torch::Tensor& mat_a,
+//     const torch::Tensor& mat_b,
+//     const torch::Tensor& scales_a,
+//     const torch::Tensor& scales_b,
+//     const torch::Dtype& out_dtype,
+//     const c10::optional<torch::Tensor>& bias);
+// void sgl_per_token_group_quant_8bit(
+//     at::Tensor input,
+//     at::Tensor output_q,
+//     at::Tensor output_s,
+//     int64_t group_size,
+//     double eps,
+//     double fp8_min,
+//     double fp8_max,
+//     bool scale_ue8m0);
+// void sgl_per_token_group_quant_8bit_v2(
+//     at::Tensor input,
+//     at::Tensor output_q,
+//     at::Tensor output_s,
+//     int64_t group_size,
+//     double eps,
+//     double min_8bit,
+//     double max_8bit,
+//     bool scale_ue8m0,
+//     bool fuse_silu_and_mul,
+//     const std::optional<torch::Tensor>& masked_m);
+// void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 
-torch::Tensor gptq_gemm(
-    torch::Tensor a,
-    torch::Tensor b_q_weight,
-    torch::Tensor b_gptq_qzeros,
-    torch::Tensor b_gptq_scales,
-    torch::Tensor b_g_idx,
-    bool use_shuffle,
-    int64_t bit);
+// torch::Tensor gptq_gemm(
+//     torch::Tensor a,
+//     torch::Tensor b_q_weight,
+//     torch::Tensor b_gptq_qzeros,
+//     torch::Tensor b_gptq_scales,
+//     torch::Tensor b_g_idx,
+//     bool use_shuffle,
+//     int64_t bit);
 
-void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
+// void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
 
 /*
  * From csrc/moe
@@ -301,25 +302,25 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
-void fp8_blockwise_scaled_grouped_mm(
-    torch::Tensor& output,
-    torch::Tensor& a_ptrs,
-    torch::Tensor& b_ptrs,
-    torch::Tensor& out_ptrs,
-    torch::Tensor& a_scales_ptrs,
-    torch::Tensor& b_scales_ptrs,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Tensor& stride_a,
-    const torch::Tensor& stride_b,
-    const torch::Tensor& stride_c,
-    const torch::Tensor& layout_sfa,
-    const torch::Tensor& layout_sfb,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets,
-    const torch::Tensor& workspace);
+// void fp8_blockwise_scaled_grouped_mm(
+//     torch::Tensor& output,
+//     torch::Tensor& a_ptrs,
+//     torch::Tensor& b_ptrs,
+//     torch::Tensor& out_ptrs,
+//     torch::Tensor& a_scales_ptrs,
+//     torch::Tensor& b_scales_ptrs,
+//     const torch::Tensor& a,
+//     const torch::Tensor& b,
+//     const torch::Tensor& scales_a,
+//     const torch::Tensor& scales_b,
+//     const torch::Tensor& stride_a,
+//     const torch::Tensor& stride_b,
+//     const torch::Tensor& stride_c,
+//     const torch::Tensor& layout_sfa,
+//     const torch::Tensor& layout_sfb,
+//     const torch::Tensor& problem_sizes,
+//     const torch::Tensor& expert_offsets,
+//     const torch::Tensor& workspace);
 
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
@@ -637,57 +638,57 @@ at::Tensor weak_ref_tensor(const at::Tensor& tensor);
 /*
  * From FlashInfer
  */
-void top_k_renorm_probs(
-    at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
+// void top_k_renorm_probs(
+//     at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
 
-void top_p_renorm_probs(
-    at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
+// void top_p_renorm_probs(
+//     at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
 
-namespace flash {
-/*
- * From fa2 sparse
- */
-std::vector<at::Tensor> mha_fwd_sparse(
-    at::Tensor& q,        // batch_size x seqlen_q x num_heads x head_size
-    const at::Tensor& k,  // batch_size x seqlen_k x num_heads_k x head_size
-    const at::Tensor& v,  // batch_size x seqlen_k x num_heads_k x head_size
-    const at::Tensor& block_count,
-    const at::Tensor& block_offset,
-    const at::Tensor& column_count,
-    const at::Tensor& column_index,
-    const std::optional<at::Tensor>& out_,           // batch_size x seqlen_q x num_heads x head_size
-    const std::optional<at::Tensor>& alibi_slopes_,  // num_heads or batch_size x num_heads
-    const double p_dropout,
-    const double softmax_scale,
-    bool is_causal,
-    const double softcap,
-    const bool return_softmax,
-    std::optional<at::Generator> gen_);
+// namespace flash {
+// /*
+//  * From fa2 sparse
+//  */
+// std::vector<at::Tensor> mha_fwd_sparse(
+//     at::Tensor& q,        // batch_size x seqlen_q x num_heads x head_size
+//     const at::Tensor& k,  // batch_size x seqlen_k x num_heads_k x head_size
+//     const at::Tensor& v,  // batch_size x seqlen_k x num_heads_k x head_size
+//     const at::Tensor& block_count,
+//     const at::Tensor& block_offset,
+//     const at::Tensor& column_count,
+//     const at::Tensor& column_index,
+//     const std::optional<at::Tensor>& out_,           // batch_size x seqlen_q x num_heads x head_size
+//     const std::optional<at::Tensor>& alibi_slopes_,  // num_heads or batch_size x num_heads
+//     const double p_dropout,
+//     const double softmax_scale,
+//     bool is_causal,
+//     const double softcap,
+//     const bool return_softmax,
+//     std::optional<at::Generator> gen_);
 
-std::vector<at::Tensor> mha_varlen_fwd_sparse(
-    at::Tensor& q,        // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
-    const at::Tensor& k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i.
-    const at::Tensor& v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i.
-    const at::Tensor& block_count,
-    const at::Tensor& block_offset,
-    const at::Tensor& column_count,
-    const at::Tensor& column_index,
-    const c10::optional<at::Tensor>& out_,  // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
-    const at::Tensor& cu_seqlens_q,         // b+1
-    const at::Tensor& cu_seqlens_k,         // b+1
-    const c10::optional<at::Tensor>&
-        seqused_k,  // b. If given, only this many elements of each batch element's keys are used.
-    const c10::optional<at::Tensor>& alibi_slopes_,  // num_heads or b x num_heads
-    int64_t max_seqlen_q,
-    const int64_t max_seqlen_k,
-    const double p_dropout,
-    const double softmax_scale,
-    const bool zero_tensors,
-    bool is_causal,
-    const double softcap,
-    const bool return_softmax,
-    c10::optional<at::Generator> gen_);
-}  // namespace flash
+// std::vector<at::Tensor> mha_varlen_fwd_sparse(
+//     at::Tensor& q,        // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+//     const at::Tensor& k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i.
+//     const at::Tensor& v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i.
+//     const at::Tensor& block_count,
+//     const at::Tensor& block_offset,
+//     const at::Tensor& column_count,
+//     const at::Tensor& column_index,
+//     const c10::optional<at::Tensor>& out_,  // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+//     const at::Tensor& cu_seqlens_q,         // b+1
+//     const at::Tensor& cu_seqlens_k,         // b+1
+//     const c10::optional<at::Tensor>&
+//         seqused_k,  // b. If given, only this many elements of each batch element's keys are used.
+//     const c10::optional<at::Tensor>& alibi_slopes_,  // num_heads or b x num_heads
+//     int64_t max_seqlen_q,
+//     const int64_t max_seqlen_k,
+//     const double p_dropout,
+//     const double softmax_scale,
+//     const bool zero_tensors,
+//     bool is_causal,
+//     const double softcap,
+//     const bool return_softmax,
+//     c10::optional<at::Generator> gen_);
+// }  // namespace flash
 
 void convert_vertical_slash_indexes(
     torch::Tensor& block_count,      // [BATCH, N_HEADS, NUM_ROWS]
@@ -755,6 +756,13 @@ int64_t ggml_moe_get_block_size(int64_t type);
  */
 std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device);
 
+void static_scaled_int8_quant(torch::Tensor& out, torch::Tensor const& input,
+                              torch::Tensor const& scale,
+                              std::optional<torch::Tensor> const& azp);
+
+void dynamic_scaled_int8_quant(torch::Tensor& out, torch::Tensor const& input,
+                               torch::Tensor& scales,
+                               std::optional<torch::Tensor> const& azp);
 /*
  * From csrc/mamba
  */
@@ -779,108 +787,124 @@ void causal_conv1d_fwd(
     bool silu_activation,
     int64_t pad_slot_id);
 
-/*
- * From csrc/expert_specialization
- */
-void es_fp8_blockwise_scaled_grouped_mm(
-    torch::Tensor& output,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Tensor& stride_a,
-    const torch::Tensor& stride_b,
-    const torch::Tensor& stride_d,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets,
-    const torch::Tensor& workspace);
+// /*
+//  * From csrc/expert_specialization
+//  */
+// void es_fp8_blockwise_scaled_grouped_mm(
+//     torch::Tensor& output,
+//     const torch::Tensor& a,
+//     const torch::Tensor& b,
+//     const torch::Tensor& scales_a,
+//     const torch::Tensor& scales_b,
+//     const torch::Tensor& stride_a,
+//     const torch::Tensor& stride_b,
+//     const torch::Tensor& stride_d,
+//     const torch::Tensor& problem_sizes,
+//     const torch::Tensor& expert_offsets,
+//     const torch::Tensor& workspace);
 
-void es_sm100_mxfp8_blockscaled_grouped_mm(
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& sfa,
-    const torch::Tensor& sfb,
-    torch::Tensor& d,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets,
-    const torch::Tensor& blockscale_offsets);
+// void es_sm100_mxfp8_blockscaled_grouped_mm(
+//     const torch::Tensor& a,
+//     const torch::Tensor& b,
+//     const torch::Tensor& sfa,
+//     const torch::Tensor& sfb,
+//     torch::Tensor& d,
+//     const torch::Tensor& problem_sizes,
+//     const torch::Tensor& expert_offsets,
+//     const torch::Tensor& blockscale_offsets);
 
-void es_sm100_mxfp8_blockscaled_grouped_quant(
-    const torch::Tensor& input,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets,
-    const torch::Tensor& blockscale_offsets,
-    torch::Tensor& quant_output,
-    torch::Tensor& scale_factor);
+// void es_sm100_mxfp8_blockscaled_grouped_quant(
+//     const torch::Tensor& input,
+//     const torch::Tensor& problem_sizes,
+//     const torch::Tensor& expert_offsets,
+//     const torch::Tensor& blockscale_offsets,
+//     torch::Tensor& quant_output,
+//     torch::Tensor& scale_factor);
 
 /*
  * From flashmla
  */
-std::vector<at::Tensor> get_mla_decoding_metadata(
-    at::Tensor& seqlens_k,
-    const int64_t num_q_tokens_per_head_k,
-    const int64_t h_k,
-    const std::optional<int64_t> h_q,
-    const bool is_fp8_kvcache,
-    const std::optional<int64_t> topk);
+// std::vector<at::Tensor> get_mla_decoding_metadata(
+//     at::Tensor& seqlens_k,
+//     const int64_t num_q_tokens_per_head_k,
+//     const int64_t h_k,
+//     const std::optional<int64_t> h_q,
+//     const bool is_fp8_kvcache,
+//     const std::optional<int64_t> topk);
 
-std::vector<at::Tensor> fwd_kvcache_mla(
-    at::Tensor& q,             // batch_size x seqlen_q x num_heads x head_size
-    const at::Tensor& kcache,  // num_blocks x page_block_size x num_heads_k x head_size (when is_fp8 is False) or
-                               // num_blocks x num_heads_k x (page_block_size*656) (when is_fp8 is True)
-    const int64_t head_size_v,
-    const at::Tensor& seqlens_k,    // batch_size
-    const at::Tensor& block_table,  // batch_size x max_num_blocks_per_seq
-    const double softmax_scale,
-    bool is_causal,
-    const at::Tensor& tile_scheduler_metadata,  // num_sm_parts x TileSchedulerMetaDataSize
-    const at::Tensor& num_splits,               // batch_size + 1
-    const bool& is_fp8,
-    const std::optional<at::Tensor>& indices,  // None, or batch_size x seqlen_q x topk
-    const std::optional<at::Tensor>& attn_sink,
-    const std::optional<at::Tensor>& extra_k_cache,
-    const std::optional<at::Tensor>& extra_indices_in_kvcache,
-    const std::optional<at::Tensor>& topk_length,
-    const std::optional<at::Tensor>& extra_topk_length);
+// std::vector<at::Tensor> fwd_kvcache_mla(
+//     at::Tensor& q,             // batch_size x seqlen_q x num_heads x head_size
+//     const at::Tensor& kcache,  // num_blocks x page_block_size x num_heads_k x head_size (when is_fp8 is False) or
+//                                // num_blocks x num_heads_k x (page_block_size*656) (when is_fp8 is True)
+//     const int64_t head_size_v,
+//     const at::Tensor& seqlens_k,    // batch_size
+//     const at::Tensor& block_table,  // batch_size x max_num_blocks_per_seq
+//     const double softmax_scale,
+//     bool is_causal,
+//     const at::Tensor& tile_scheduler_metadata,  // num_sm_parts x TileSchedulerMetaDataSize
+//     const at::Tensor& num_splits,               // batch_size + 1
+//     const bool& is_fp8,
+//     const std::optional<at::Tensor>& indices,  // None, or batch_size x seqlen_q x topk
+//     const std::optional<at::Tensor>& attn_sink,
+//     const std::optional<at::Tensor>& extra_k_cache,
+//     const std::optional<at::Tensor>& extra_indices_in_kvcache,
+//     const std::optional<at::Tensor>& topk_length,
+//     const std::optional<at::Tensor>& extra_topk_length);
 
-void FMHACutlassSM100FwdRun(
-    at::Tensor workspace_buffer,
-    at::Tensor q,
-    at::Tensor k,
-    at::Tensor v,
-    at::Tensor cumulative_seqlen_q,
-    at::Tensor cumulative_seqlen_kv,
-    at::Tensor o,
-    at::Tensor lse,
-    int64_t mask_mode_code,
-    double softmax_scale,
-    int64_t max_seqlen_q,
-    int64_t max_seqlen_kv,
-    bool is_varlen);
+// void FMHACutlassSM100FwdRun(
+//     at::Tensor workspace_buffer,
+//     at::Tensor q,
+//     at::Tensor k,
+//     at::Tensor v,
+//     at::Tensor cumulative_seqlen_q,
+//     at::Tensor cumulative_seqlen_kv,
+//     at::Tensor o,
+//     at::Tensor lse,
+//     int64_t mask_mode_code,
+//     double softmax_scale,
+//     int64_t max_seqlen_q,
+//     int64_t max_seqlen_kv,
+//     bool is_varlen);
 
-std::vector<at::Tensor> sparse_prefill_fwd(
-    const at::Tensor& q,
-    const at::Tensor& kv,
-    const at::Tensor& indices,
-    double sm_scale,
-    int64_t d_v,
-    const std::optional<at::Tensor>& attn_sink,
-    const std::optional<at::Tensor>& topk_length);
+// std::vector<at::Tensor> sparse_prefill_fwd(
+//     const at::Tensor& q,
+//     const at::Tensor& kv,
+//     const at::Tensor& indices,
+//     double sm_scale,
+//     int64_t d_v,
+//     const std::optional<at::Tensor>& attn_sink,
+//     const std::optional<at::Tensor>& topk_length);
 
-std::vector<at::Tensor> fwd_kvcache_mla_fp8(
-    at::Tensor& q,             // batch_size x seqlen_q x num_heads x head_size
-    const at::Tensor& kcache,  // num_blocks x page_block_size x num_heads_k x head_size (when is_fp8 is False) or
-                               // num_blocks x num_heads_k x (page_block_size*656) (when is_fp8 is True)
-    const int64_t head_size_v,
-    const at::Tensor& seqlens_k,    // batch_size
-    const at::Tensor& block_table,  // batch_size x max_num_blocks_per_seq
-    const double softmax_scale,
-    bool is_causal,
-    const at::Tensor& tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
-    const at::Tensor& num_splits,                // batch_size + 1
-    const std::optional<at::Tensor>& descale_q,  // None or batch_size
-    const std::optional<at::Tensor>& descale_k   // None or batch_size
-);
+// std::vector<at::Tensor> fwd_kvcache_mla_fp8(
+//     at::Tensor& q,             // batch_size x seqlen_q x num_heads x head_size
+//     const at::Tensor& kcache,  // num_blocks x page_block_size x num_heads_k x head_size (when is_fp8 is False) or
+//                                // num_blocks x num_heads_k x (page_block_size*656) (when is_fp8 is True)
+//     const int64_t head_size_v,
+//     const at::Tensor& seqlens_k,    // batch_size
+//     const at::Tensor& block_table,  // batch_size x max_num_blocks_per_seq
+//     const double softmax_scale,
+//     bool is_causal,
+//     const at::Tensor& tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
+//     const at::Tensor& num_splits,                // batch_size + 1
+//     const std::optional<at::Tensor>& descale_q,  // None or batch_size
+//     const std::optional<at::Tensor>& descale_k   // None or batch_size
+// );
 
-std::vector<at::Tensor> get_mla_decoding_metadata_dense_fp8(
-    at::Tensor& seqlens_k, const int64_t num_heads_per_head_k, const int64_t num_heads_k);
+// std::vector<at::Tensor> get_mla_decoding_metadata_dense_fp8(
+//     at::Tensor& seqlens_k, const int64_t num_heads_per_head_k, const int64_t num_heads_k);
+
+/*
+* From csrc/cutlass_w8a8
+*/
+void cutlass_scaled_mm(torch::Tensor& out, torch::Tensor const& a,
+                       torch::Tensor const& b, torch::Tensor const& a_scales,
+                       torch::Tensor const& b_scales,
+                       std::optional<torch::Tensor> const& bias);
+
+void cutlass_scaled_mm_azp(torch::Tensor& out, torch::Tensor const& a,
+                           torch::Tensor const& b,
+                           torch::Tensor const& a_scales,
+                           torch::Tensor const& b_scales,
+                           torch::Tensor const& azp_adj,
+                           std::optional<torch::Tensor> const& azp,
+                           std::optional<torch::Tensor> const& bias);
