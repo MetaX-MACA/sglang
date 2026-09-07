@@ -53,7 +53,7 @@ def _infer_target_layer_ids(model_runner: Any, hf_config: Any) -> List[int]:
         return [int(x.strip()) for x in env_layer_ids.split(",") if x.strip()]
 
     try:
-        from sglang.srt.speculative.dspark_components.dspark_config import (
+        from sglang.srt.speculative.dspark_components.dspark_utils import (
             parse_dspark_draft_config,
         )
 
