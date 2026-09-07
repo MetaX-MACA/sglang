@@ -51,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.moe import should_use_dp_reduce_scatterv
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_maca
 
 
 def tp_all_gather_hidden_states(hidden_states, forward_batch):
@@ -85,7 +86,10 @@ class MHCState:
 
     def attn_split(self, hidden_states, out_norm: Optional[torch.nn.Module] = None):
         residual = hidden_states
-        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
+        if not is_maca():
+            out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
+        else:
+            out_norm_weight, out_norm_eps = None, None
         hidden_states, self.h_res, self.h_post, norm_fused = self.hc_attn_pre(
             hidden_states, out_norm_weight, out_norm_eps
         )
@@ -96,7 +100,10 @@ class MHCState:
     def attn_to_mlp(
         self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
     ):
-        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
+        if not is_maca():
+            out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
+        else:
+            out_norm_weight, out_norm_eps = None, None
         if self.hc_attn_to_mlp is not None:
             fused = self.hc_attn_to_mlp(
                 hidden_states,

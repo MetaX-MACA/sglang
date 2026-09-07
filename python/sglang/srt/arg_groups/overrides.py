@@ -1807,6 +1807,28 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     return {}
 
 
+@register_post_process
+def _dsa_index_cache_dtype_default(view: Any) -> dict:
+    """Set dsa index cache by default according to model quantization method."""
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    hf_config = view.get_model_config().hf_config
+    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
+        return {}
+    if not is_deepseek_dsa(hf_config):
+        return {}
+
+    if envs.SGLANG_DSA_INDEX_CACHE_TYPE.is_set():
+        return {}
+    
+    if "w8a8_int8" == view.quantization:
+        envs.SGLANG_DSA_INDEX_CACHE_TYPE.set("int8")
+    else:
+        envs.SGLANG_DSA_INDEX_CACHE_TYPE.set("fp8")
+
+    return {}
+
+
 def _check_tilelang_dsa_fp8_kv(
     kv_cache_dtype: str,
     prefill_backend: Optional[str],

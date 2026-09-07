@@ -269,10 +269,18 @@ def sparse_attention_fwd_kernel_v1(
     sm_scale=None,
     is_causal=True,
     block_I=64,
-    num_stages=1,
+    num_stages=2,
     threads=256,
     return_lse=False,
 ):
+    # for low smem platform
+    default_smem = torch.cuda.get_device_properties(torch.cuda.current_device()).shared_memory_per_block
+    if (default_smem // 1024) < 160:
+        num_stages //= 2
+    if (default_smem // 1024) < 96:
+        block_I //= 2
+        threads //= 2
+
     assert (
         dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0
     ), f"dim={dim} must be a power of 2 or a multiple of 64"

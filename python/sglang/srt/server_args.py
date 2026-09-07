@@ -4633,10 +4633,12 @@ class ServerArgs:
         # _dsa_kv_cache_dtype_default), invoked here at its legacy slot.
         from sglang.srt.arg_groups.overrides import (
             _dsa_kv_cache_dtype_default,
+            _dsa_index_cache_dtype_default,
             run_post_process_pass,
         )
 
         run_post_process_pass(self, _dsa_kv_cache_dtype_default)
+        run_post_process_pass(self, _dsa_index_cache_dtype_default)
 
     def _set_default_dsa_backends(self, major: int) -> None:
         # Moved to the resolution pipeline (arg_groups/overrides.py:

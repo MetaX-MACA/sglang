@@ -1190,7 +1190,6 @@ class Glm5NextModel(nn.Module):
         aux_hidden_states = []
         topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
-            # print(f"---------layer {i}-----")
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
                 nullcontext()
@@ -1872,9 +1871,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         missing = set(params_dict.keys()) - loaded_params
         if missing:
             logging.warning(
-                f"DSpark V4 confidence head is enabled but the checkpoint is missing "
-                f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
-                f"or disable the confidence head (enable_confidence_head=False)."
+                f"glm5 weight is missing "
+                f"{sorted(missing)}. "
             )        
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
