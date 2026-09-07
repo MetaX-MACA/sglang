@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
+    DecodeRequest,
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
@@ -78,7 +79,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             bootstrap_room=7,
             return_logprob=False,
         )
-        decode_req = SimpleNamespace(
+        decode_req = DecodeRequest(
             req=req,
             kv_receiver=receiver,
             metadata_buffer_index=3,
@@ -93,6 +94,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.tp_rank = 0
         queue.tree_cache = MagicMock()
         queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
+        queue.kv_manager = MagicMock()
+        queue.kv_manager.pop_pd_hidden_acked_chunks.return_value = []
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
         queue._clean_hicache_prefetch_resources = MagicMock()
