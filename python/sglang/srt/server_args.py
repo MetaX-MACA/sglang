@@ -3584,6 +3584,7 @@ class ServerArgs:
         return capture_sizes
 
     def _set_default_dsa_kv_cache_dtype(self, major: int, quantization: str) -> str:
+        enable_dsa_fp8_kv_store = envs.MX_ENABLE_NSA_FP8_KV_STORE.get()
         user_set_prefill = self.dsa_prefill_backend is not None
         user_set_decode = self.dsa_decode_backend is not None
 
@@ -3596,7 +3597,18 @@ class ServerArgs:
                 "DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
             )
 
-        if self.kv_cache_dtype == "auto":
+        if enable_dsa_fp8_kv_store:
+            if self.kv_cache_dtype not in ("auto", "fp8_e4m3"):
+                logger.warning(
+                    "MX_ENABLE_NSA_FP8_KV_STORE overrides --kv-cache-dtype to fp8_e4m3."
+                )
+            self.kv_cache_dtype = "fp8_e4m3"
+            logger.warning(
+                "MX_ENABLE_NSA_FP8_KV_STORE=1 forces FP8 KV cache storage; "
+                "backend selection is unchanged; FlashMLA KV uses native FP8 when "
+                "supported and dequantizes selected KV otherwise."
+            )
+        elif self.kv_cache_dtype == "auto":
             if major >= 10:
                 self.kv_cache_dtype = "fp8_e4m3"
             else:

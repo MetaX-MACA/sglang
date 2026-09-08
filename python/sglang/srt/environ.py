@@ -679,6 +679,9 @@ class Envs:
     SGLANG_DSA_DISABLE_FUSED_KERNEL = EnvBool(False)
     
     # Metax
+    MX_ENABLE_NSA_FP8_KV_STORE = EnvBool(False)
+    MX_ENABLE_NSA_FP8_KV_OPTIMIZED_QDQ = EnvBool(False)
+    MX_ENABLE_NSA_FP8_KV_UNIQUE_SLOTS = EnvBool(False)
     MX_ENABLE_FUSE_SILUMUL_QUANT = EnvBool(False)
     MX_ENABLE_FUSE_RMSNORM_QUANT = EnvBool(False)
     MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL = EnvBool(False)
