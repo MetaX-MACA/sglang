@@ -689,7 +689,7 @@ class Envs:
     MX_ENABLE_FUSE_ACT_FP8_QUANT = EnvBool(False)
     MX_INT8_MQA_LOGITS_BACKEND = EnvStr("triton")
     MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE = EnvInt(256)
-    MX_MOE_FUSED_GATE_BACKEND = EnvStr("cuda")
+    MX_MOE_FUSED_GATE_BACKEND = EnvStr("triton")
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
