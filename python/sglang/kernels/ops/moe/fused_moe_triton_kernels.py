@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 from collections import OrderedDict
+import os
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -30,6 +31,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
 )
 
+from sgl_kernel import cutlass_moe_mm_w8a8
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -51,7 +53,8 @@ elif _is_hip:
     pass
 
 padding_size = get_moe_padding_size(_use_aiter)
-
+enable_mctlass_fused_moe = (os.getenv("ENABLE_MCTLASS_FUSED_MOE", "0") == "1")
+enable_mctlass_fused_moe_python_api = (os.getenv("ENABLE_MCTLASS_FUSED_MOE_PYTHON_API", "0") == "1")
 
 def support_tensor_descriptor():
     return _support_tensor_descriptor
@@ -980,7 +983,27 @@ def invoke_fused_moe_kernel(
             filter_expert=filter_expert,
             **config,
         )
-
+    elif use_int8_w8a8  and enable_mctlass_fused_moe:
+        if enable_mctlass_fused_moe_python_api:
+            import mctlassEx
+            # stream_ptr = torch.cuda.current_stream().cuda_stream
+            # mctlass_op = mctlassEx.mctlassExHandleWrapper()
+            from mctlassEx import FusedMoeGEMM
+            gemm = FusedMoeGEMM()
+            C1 = C.view(-1, C.size(-1)).contiguous()
+            gemm(A.shape[0], B.shape[1], A.shape[1], B.shape[0], sorted_token_ids.shape[0], top_k, A, B, C1, A_scale, B_scale, None, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, mul_routed_weight, filter_expert = filter_expert)
+            # kernel_m = mctlass_op.mctlass_fuse_moe_get_kernel_m(A, B, C1, top_k)
+            # mctlass_op.mctlass_fuse_moe_gemm(A, B, C1, A_scale, B_scale, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, sorted_token_ids.shape[0], top_k, mul_routed_weight, stream_ptr)
+        else:
+            cutlass_moe_mm_w8a8(A, B, C,
+                                A_scale, B_scale, topk_weights, sorted_token_ids, expert_ids,
+                                num_tokens_post_padded,
+                                B.shape[1], # N
+                                A.shape[1], # K
+                                sorted_token_ids.shape[0],
+                                topk_ids.numel(), # num_valid_tokens
+                                top_k,
+                                mul_routed_weight)
     else:
         if a_use_tma or b_use_tma:
             _set_triton_tma_allocator()

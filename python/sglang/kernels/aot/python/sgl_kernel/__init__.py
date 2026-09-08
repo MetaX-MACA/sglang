@@ -95,6 +95,9 @@ else:
         prepare_moe_input,
         topk_sigmoid,
         topk_softmax,
+        cutlass_moe_mm_gemm_kernel_m_w8a8,
+        cutlass_moe_mm_w8a8,
+        fused_moe_gate_opt,   
     )
     from sgl_kernel.quantization import (
         ggml_dequantize,

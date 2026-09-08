@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -43,6 +44,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .moe_align_block_size import moe_align_block_size
+from sgl_kernel import cutlass_moe_mm_gemm_kernel_m_w8a8
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -120,6 +122,11 @@ def _validate_fused_swiglu_interleaved(
             "fuse_swiglu_interleaved set on an incompatible fused_moe call"
         )
 
+
+enable_mctlass_fused_moe = os.getenv("ENABLE_MCTLASS_FUSED_MOE", "0") == "1"
+enable_mctlass_fused_moe_python_api = (
+    os.getenv("ENABLE_MCTLASS_FUSED_MOE_PYTHON_API", "0") == "1"
+)
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
     return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
@@ -464,18 +471,12 @@ def _prepare_fused_moe_run(
             "Down MoE TMA is enabled (USE_TMA=true in the down-projection config)."
         )
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, config["BLOCK_SIZE_M"], E
-    )
 
     return (
         config,
         down_config,
         down_moe_use_tma,
         up_moe_use_tma,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
     )
 
 
@@ -485,9 +486,6 @@ def _fused_moe_kernel_sequence(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
     config: Dict[str, Any],
     down_config: Optional[Dict[str, Any]],
     down_moe_use_tma: bool,
@@ -618,6 +616,40 @@ def _fused_moe_kernel_sequence(
             dtype=hidden_states.dtype,
         )
 
+    down_config = down_config or config
+
+    stage1_config = config["stage1"] if "stage1" in config else config
+    stage2_config = down_config["stage2"] if "stage2" in down_config else down_config
+    #  and envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE
+    if use_int8_w8a8 and enable_mctlass_fused_moe:
+        # call mctlass gemm_kernel_mnk to calculate kernel_m
+        if enable_mctlass_fused_moe_python_api:
+            from mctlassEx import FusedMoeGEMM
+
+            gemm = FusedMoeGEMM()
+            kernel_m = gemm.get_kernel_m(
+                hidden_states.view(torch.int8),
+                w1,
+                intermediate_cache1,
+                w1.shape[0],
+                hidden_states.shape[0],
+                w1.shape[1],
+                hidden_states.shape[1],
+                topk_ids.shape[1],
+            )
+        else:
+            kernel_m = cutlass_moe_mm_gemm_kernel_m_w8a8(
+                topk_ids.numel(), N, hidden_states.shape[1], E
+            )
+        assert kernel_m > 0, "cutlass_moe_w8a8 BLOCK_SIZE_M must greater than zero."
+        # override kernel_m to config["BLOCK_SIZE_M"]
+        stage1_config["BLOCK_SIZE_M"] = kernel_m
+        stage2_config["BLOCK_SIZE_M"] = kernel_m
+
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, stage1_config["BLOCK_SIZE_M"], E
+    )
+
     invoke_fused_moe_kernel(
         a1_q if a1_q is not None else hidden_states,
         w1,
@@ -633,7 +665,7 @@ def _fused_moe_kernel_sequence(
         num_tokens_post_padded,
         apply_router_weight_on_input,
         topk,
-        config,
+        stage1_config,
         compute_type=compute_type,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
@@ -844,7 +876,7 @@ def _fused_moe_kernel_sequence(
         num_tokens_post_padded,
         not apply_router_weight_on_input and not no_combine,
         1,
-        down_config or config,
+        stage2_config,
         compute_type=compute_type,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
@@ -1011,9 +1043,6 @@ def fused_experts_impl(
         down_config,
         down_moe_use_tma,
         up_moe_use_tma,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
     ) = _prepare_fused_moe_run(
         hidden_states,
         w1,
@@ -1033,9 +1062,6 @@ def fused_experts_impl(
         w2,
         topk_weights,
         topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
         config,
         down_config,
         down_moe_use_tma,

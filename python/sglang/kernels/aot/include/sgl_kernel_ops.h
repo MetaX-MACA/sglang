@@ -302,6 +302,18 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
+int64_t fused_moe_gate_opt(
+    at::Tensor& gating_outputs, 
+    at::Tensor& correction_bias, 
+    at::Tensor& out_routing_weights, 
+    at::Tensor& out_selected_experts, 
+    int64_t topk, 
+    bool renormalize, 
+    int64_t num_expert_groupm, 
+    int64_t topk_group, 
+    std::optional<int64_t> num_fused_shared_experts, 
+    std::optional<double> routed_scaling_factor);
+
 // void fp8_blockwise_scaled_grouped_mm(
 //     torch::Tensor& output,
 //     torch::Tensor& a_ptrs,
@@ -787,6 +799,27 @@ void causal_conv1d_fwd(
     bool silu_activation,
     int64_t pad_slot_id);
 
+int64_t cutlass_moe_mm_gemm_kernel_m_w8a8(int64_t num_valid_tokens,
+                                          int64_t N, 
+                                          int64_t K, 
+                                          int64_t group);
+                                          
+void cutlass_moe_mm_w8a8(at::Tensor const& a, 
+                         at::Tensor const& b, 
+                         at::Tensor& c,
+                         at::Tensor const& a_scales, 
+                         at::Tensor const& b_scales, 
+                         at::Tensor const& moe_weight,
+                         at::Tensor const& token_ids, 
+                         at::Tensor const& expert_ids,
+                         at::Tensor const& num_tokens_post_padded,
+                         int64_t N, 
+                         int64_t K, 
+                         int64_t EM, 
+                         int64_t num_valid_tokens, 
+                         int64_t topk, 
+                         bool mul_routed_weight);
+                             
 // /*
 //  * From csrc/expert_specialization
 //  */
