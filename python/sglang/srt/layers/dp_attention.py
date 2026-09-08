@@ -166,6 +166,9 @@ class _DpGatheredBufferWrapper:
     _dp_max_padding: bool = False
     _global_num_tokens: Optional[List[int]] = None
     _global_num_tokens_gpu: Optional[torch.Tensor] = None
+    _global_dp_buffer: Optional[torch.Tensor] = None
+    _local_dp_buffer: Optional[torch.Tensor] = None
+    
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -174,6 +177,8 @@ class _DpGatheredBufferWrapper:
         dp.buffer_hidden_size = hidden_size
         dp.buffer_dtype = dtype
         dp.buffer_device = device
+        cls._global_dp_buffer = None
+        cls._local_dp_buffer = None
 
     @classmethod
     def set_dp_buffer_len(
@@ -189,30 +194,41 @@ class _DpGatheredBufferWrapper:
         cls._dp_max_padding = dp_max_padding
         cls._global_num_tokens = global_num_tokens
         cls._global_num_tokens_gpu = global_num_tokens_gpu
+        # The cached buffers are shape-keyed: a stale buffer from a previous
+        # forward (or CUDA-graph bucket) with a different token count would
+        # mismatch the residual in the next fused add-rmsnorm.
+        if cls._global_dp_buffer is not None:
+            del cls._global_dp_buffer
+            cls._global_dp_buffer = None
+        if cls._local_dp_buffer is not None:
+            del cls._local_dp_buffer
+            cls._local_dp_buffer = None
 
     @classmethod
     def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
 
         dp = get_flags().dp
-        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
-            buffer = torch.empty(
-                (cls._global_dp_buffer_len, dp.buffer_hidden_size),
-                dtype=dp.buffer_dtype,
-                device=dp.buffer_device,
-            )
-        return buffer
+        if cls._global_dp_buffer is None:
+            with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
+                cls._global_dp_buffer = torch.empty(
+                    (cls._global_dp_buffer_len, dp.buffer_hidden_size),
+                    dtype=dp.buffer_dtype,
+                    device=dp.buffer_device,
+                )
+        return cls._global_dp_buffer
 
     @classmethod
     def get_local_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
 
         dp = get_flags().dp
-        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
-            buffer = torch.empty(
-                (cls._local_dp_buffer_len, dp.buffer_hidden_size),
-                dtype=dp.buffer_dtype,
-                device=dp.buffer_device,
-            )
-        return buffer
+        if cls._local_dp_buffer is None:
+            with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
+                cls._local_dp_buffer = torch.empty(
+                    (cls._local_dp_buffer_len, dp.buffer_hidden_size),
+                    dtype=dp.buffer_dtype,
+                    device=dp.buffer_device,
+                )
+        return cls._local_dp_buffer
 
     @classmethod
     def get_global_dp_buffer_len(cls) -> int:
