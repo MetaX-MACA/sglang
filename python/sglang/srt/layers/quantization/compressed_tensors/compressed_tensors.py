@@ -56,6 +56,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     # NPUCompressedTensorsW4A16Int4DynamicMoE,
     # NPUCompressedTensorsW8A8Int8,
     # NPUCompressedTensorsW8A8Int8DynamicMoE,
+    CompressedTensorsW8A8Int8DynamicMoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
@@ -883,6 +884,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         elif self._is_fp8_w8a8(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
             return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
+        elif self._is_dynamic_token_int8_w8a8(weight_quant, input_quant):
+            logger.info_once("Using CompressedTensorsW8A8Int8DynamicMoE")
+            return CompressedTensorsW8A8Int8DynamicMoE(weight_quant, input_quant)
         elif self._is_dynamic_token_w8a8(weight_quant, input_quant):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW8A8Int8DynamicMoE")
