@@ -1136,7 +1136,7 @@ class Envs:
     # the tuned production path); the Triton path is bit-exact on DeepSeek-V3.2 e2e
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
-    SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends

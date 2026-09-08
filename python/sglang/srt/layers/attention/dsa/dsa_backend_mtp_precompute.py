@@ -17,6 +17,7 @@ from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.speculative.spec_info import SpecInput
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -49,9 +50,6 @@ class PrecomputedMetadata:
     # Dimensions
     max_len: int  # for decode/draft_extend
     max_seqlen_k: int  # for target_verify
-
-    # FlashMLA (optional)
-    flashmla_metadata: Optional[torch.Tensor] = None
 
 
 def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
@@ -163,12 +161,12 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             seqlens_expanded = cache_seqlens
             seqlens_expanded_size = bs
 
-            flashmla_metadata = None
-            if self.dsa_decode_impl == "flashmla_kv":
-                flashmla_metadata = self._compute_flashmla_metadata(
-                    cache_seqlens=dsa_cache_seqlens,
-                    seq_len_q=1,
-                )
+            # flashmla_metadata = None
+            # if self.dsa_decode_impl == "flashmla_kv":
+            #     flashmla_metadata = self._compute_flashmla_metadata(
+            #         cache_seqlens=dsa_cache_seqlens,
+            #         seq_len_q=1,
+            #     )
 
             return PrecomputedMetadata(
                 cache_seqlens=cache_seqlens,
@@ -181,7 +179,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 seqlens_expanded_size=seqlens_expanded_size,
                 max_len=max_len,
                 max_seqlen_k=max_len,
-                flashmla_metadata=flashmla_metadata,
+                # flashmla_metadata=flashmla_metadata,
             )
 
         # Convert to int32 and compute cumsum
@@ -207,13 +205,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         else:
             real_page_table = None  # Will use page_indices directly
 
-        # Compute FlashMLA metadata if needed
-        flashmla_metadata = None
-        if self.dsa_decode_impl == "flashmla_kv":
-            flashmla_metadata = self._compute_flashmla_metadata(
-                cache_seqlens=dsa_cache_seqlens,
-                seq_len_q=1,
-            )
 
         return PrecomputedMetadata(
             cache_seqlens=cache_seqlens,
@@ -226,7 +217,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             seqlens_expanded_size=seqlens_expanded_size,
             max_len=max_len,
             max_seqlen_k=max_len,
-            flashmla_metadata=flashmla_metadata,
         )
 
     def _precompute_target_verify_mode(
@@ -295,13 +285,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 next_n=self.speculative_num_draft_tokens,
             )
 
-            flashmla_metadata = None
-            if self.dsa_decode_impl == "flashmla_kv":
-                flashmla_metadata = self._compute_flashmla_metadata(
-                    cache_seqlens=dsa_cache_seqlens,
-                    seq_len_q=1,
-                )
-
             return PrecomputedMetadata(
                 cache_seqlens=cache_seqlens,
                 cu_seqlens_k=cu_seqlens_k,
@@ -313,7 +296,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 seqlens_expanded_size=seqlens_expanded_size,
                 max_len=-1,
                 max_seqlen_k=max_seqlen_k,
-                flashmla_metadata=flashmla_metadata,
             )
 
         # Cache seqlens with draft tokens
@@ -354,13 +336,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         else:
             real_page_table = None
 
-        # FlashMLA metadata
-        flashmla_metadata = None
-        if self.dsa_decode_impl == "flashmla_kv":
-            flashmla_metadata = self._compute_flashmla_metadata(
-                cache_seqlens=dsa_cache_seqlens,
-                seq_len_q=1,
-            )
 
         return PrecomputedMetadata(
             cache_seqlens=cache_seqlens,
@@ -373,7 +348,76 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             seqlens_expanded_size=seqlens_expanded_size,
             max_len=-1,  # Not used in this mode
             max_seqlen_k=max_seqlen_k,
-            flashmla_metadata=flashmla_metadata,
+        )
+
+    def _precompute_draft_extend_mode(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        spec_info: "SpecInput",
+    ) -> PrecomputedMetadata:
+        """Precompute metadata for draft extend mode."""
+        max_seqlen_k = int(seq_lens_cpu.max().item())
+
+        # Cache seqlens
+        cache_seqlens = seq_lens.to(torch.int32)
+        cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
+
+        # Extend seqlens from spec_info: num_accept_tokens already includes
+        # the bonus token (drafts + 1).
+        extend_seq_lens = spec_info.num_accept_tokens[:bs]
+        extend_seq_lens_cpu = extend_seq_lens.tolist()
+
+        # Page indices (repeated per accept length)
+        page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
+        page_indices = torch.repeat_interleave(
+            page_indices, repeats=extend_seq_lens, dim=0
+        ).contiguous()
+
+        # Generate expanded seqlens
+        seqlens_expanded = torch.cat(
+            [
+                torch.arange(
+                    kv_len - qo_len + 1,
+                    kv_len + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                for qo_len, kv_len in zip(
+                    extend_seq_lens_cpu,
+                    seq_lens_cpu.tolist(),
+                    strict=True,
+                )
+            ]
+        )
+
+        # Compute DSA seqlens
+        dsa_cache_seqlens = compute_dsa_seqlens(seqlens_expanded, self.dsa_index_topk)
+        seqlens_expanded_size = seqlens_expanded.shape[0]
+
+        # DSA cumsum
+        dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
+
+        # Transform page table
+        if self.real_page_size > 1:
+            real_page_table = self._transform_table_1_to_real(page_indices)
+        else:
+            real_page_table = None
+
+
+        return PrecomputedMetadata(
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
+            page_indices=page_indices,
+            real_page_table=real_page_table,
+            seqlens_expanded=seqlens_expanded,
+            dsa_cache_seqlens=dsa_cache_seqlens,
+            dsa_cu_seqlens_k=dsa_cu_seqlens_k,
+            seqlens_expanded_size=seqlens_expanded_size,
+            max_len=max_seqlen_k,
+            max_seqlen_k=max_seqlen_k,
         )
 
 

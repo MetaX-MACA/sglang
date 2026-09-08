@@ -8,7 +8,8 @@ import triton
 from sglang.srt.environ import envs
 from sglang.srt.utils import ceil_div, is_cuda, is_musa
 
-from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
+
 logger = logging.getLogger(__name__)
 
 

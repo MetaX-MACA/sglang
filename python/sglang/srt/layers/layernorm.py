@@ -61,17 +61,17 @@ _flashinfer_rmsnorm_quant_available = False
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
         try:
-            import flashinfer.norm
+            from flashinfer.norm import layernorm
 
-            from sglang.srt.utils.custom_op import register_custom_op
+            # from sglang.srt.utils.custom_op import register_custom_op
 
-            def _layernorm_fake_impl(
-                input: torch.Tensor,
-                gamma: torch.Tensor,
-                beta: torch.Tensor,
-                eps: float = 1e-6,
-            ) -> torch.Tensor:
-                return torch.empty_like(input)
+            # def _layernorm_fake_impl(
+            #     input: torch.Tensor,
+            #     gamma: torch.Tensor,
+            #     beta: torch.Tensor,
+            #     eps: float = 1e-6,
+            # ) -> torch.Tensor:
+            #     return torch.empty_like(input)
 
             # @register_custom_op(fake_impl=_layernorm_fake_impl)
             # def layernorm(
@@ -81,7 +81,7 @@ if _is_cuda or _is_xpu or _is_musa:
             #     eps: float = 1e-6,
             # ) -> torch.Tensor:
             #     return flashinfer.norm.layernorm(input, gamma, beta, eps)
-            _flashinfer_layernorm_available = True
+            _flashinfer_layernorm_available = False
         except (ImportError, AttributeError):
             _flashinfer_layernorm_available = False
 

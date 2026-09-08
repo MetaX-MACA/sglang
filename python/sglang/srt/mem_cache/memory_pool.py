@@ -42,6 +42,7 @@ from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
@@ -4395,7 +4396,8 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
-    index_k_with_scale_buffer_dtype = torch.uint8
+    int8_cache = True if os.getenv("MX_ENABLE_NSA_INT8") else False
+    index_k_with_scale_buffer_dtype = torch.uint8 if os.getenv("MX_ENABLE_NSA_INT8") else torch.bfloat16
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
     def __init__(
@@ -4513,12 +4515,41 @@ class DSATokenToKVPool(MLATokenToKVPool):
             layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
         )
 
+    def get_index_batched_k_buffer(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ):
+        """
+        Fused method to get multi batch index K in a single call using Triton.
+        More efficient than calling get_index_k_continuous separately.
+
+        :param layer_id: Layer index
+        :param seq_len_tensor: multi-bacth Sequence length
+        :param page_indices: Page indices tensor
+        :param seq_len_sum: sum of multi-batch seq len
+        :param max_seq_len: max len of multi-batch seq
+        :return: k_fp8: (seq_len, index_head_dim), dtype is same to buf
+        """
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return index_buf_accessor.GetBatchedK.execute(
+            self,
+            buf,
+            page_indices=page_indices,
+            seq_len_tensor=seq_len_tensor,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
+        )
+
     def set_index_k_scale_buffer(
         self,
         layer_id: int,
         loc: torch.Tensor,
         index_k: torch.Tensor,
-        index_k_scale: torch.Tensor,
+        index_k_scale: Optional[torch.Tensor] = None,
     ) -> None:
         self.index_key_cache.store_quantized(layer_id, loc, index_k, index_k_scale)
 

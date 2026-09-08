@@ -864,6 +864,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         ret.init_mlp_sync_metadata(batch, device)
 
+        #check nsa ds-v3.2
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+        ret.is_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
+
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             if model_runner.lora_manager is not None:
@@ -1381,11 +1385,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         bs = self.batch_size
 
+        is_idle = False
+        if self.forward_mode.is_idle() and not self.is_dsa:
+            is_idle = True
+
         if (
             self.forward_mode.is_decode()
             or self.forward_mode.is_target_verify()
             or self.forward_mode.is_draft_extend_v2()
-            or self.forward_mode.is_idle()
+            or is_idle
+            # or self.forward_mode.is_idle()
         ):
             # Mamba-hybrid families need the fabricated-row idle conversion
             # below; this includes their MTP draft workers, whose mamba-less

@@ -14,33 +14,57 @@ namespace sglang {
 // Adapted from DeepEP: https://github.com/deepseek-ai/DeepEP/blob/main/csrc/kernels/utils.cuh
 
 SGL_DEVICE int get_lane_id() {
+#if defined(__MACA_ARCH__) || defined(__MACACC__) || defined(__MACA__) || defined(__MXCC__)
+  // MACA does not accept PTX special-register syntax (for example,
+  // ``%laneid``) in inline assembly.  The kernels below use 32-thread
+  // warps explicitly, so the lane can be derived portably from threadIdx.
+  return threadIdx.x & 31;
+#else
   int lane_id;
   asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
   return lane_id;
+#endif
 }
 
-SGL_DEVICE void st_na_global_v1(const int* ptr, int v) {
+SGL_DEVICE void st_na_global_v1(int* ptr, int v) {
+#if defined(__MACA_ARCH__) || defined(__MACACC__) || defined(__MACA__) || defined(__MXCC__)
+  *ptr = v;
+#else
   asm volatile("st.global.L1::no_allocate.s32 [%0], %1;" ::"l"(ptr), "r"(v) : "memory");
+#endif
 }
 
-SGL_DEVICE void st_na_global_v2(const int2* ptr, const int2& v) {
+SGL_DEVICE void st_na_global_v2(int2* ptr, const int2& v) {
+#if defined(__MACA_ARCH__) || defined(__MACACC__) || defined(__MACA__) || defined(__MXCC__)
+  *ptr = v;
+#else
   asm volatile("st.global.L1::no_allocate.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(v.x), "r"(v.y) : "memory");
+#endif
 }
 
 SGL_DEVICE int ld_na_global_v1(const int* ptr) {
+#if defined(__MACA_ARCH__) || defined(__MACACC__) || defined(__MACA__) || defined(__MXCC__)
+  return *ptr;
+#else
   int r;
   asm volatile("ld.global.nc.L1::no_allocate.s32 %0, [%1];" : "=r"(r) : "l"(ptr));
   return r;
+#endif
 }
 
 SGL_DEVICE int2 ld_na_global_v2(const int2* ptr) {
+#if defined(__MACA_ARCH__) || defined(__MACACC__) || defined(__MACA__) || defined(__MXCC__)
+  return *ptr;
+#else
   int2 r;
   asm volatile("ld.global.nc.L1::no_allocate.v2.s32 {%0, %1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(ptr));
   return r;
+#endif
 }
 
 SGL_DEVICE void prefetch_L2(const void* p) {
-#if defined(ENABLE_L2_PREFETCH)
+#if defined(ENABLE_L2_PREFETCH) && !defined(__MACA_ARCH__) && !defined(__MACACC__) && !defined(__MACA__) && \
+    !defined(__MXCC__)
   asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
 #endif
 }

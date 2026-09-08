@@ -49,77 +49,98 @@ _is_musa = is_musa()
 _is_gfx1250 = is_gfx1250_supported()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-# if _is_cuda:
-#     from sglang.kernels.ops.quantization import (
-#         per_token_group_quant,
-#         sgl_per_token_quant_fp8,
-#     )
-#     from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
-#         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
-#     )
-# elif _is_xpu:
-#     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
-
-# if _is_musa:
-#     from sgl_kernel import sgl_per_token_quant_fp8
-
-#     from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
-#         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
-#     )
-
-# if _is_musa:
-#     # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
-#     from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
-
-if _is_hip:
-    _has_vllm = False
-    if _use_aiter:
-        try:
-            from aiter import (  # v0.1.3
-                dynamic_per_tensor_quant,
-                dynamic_per_token_scaled_quant,
-                static_per_tensor_quant,
-            )
-        except ImportError:
-            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
-    else:
-        try:
-            import vllm._C  # noqa: F401
-
-            _has_vllm = True
-        except ImportError:
-            # Fallback: vllm not available, will use native PyTorch implementation
-            _has_vllm = False
-
-if _is_musa:
-
-    @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_8bit_v2")
-    def _(
-        input,
-        output_q,
-        output_s,
-        group_size,
-        eps,
-        fp8_min,
-        fp8_max,
-        scale_ue8m0,
-        fuse_silu_and_mul,
-        masked_m,
-    ):
-        return
-
-
 logger = logging.getLogger(__name__)
 
+_mcoplib_loaded = False
+if _is_cuda:
+    # Loading mcoplib._C registers the vLLM-compatible FP8 quantization ops
+    # under torch.ops._C. mcoplib does not export
+    # sgl_kernel::sgl_per_token_quant_fp8.
+    try:
+        import mcoplib._C  # noqa: F401
+
+        _mcoplib_per_token_quant_fp8 = (
+            torch.ops._C.dynamic_per_token_scaled_fp8_quant.default
+        )
+        _mcoplib_dynamic_per_tensor_quant_fp8 = (
+            torch.ops._C.dynamic_scaled_fp8_quant.default
+        )
+        _mcoplib_static_per_tensor_quant_fp8 = (
+            torch.ops._C.static_scaled_fp8_quant.default
+        )
+        _mcoplib_loaded = True
+    except (
+        ImportError,
+        ModuleNotFoundError,
+        OSError,
+        AttributeError,
+        RuntimeError,
+    ):
+        logger.warning(
+            "mcoplib._C is unavailable; using SGLang FP8 quantization kernels"
+        )
+
+from sglang.kernels.ops.quantization import per_token_group_quant
+
+if _is_cuda and _mcoplib_loaded:
+
+    def sgl_per_token_quant_fp8(
+        input: torch.Tensor,
+        output_q: torch.Tensor,
+        output_s: torch.Tensor,
+    ) -> None:
+        """Run mcoplib's per-token FP8 quantizer using SGLang's argument order."""
+        _mcoplib_per_token_quant_fp8(output_q, input, output_s, None)
+
+    def sgl_per_tensor_quant_fp8(
+        input: torch.Tensor,
+        output_q: torch.Tensor,
+        output_s: torch.Tensor,
+        is_static: bool,
+    ) -> None:
+        """Run mcoplib's dynamic or static per-tensor FP8 quantizer."""
+        if is_static:
+            _mcoplib_static_per_tensor_quant_fp8(output_q, input, output_s, None)
+        else:
+            _mcoplib_dynamic_per_tensor_quant_fp8(output_q, input, output_s)
+elif _is_cuda:
+    # mcoplib is an optional acceleration library. Keep the same public
+    # interface and route to the registered SGLang kernels when it is absent.
+    from sglang.kernels.ops.quantization import (
+        sgl_per_token_quant_fp8 as _sgl_per_token_quant_fp8,
+    )
+    from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
+        per_tensor_quant_fp8 as _sgl_per_tensor_quant_fp8,
+    )
+
+    def sgl_per_token_quant_fp8(
+        input: torch.Tensor,
+        output_q: torch.Tensor,
+        output_s: torch.Tensor,
+    ) -> None:
+        _sgl_per_token_quant_fp8(input, output_q, output_s)
+
+    def sgl_per_tensor_quant_fp8(
+        input: torch.Tensor,
+        output_q: torch.Tensor,
+        output_s: torch.Tensor,
+        is_static: bool,
+    ) -> None:
+        _sgl_per_tensor_quant_fp8(input, output_q, output_s, is_static)
+
+if _is_musa:
+    # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
+    from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
+
 use_mcoplib = False
-try:
-    from  mcoplib.op import per_token_cast_to_fp8 as per_token_cast_to_fp8_opt
-    use_mcoplib = True
-except:
-    logger.warning("please pip install mcoplib")
+if _mcoplib_loaded:
+    try:
+        from mcoplib.op import per_token_cast_to_fp8 as per_token_cast_to_fp8_opt
 
-
+        use_mcoplib = True
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        pass
+    
 @lru_cache()
 def is_fp8_fnuz() -> bool:
     if _is_hip:
@@ -476,13 +497,6 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
 ):
-    if use_mcoplib:
-        return torch.empty(
-            x_shape[:-1] + (x_shape[-1] // group_size,),
-            device=device,
-            dtype=torch.float32,
-        )
-
     if scale_ue8m0:
         if column_major_scales and scale_tma_aligned:
             *x_batch, x_q_mn, x_q_k = x_shape
@@ -538,33 +552,35 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     m, n = x.shape
     x_view = x.view(m, -1, 128)
     x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(
-        m, n
-    ), (x_amax / 448.0).view(m, -1)
+    return (x_view * (fp8_max / x_amax.unsqueeze(2))).to(fp8_dtype).view(m, n), (
+        x_amax / fp8_max
+    ).view(m, -1)
 
 
 def per_token_cast_to_fp8_3d(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 3, f"Input tensor must be 3D, got shape {x.shape}"
-    
+
     num_groups, m, n = x.shape
     assert n % 128 == 0, f"Input size(2) must be divisible by 128, got {n}"
-    
+
     quant_list = []
     scale_list = []
-    
+
     for x_group in x:
         if use_mcoplib:
-            x_group_quant = torch.empty(m, n, dtype=torch.float8_e4m3fn, device='cuda')
-            x_group_scale = torch.empty(m,n//128, dtype=torch.float32, device='cuda')
+            x_group_quant = torch.empty(m, n, dtype=fp8_dtype, device=x.device)
+            x_group_scale = torch.empty(
+                m, n // 128, dtype=torch.float32, device=x.device
+            )
             per_token_cast_to_fp8_opt(x_group_quant, x_group_scale, x_group)
         else:
             x_group_quant, x_group_scale = per_token_cast_to_fp8(x_group)
         scale_list.append(x_group_scale.unsqueeze(0))
         quant_list.append(x_group_quant.unsqueeze(0))
-        
+
     final_quant_tensor = torch.cat(quant_list, dim=0)
     final_scales = torch.cat(scale_list, dim=0)
-    
+
     return final_quant_tensor, final_scales
 
 # AOT v2 (the MUSA path) runtime-switches on these; the JIT
@@ -690,24 +706,31 @@ def sglang_per_token_group_quant_fp8(
         scale_ue8m0=scale_ue8m0,
     )
 
-    if use_mcoplib:
-        per_token_cast_to_fp8_opt(x_q, x_s, x)
-    else:
-        x_q, x_s = per_token_cast_to_fp8(x)
-        
-    # if x.shape[0] > 0:
-    #     _run_per_token_group_quant_8bit_kernel(
-    #         x,
-    #         x_q,
-    #         x_s,
-    #         group_size,
-    #         eps,
-    #         fp8_min,
-    #         fp8_max,
-    #         scale_ue8m0=scale_ue8m0,
-    #         fuse_silu_and_mul=fuse_silu_and_mul,
-    #         masked_m=masked_m,
-    #     )
+    if x.shape[0] > 0:
+        if (
+            use_mcoplib
+            and x.dim() == 2
+            and group_size == 128
+            and not column_major_scales
+            and not scale_tma_aligned
+            and not scale_ue8m0
+            and not fuse_silu_and_mul
+            and masked_m is None
+        ):
+            per_token_cast_to_fp8_opt(x_q, x_s, x)
+        else:
+            _run_per_token_group_quant_8bit_kernel(
+                x,
+                x_q,
+                x_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0=scale_ue8m0,
+                fuse_silu_and_mul=fuse_silu_and_mul,
+                masked_m=masked_m,
+            )
 
     return x_q, x_s
 

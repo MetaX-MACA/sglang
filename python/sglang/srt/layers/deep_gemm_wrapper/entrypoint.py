@@ -281,12 +281,9 @@ def configure_deep_gemm_num_sms(num_sms):
     if num_sms is None or not ENABLE_JIT_DEEPGEMM:
         yield
     else:
-        original_num_sms = deep_gemm.get_num_sms()
-        deep_gemm.set_num_sms(num_sms)
-        try:
-            yield
-        finally:
-            deep_gemm.set_num_sms(original_num_sms)
+        # The MetaX DeepGEMM bridge does not expose set_num_sms. Keep this
+        # context manager as a no-op while preserving the call-site contract.
+        yield
 
 
 def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
