@@ -1,5 +1,6 @@
 import enum
 import logging
+import os
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
@@ -562,7 +563,9 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+            allow_reduce_scatter=not bool(
+                os.getenv("MX_DISABLE_DENSE_REDUCE_SCATTER")
+            ),
         )
 
     def forward(
@@ -735,7 +738,9 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
+            allow_reduce_scatter=not bool(
+                os.getenv("MX_DISABLE_DENSE_REDUCE_SCATTER")
+            ),
         )
 
         self.alt_stream = alt_stream
