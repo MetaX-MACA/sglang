@@ -333,7 +333,8 @@ class DeepseekMLAForwardMixin:
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            overlap_qk_norm = envs.OVERLAP_QK_NORM.get()
+            if overlap_qk_norm and self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
