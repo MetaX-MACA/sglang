@@ -1188,17 +1188,13 @@ class DeepseekV2MoE(nn.Module):
                 gemm_output_zero_allocator,
                 pre_quant_input=pre_quant_input,
             )
-        if self.is_deepseek_v4:
-            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-                self.experts,
-                final_hidden_states,
-                None if self._shared_expert_tp1 else shared_output,
-                self.routed_scaling_factor,
-            )
+        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+            self.experts,
+            final_hidden_states,
+            None if self._shared_expert_tp1 else shared_output,
+            self.routed_scaling_factor,
+        )
 
-        if shared_output is not None:
-            final_hidden_states+=shared_output
-        
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):

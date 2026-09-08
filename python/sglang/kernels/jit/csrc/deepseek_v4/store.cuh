@@ -15,12 +15,22 @@
 #include <bit>
 #include <cstdint>
 #include <cuda_fp8.h>
+#include <type_traits>
 
 namespace sglang {
 
 using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
+
+SGL_DEVICE int8_t int8_clip(float val) {
+  namespace math = device::math;
+  return static_cast<int8_t>(math::max(math::min(val, 127.0f), -128.0f));
+}
+
+SGL_DEVICE char2 pack_int8(float x, float y) {
+  return char2{int8_clip(x), int8_clip(y)};
+}
 
 struct FusedStoreCacheParam {
   const void* __restrict__ input;
@@ -29,7 +39,7 @@ struct FusedStoreCacheParam {
   uint32_t num_tokens;
 };
 
-template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
+template <typename Float, typename IndicesT, typename StoreT, uint32_t kPageBits, bool kUsePDL>
 __global__ void fused_store_flashmla_cache(const  FusedStoreCacheParam param) {
   using namespace device;
 
@@ -75,9 +85,11 @@ __global__ void fused_store_flashmla_cache(const  FusedStoreCacheParam param) {
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
+template <typename Float, typename IndicesT, typename StoreT, uint32_t kPageBits, bool kUsePDL>
 __global__ void fused_store_indexer_cache(const  FusedStoreCacheParam param) {
   using namespace device;
+  constexpr bool kStoreFp8 = std::is_same_v<StoreT, uint8_t>;
+  static_assert(kStoreFp8 || std::is_same_v<StoreT, int8_t>);
 
   /// NOTE: 132 = 128 + 4
   constexpr int64_t kPageBytes = 132 << kPageBits;
@@ -97,34 +109,44 @@ __global__ void fused_store_indexer_cache(const  FusedStoreCacheParam param) {
   // always load the value from input (don't store if invalid)
   using Float2 = packed_t<Float>;
   using InStorage = AlignedVector<Float2, 2>;
-  using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
   const auto elems = static_cast<const InStorage*>(input)[global_tid];
   const auto [x0, x1] = cast<fp32x2_t>(elems[0]);
   const auto [y0, y1] = cast<fp32x2_t>(elems[1]);
   const auto local_max = fmaxf(fmaxf(fabs(x0), fabs(x1)), fmaxf(fabs(y0), fabs(y1)));
   const auto abs_max = warp::reduce_max(local_max);
-  // use normal fp32 scale
-  const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
-  const auto inv_scale = 1.0f / scale;
   const int32_t page = index >> kPageBits;
   const int32_t offset = index & ((1 << kPageBits) - 1);
   const auto page_ptr = pointer::offset(cache, page * kPageBytes);
   const auto value_ptr = pointer::offset(page_ptr, offset * 128);
   const auto scale_ptr = pointer::offset(page_ptr, 128 << kPageBits, offset * 4);
-  OutStorage result;
-  result[0] = pack_fp8(x0 * inv_scale, x1 * inv_scale);
-  result[1] = pack_fp8(y0 * inv_scale, y1 * inv_scale);
-  static_cast<OutStorage*>(value_ptr)[lane_id] = result;
-  static_cast<float*>(scale_ptr)[0] = scale;
+  if constexpr (kStoreFp8) {
+    using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
+    const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+    const auto inv_scale = 1.0f / scale;
+    OutStorage result;
+    result[0] = pack_fp8(x0 * inv_scale, x1 * inv_scale);
+    result[1] = pack_fp8(y0 * inv_scale, y1 * inv_scale);
+    static_cast<OutStorage*>(value_ptr)[lane_id] = result;
+    static_cast<float*>(scale_ptr)[0] = scale;
+  } else {
+    using OutStorage = AlignedVector<char2, 2>;
+    const auto scale = fmaxf(1e-4f, abs_max) / 127.0f;
+    const auto inv_scale = 1.0f / scale;
+    OutStorage result;
+    result[0] = pack_int8(x0 * inv_scale, x1 * inv_scale);
+    result[1] = pack_int8(y0 * inv_scale, y1 * inv_scale);
+    static_cast<OutStorage*>(value_ptr)[lane_id] = result;
+    static_cast<float*>(scale_ptr)[0] = scale;
+  }
 
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <typename Float, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
+template <typename Float, typename IndicesT, typename StoreT, uint32_t kPageSize, bool kUsePDL>
 struct FusedStoreCacheFlashMLAKernel {
   static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
   static constexpr int64_t kPageBytes = host::div_ceil(584 * kPageSize, 576) * 576;
-  static constexpr auto kernel = fused_store_flashmla_cache<Float, IndicesT, kLogSize, kUsePDL>;
+  static constexpr auto kernel = fused_store_flashmla_cache<Float, IndicesT, StoreT, kLogSize, kUsePDL>;
 
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);
@@ -161,11 +183,11 @@ struct FusedStoreCacheFlashMLAKernel {
   }
 };
 
-template <typename Float, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
+template <typename Float, typename IndicesT, typename StoreT, uint32_t kPageSize, bool kUsePDL>
 struct FusedStoreCacheIndexerKernel {
   static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
   static constexpr int64_t kPageBytes = 132 * kPageSize;
-  static constexpr auto kernel = fused_store_indexer_cache<Float, IndicesT, kLogSize, kUsePDL>;
+  static constexpr auto kernel = fused_store_indexer_cache<Float, IndicesT, StoreT, kLogSize, kUsePDL>;
 
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);
@@ -182,7 +204,7 @@ struct FusedStoreCacheIndexerKernel {
         .verify(input);
     TensorMatcher({-1, -1})  // cache
         .with_strides({kPageBytes, 1})
-        .with_dtype<uint8_t>()
+        .with_dtype<StoreT>()
         .with_device(device_)
         .verify(cache);
     TensorMatcher({N})  // indices

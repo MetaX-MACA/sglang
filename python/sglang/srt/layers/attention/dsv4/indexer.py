@@ -761,7 +761,10 @@ class C4IndexerBackendMixin:
 
             fn = fp8_paged_mqa_logits_triton
         else:
-            from deep_gemm import fp8_paged_mqa_logits as fn
+            if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":
+                from deep_gemm import fp8_paged_mqa_logits as fn
+            else:
+                from deep_gemm import int8_paged_mqa_logits as fn
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
 

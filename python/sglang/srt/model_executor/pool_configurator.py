@@ -820,6 +820,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
+        self.kv_cache_dtype = kvc.kv_cache_dtype
 
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
@@ -888,12 +889,23 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        if self.kv_cache_dtype in (
+            torch.float8_e5m2,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ):
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        else:
+            assert self.kv_cache_dtype is torch.bfloat16
+            kv_bytes = (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
 
         quant_block_size = 128
-        indexer_bytes = (
-            self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
-        )
+        if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() in ("fp8", "int8"):
+            indexer_bytes = (
+                self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
+            )
+        else:
+            raise NotImplementedError("DSV4 index cache only supports fp8 or int8")
 
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         c4_state_dtype_size, c128_state_dtype_size = (

@@ -18,25 +18,22 @@ logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
-    from deep_gemm.utils.layout import (
-        get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
-    )
+
+    if DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        from deep_gemm.utils.layout import (
+            get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
+        )
 
     def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
-        """Transform ``sf`` into an MN-major, TMA-aligned layout for DeepGEMM.
+        """Return the scale layout required by the active DeepGEMM backend."""
+        if not DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+            # MetaX and other non-TMA paths consume the native scale layout.
+            return sf
 
-        When ``sf`` is already in that layout, sgl-deep-gemm's fast path
-        (<= 0.1.4.post1) returns a NON-OWNING ``torch::from_blob`` alias of
-        ``sf`` across the TVM-FFI boundary. Callers rebind the result over
-        their only reference (``x = get_mn_major_tma_aligned_tensor(x)``),
-        which frees the storage while the GEMM still reads through the alias
-        -- a use-after-free that surfaces as NaN logits or "pointer resides
-        on host memory" during CUDA graph capture once the allocator reuses
-        the block. Hand back ``sf`` itself in that case so ownership is
-        preserved.
-        """
         out = _get_mn_major_tma_aligned_tensor(sf)
         if out.data_ptr() == sf.data_ptr():
+            # Some versions return a non-owning alias. Preserve the input
+            # tensor so its storage remains alive for the GEMM.
             assert out.shape == sf.shape and out.stride() == sf.stride()
             return sf
         return out
@@ -264,6 +261,13 @@ def tf32_hc_prenorm_gemm(
 ):
     if x.shape[0] == 0:
         return
+
+    # The MetaX MHC prenorm op is provided by the installed deep_gemm package
+    # even when the JIT wrapper is disabled.  Import it at the call site instead
+    # of relying on the module-level ENABLE_JIT_DEEPGEMM guard; otherwise the
+    # default-enabled MHC prenorm path fails with an undefined `deep_gemm` name.
+    import deep_gemm
+
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
 
 

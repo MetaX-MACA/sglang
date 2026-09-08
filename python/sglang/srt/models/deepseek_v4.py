@@ -1791,8 +1791,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-            alt_streams=alt_streams,
+            prefix=add_prefix("attn", prefix),
+            alt_streams=None if _is_npu else alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
         moe_alt_stream = (
@@ -2197,7 +2197,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_ffn_fn,
                     self.hc_ffn_scale,
                     self.hc_ffn_base,
-                    norm=self.post_attention_layernorm,
                     forward_batch=forward_batch,
                 )
                 if not norm_fused:
@@ -2210,7 +2209,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_ffn_fn,
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
-                norm=self.post_attention_layernorm,
                 forward_batch=forward_batch,
             )
             if not norm_fused:
@@ -2507,7 +2505,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            norm=self.post_attention_layernorm,
             forward_batch=state.forward_batch,
         )
         if not norm_fused:
@@ -3805,8 +3802,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                             elif fuse_wqa_wkv and (
                                 name.endswith(".wq_a.weight")
                                 or name.endswith(".wq_a.weight_scale_inv")
+                                or name.endswith(".wq_a.weight_scale")
                                 or name.endswith(".wkv.weight")
                                 or name.endswith(".wkv.weight_scale_inv")
+                                or name.endswith(".wkv.weight_scale")
                                 or name.endswith(".wq_a.qweight")
                                 or name.endswith(".wkv.qweight")
                                 or name.endswith(".wq_a.qweight_type")
