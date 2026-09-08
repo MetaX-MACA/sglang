@@ -74,7 +74,7 @@ SGL_DEVICE bool bumper_block(const Params& params) {
 }
 
 template <uint32_t kWorldSize, bool kHasResidual, bool kUsePDL>
-__global__ void reduce_scatter_res_kernel(const __grid_constant__ Params params) {
+__global__ void reduce_scatter_res_kernel(const   Params params) {
   using vec_t = device::AlignedVector<bf16x2_t, 4>;  // 16 B
 
   device::PDLWaitPrimary<kUsePDL>();
@@ -133,7 +133,7 @@ __global__ void reduce_scatter_res_kernel(const __grid_constant__ Params params)
 }
 
 template <uint32_t kWorldSize, bool kUsePDL>
-__global__ void all_gather_kernel(const __grid_constant__ Params params) {
+__global__ void all_gather_kernel(const   Params params) {
   using vec_t = device::AlignedVector<bf16x2_t, 4>;  // 16 B
 
   device::PDLWaitPrimary<kUsePDL>();
@@ -183,7 +183,7 @@ __global__ void all_gather_kernel(const __grid_constant__ Params params) {
 // compatibility with CustomAllReduceV2 and make the remote writes visible
 // before any rank leaves the kernel.
 template <uint32_t kWorldSize, bool kUsePDL>
-__global__ void all_gather_direct_kernel(const __grid_constant__ Params params) {
+__global__ void all_gather_direct_kernel(const   Params params) {
   using vec_t = device::AlignedVector<bf16x2_t, 4>;  // 16 B
 
   // Reserve the window before the PDL wait, signal after it.
@@ -210,7 +210,7 @@ __global__ void all_gather_direct_kernel(const __grid_constant__ Params params) 
 // symmetric memory. Each rank reduces only its owned row shard directly from
 // the multicast alias, so no staging or second broadcast is needed.
 template <uint32_t kWorldSize, bool kHasResidual, bool kUsePDL>
-__global__ void reduce_scatter_pull_kernel(const __grid_constant__ Params params) {
+__global__ void reduce_scatter_pull_kernel(const   Params params) {
   using vec_t = device::AlignedVector<bf16x2_t, 4>;  // 16 B
   using SumOp = device::ReductionTrait<device::ReductionOp::SUM, bf16x2_t>;
 

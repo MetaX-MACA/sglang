@@ -35,7 +35,7 @@ struct GatherScatterParams {
 constexpr uint32_t kGSThreads = 256;
 
 template <int W1, typename DType>
-__global__ void gather_scatter_kernel(const __grid_constant__ GatherScatterParams p) {
+__global__ void gather_scatter_kernel(const   GatherScatterParams p) {
   const int b = blockIdx.y;
   if (!static_cast<const bool*>(p.mask)[b]) return;  // masked-out lane: untouched
 

@@ -53,7 +53,7 @@ constexpr uint32_t kConvThreads = 256;  // threads per block (each owns 2 channe
 // blockIdx.x = token strip (BLOCK_T tokens); each thread owns channel pair (c0, c0+1).
 // Requires bf16, D even, and unit channel/row-inner stride (host-checked).
 template <int W, bool USE_SILU, bool USE_RESIDUAL, bool IS_DECODE, typename DType>
-__global__ void causal_conv1d_kernel(const __grid_constant__ CausalConv1dParams p) {
+__global__ void causal_conv1d_kernel(const   CausalConv1dParams p) {
   constexpr int BT = kConvBlockT;
   constexpr int WIN = BT + (W - 1);
 

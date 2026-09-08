@@ -141,7 +141,7 @@ struct AttnPrologueParams {
 };
 
 template <typename DType, int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_STORE, bool USE_MXFP8, bool USE_PDL>
-__global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __grid_constant__ AttnPrologueParams p) {
+__global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const   AttnPrologueParams p) {
   static_assert(std::is_same_v<DType, __nv_bfloat16>);
   static_assert(!USE_MXFP8 || DO_STORE, "MXFP8 prologue quantization owns the KV store");
   constexpr int W1 = W - 1;
@@ -566,7 +566,7 @@ template <
     bool USE_MXFP8,
     bool USE_PDL>
 __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
-    const __grid_constant__ AttnPrologueDecodeParams p) {
+    const   AttnPrologueDecodeParams p) {
   static_assert(std::is_same_v<DType, __nv_bfloat16>);
   static_assert(!USE_MXFP8 || DO_STORE, "MXFP8 decode prologue quantization owns the KV store");
   constexpr int W1 = W - 1;
@@ -973,7 +973,7 @@ struct AttnPrologueExtendParams {
 
 template <typename DType, int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_STORE, bool USE_MXFP8, bool USE_PDL>
 __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
-    const __grid_constant__ AttnPrologueExtendParams p) {
+    const   AttnPrologueExtendParams p) {
   static_assert(std::is_same_v<DType, __nv_bfloat16>);
   static_assert(!USE_MXFP8 || DO_STORE, "MXFP8 prologue quantization owns the KV store");
   constexpr int W1 = W - 1;
@@ -1203,7 +1203,7 @@ struct KvConvUpdateParams {
 };
 
 template <int W, bool DO_TRACK>
-__global__ void inkling_kv_conv_update_kernel(const __grid_constant__ KvConvUpdateParams p) {
+__global__ void inkling_kv_conv_update_kernel(const   KvConvUpdateParams p) {
   constexpr int W1 = W - 1;
   const uint32_t nkv = p.dkv / kVecElems;
   const uint32_t items = p.B * 2u * nkv;

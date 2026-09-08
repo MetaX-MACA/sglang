@@ -166,13 +166,13 @@ def fp4_gemm(
         raise ValueError(f"Unsupported FlashInfer FP4 GEMM quant mode: {quant_mode}")
 
 
-if is_cuda() and (not get_platform().is_sm120) and (fp4_quantize is not None):
+# if is_cuda() and (not get_platform().is_sm120) and (fp4_quantize is not None):
 
-    @register_fake_if_exists("sgl_kernel::scaled_fp4_quant")
-    def _sgl_kernel_scaled_fp4_quant_fake(
-        output, input, output_scale, input_global_scale
-    ):
-        return
+#     @register_fake_if_exists("sgl_kernel::scaled_fp4_quant")
+#     def _sgl_kernel_scaled_fp4_quant_fake(
+#         output, input, output_scale, input_global_scale
+#     ):
+#         return
 
 
 # FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32

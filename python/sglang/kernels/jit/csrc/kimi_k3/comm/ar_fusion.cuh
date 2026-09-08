@@ -90,7 +90,7 @@ constexpr uint32_t kNormRowVecs = kNormDim / 8;                       // 448
 constexpr uint32_t kNormWarps = kNormRowVecs / device::kWarpThreads;  // 14
 
 template <uint32_t kWorldSize, bool kHasResidual, bool kUsePDL>
-__global__ __launch_bounds__(1024, 1) void all_reduce_push_res_kernel(const __grid_constant__ FusionParams params) {
+__global__ __launch_bounds__(1024, 1) void all_reduce_push_res_kernel(const   FusionParams params) {
   using vec_t = device::AlignedVector<bf16x2_t, 4>;
 
   const auto tx = threadIdx.x;
@@ -239,7 +239,7 @@ SGL_DEVICE float reduce_sqr(device::AlignedVector<T2, N>& out_vec, device::Align
 // num_norm_rows to the full row count (every reduced row is normed).
 template <uint32_t kWorldSize, uint32_t kClusterSize, bool kUsePDL, bool kFinalize = false>
 __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClusterSize, 1, 1)  //
-    void all_reduce_push_norm_cluster_kernel(const __grid_constant__ FusionParams params) {
+    void all_reduce_push_norm_cluster_kernel(const   FusionParams params) {
   namespace cg = cooperative_groups;
   using namespace device;
   using vec_t = AlignedVector<bf16x2_t, 4>;
@@ -445,7 +445,7 @@ pull_reduce_pass(uint32_t& vid, const uint32_t num_vecs, const uint32_t step, ui
 
 template <uint32_t kUnroll, bool kHasResidual, bool kUsePDL>
 __global__
-__launch_bounds__(kPullBlockSize, 1) void all_reduce_pull_res_kernel(const __grid_constant__ PullParams params) {
+__launch_bounds__(kPullBlockSize, 1) void all_reduce_pull_res_kernel(const   PullParams params) {
   static_assert(1 <= kUnroll && kUnroll <= 16 && (kUnroll & (kUnroll - 1)) == 0);
 
   const auto tx = threadIdx.x;
@@ -494,7 +494,7 @@ __launch_bounds__(kPullBlockSize, 1) void all_reduce_pull_res_kernel(const __gri
 // this rank's row shard, in place.
 template <uint32_t kUnroll, bool kUsePDL>
 __global__
-__launch_bounds__(kNormRowVecs, 1) void all_reduce_pull_norm_kernel(const __grid_constant__ PullParams params) {
+__launch_bounds__(kNormRowVecs, 1) void all_reduce_pull_norm_kernel(const   PullParams params) {
   using vec_t = device::AlignedVector<bf16x2_t, 4>;
   using namespace device;
 

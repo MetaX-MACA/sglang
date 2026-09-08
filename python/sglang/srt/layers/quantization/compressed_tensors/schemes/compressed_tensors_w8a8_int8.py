@@ -27,7 +27,7 @@ __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sgl_kernel import int8_scaled_mm
+    from sgl_kernel import cutlass_scaled_mm
 
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
@@ -96,8 +96,8 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # ampere and up
-        return 80
+        # lovelace and up
+        return 75
 
     def process_weights_after_loading(self, layer) -> None:
         # If per tensor, when we have a fused module (e.g. QKV) with per
@@ -172,11 +172,18 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
     ) -> torch.Tensor:
         # TODO: add cutlass_scaled_mm_azp support
-        x_q, x_scale = per_token_quant_int8(x)
+        if isinstance(x, tuple):
+            out_dtype = x[0]
+            x_q     = x[1]
+            x_scale = x[2]
+        else:
+            x_q, x_scale = per_token_quant_int8(x)
+            out_dtype=x.dtype
 
-        return int8_scaled_mm(
-            x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
-        )
+
+        assert self.input_symmetric is True
+
+        return cutlass_scaled_mm(x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=out_dtype, bias=bias)
 
 
 class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):

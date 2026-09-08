@@ -185,7 +185,7 @@ SGL_DEVICE void stage_wave_sum(float v, int lane, int wid, float* out) {
 }  // namespace radix4
 
 template <typename T, int EXPERTS, int TOPK, int BLOCK>
-__global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ const RouteRadix4Params params) {
+__global__ __launch_bounds__(BLOCK) void route_radix4_kernel(  const RouteRadix4Params params) {
   constexpr int WAVE = static_cast<int>(kRadix4Wave);
   constexpr int NWAVE = BLOCK / WAVE;
   constexpr int VPT = (EXPERTS + BLOCK - 1) / BLOCK;

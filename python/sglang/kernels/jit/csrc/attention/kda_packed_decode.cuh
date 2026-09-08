@@ -64,7 +64,7 @@ __device__ __forceinline__ float warp_allreduce_sum(float v) {
 // K = V = 128 specialization: one lane owns 4 consecutive K-elements (16B).
 template <int kWarps, bool kUsePDL>
 __global__
-__launch_bounds__(kWarps * 32) void kda_packed_decode_kernel(const KdaPackedDecodeParams __grid_constant__ params) {
+__launch_bounds__(kWarps * 32) void kda_packed_decode_kernel(const KdaPackedDecodeParams   params) {
   using namespace device;
   constexpr int K = 128;
   constexpr int V = 128;

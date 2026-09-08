@@ -17,7 +17,7 @@ struct HicacheRelayoutParams {
 };
 
 template <typename IndexType, int64_t kElementSize, bool kIsMLA>
-__global__ void hicache_relayout_kernel(const __grid_constant__ HicacheRelayoutParams params) {
+__global__ void hicache_relayout_kernel(const HicacheRelayoutParams params) {
   using namespace device;
   using pack_t = uint4;
   static_assert(kElementSize % 16 == 0, "hicache_relayout_kernel requires 16-byte aligned element size");

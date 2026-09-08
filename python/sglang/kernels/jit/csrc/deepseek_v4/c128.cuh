@@ -242,7 +242,7 @@ SGL_DEVICE void c128_forward(
 }
 
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kUsePDL>
-C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodeParams params) {
+C128_KERNEL void flash_c128_decode(const  Compress128DecodeParams params) {
   using namespace device;
 
   constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 64
@@ -297,7 +297,7 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
 
 // compress kernel
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kWrite, bool kUsePDL>
-C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
+C128_KERNEL void flash_c128_prefill(const  Compress128PrefillParams params) {
   using namespace device;
 
   constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 64

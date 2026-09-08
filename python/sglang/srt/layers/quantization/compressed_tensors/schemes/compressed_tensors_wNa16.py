@@ -43,8 +43,8 @@ from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 
-if _is_cuda:
-    from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
+# if _is_cuda:
+#     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 
 ScalarType, scalar_types = get_scalar_types()
@@ -247,13 +247,13 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         def transform_w_q(x):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
-            x.data = gptq_marlin_repack(
-                x.data.contiguous(),
-                perm=layer.g_idx_sort_indices,
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                num_bits=c.weight_type.size_bits,
-            )
+            # x.data = gptq_marlin_repack(
+            #     x.data.contiguous(),
+            #     perm=layer.g_idx_sort_indices,
+            #     size_k=c.partition_weight_shape[0],
+            #     size_n=c.partition_weight_shape[1],
+            #     num_bits=c.weight_type.size_bits,
+            # )
             return x
 
         def transform_w_s(x):

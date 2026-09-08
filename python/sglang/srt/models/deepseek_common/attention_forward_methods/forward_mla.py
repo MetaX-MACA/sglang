@@ -73,6 +73,9 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
 
+from sgl_kernel import cutlass_scaled_batch_mm
+from sgl_kernel import scaled_int8_quant
+
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
@@ -107,7 +110,11 @@ def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
 
 
 if _is_cuda:
-    from sglang.kernels.ops.gemm import bmm_fp8
+    try:
+        from sglang.kernels.ops.gemm import bmm_fp8
+    except:
+        bmm_fp8 = None
+    
 
 
 def should_defer_dsa_cp_kv_gather(
@@ -873,11 +880,10 @@ class DeepseekMLAForwardMixin:
                     torch.bfloat16,
                 )
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-        elif _is_musa:
-            attn_bmm_output = torch.bmm(
-                attn_output.to(torch.bfloat16).transpose(0, 1), self.w_vc
-            )
-            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        elif self.w_vc.dtype == torch.int8:
+            attn_output_quant_val, attn_output_quant_scale, _ = scaled_int8_quant(attn_output.transpose(0, 1).contiguous())
+            attn_bmm_output = cutlass_scaled_batch_mm(a = attn_output_quant_val, b = self.w_vc, scale_a = attn_output_quant_scale, scale_b = self.w_vc_scale, out_dtype = attn_output.dtype)
+            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)   
         else:
             if is_in_tc_piecewise_cuda_graph():
                 # torch dynamo requires out= op was called where output tensor was non-contiguous

@@ -73,7 +73,7 @@ SGL_DEVICE int64_t swa_translate(const int64_t* __restrict__ lut, int64_t lut_le
 // writes the ``-1`` sentinel so the verify kernel skips the token-mismatch check.
 template <bool HAS_SWA_LUT, bool HAS_VERIFY_EXPECTED_TOKEN_POOL>
 __global__ void plan_entries_persistent_kernel(
-    const PlanEntriesParams __grid_constant__ params,
+    const PlanEntriesParams   params,
     int64_t lut_len  // only meaningful when HAS_SWA_LUT
 ) {
   const int64_t total_verify = params.verify_offsets_scratch[params.bs_padded];

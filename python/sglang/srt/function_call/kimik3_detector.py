@@ -1,9 +1,7 @@
 import json
 import logging
 import re
-from typing import List, Literal, Optional, Union
-
-from xgrammar import StructuralTag
+from typing import Any, List, Literal, Optional, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -22,12 +20,9 @@ from sglang.srt.function_call.kimik3_format import (
     strip_partial_marker_suffix,
     strip_response_wrappers,
 )
-from sglang.srt.function_call.kimik3_structural_tag import (
-    get_kimik3_auto_tool_call_structural_tag,
-    get_kimik3_structural_tag,
-)
 
 logger = logging.getLogger(__name__)
+StructuralTag = Any
 
 _CALL_RE = re.compile(
     r"<\|open\|>call\s+(?P<attrs>(?:(?!<\|sep\|>).)*?)<\|sep\|>"
@@ -96,6 +91,10 @@ class KimiK3Detector(BaseFormatDetector):
         thinking_mode: bool = False,
         parallel_tool_calls: bool = True,
     ) -> Optional[StructuralTag]:
+        from sglang.srt.function_call.kimik3_structural_tag import (
+            get_kimik3_auto_tool_call_structural_tag,
+        )
+
         return get_kimik3_auto_tool_call_structural_tag(
             tools or [],
             thinking_mode=thinking_mode,
@@ -109,6 +108,10 @@ class KimiK3Detector(BaseFormatDetector):
         thinking_mode: bool = False,
         parallel_tool_calls: bool = True,
     ) -> StructuralTag:
+        from sglang.srt.function_call.kimik3_structural_tag import (
+            get_kimik3_structural_tag,
+        )
+
         return get_kimik3_structural_tag(
             tools=tools or [],
             tool_choice=tool_choice,

@@ -50,27 +50,27 @@ _is_gfx1250 = is_gfx1250_supported()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_cuda:
-    from sglang.kernels.ops.quantization import (
-        per_token_group_quant,
-        sgl_per_token_quant_fp8,
-    )
-    from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
-        per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
-    )
-elif _is_xpu:
-    from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
+# if _is_cuda:
+#     from sglang.kernels.ops.quantization import (
+#         per_token_group_quant,
+#         sgl_per_token_quant_fp8,
+#     )
+#     from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
+#         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
+#     )
+# elif _is_xpu:
+#     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
 
-if _is_musa:
-    from sgl_kernel import sgl_per_token_quant_fp8
+# if _is_musa:
+#     from sgl_kernel import sgl_per_token_quant_fp8
 
-    from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
-        per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
-    )
+#     from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
+#         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
+#     )
 
-if _is_musa:
-    # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
-    from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
+# if _is_musa:
+#     # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
+#     from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
 
 if _is_hip:
     _has_vllm = False
@@ -815,7 +815,7 @@ def sglang_per_token_quant_fp8(
         dtype=torch.float32,
     )
 
-    sgl_per_token_quant_fp8(x, x_q, x_s)
+    # sgl_per_token_quant_fp8(x, x_q, x_s)
 
     return x_q, x_s
 
@@ -1908,39 +1908,39 @@ if _is_hip:
             shape = (max(num_token_padding, input.shape[0]), shape[1])
         output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
 
-        if scale is None:
-            # Dynamic scaling
-            if use_per_token_if_dynamic:
-                scale = torch.empty(
-                    (shape[0], 1), device=input.device, dtype=torch.float32
-                )
-                if _use_aiter:
-                    dynamic_per_token_scaled_quant(output, input, scale)
-                elif _has_vllm:
-                    torch.ops._C.dynamic_per_token_scaled_fp8_quant(
-                        output, input.contiguous(), scale, None
-                    )
-                else:
-                    _native_dynamic_per_token_quant_fp8(output, input, scale)
-            else:
-                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-                if _use_aiter:
-                    dynamic_per_tensor_quant(output, input, scale)
-                elif _has_vllm:
-                    torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
-                else:
-                    _native_dynamic_per_tensor_quant_fp8(output, input, scale)
-        else:
-            # Static scaling
-            assert (
-                scale.numel() == 1
-            ), f"Expected scalar scale, got numel={scale.numel()}"
-            if _use_aiter:
-                static_per_tensor_quant(output, input, scale)
-            elif _has_vllm:
-                torch.ops._C.static_scaled_fp8_quant(output, input, scale)
-            else:
-                _native_static_quant_fp8(output, input, scale)
+        # if scale is None:
+        #     # Dynamic scaling
+        #     if use_per_token_if_dynamic:
+        #         scale = torch.empty(
+        #             (shape[0], 1), device=input.device, dtype=torch.float32
+        #         )
+        #         if _use_aiter:
+        #             dynamic_per_token_scaled_quant(output, input, scale)
+        #         elif _has_vllm:
+        #             torch.ops._C.dynamic_per_token_scaled_fp8_quant(
+        #                 output, input.contiguous(), scale, None
+        #             )
+        #         else:
+        #             _native_dynamic_per_token_quant_fp8(output, input, scale)
+        #     else:
+        #         scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+        #         if _use_aiter:
+        #             dynamic_per_tensor_quant(output, input, scale)
+        #         elif _has_vllm:
+        #             torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
+        #         else:
+        #             _native_dynamic_per_tensor_quant_fp8(output, input, scale)
+        # else:
+        #     # Static scaling
+        #     assert (
+        #         scale.numel() == 1
+        #     ), f"Expected scalar scale, got numel={scale.numel()}"
+        #     if _use_aiter:
+        #         static_per_tensor_quant(output, input, scale)
+        #     elif _has_vllm:
+        #         torch.ops._C.static_scaled_fp8_quant(output, input, scale)
+        #     else:
+        #         _native_static_quant_fp8(output, input, scale)
 
         return output, scale
 

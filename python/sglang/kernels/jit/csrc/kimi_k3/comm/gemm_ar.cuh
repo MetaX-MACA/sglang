@@ -291,7 +291,7 @@ tcgen05_mma_f16(uint32_t d, uint64_t desc_a, uint64_t desc_b, uint32_t inst_desc
 
 // Warm the cache line holding the tensor-map descriptor so the first load of
 // the persistent loop does not pay the descriptor fetch. `tmap` is a generic
-// address into the __grid_constant__ CUtensorMap param; generic addressing
+// address into the   CUtensorMap param; generic addressing
 // resolves it to .param (§9.7.9.15).
 static SGL_DEVICE void prefetch_tensormap(const void* tmap) {
   asm volatile("prefetch.tensormap [%0];" ::"l"(tmap) : "memory");
@@ -594,9 +594,9 @@ struct Strip {
 // followers skip their own A issue but keep full expect_tx.
 template <int M, int K, int R, Comm COMM, bool GEMM_ON, int S, int CH, int C>
 __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
-    const __grid_constant__ CUtensorMap w_map,
-    const __grid_constant__ CUtensorMap x_map,
-    const __grid_constant__ Params<R> prm) {
+    const   CUtensorMap w_map,
+    const   CUtensorMap x_map,
+    const   Params<R> prm) {
   constexpr int Mp = (M + 15) & ~15;  // mma m16 padding (x buffer padded)
   constexpr int MT = Mp / 16;
   constexpr int KSTEPS = K / (kBK * CH);  // OUTER stages: CH k-chunks batched
@@ -879,9 +879,9 @@ SGL_DEVICE size_t d3_slot_off(int t, int nb, int w, int l, int nblk_per_tile) {
 // transposes (local scatter, cheap at these payloads).
 template <int M, int K, int R, Comm COMM>
 __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
-    const __grid_constant__ CUtensorMap x_tmap,  // A = x [kMMax, K]
-    const __grid_constant__ CUtensorMap w_tmap,  // B = W [kN, K]
-    const __grid_constant__ Params<R> prm) {
+    const   CUtensorMap x_tmap,  // A = x [kMMax, K]
+    const   CUtensorMap w_tmap,  // B = W [kN, K]
+    const   Params<R> prm) {
   constexpr bool SWAP = (M <= 64);
   // two-shot planes share RS/reduce/out-copy; they differ only in the AG +
   // flag transport (kTwoShot = NVLS multimem, kTwoShotPeer = pure P2P).

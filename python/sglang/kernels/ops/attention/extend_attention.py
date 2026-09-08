@@ -122,27 +122,20 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
         elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
-            # Ampere architecture (A100, etc.)
-            # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
-            if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
-                if Lq <= 128:
-                    BLOCK_M, BLOCK_N = (64, 128)
-                elif Lq <= 256:
-                    BLOCK_M, BLOCK_N = (64, 64)
-                else:
-                    BLOCK_M, BLOCK_N = (32, 32)
+            if Lq <= 128:
+                 # BLOCK_M, BLOCK_N = (64, 128)
+                 BLOCK_M, BLOCK_N = (64, 64)  # consideration for C500 shared memory
+            elif Lq <= 256:
+                 # BLOCK_M, BLOCK_N = (64, 64)
+                 BLOCK_M, BLOCK_N = (64, 32)  # requested by triton team
             else:
-                if Lq <= 128:
-                    BLOCK_M, BLOCK_N = (128, 128)
-                elif Lq <= 256:
-                    BLOCK_M, BLOCK_N = (64, 64)
-                else:
-                    BLOCK_M, BLOCK_N = (32, 64)
+                 # BLOCK_M, BLOCK_N = (32, 32)
+                BLOCK_M, BLOCK_N = (16, 16)  # requested by triton team
         else:
             # Older architectures
             BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
-        num_warps = 4 if Lq <= 64 else 8
+        num_warps = 4 
 
     return BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps
 
@@ -879,7 +872,7 @@ def extend_attention_fwd(
         grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1
 
-    extra_kargs = {}
+    extra_kargs = {"scenario" : "flashattn-fwd"}
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 

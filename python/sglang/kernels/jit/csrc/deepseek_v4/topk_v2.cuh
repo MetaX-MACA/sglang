@@ -127,7 +127,7 @@ struct TopKRaggedParams {
  * The short items are handled by the separate topk_kernel.
  */
 template <bool kPDL>
-CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
+CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const   TopKPagedParams params) {
   device::enable_smem_spilling();
   __shared__ impl::MaxSmem<Cluster::Smem> smem;
   const uint32_t num_cluster_items = params.global().num_cluster_items;
@@ -206,7 +206,7 @@ SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
  * It must however land after the PDL wait, or the indexer overwrites it.
  */
 template <bool kPDL>
-TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams params) {
+TOPK_KERNEL void topk_ragged_kernel(const   TopKRaggedParams params) {
   device::enable_smem_spilling();
   constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
   const auto bx = blockIdx.x;
@@ -267,7 +267,7 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
  * - Level 3: max_seq_len > cluster_floor   -> + epilogue process of cluster path
  */
 template <bool kPDL, int kLevel, TopKMode kMode>
-TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params) {
+TOPK_KERNEL void topk_main_kernel(const   TopKPagedParams params) {
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
@@ -316,7 +316,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
 
 #ifndef USE_ROCM
 template <bool kPDL, TopKMode kMode>
-CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKPagedParams params) {
+CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const   TopKPagedParams params) {
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;

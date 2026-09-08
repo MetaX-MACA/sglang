@@ -65,7 +65,7 @@ struct SituAndMulParams {
 };
 
 template <typename TIn, typename TOut, bool kHasLinearBeta, bool kUsePDL>
-__global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams params) {
+__global__ void situ_and_mul_kernel(const   SituAndMulParams params) {
   using namespace device;
   constexpr auto kWidest = sizeof(TIn) > sizeof(TOut) ? sizeof(TIn) : sizeof(TOut);
   constexpr auto kVecSize = kMaxVecBytes / kWidest;
@@ -265,7 +265,7 @@ SGL_DEVICE CTAWork get_work(const SituMulQuantVarlenParams& params) {
 
 template <bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
-    situ_mul_quant_varlen_kernel(const SituMulQuantVarlenParams __grid_constant__ params) {
+    situ_mul_quant_varlen_kernel(const SituMulQuantVarlenParams   params) {
   using namespace device;
 
   constexpr uint32_t kGroupSize = 128u;

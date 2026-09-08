@@ -39,7 +39,7 @@ enum class ForwardMode {
 };
 
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, ForwardMode kMode, bool kUsePDL>
-__global__ void fused_norm_rope(const __grid_constant__ FusedNormRopeParams params) {
+__global__ void fused_norm_rope(const  FusedNormRopeParams params) {
   using namespace device;
   using enum ForwardMode;
 

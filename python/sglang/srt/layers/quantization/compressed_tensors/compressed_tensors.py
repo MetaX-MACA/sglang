@@ -41,9 +41,9 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsLinearScheme,
     CompressedTensorsMoEScheme,
-    CompressedTensorsMxInt4MoE,
-    CompressedTensorsW4A4Fp4,
-    CompressedTensorsW4A4Nvfp4MoE,
+    # CompressedTensorsMxInt4MoE,
+    # CompressedTensorsW4A4Fp4,
+    # CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
@@ -52,10 +52,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
-    NPUCompressedTensorsW4A8Int8DynamicMoE,
-    NPUCompressedTensorsW4A16Int4DynamicMoE,
-    NPUCompressedTensorsW8A8Int8,
-    NPUCompressedTensorsW8A8Int8DynamicMoE,
+    # NPUCompressedTensorsW4A8Int8DynamicMoE,
+    # NPUCompressedTensorsW4A16Int4DynamicMoE,
+    # NPUCompressedTensorsW8A8Int8,
+    # NPUCompressedTensorsW8A8Int8DynamicMoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
@@ -63,7 +63,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     is_activation_quantization_format,
     should_ignore_layer,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+# from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
@@ -595,6 +595,14 @@ class CompressedTensorsConfig(QuantizationConfig):
             and is_symmetric
         )
 
+    def _is_dynamic_token_int8_w8a8(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+        # Confirm weights and activations quantized.
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_int8_w8a8 = (weight_quant.type == QuantizationType.INT and input_quant.type == QuantizationType.INT)
+        return is_int8_w8a8 and self._is_dynamic_token_w8a8(weight_quant, input_quant)
+    
     def _is_wNa16_group_channel(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:

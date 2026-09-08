@@ -237,7 +237,7 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
 }
 
 template <bool kUsePDL>
-__global__ void topk_transform_kernel(const __grid_constant__ TopKParams params) {
+__global__ void topk_1024_transform(const  TopK1024Params params) {
   const auto &[
     scores, seq_lens, page_table, page_indices, raw_indices, // pointers
     score_stride, page_table_stride, page_bits, topk // sizes

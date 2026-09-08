@@ -59,6 +59,9 @@ def is_hip_runtime() -> bool:
 def is_musa_runtime() -> bool:
     return hasattr(torch.version, "musa") and torch.version.musa is not None
 
+@cache_once
+def is_maca_runtime() -> bool:
+    return "metax" in torch.__version__
 
 _REGISTERED_CLASSES: Dict[type, type] = {}
 

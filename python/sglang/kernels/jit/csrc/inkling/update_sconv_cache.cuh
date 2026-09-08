@@ -41,7 +41,7 @@ constexpr uint32_t kUpdThreads = 256;  // threads/block, each owns a channel pai
 constexpr int kPadSlot = -1;
 
 template <int W1, typename DType>
-__global__ void update_sconv_cache_kernel(const __grid_constant__ UpdateSconvParams p) {
+__global__ void update_sconv_cache_kernel(const   UpdateSconvParams p) {
   const int b = blockIdx.y;
   const int ci = static_cast<const int32_t*>(p.cache_indices)[b];
   const int start = static_cast<const int32_t*>(p.qsl)[b];

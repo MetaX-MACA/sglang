@@ -47,7 +47,7 @@ constexpr uint32_t kDecThreads = 256;
 constexpr int kPadSlot = -1;
 
 template <int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_TRACK, typename DType>
-__global__ void fused_decode_update_kernel(const __grid_constant__ DecodeUpdateParams p) {
+__global__ void fused_decode_update_kernel(const   DecodeUpdateParams p) {
   constexpr int W1 = W - 1;  // number of cached history taps / conv-state rows
   const int t = blockIdx.y;
   const int ci = static_cast<const int32_t*>(p.cache_indices)[t];

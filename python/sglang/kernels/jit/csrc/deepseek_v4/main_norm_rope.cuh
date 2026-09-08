@@ -79,7 +79,7 @@ struct FusedQNormRopeParams {
 };
 
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL>
-Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams params) {
+Q_KERNEL void fused_q_norm_rope(const FusedQNormRopeParams params) {
   using namespace device;
 
   constexpr int64_t kMaxVecSize = 16 / sizeof(DType);
@@ -260,7 +260,7 @@ struct FusedKNormRopeFlashMLAParams {
 };
 
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, int32_t kPageBits, bool kUsePDL>
-K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeFlashMLAParams params) {
+K_KERNEL void fused_k_norm_rope_flashmla(const FusedKNormRopeFlashMLAParams params) {
   using namespace device;
 
   constexpr int64_t kVecSize = 2;
@@ -457,7 +457,7 @@ struct FusedQIndexerRopeHadamardQuantParams {
 };
 
 template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
-Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
+Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const FusedQIndexerRopeHadamardQuantParams params) {
   using namespace device;
 
   constexpr int64_t kHeadDim = 128;
@@ -694,7 +694,7 @@ struct FusedQIndexerRopeHadamardFp4QuantParams {
 
 template <typename DType, typename PosT, bool kUsePDL>
 Q_KERNEL void
-fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRopeHadamardFp4QuantParams params) {
+fused_q_indexer_rope_hadamard_fp4_quant(const FusedQIndexerRopeHadamardFp4QuantParams params) {
   using namespace device;
 
   constexpr int64_t kHeadDim = 128;

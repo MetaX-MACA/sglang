@@ -30,7 +30,7 @@ struct FusedStoreCacheParam {
 };
 
 template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
-__global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCacheParam param) {
+__global__ void fused_store_flashmla_cache(const  FusedStoreCacheParam param) {
   using namespace device;
 
   /// NOTE: 584 = 576 + 8
@@ -76,7 +76,7 @@ __global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCac
 }
 
 template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
-__global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCacheParam param) {
+__global__ void fused_store_indexer_cache(const  FusedStoreCacheParam param) {
   using namespace device;
 
   /// NOTE: 132 = 128 + 4

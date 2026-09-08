@@ -59,7 +59,7 @@ __device__ __forceinline__ float compute_score(float x) {
 }
 
 template <uint32_t kWarpsPerToken, ScoringFunc kScoringFunc>
-__global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __grid_constant__ params) {
+__global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams  params) {
   const auto& [input, bias, output, indices, num_rows, num_experts, topk, num_fused_shared_experts, renormalize, routed_scaling_factor, apply_routed_scaling_factor_on_output] =
       params;
 
@@ -185,7 +185,7 @@ __global__ void moe_fused_gate_kernel_small_token(const MoEFusedGateParams __gri
 }
 
 template <ScoringFunc kScoringFunc>
-__global__ void moe_fused_gate_kernel(const MoEFusedGateParams __grid_constant__ params) {
+__global__ void moe_fused_gate_kernel(const MoEFusedGateParams  params) {
   const auto& [input, bias, output, indices, num_rows, num_experts, topk, num_fused_shared_experts, renormalize, routed_scaling_factor, apply_routed_scaling_factor_on_output] =
       params;
 

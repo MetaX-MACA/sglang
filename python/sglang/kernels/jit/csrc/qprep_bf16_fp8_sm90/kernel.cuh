@@ -146,7 +146,7 @@ __device__ __forceinline__ uint16_t f32x2_to_bf16x2_to_e4m3x2(float f0, float f1
 // ---------------------------------------------------------------------------
 
 template <typename Kernel>
-__global__ void qprep_bf16_fp8_kernel(__grid_constant__ const QprepBf16Fp8Sm90Params params);
+__global__ void qprep_bf16_fp8_kernel(  const QprepBf16Fp8Sm90Params params);
 
 template <int K_DIM>
 struct QprepBf16Fp8Kernel {
@@ -506,7 +506,7 @@ struct QprepBf16Fp8Kernel {
 
 template <typename Kernel>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, Kernel::MIN_CTAS)
-    qprep_bf16_fp8_kernel(__grid_constant__ const QprepBf16Fp8Sm90Params params) {
+    qprep_bf16_fp8_kernel(  const QprepBf16Fp8Sm90Params params) {
   Kernel::devfunc(params);
 }
 

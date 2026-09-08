@@ -186,7 +186,7 @@ SGL_DEVICE void copy_kv_rows_warp(
  * \tparam T The data type of the indices (`int32_t` or `int64_t`).
  */
 template <int64_t kKElementBytes, int64_t kVElementBytes, int kSplit, bool kUsePDL, typename T>
-__global__ void store_kvcache(const __grid_constant__ StoreKVCacheParams params) {
+__global__ void store_kvcache(const StoreKVCacheParams params) {
   using namespace device;
   constexpr auto kKSplitSize = kKElementBytes / kSplit;
   constexpr auto kVSplitSize = kVElementBytes / kSplit;

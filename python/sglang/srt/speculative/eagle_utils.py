@@ -771,9 +771,12 @@ def eagle_sample(
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
     else:
+        import flashinfer
+        from flashinfer import (
+            top_k_renorm_probs,
+            top_p_renorm_probs,
+        )
         from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
             tree_speculative_sampling_target_only,
         )
 
@@ -802,7 +805,7 @@ def eagle_sample(
             )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
             if sampling_info.need_top_k_sampling:
-                target_probs = top_k_renorm_prob(
+                target_probs = top_k_renorm_probs(
                     target_probs,
                     torch.repeat_interleave(
                         sampling_info.top_ks, verify_input.draft_token_num, dim=0
@@ -812,7 +815,7 @@ def eagle_sample(
                     target_probs, "v2 verify: target_probs after top_k_renorm"
                 )
             if sampling_info.need_top_p_sampling:
-                target_probs = top_p_renorm_prob(
+                target_probs = top_p_renorm_probs(
                     target_probs,
                     torch.repeat_interleave(
                         sampling_info.top_ps, verify_input.draft_token_num, dim=0

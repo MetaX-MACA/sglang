@@ -38,7 +38,7 @@ struct ProducerParams {
 
 template <uint32_t K, uint32_t N, uint32_t M, uint32_t N_SPLIT, bool kUsePDL>
 __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
-    const __grid_constant__ ProducerParams params,
+    const   ProducerParams params,
     const bf16_t* __restrict__ x,         // [M, K]
     const bf16_t* __restrict__ weight) {  // [N, K] FULL replicated weight
   using namespace device;
@@ -134,7 +134,7 @@ struct ConsumerParams {
 };
 
 template <uint32_t N, bool kHasC, bool kUsePDL>
-__global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) {
+__global__ void spin_add3_kernel(const   ConsumerParams params) {
   using namespace device;
   using vec_t = AlignedVector<bf16x2_t, kSpinVec / 2>;  // 8 bf16 as 4 pairs
   constexpr uint32_t kNLocal = N / kWorld;

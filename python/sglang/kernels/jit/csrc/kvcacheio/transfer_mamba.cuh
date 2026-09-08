@@ -29,7 +29,7 @@ struct MambaTransferParams {
 };
 
 __global__
-__launch_bounds__(kBlockSize, 1) void transfer_mamba_load_kernel(const __grid_constant__ MambaTransferParams params) {
+__launch_bounds__(kBlockSize, 1) void transfer_mamba_load_kernel(const   MambaTransferParams params) {
   const int tid = threadIdx.x;
 
   for (int64_t item_id = static_cast<int64_t>(blockIdx.x); item_id < params.num_items; item_id += gridDim.x) {
@@ -55,7 +55,7 @@ __launch_bounds__(kBlockSize, 1) void transfer_mamba_load_kernel(const __grid_co
 }
 
 __global__
-__launch_bounds__(kBlockSize, 1) void transfer_mamba_backup_kernel(const __grid_constant__ MambaTransferParams params) {
+__launch_bounds__(kBlockSize, 1) void transfer_mamba_backup_kernel(const   MambaTransferParams params) {
   const int tid = threadIdx.x;
   const int64_t total_work = params.num_items * params.num_layers;
 

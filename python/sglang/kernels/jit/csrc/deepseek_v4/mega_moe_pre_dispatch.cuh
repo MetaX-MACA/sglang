@@ -46,7 +46,7 @@ struct MegaMoEPreDispatchParams {
 // loop bookkeeping alone costs ~10% on the rows that fit a single chunk.
 template <uint32_t kGroupSize, bool kUsePDL, bool kMultiChunk>
 __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
-    mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams __grid_constant__ params) {
+    mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams   params) {
   using namespace device;
 
   constexpr uint32_t kVecElems = 8;  // 8 bf16 = 16B load per thread

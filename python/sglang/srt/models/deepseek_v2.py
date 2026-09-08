@@ -19,7 +19,7 @@
 """Inference-only DeepseekV2 model."""
 
 from __future__ import annotations
-
+import os
 import logging
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -228,11 +228,11 @@ if _use_aiter_gfx95:
 if _use_aiter:
     pass
 
-if _is_cuda:
-    from sglang.kernels.ops.gemm.dsv3_router_gemm import (
-        dsv3_router_gemm as dsv3_router_gemm,
-    )
-elif _is_npu:
+# if _is_cuda:
+#     from sglang.kernels.ops.gemm.dsv3_router_gemm import (
+#         dsv3_router_gemm as dsv3_router_gemm,
+#     )
+if False:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
         forward_dsa_prepare_npu,
@@ -538,26 +538,29 @@ class MoEGate(nn.Module):
                 return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
         else:
-            if (
-                _is_cuda
-                and hidden_states.shape[0] <= 16
-                and hidden_states.shape[1] % 1024 == 0
-                and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
-                and _device_sm >= 90
-            ):
-                logits = dsv3_router_gemm(
-                    hidden_states, self.weight, out_dtype=torch.float32
-                )
+            # if (
+            #     _is_cuda
+            #     and hidden_states.shape[0] <= 16
+            #     and hidden_states.shape[1] % 1024 == 0
+            #     and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
+            #     and _device_sm >= 90
+            # ):
+            #     logits = dsv3_router_gemm(
+            #         hidden_states, self.weight, out_dtype=torch.float32
+            #     )
 
-            elif _use_aiter:
-                logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
-            elif not _is_cuda:
-                logits = F.linear(hidden_states, self.weight, None)
-            else:
-                # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
+            # elif _use_aiter:
+            #     logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
+            # elif _is_npu:
+            #     logits = F.linear(hidden_states, self.weight, None)
+            # else:
+            if self.is_deepseek_v4:
                 from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 
                 logits = linear_bf16_fp32(hidden_states, self.weight)
+            else:
+                # After testing, we may use the faster code in `if deepseek v4` branch
+                logits = F.linear(hidden_states, self.weight, None)
 
         return logits
 
@@ -581,7 +584,7 @@ class DeepseekV2MoE(nn.Module):
         self.moe_ep_size = get_parallel().moe_ep_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-
+        self.is_deepseek_v4 = is_deepseek_v4
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
@@ -1185,14 +1188,17 @@ class DeepseekV2MoE(nn.Module):
                 gemm_output_zero_allocator,
                 pre_quant_input=pre_quant_input,
             )
+        if self.is_deepseek_v4:
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
+                self.routed_scaling_factor,
+            )
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
-        )
-
+        if shared_output is not None:
+            final_hidden_states+=shared_output
+        
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
@@ -1957,6 +1963,9 @@ class DeepseekV2AttentionMLA(
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
+        
+        self.w_kc_scale = None
+        self.w_vc_scale = None
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -1973,9 +1982,14 @@ class DeepseekV2AttentionMLA(
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
             in {"awq", "awq_marlin", "moe_wna16"}
         )
-        self._use_min_latency_fused_a_gemm: bool | None = None
+        # self.use_min_latency_fused_a_gemm = (
+        #     self.has_fused_proj
+        #     and not get_exec().deterministic.enable_deterministic_inference
+        #     and not self.is_packed_weight
+        #     and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
+        # )
         self.fused_a_gemm_backend = "auto"
-
+        self._use_min_latency_fused_a_gemm = False
         self.has_q_b_proj = hasattr(self, "q_b_proj")
         q_b_proj_verified_shapes = {(2048, 2048), (4096, 2048)}
         q_b_weight = (
@@ -2998,6 +3012,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
+        self.enable_dequant_bf16 = True if os.getenv("MX_ENABLE_DEQUANT_BF16") else False      
         self.determine_num_fused_shared_experts()
         self.use_dsa = is_deepseek_dsa(config)
         self.model = DeepseekV2Model(
@@ -3272,28 +3287,28 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
 
-@register_custom_op(out_shape="hidden_states")
-def dsv2_flashinfer_moe_dual_stream_graph(
-    hidden_states: torch.Tensor,
-    layer_id: int,
-    fuse_mlp_allreduce: bool,
-    mlp_reduce_scatter: bool,
-) -> torch.Tensor:
-    forward_context = get_tc_piecewise_forward_context()
-    assert forward_context is not None
-    assert forward_context.moe_fusions is not None
+# @register_custom_op(out_shape="hidden_states")
+# def dsv2_flashinfer_moe_dual_stream_graph(
+#     hidden_states: torch.Tensor,
+#     layer_id: int,
+#     fuse_mlp_allreduce: bool,
+#     mlp_reduce_scatter: bool,
+# ) -> torch.Tensor:
+#     forward_context = get_tc_piecewise_forward_context()
+#     assert forward_context is not None
+#     assert forward_context.moe_fusions is not None
 
-    moe_fusion = forward_context.moe_fusions[layer_id]
-    assert moe_fusion is not None
+    # moe_fusion = forward_context.moe_fusions[layer_id]
+    # assert moe_fusion is not None
     # Custom-op execution happens outside the caller's Python scope under
     # torch.compile. Carry graph-varying control state as scalar operands and
     # republish it for the nested MoE/linear consumers.
-    with get_forward().scoped(
-        fuse_mlp_allreduce=fuse_mlp_allreduce,
-        mlp_reduce_scatter=mlp_reduce_scatter,
-        flashinfer_trtllm_bypass=True,
-    ):
-        return moe_fusion.forward_normal_dual_stream(hidden_states)
+    # with get_forward().scoped(
+    #     fuse_mlp_allreduce=fuse_mlp_allreduce,
+    #     mlp_reduce_scatter=mlp_reduce_scatter,
+    #     flashinfer_trtllm_bypass=True,
+    # ):
+    #     return moe_fusion.forward_normal_dual_stream(hidden_states)
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]

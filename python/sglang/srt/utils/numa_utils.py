@@ -389,8 +389,8 @@ def _query_numa_node_for_gpu(device_id: int):
     """
     try:
         import pynvml
-    except ModuleNotFoundError:
-        logger.warning("pynvml not installed, skipping NUMA node configuration for GPU")
+    except :
+        pynvml=None
         return []
 
     try:

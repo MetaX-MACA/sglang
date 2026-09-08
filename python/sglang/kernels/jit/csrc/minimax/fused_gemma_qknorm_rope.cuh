@@ -117,7 +117,7 @@ struct FusedTrait {
 };
 
 template <typename Trait>
-__global__ void fused_gemma_qknorm_rope_kernel(const __grid_constant__ FusedGemmaQKNormParams params) {
+__global__ void fused_gemma_qknorm_rope_kernel(const FusedGemmaQKNormParams params) {
   return Trait::forward(params);
 }
 

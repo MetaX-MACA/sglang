@@ -206,8 +206,8 @@ if _use_aiter:
 
 
 if _is_cuda:
-    from sglang.kernels.ops.gemm import fp8_scaled_mm
-    from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
+    # from sglang.kernels.ops.gemm import fp8_scaled_mm
+    # from sglang.kernels.ops.gemm.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
     @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
@@ -217,7 +217,11 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
+    try:
+        from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
+    except:
+        _raw_bmm_fp8_batched = None
+    
 
     @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
     def _bmm_fp8_batched_op(
@@ -1012,9 +1016,9 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     q_input, x_scale = sglang_per_token_group_quant_fp8_row_padded(
         input_2d, block_size[1]
     )
-    output = fp8_blockwise_scaled_mm(
-        q_input, weight.T, x_scale, weight_scale.T, out_dtype=input_2d.dtype
-    )
+    # output = fp8_blockwise_scaled_mm(
+    #     q_input, weight.T, x_scale, weight_scale.T, out_dtype=input_2d.dtype
+    # )
     if output.shape[0] != input_2d.shape[0]:
         # GEMM ran on the row-padded buffer; drop the padding rows.
         output = output[: input_2d.shape[0]]

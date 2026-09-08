@@ -47,7 +47,7 @@ struct VerifyKernelParams {
 };
 
 template <bool CHECK_VERIFY_EXPECTED_TOKEN>
-__global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ p) {
+__global__ void canary_verify_kernel(const VerifyKernelParams   p) {
   const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t stride = gridDim.x * blockDim.x;
 

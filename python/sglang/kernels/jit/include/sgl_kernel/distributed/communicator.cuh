@@ -76,7 +76,7 @@ static_assert(sizeof(Semaphore) == 128, "must match _SEMAPHORE_BYTES in custom_a
 
 /// Kernel-facing slice of a push plane: `[offset, offset + size)` within every
 /// slot, with `slot_bytes` as the stride from one slot to the next. Trivially
-/// copyable, so it drops straight into a `__grid_constant__` params struct.
+/// copyable, so it drops straight into a ` ` params struct.
 template <uint32_t kWorldSize>
 struct PushWorkSpace {
   std::array<uint8_t*, kWorldSize> workspaces;

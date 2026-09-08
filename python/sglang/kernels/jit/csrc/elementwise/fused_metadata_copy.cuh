@@ -11,7 +11,7 @@
  * PERFORMANCE BENEFITS:
  * - Single kernel launch vs. multiple separate copies (3-10x faster)
  * - Optimized memory coalescing and SM utilization
- * - __grid_constant__ parameter passing via constant memory
+ * -   parameter passing via constant memory
  * - Especially beneficial in CUDA graph replay scenarios
  *
  * DESIGN:
@@ -82,7 +82,7 @@ struct DestinationPointers {
 
 /**
  * Parameter structure for single-backend fused metadata copy kernel.
- * Passed via __grid_constant__ for efficient constant memory access.
+ * Passed via   for efficient constant memory access.
  */
 struct FusedMetadataCopyParams {
   SourcePointers src;       // Source tensor pointers
@@ -138,7 +138,7 @@ struct FusedMetadataCopyMultiParams {
  * @tparam HAS_FLASHMLA Compile-time flag for FlashMLA metadata support
  */
 template <bool HAS_REAL_PAGE_TABLE, bool HAS_FLASHMLA>
-__global__ void fused_metadata_copy_kernel(const FusedMetadataCopyParams __grid_constant__ params) {
+__global__ void fused_metadata_copy_kernel(const FusedMetadataCopyParams   params) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int total_threads = gridDim.x * blockDim.x;
 
@@ -268,7 +268,7 @@ __global__ void fused_metadata_copy_kernel(const FusedMetadataCopyParams __grid_
  * @tparam HAS_FLASHMLA Compile-time flag for FlashMLA metadata support
  */
 template <bool HAS_REAL_PAGE_TABLE, bool HAS_FLASHMLA>
-__global__ void fused_metadata_copy_multi_kernel(const FusedMetadataCopyMultiParams __grid_constant__ params) {
+__global__ void fused_metadata_copy_multi_kernel(const FusedMetadataCopyMultiParams   params) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int total_threads = gridDim.x * blockDim.x;
 
@@ -481,7 +481,7 @@ inline dim3 get_launch_config(int total_work, int threads_per_block = THREADS_PE
  * - Extracts raw pointers from TensorView objects
  * - Constructs FusedMetadataCopyParams with nested SourcePointers/DestinationPointers
  * - Calculates grid configuration based on maximum work size
- * - Launches fused_metadata_copy_kernel with __grid_constant__ parameters
+ * - Launches fused_metadata_copy_kernel with   parameters
  *
  * @tparam FORWARD_MODE Forward mode: 0=DECODE, 1=TARGET_VERIFY, 2=DRAFT_EXTEND
  * @tparam HAS_REAL_PAGE_TABLE Whether real_page_table tensors are present
@@ -598,7 +598,7 @@ struct FusedMetadataCopyKernel {
  *
  * IMPLEMENTATION:
  * - Constructs FusedMetadataCopyMultiParams with 1 SourcePointers + 3 DestinationPointers
- * - Launches fused_metadata_copy_multi_kernel with __grid_constant__ parameters
+ * - Launches fused_metadata_copy_multi_kernel with   parameters
  *
  * @tparam HAS_REAL_PAGE_TABLE Whether real_page_table tensors are present
  * @tparam HAS_FLASHMLA Whether FlashMLA metadata tensors are present

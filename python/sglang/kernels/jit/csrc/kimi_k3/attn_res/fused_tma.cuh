@@ -564,7 +564,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
 // so that many CTAs actually co-reside; smem must also fit kOccupancy copies.
 template <typename Trait, uint32_t kOccupancy>
 __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
-    attn_res_fused_tma_kernel(const __grid_constant__ AttnResTMAParams params) {
+    attn_res_fused_tma_kernel(const   AttnResTMAParams params) {
   extern __shared__ char smem_raw[];
   Trait::forward(params, reinterpret_cast<typename Trait::Smem*>(smem_raw));
 }
@@ -575,7 +575,7 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
 // protocol used by the neighboring K3 collectives.
 template <typename Trait, uint32_t kOccupancy>
 __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
-    attn_res_fused_pull_rs_kernel(const __grid_constant__ AttnResTMAParams params) {
+    attn_res_fused_pull_rs_kernel(const   AttnResTMAParams params) {
   // The window base lives in shared memory, not in the barrier object: this
   // kernel's body is register-budgeted (see kConsumerRegs / setmaxnreg), so
   // keeping the object live across Trait::forward would spill.
@@ -630,7 +630,7 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
 // full-token output instead of launching a separate all-gather.
 template <typename Trait, uint32_t kOccupancy>
 __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
-    attn_res_fused_direct_ag_kernel(const __grid_constant__ AttnResTMAParams params) {
+    attn_res_fused_direct_ag_kernel(const   AttnResTMAParams params) {
   __shared__ uint32_t exit_base;  // see the note in the pull-RS kernel above
   {
     const auto barrier =

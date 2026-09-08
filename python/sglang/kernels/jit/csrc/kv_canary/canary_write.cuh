@@ -56,7 +56,7 @@ struct WriteKernelParams {
   RealKvHashMode real_kv_hash_mode;
 };
 
-__global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p) {
+__global__ void canary_write_kernel(const WriteKernelParams   p) {
   const uint32_t r = blockIdx.x;
 
   // Unconditional kernel_run_counter bump (block 0 is always present).

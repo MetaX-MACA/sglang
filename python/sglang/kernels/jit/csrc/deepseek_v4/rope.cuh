@@ -32,7 +32,7 @@ struct FusedQKRopeParams {
 
 template <bool kUsePDL, bool kInverse, typename IndexType>
 __global__ __launch_bounds__(kBlockSize, 16)  //
-    void deepseek_rope_kernel(const __grid_constant__ FusedQKRopeParams param) {
+    void deepseek_rope_kernel(const  FusedQKRopeParams param) {
   using namespace device;
   using DType2 = packed_t<DType>;
 

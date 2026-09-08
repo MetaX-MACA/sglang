@@ -24,7 +24,7 @@ struct MlaOutputGateParams {
 };
 
 template <int kThreads, bool kUsePDL>
-__global__ void mla_output_gate_kernel(const MlaOutputGateParams __grid_constant__ params) {
+__global__ void mla_output_gate_kernel(const MlaOutputGateParams   params) {
   using namespace device;
 
   constexpr int kVecN = 8;

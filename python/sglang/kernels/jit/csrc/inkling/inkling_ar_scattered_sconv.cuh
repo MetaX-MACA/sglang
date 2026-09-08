@@ -180,7 +180,7 @@ __device__ __forceinline__ void ss_fused_norm_tail(const ArScatteredSconvParams&
 
 template <typename DType, uint32_t kNumGPU, int W, bool USE_SILU, bool USE_RESIDUAL, bool kPerBlockBarrier>
 __global__
-__launch_bounds__(1024, 1) void inkling_ar_scattered_sconv_kernel(const __grid_constant__ ArScatteredSconvParams p) {
+__launch_bounds__(1024, 1) void inkling_ar_scattered_sconv_kernel(const   ArScatteredSconvParams p) {
   static_assert(std::is_same_v<DType, __nv_bfloat16>, "multimem path is bf16-only");
   constexpr int W1 = W - 1;
 
@@ -511,7 +511,7 @@ uint32_t ss_max_resident_blocks(Kernel kernel, uint32_t block_size, DLDevice dev
 
 template <typename DType, uint32_t kNumGPU, int W, bool USE_SILU, bool USE_RESIDUAL, bool kPerBlockBarrier>
 __global__
-__launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const __grid_constant__ ArScatteredSconvParams p) {
+__launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const   ArScatteredSconvParams p) {
   static_assert(std::is_same_v<DType, __nv_bfloat16>, "multimem path is bf16-only");
   constexpr int W1 = W - 1;
 
@@ -975,7 +975,7 @@ struct ColDecodeParams {
 };
 
 template <typename DType, uint32_t kNumGPU, int W, bool USE_SILU, bool USE_RESIDUAL, int VPT>
-__global__ __launch_bounds__(1024, 1) void inkling_ar_col_decode_kernel(const __grid_constant__ ColDecodeParams p) {
+__global__ __launch_bounds__(1024, 1) void inkling_ar_col_decode_kernel(const   ColDecodeParams p) {
   static_assert(std::is_same_v<DType, __nv_bfloat16>, "multimem path is bf16-only");
   constexpr int W1 = W - 1;
   const uint32_t t = blockIdx.x;
@@ -1306,7 +1306,7 @@ struct ArBandedSconvParams {
 
 template <typename DType, uint32_t kNumGPU, int W, bool USE_SILU, bool USE_RESIDUAL, bool kPerBlockBarrier>
 __global__
-__launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const __grid_constant__ ArBandedSconvParams p) {
+__launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const   ArBandedSconvParams p) {
   static_assert(std::is_same_v<DType, __nv_bfloat16>, "multimem path is bf16-only");
   constexpr int W1 = W - 1;
   const bool scattered = p.Hc < p.H;
@@ -1711,7 +1711,7 @@ struct SsconvNormDecodeParams {
 
 template <typename DType, uint32_t kNumGPU, int W, bool USE_SILU, bool USE_RESIDUAL, int VPT>
 __global__
-__launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const __grid_constant__ SsconvNormDecodeParams p) {
+__launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const   SsconvNormDecodeParams p) {
   static_assert(std::is_same_v<DType, __nv_bfloat16>, "multimem push path is bf16-only");
   constexpr int W1 = W - 1;
   const uint32_t t = blockIdx.x;

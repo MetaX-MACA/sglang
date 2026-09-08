@@ -67,18 +67,34 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
+aiter_paged_mqa_logits = None
+cutedsl_paged_mqa_logits = None
+deepgemm_paged_mqa_logits_native = None
+deepgemm_paged_mqa_logits_split = None
+pick_dsl_expand = None
 if not _is_npu:
-    from sglang.kernels.ops.attention.dsa import (
-        aiter_paged_mqa_logits,
-        cutedsl_paged_mqa_logits,
-        deepgemm_paged_mqa_logits_native,
-        deepgemm_paged_mqa_logits_split,
-    )
-else:
-    aiter_paged_mqa_logits = None
-    cutedsl_paged_mqa_logits = None
-    deepgemm_paged_mqa_logits_native = None
-    deepgemm_paged_mqa_logits_split = None
+    try:
+        from sglang.kernels.ops.attention.dsa import (
+            aiter_paged_mqa_logits,
+            cutedsl_paged_mqa_logits,
+            deepgemm_paged_mqa_logits_native,
+            deepgemm_paged_mqa_logits_split,
+        )
+    except ImportError as e:
+        logger.warning(
+            "DSA paged MQA backends unavailable (%s); indexer may be limited.",
+            e,
+        )
+        
+if _is_cuda:
+    try:
+        from sglang.jit_kernel.dsa import pick_dsl_expand
+    except ImportError as e:
+        logger.warning(
+            "CuTe DSL pick_dsl_expand unavailable (%s); disable cutedsl backend.",
+            e,
+        )
+        pick_dsl_expand = None
 
 if _is_cuda:
     from sglang.kernels.ops.attention.dsa import pick_dsl_expand

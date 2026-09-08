@@ -41,7 +41,7 @@ struct DraftExtendParams {
 constexpr uint32_t kDEThreads = 256;
 
 template <int W1, bool DO_TRACK, typename DType>
-__global__ void draft_extend_kernel(const __grid_constant__ DraftExtendParams p) {
+__global__ void draft_extend_kernel(const   DraftExtendParams p) {
   const int b = blockIdx.y;
   const int c0 = (blockIdx.x * kDEThreads + threadIdx.x) * 2;
   if (c0 >= static_cast<int>(p.D)) return;

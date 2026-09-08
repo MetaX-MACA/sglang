@@ -110,7 +110,7 @@ struct ArSconvNormParams {
 // VPT = 16B vecs handled per thread (tuning knob; see the header comment).
 // Vec i of a thread is at index threadIdx.x + i*blockDim.x (warp-coalesced).
 template <typename DType, uint32_t kNumGPU, int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_TRACK, int VPT>
-__global__ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_kernel(const __grid_constant__ ArSconvNormParams p) {
+__global__ __launch_bounds__(1024, 1) void inkling_ar_sconv_norm_kernel(const   ArSconvNormParams p) {
   static_assert(std::is_same_v<DType, __nv_bfloat16>, "multimem push path is bf16-only");
   constexpr int W1 = W - 1;
   const uint32_t t = blockIdx.x;
@@ -360,7 +360,7 @@ struct ArSconvNormVerifyParams {
 
 template <typename DType, uint32_t kNumGPU, int W, bool USE_SILU, bool USE_RESIDUAL>
 __global__
-__launch_bounds__(1024, 1) void inkling_ar_sconv_norm_verify_kernel(const __grid_constant__ ArSconvNormVerifyParams p) {
+__launch_bounds__(1024, 1) void inkling_ar_sconv_norm_verify_kernel(const   ArSconvNormVerifyParams p) {
   static_assert(std::is_same_v<DType, __nv_bfloat16>, "multimem push path is bf16-only");
   constexpr int W1 = W - 1;
   const uint32_t vecs = p.D / kVecElems;

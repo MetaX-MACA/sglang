@@ -178,6 +178,8 @@ def register_xpu_device_properties_for_dynamo() -> None:
     if xpu_props_type is not None:
         dynamo_utils.common_constant_types.add(xpu_props_type)
 
+def is_maca() -> bool:
+    return "metax" in torch.__version__
 
 @lru_cache(maxsize=1)
 def is_npu() -> bool:
@@ -810,7 +812,40 @@ def get_mtgpu_memory_capacity():
         raise RuntimeError(
             "mthreads-gmi not found. Ensure Moore Threads drivers are installed and accessible."
         )
+        
+def get_mxgpu_memory_capacity():
+    try:
+        # Run nvidia-smi and capture the output
+        mx_smi_command = ["mx-smi", "--show-memory"]
+        grep_command = ["grep", "vis_vram total"]
+        awk_command = ["awk", "{print $4}"]
 
+        process1 = subprocess.Popen(mx_smi_command, stdout=subprocess.PIPE)
+        process2 = subprocess.Popen(grep_command, stdin=process1.stdout, stdout=subprocess.PIPE)
+        process1.stdout.close()  
+        process3 = subprocess.Popen(awk_command, stdin=process2.stdout, stdout=subprocess.PIPE)
+        process2.stdout.close() 
+
+        output, error = process3.communicate()
+        if error:
+            raise RuntimeError(f"mx-smi error: {error.decode().strip()}")
+
+        # Parse the output to extract memory values
+        memory_values = [
+            float(mem) / 1024
+            for mem in output.decode().strip().split("\n")
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+    
+    except FileNotFoundError:
+        raise RuntimeError(
+            "mx-smi not found. Ensure MACA drivers are installed and accessible."
+        )
 
 def get_device_memory_capacity(device: str = None):
     # OOT platforms provide their own memory query via the platform class.
@@ -820,7 +855,10 @@ def get_device_memory_capacity(device: str = None):
             return mem_bytes / (1 << 20)  # bytes -> MiB
         return None
     if is_cuda():
-        gpu_mem = get_nvgpu_memory_capacity()
+        if is_maca():
+            gpu_mem = get_mxgpu_memory_capacity()
+        else:
+            gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
         gpu_mem = get_amdgpu_memory_capacity()
     elif device == "hpu":

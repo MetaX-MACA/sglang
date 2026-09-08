@@ -98,12 +98,14 @@ if _is_cuda or _is_xpu or _is_musa:
     else:
         _flashinfer_layernorm_available = False
         _flashinfer_rmsnorm_quant_available = False
-
-    from sgl_kernel import (
-        fused_add_rmsnorm,
+        
+    import flashinfer
+    from sgl_kernel import fused_add_rmsnorm
+    from flashinfer import rmsnorm 
+    # as flashinfer_rmsnorm
+    from flashinfer import (
         gemma_fused_add_rmsnorm,
-        gemma_rmsnorm,
-        rmsnorm,
+        gemma_rmsnorm
     )
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
@@ -186,6 +188,28 @@ if _is_npu:
 
 _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE = 5120
 
+if _is_cuda:
+    @torch.library.custom_op("sglang::rmsnorm", mutates_args=())
+    def sgl_rmsnorm(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+        out: Optional[torch.Tensor] = None,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        return rmsnorm(input, weight, eps, out, enable_pdl)
+
+    @torch.library.register_fake("sglang::rmsnorm")
+    def _(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+        out: Optional[torch.Tensor] = None,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        if out is None:
+            out = torch.empty_like(input)
+        return out
 
 @lru_cache(maxsize=1)
 def _get_aiter_per_group_quant():
@@ -598,7 +622,7 @@ class RMSNorm(BaseFusedOp):
                 fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
                 result = x, residual
         else:
-            result = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            result = sgl_rmsnorm(x, self.weight.data, self.variance_epsilon)
 
         if needs_reshape:
             if residual is not None:

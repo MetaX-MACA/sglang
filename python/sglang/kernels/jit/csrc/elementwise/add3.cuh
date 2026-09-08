@@ -20,7 +20,7 @@ struct Add3Params {
 };
 
 template <bool kUsePDL, bool kPrefetchBC>
-__global__ void add3_kernel(const __grid_constant__ Add3Params params) {
+__global__ void add3_kernel(const   Add3Params params) {
   constexpr uint32_t kVecPairs = device::kMaxVecBytes / sizeof(bf16x2_t);
   using vec_t = device::AlignedVector<bf16x2_t, kVecPairs>;
 

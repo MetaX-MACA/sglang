@@ -42,7 +42,7 @@ struct Compress128OnlineDecodeParams {
 };
 
 template <int64_t kHeadDim, typename BufferFloat, bool kUsePDL>
-__global__ void flash_c128_online_decode_v2(const __grid_constant__ Compress128OnlineDecodeParams params) {
+__global__ void flash_c128_online_decode_v2(const Compress128OnlineDecodeParams params) {
   using namespace device;
   constexpr uint32_t kVecSize = 4;
   constexpr uint32_t kBlockSize = kHeadDim / kVecSize;
@@ -271,7 +271,7 @@ constexpr float kPadScore = -FLT_MAX;
 ///   `read_page_0`), writes new running state to `read_page_0`.
 template <int64_t kHeadDim, typename BufferFloat, bool kWrite, bool kUsePDL>
 __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
-    void flash_c128_online_prefill_v2(const __grid_constant__ Compress128OnlinePrefillParams params) {
+    void flash_c128_online_prefill_v2(const  Compress128OnlinePrefillParams params) {
   using namespace device;
 
   constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 64

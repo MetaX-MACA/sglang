@@ -54,7 +54,7 @@ def find_nccl_library() -> str:
         )
     else:
         if torch.version.cuda is not None:
-            so_file = "libnccl.so.2"
+            so_file = "libmccl.so"
         elif torch.version.hip is not None:
             so_file = "librccl.so.1"
         elif hasattr(torch.version, "musa") and torch.version.musa is not None:
@@ -72,76 +72,6 @@ def find_nccl_library() -> str:
 ncclResult_t = ctypes.c_int
 ncclComm_t = ctypes.c_void_p
 ncclWindow_t = ctypes.c_void_p
-
-
-# Sentinels NCCL uses to mark "use the default value", see
-# NCCL_CONFIG_UNDEF_INT / NCCL_CONFIG_UNDEF_PTR / NCCL_API_MAGIC in nccl.h.in.
-NCCL_CONFIG_UNDEF_INT = -(2**31)  # INT_MIN
-NCCL_CONFIG_UNDEF_PTR = None
-NCCL_API_MAGIC = 0xCAFEBEEF
-
-# Version code of the header layout the struct below was extracted from, i.e.
-# the equivalent of NCCL_VERSION_CODE baked into NCCL_CONFIG_INITIALIZER at
-# compile time. It declares which fields this initializer knows about, so a
-# (possibly older/newer) runtime libnccl.so honors exactly the fields this
-# struct exposes. Bump this together with the struct layout when re-extracting
-# from nccl.h.in.
-NCCL_CONFIG_VERSION = 23000  # NCCL_VERSION(2, 30, 0)
-
-
-class ncclConfig_t(ctypes.Structure):
-    """Mirror of ``ncclConfig_t`` (``ncclConfig_v22800``) from nccl.h.in.
-
-    Fields are append-only across NCCL versions, and NCCL only copies
-    ``min(config.size, sizeof(its own struct))`` bytes, so declaring the full
-    (newest) layout stays compatible with both older and newer libnccl.so.
-    """
-
-    _fields_ = [
-        # attributes that users should never touch.
-        ("size", ctypes.c_size_t),
-        ("magic", ctypes.c_uint),
-        ("version", ctypes.c_uint),
-        # attributes that users are able to customize.
-        ("blocking", ctypes.c_int),
-        ("cgaClusterSize", ctypes.c_int),
-        ("minCTAs", ctypes.c_int),
-        ("maxCTAs", ctypes.c_int),
-        ("netName", ctypes.c_char_p),
-        ("splitShare", ctypes.c_int),
-        ("trafficClass", ctypes.c_int),
-        ("commName", ctypes.c_char_p),
-        ("collnetEnable", ctypes.c_int),
-        ("CTAPolicy", ctypes.c_int),
-        ("shrinkShare", ctypes.c_int),
-        ("nvlsCTAs", ctypes.c_int),
-        ("nChannelsPerNetPeer", ctypes.c_int),
-        ("nvlinkCentricSched", ctypes.c_int),
-        ("graphUsageMode", ctypes.c_int),
-        ("numRmaCtx", ctypes.c_int),
-        ("maxP2pPeers", ctypes.c_int),
-    ]
-
-    @classmethod
-    def create(cls) -> "ncclConfig_t":
-        """Build a config equivalent to ``NCCL_CONFIG_INITIALIZER``.
-
-        All customizable fields are set to the UNDEF sentinels; callers may
-        override individual fields afterwards.
-        """
-        config = cls()
-        config.size = ctypes.sizeof(cls)
-        config.magic = NCCL_API_MAGIC
-        config.version = NCCL_CONFIG_VERSION
-        # Must explicitly set sentinels: ctypes zero-initializes, and 0 is a
-        # valid value for many fields (e.g. blocking=0 means non-blocking).
-        for name, ctype in cls._fields_[3:]:
-            if ctype is ctypes.c_char_p:
-                setattr(config, name, NCCL_CONFIG_UNDEF_PTR)
-            else:
-                setattr(config, name, NCCL_CONFIG_UNDEF_INT)
-        return config
-
 
 class ncclUniqueId(ctypes.Structure):
     _fields_ = [("internal", ctypes.c_byte * 128)]
@@ -228,33 +158,19 @@ class Function:
 class NCCLLibrary:
     exported_functions = [
         # const char* ncclGetErrorString(ncclResult_t result)
-        Function("ncclGetErrorString", ctypes.c_char_p, [ncclResult_t]),
+        Function("mcclGetErrorString", ctypes.c_char_p, [ncclResult_t]),
         # ncclResult_t  ncclGetVersion(int *version);
-        Function("ncclGetVersion", ncclResult_t, [ctypes.POINTER(ctypes.c_int)]),
+        Function("mcclGetVersion", ncclResult_t, [ctypes.POINTER(ctypes.c_int)]),
         # ncclResult_t ncclGetUniqueId(ncclUniqueId* uniqueId);
-        Function("ncclGetUniqueId", ncclResult_t, [ctypes.POINTER(ncclUniqueId)]),
+        Function("mcclGetUniqueId", ncclResult_t, [ctypes.POINTER(ncclUniqueId)]),
         # ncclResult_t  ncclCommInitRank(
         #   ncclComm_t* comm, int nranks, ncclUniqueId commId, int rank);
         # note that ncclComm_t is a pointer type, so the first argument
         # is a pointer to a pointer
         Function(
-            "ncclCommInitRank",
+            "mcclCommInitRank",
             ncclResult_t,
             [ctypes.POINTER(ncclComm_t), ctypes.c_int, ncclUniqueId, ctypes.c_int],
-        ),
-        # ncclResult_t ncclCommInitRankConfig(
-        #   ncclComm_t* comm, int nranks, ncclUniqueId commId, int rank,
-        #   ncclConfig_t* config);
-        Function(
-            "ncclCommInitRankConfig",
-            ncclResult_t,
-            [
-                ctypes.POINTER(ncclComm_t),
-                ctypes.c_int,
-                ncclUniqueId,
-                ctypes.c_int,
-                ctypes.POINTER(ncclConfig_t),
-            ],
         ),
         # ncclResult_t  ncclAllReduce(
         #   const void* sendbuff, void* recvbuff, size_t count,
@@ -263,7 +179,7 @@ class NCCLLibrary:
         # note that cudaStream_t is a pointer type, so the last argument
         # is a pointer
         Function(
-            "ncclAllReduce",
+            "mcclAllReduce",
             ncclResult_t,
             [
                 buffer_type,
@@ -282,7 +198,7 @@ class NCCLLibrary:
         # note that cudaStream_t is a pointer type, so the last argument
         # is a pointer
         Function(
-            "ncclAllGather",
+            "mcclAllGather",
             ncclResult_t,
             [
                 buffer_type,
@@ -300,7 +216,7 @@ class NCCLLibrary:
         # note that cudaStream_t is a pointer type, so the last argument
         # is a pointer
         Function(
-            "ncclReduce",
+            "mcclReduce",
             ncclResult_t,
             [
                 buffer_type,
@@ -320,7 +236,7 @@ class NCCLLibrary:
         # note that cudaStream_t is a pointer type, so the last argument
         # is a pointer
         Function(
-            "ncclReduceScatter",
+            "mcclReduceScatter",
             ncclResult_t,
             [
                 buffer_type,
@@ -336,7 +252,7 @@ class NCCLLibrary:
         #   const void* sendbuff, size_t count, ncclDataType_t datatype,
         #   int dest, ncclComm_t comm, cudaStream_t stream);
         Function(
-            "ncclSend",
+            "mcclSend",
             ncclResult_t,
             [
                 buffer_type,
@@ -351,7 +267,7 @@ class NCCLLibrary:
         #   void* recvbuff, size_t count, ncclDataType_t datatype,
         #   int src, ncclComm_t comm, cudaStream_t stream);
         Function(
-            "ncclRecv",
+            "mcclRecv",
             ncclResult_t,
             [
                 buffer_type,
@@ -367,7 +283,7 @@ class NCCLLibrary:
         #   ncclDataType_t datatype, int root, ncclComm_t comm,
         #   cudaStream_t stream);
         Function(
-            "ncclBroadcast",
+            "mcclBroadcast",
             ncclResult_t,
             [
                 buffer_type,
@@ -384,17 +300,17 @@ class NCCLLibrary:
         # because Python object destruction can happen in random order,
         # it is better not to call it at all.
         # ncclResult_t  ncclCommDestroy(ncclComm_t comm);
-        Function("ncclCommDestroy", ncclResult_t, [ncclComm_t]),
+        Function("mcclCommDestroy", ncclResult_t, [ncclComm_t]),
         # ncclResult_t ncclGroupStart();
-        Function("ncclGroupStart", ncclResult_t, []),
+        Function("mcclGroupStart", ncclResult_t, []),
         # ncclResult_t ncclGroupEnd();
-        Function("ncclGroupEnd", ncclResult_t, []),
+        Function("mcclGroupEnd", ncclResult_t, []),
     ]
 
     exported_functions_symm_mem = [
         # ncclResult_t ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, ncclWindow_t* win, int winFlags);
         Function(
-            "ncclCommWindowRegister",
+            "mcclCommWindowRegister",
             ncclResult_t,
             [
                 ncclComm_t,
@@ -405,7 +321,7 @@ class NCCLLibrary:
             ],
         ),
         # ncclResult_t ncclCommWindowDeregister(ncclComm_t comm, ncclWindow_t win);
-        Function("ncclCommWindowDeregister", ncclResult_t, [ncclComm_t, ncclWindow_t]),
+        Function("mcclCommWindowDeregister", ncclResult_t, [ncclComm_t, ncclWindow_t]),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -442,7 +358,7 @@ class NCCLLibrary:
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: Dict[str, Any] = {}
             exported_functions = NCCLLibrary.exported_functions
-            if hasattr(self.lib, "ncclCommWindowRegister"):
+            if hasattr(self.lib, "mcclCommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
             for func in exported_functions:
                 f = getattr(self.lib, func.name)
@@ -453,7 +369,7 @@ class NCCLLibrary:
         self._funcs = NCCLLibrary.path_to_dict_mapping[so_file]
 
     def ncclGetErrorString(self, result: ncclResult_t) -> str:
-        return self._funcs["ncclGetErrorString"](result).decode("utf-8")
+        return self._funcs["mcclGetErrorString"](result).decode("utf-8")
 
     def NCCL_CHECK(self, result: ncclResult_t) -> None:
         if result != 0:
@@ -462,7 +378,7 @@ class NCCLLibrary:
 
     def ncclGetRawVersion(self) -> int:
         version = ctypes.c_int()
-        self.NCCL_CHECK(self._funcs["ncclGetVersion"](ctypes.byref(version)))
+        self.NCCL_CHECK(self._funcs["mcclGetVersion"](ctypes.byref(version)))
         # something like 21903
         return version.value
 
@@ -476,33 +392,15 @@ class NCCLLibrary:
 
     def ncclGetUniqueId(self) -> ncclUniqueId:
         unique_id = ncclUniqueId()
-        self.NCCL_CHECK(self._funcs["ncclGetUniqueId"](ctypes.byref(unique_id)))
+        self.NCCL_CHECK(self._funcs["mcclGetUniqueId"](ctypes.byref(unique_id)))
         return unique_id
-
-    def ncclCommInitRankConfig(
-        self,
-        world_size: int,
-        unique_id: ncclUniqueId,
-        rank: int,
-        config: Optional[ncclConfig_t] = None,
-    ) -> ncclComm_t:
-        comm = ncclComm_t()
-        if config is None:
-            # Equivalent to NCCL_CONFIG_INITIALIZER (header-layout version).
-            config = ncclConfig_t.create()
-        self.NCCL_CHECK(
-            self._funcs["ncclCommInitRankConfig"](
-                ctypes.byref(comm), world_size, unique_id, rank, ctypes.byref(config)
-            )
-        )
-        return comm
 
     def ncclCommInitRank(
         self, world_size: int, unique_id: ncclUniqueId, rank: int
     ) -> ncclComm_t:
         comm = ncclComm_t()
         self.NCCL_CHECK(
-            self._funcs["ncclCommInitRank"](
+            self._funcs["mcclCommInitRank"](
                 ctypes.byref(comm), world_size, unique_id, rank
             )
         )
@@ -524,7 +422,7 @@ class NCCLLibrary:
         # when we pass int to a function, it will be converted to `ctypes.c_int`
         # by ctypes automatically
         self.NCCL_CHECK(
-            self._funcs["ncclAllReduce"](
+            self._funcs["mcclAllReduce"](
                 sendbuff, recvbuff, count, datatype, op, comm, stream
             )
         )
@@ -546,7 +444,7 @@ class NCCLLibrary:
         # when we pass int to a function, it will be converted to `ctypes.c_int`
         # by ctypes automatically
         self.NCCL_CHECK(
-            self._funcs["ncclReduce"](
+            self._funcs["mcclReduce"](
                 sendbuff, recvbuff, count, datatype, op, root, comm, stream
             )
         )
@@ -567,7 +465,7 @@ class NCCLLibrary:
         # when we pass int to a function, it will be converted to `ctypes.c_int`
         # by ctypes automatically
         self.NCCL_CHECK(
-            self._funcs["ncclReduceScatter"](
+            self._funcs["mcclReduceScatter"](
                 sendbuff, recvbuff, count, datatype, op, comm, stream
             )
         )
@@ -586,7 +484,7 @@ class NCCLLibrary:
         # when we pass int to a function, it will be converted to `ctypes.c_int`
         # by ctypes automatically
         self.NCCL_CHECK(
-            self._funcs["ncclAllGather"](
+            self._funcs["mcclAllGather"](
                 sendbuff, recvbuff, count, datatype, comm, stream
             )
         )
@@ -601,7 +499,7 @@ class NCCLLibrary:
         stream: cudaStream_t,
     ) -> None:
         self.NCCL_CHECK(
-            self._funcs["ncclSend"](sendbuff, count, datatype, dest, comm, stream)
+            self._funcs["mcclSend"](sendbuff, count, datatype, dest, comm, stream)
         )
 
     def ncclRecv(
@@ -614,7 +512,7 @@ class NCCLLibrary:
         stream: cudaStream_t,
     ) -> None:
         self.NCCL_CHECK(
-            self._funcs["ncclRecv"](recvbuff, count, datatype, src, comm, stream)
+            self._funcs["mcclRecv"](recvbuff, count, datatype, src, comm, stream)
         )
 
     def ncclBroadcast(
@@ -628,33 +526,33 @@ class NCCLLibrary:
         stream: cudaStream_t,
     ) -> None:
         self.NCCL_CHECK(
-            self._funcs["ncclBroadcast"](
+            self._funcs["mcclBroadcast"](
                 sendbuff, recvbuff, count, datatype, root, comm, stream
             )
         )
 
     def ncclCommDestroy(self, comm: ncclComm_t) -> None:
-        self.NCCL_CHECK(self._funcs["ncclCommDestroy"](comm))
+        self.NCCL_CHECK(self._funcs["mcclCommDestroy"](comm))
 
     def ncclCommWindowRegister(
         self, comm: ncclComm_t, buff: buffer_type, size: int, win_flags: int
     ) -> ncclWindow_t:
         window = ncclWindow_t()
         self.NCCL_CHECK(
-            self._funcs["ncclCommWindowRegister"](
+            self._funcs["mcclCommWindowRegister"](
                 comm, buff, size, ctypes.byref(window), win_flags
             )
         )
         return window
 
     def ncclCommWindowDeregister(self, comm: ncclComm_t, window: ncclWindow_t) -> None:
-        self.NCCL_CHECK(self._funcs["ncclCommWindowDeregister"](comm, window))
+        self.NCCL_CHECK(self._funcs["mcclCommWindowDeregister"](comm, window))
 
     def ncclGroupStart(self) -> None:
-        self.NCCL_CHECK(self._funcs["ncclGroupStart"]())
+        self.NCCL_CHECK(self._funcs["mcclGroupStart"]())
 
     def ncclGroupEnd(self) -> None:
-        self.NCCL_CHECK(self._funcs["ncclGroupEnd"]())
+        self.NCCL_CHECK(self._funcs["mcclGroupEnd"]())
 
 
 __all__ = [
@@ -662,7 +560,6 @@ __all__ = [
     "ncclDataTypeEnum",
     "ncclRedOpTypeEnum",
     "ncclUniqueId",
-    "ncclConfig_t",
     "ncclComm_t",
     "cudaStream_t",
     "buffer_type",

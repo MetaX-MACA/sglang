@@ -200,7 +200,7 @@ template <
     bool kPackKV,
     bool kCacheHasFullWidth,
     typename IdType>
-__global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_constant__ params) {
+__global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV>   params) {
   using namespace device;
 
   static_assert(std::is_same_v<DType, fp16_t> || std::is_same_v<DType, bf16_t>);

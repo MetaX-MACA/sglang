@@ -27,14 +27,14 @@ from sglang.srt.utils.common import next_power_of_2
 
 _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
 
-if is_flashinfer_available():
-    from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
-    from flashinfer.fp4_quantization import block_scale_interleave
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
+# if is_flashinfer_available():
+#     from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
+#     from flashinfer.fp4_quantization import block_scale_interleave
+#     from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+#     from flashinfer.fused_moe.core import (
+#         _maybe_get_cached_w3_w1_permute_indices,
+#         get_w2_permute_indices_with_cache,
+#     )
 
 logger = logging.getLogger(__name__)
 

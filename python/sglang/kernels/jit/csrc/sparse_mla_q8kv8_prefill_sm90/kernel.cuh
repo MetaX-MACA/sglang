@@ -47,7 +47,7 @@ namespace fwd {
 
 template <typename Kernel, typename TMAParamsT>
 __global__ void sparse_mla_q8kv8_prefill_kernel(
-    __grid_constant__ const SparseMlaQ8Kv8PrefillParams params, __grid_constant__ const TMAParamsT tma_params);
+      const SparseMlaQ8Kv8PrefillParams params,   const TMAParamsT tma_params);
 
 template <int D_QK, bool HAVE_TOPK_LENGTH, bool HAVE_ATTN_SINK>
 struct SparseMlaQ8Kv8PrefillKernel {
@@ -1061,7 +1061,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
 // ============================================================================
 template <typename Kernel, typename TMAParamsT>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 1) sparse_mla_q8kv8_prefill_kernel(
-    __grid_constant__ const SparseMlaQ8Kv8PrefillParams params, __grid_constant__ const TMAParamsT tma_params) {
+      const SparseMlaQ8Kv8PrefillParams params,   const TMAParamsT tma_params) {
   Kernel::devfunc(params, tma_params);
 }
 

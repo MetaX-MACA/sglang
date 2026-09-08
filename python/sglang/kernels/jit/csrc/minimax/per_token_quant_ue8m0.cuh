@@ -38,7 +38,7 @@ struct PerTokenQuantUe8m0Params {
 
 template <uint32_t kGroupSize, bool kUsePDL>
 __global__ __launch_bounds__(1024, 2) void  //
-    per_token_quant_ue8m0_kernel(const PerTokenQuantUe8m0Params __grid_constant__ params) {
+    per_token_quant_ue8m0_kernel(const PerTokenQuantUe8m0Params params) {
   using namespace device;
   constexpr uint32_t kVecElems = 8;  // 8 bf16 = 16B load per thread
   static_assert(kGroupSize % kVecElems == 0, "group_size must be a multiple of 8");
@@ -109,7 +109,7 @@ struct PerTokenQuantUe8m0ScatterParams {
 
 template <uint32_t kGroupSize, uint32_t kTopK, bool kUsePDL>
 __global__ __launch_bounds__(1024, 2) void  //
-    per_token_quant_ue8m0_scatter_kernel(const PerTokenQuantUe8m0ScatterParams __grid_constant__ params) {
+    per_token_quant_ue8m0_scatter_kernel(const PerTokenQuantUe8m0ScatterParams   params) {
   using namespace device;
   constexpr uint32_t kVecElems = 8;  // 8 bf16 = 16B load per thread
   static_assert(kGroupSize % kVecElems == 0, "group_size must be a multiple of 8");
