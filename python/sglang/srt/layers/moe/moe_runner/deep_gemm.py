@@ -662,6 +662,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
             )
+        else:
+            hidden_states_scale = hidden_states_scale
 
         num_groups, m, k = hidden_states.shape
         n = w13_weight.size(1)

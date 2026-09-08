@@ -583,15 +583,25 @@ def fused_moe_kernel(
                 if swap_ab:
                     a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
                     a_scale, b_scale = b_scale, a_scale
-                if BLOCK_SIZE_N > group_n:
-                    accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                if use_fp8_w8a8:
+                    # MetaX Triton does not support fp8e4nv as tl.dot's RHS.
+                    # FP8 values are exactly representable in BF16/FP16, so
+                    # promote both operands to the model compute type while
+                    # retaining the existing FP32 accumulation and scale math.
+                    dot_result = tl.dot(a.to(compute_type), b.to(compute_type))
                 else:
-                    accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
+                    dot_result = tl.dot(a, b)
+                if BLOCK_SIZE_N > group_n:
+                    accumulator += dot_result * a_scale[:, None] * b_scale[None, :]
+                else:
+                    accumulator += dot_result * (a_scale[:, None] * b_scale)
             else:
                 if use_fp8_w8a8:
                     if swap_ab:
                         a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
-                    accumulator = tl.dot(a, b, acc=accumulator)
+                    accumulator = tl.dot(
+                        a.to(compute_type), b.to(compute_type), acc=accumulator
+                    )
                 else:
                     accumulator += tl.dot(a, b)
         else:

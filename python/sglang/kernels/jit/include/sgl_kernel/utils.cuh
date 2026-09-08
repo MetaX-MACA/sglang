@@ -148,29 +148,53 @@ inline constexpr auto kFullMask = 0xffffffffffffffffULL;
  * synchronize with a preceding kernel in the same stream. On older
  * architectures or ROCm this is a no-op.
  */
+// template <bool kUsePDL>
+// SGL_DEVICE void PDLWaitPrimary() {
+// #if SGL_ARCH_HOPPER_OR_GREATER
+//   if constexpr (kUsePDL) {
+//     asm volatile("griddepcontrol.wait;" ::: "memory");
+//   }
+// #endif
+// }
+
+// /**
+//  * \brief PDL: trigger dependent (secondary) kernel launch.
+//  *
+//  * On Hopper (sm_90+), inserts a `griddepcontrol.launch_dependents`
+//  * instruction. On older architectures or ROCm this is a no-op.
+//  */
+// template <bool kUsePDL>
+// SGL_DEVICE void PDLTriggerSecondary() {
+// #if SGL_ARCH_HOPPER_OR_GREATER
+//   if constexpr (kUsePDL) {
+//     asm volatile("griddepcontrol.launch_dependents;" :::);
+//   }
+// #endif
+// }
+
+#ifndef SGL_ARCH_HOPPER_OR_GREATER
+#define SGL_ARCH_HOPPER_OR_GREATER 0
+#endif
+
 template <bool kUsePDL>
 SGL_DEVICE void PDLWaitPrimary() {
-#if SGL_ARCH_HOPPER_OR_GREATER
-  if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-  }
+#if defined(_CUDA_ARCH) && (CUDA_ARCH_ >= 900) && SGL_ARCH_HOPPER_OR_GREATER
+if constexpr (kUsePDL)
+{ asm volatile("griddepcontrol.wait;" ::: "memory"); }
+#else
+(void)kUsePDL;
 #endif
 }
 
-/**
- * \brief PDL: trigger dependent (secondary) kernel launch.
- *
- * On Hopper (sm_90+), inserts a `griddepcontrol.launch_dependents`
- * instruction. On older architectures or ROCm this is a no-op.
- */
 template <bool kUsePDL>
 SGL_DEVICE void PDLTriggerSecondary() {
-#if SGL_ARCH_HOPPER_OR_GREATER
-  if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.launch_dependents;" :::);
-  }
+#if defined(_CUDA_ARCH) && (CUDA_ARCH_ >= 900) && SGL_ARCH_HOPPER_OR_GREATER
+if constexpr (kUsePDL)
+{ asm volatile("griddepcontrol.launch_dependents;" :::); }
+#else
+(void)kUsePDL;
 #endif
-}
+} 
 
 template <std::integral T, std::integral U>
 SGL_DEVICE constexpr auto div_ceil(T a, U b) {

@@ -112,6 +112,13 @@ if _is_musa:
 
 logger = logging.getLogger(__name__)
 
+use_mcoplib = False
+try:
+    from  mcoplib.op import per_token_cast_to_fp8 as per_token_cast_to_fp8_opt
+    use_mcoplib = True
+except:
+    logger.warning("please pip install mcoplib")
+
 
 @lru_cache()
 def is_fp8_fnuz() -> bool:
@@ -469,6 +476,13 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
 ):
+    if use_mcoplib:
+        return torch.empty(
+            x_shape[:-1] + (x_shape[-1] // group_size,),
+            device=device,
+            dtype=torch.float32,
+        )
+
     if scale_ue8m0:
         if column_major_scales and scale_tma_aligned:
             *x_batch, x_q_mn, x_q_k = x_shape
@@ -518,6 +532,40 @@ def create_per_token_group_quant_fp8_output_scale(
             dtype=torch.float32,
         )
 
+
+def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2 and x.size(1) % 128 == 0
+    m, n = x.shape
+    x_view = x.view(m, -1, 128)
+    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+    return (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(
+        m, n
+    ), (x_amax / 448.0).view(m, -1)
+
+
+def per_token_cast_to_fp8_3d(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 3, f"Input tensor must be 3D, got shape {x.shape}"
+    
+    num_groups, m, n = x.shape
+    assert n % 128 == 0, f"Input size(2) must be divisible by 128, got {n}"
+    
+    quant_list = []
+    scale_list = []
+    
+    for x_group in x:
+        if use_mcoplib:
+            x_group_quant = torch.empty(m, n, dtype=torch.float8_e4m3fn, device='cuda')
+            x_group_scale = torch.empty(m,n//128, dtype=torch.float32, device='cuda')
+            per_token_cast_to_fp8_opt(x_group_quant, x_group_scale, x_group)
+        else:
+            x_group_quant, x_group_scale = per_token_cast_to_fp8(x_group)
+        scale_list.append(x_group_scale.unsqueeze(0))
+        quant_list.append(x_group_quant.unsqueeze(0))
+        
+    final_quant_tensor = torch.cat(quant_list, dim=0)
+    final_scales = torch.cat(scale_list, dim=0)
+    
+    return final_quant_tensor, final_scales
 
 # AOT v2 (the MUSA path) runtime-switches on these; the JIT
 # per_token_group_quant kernel also templates on 256.
@@ -642,19 +690,24 @@ def sglang_per_token_group_quant_fp8(
         scale_ue8m0=scale_ue8m0,
     )
 
-    if x.shape[0] > 0:
-        _run_per_token_group_quant_8bit_kernel(
-            x,
-            x_q,
-            x_s,
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            scale_ue8m0=scale_ue8m0,
-            fuse_silu_and_mul=fuse_silu_and_mul,
-            masked_m=masked_m,
-        )
+    if use_mcoplib:
+        per_token_cast_to_fp8_opt(x_q, x_s, x)
+    else:
+        x_q, x_s = per_token_cast_to_fp8(x)
+        
+    # if x.shape[0] > 0:
+    #     _run_per_token_group_quant_8bit_kernel(
+    #         x,
+    #         x_q,
+    #         x_s,
+    #         group_size,
+    #         eps,
+    #         fp8_min,
+    #         fp8_max,
+    #         scale_ue8m0=scale_ue8m0,
+    #         fuse_silu_and_mul=fuse_silu_and_mul,
+    #         masked_m=masked_m,
+    #     )
 
     return x_q, x_s
 
@@ -815,7 +868,7 @@ def sglang_per_token_quant_fp8(
         dtype=torch.float32,
     )
 
-    # sgl_per_token_quant_fp8(x, x_q, x_s)
+    sgl_per_token_quant_fp8(x, x_q, x_s)
 
     return x_q, x_s
 

@@ -12,6 +12,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
+from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,26 @@ if ENABLE_JIT_DEEPGEMM:
 
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
+
+# import importlib
+# def try_import_with_message(name: str):
+#     try:
+#         module = importlib.import_module(name)
+#         return module
+#     except ImportError:
+#         print(f"can't import {name}, please use 'pip install {name}'")
+#         return None
+
+# if try_import_with_message("mctlassEx") != None :
+#     backend_name = "mctlassEx" 
+#     from deep_gemm import get_mctlass_op
+#     mctlass_op = get_mctlass_op()
+
+# else:
+backend_name = "torch_bf16"
+
+# if try_import_with_message("mctlassEx") != None :
+#     backends.append("mctlassEx")
 
 
 # TODO maybe rename these functions
@@ -85,6 +106,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
                 out,
                 masked_m,
                 expected_m,
+                backend=backend_name,
                 **fp4_kwargs,
                 **(
                     dict(
@@ -156,7 +178,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            lhs, rhs, out, m_indices, **fp4_kwargs
+            lhs, rhs, out, m_indices, backend=backend_name, **fp4_kwargs,
         )
 
 
@@ -189,6 +211,7 @@ def gemm_nt_f8f8bf16(
             lhs,
             rhs,
             out,
+            backend=backend_name,
         )
 
 

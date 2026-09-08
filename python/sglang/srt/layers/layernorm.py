@@ -73,15 +73,14 @@ if _is_cuda or _is_xpu or _is_musa:
             ) -> torch.Tensor:
                 return torch.empty_like(input)
 
-            @register_custom_op(fake_impl=_layernorm_fake_impl)
-            def layernorm(
-                input: torch.Tensor,
-                gamma: torch.Tensor,
-                beta: torch.Tensor,
-                eps: float = 1e-6,
-            ) -> torch.Tensor:
-                return flashinfer.norm.layernorm(input, gamma, beta, eps)
-
+            # @register_custom_op(fake_impl=_layernorm_fake_impl)
+            # def layernorm(
+            #     input: torch.Tensor,
+            #     gamma: torch.Tensor,
+            #     beta: torch.Tensor,
+            #     eps: float = 1e-6,
+            # ) -> torch.Tensor:
+            #     return flashinfer.norm.layernorm(input, gamma, beta, eps)
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):
             _flashinfer_layernorm_available = False
