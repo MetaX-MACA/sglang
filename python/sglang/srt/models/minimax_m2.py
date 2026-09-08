@@ -1285,6 +1285,9 @@ class MiniMaxM2ForCausalLM(nn.Module):
             ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            
+        for layer_id in self.model.layers_to_capture:
+            setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
