@@ -26,7 +26,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
-from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.configs.model_config import is_deepseek_dsa, is_glm5_3
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -165,6 +165,8 @@ class DeepseekModelNextN(nn.Module):
         if _is_npu and (
             get_spec().speculative_draft_model_path == get_model().model_path
         ):
+            layer_name = "layers." + str(config.num_hidden_layers)
+        if is_glm5_3(config):
             layer_name = "layers." + str(config.num_hidden_layers)
 
         self.quant_config = quant_config
@@ -368,7 +370,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 
         self.model = DeepseekModelNextN(
-            config, nextn_quant_config, prefix=add_prefix("model", prefix)
+            config, nextn_quant_config, prefix=add_prefix("model", prefix) if not is_glm5_3(config) else add_prefix("model.language_model", prefix)
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,

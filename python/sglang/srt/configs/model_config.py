@@ -209,6 +209,12 @@ def is_deepseek_v4(config) -> bool:
         "DeepseekV4ForCausalLMDSpark",
     )
 
+def is_glm5_3(config) -> bool:
+    return _hf_arch(config) in (
+        "Glm5NextForConditionalGeneration",
+        "Glm5NextForConditionalGenerationNextN",
+    )
+
 
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config) or is_deepseek_v4(config)
