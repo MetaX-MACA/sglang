@@ -2349,7 +2349,9 @@ def select_experts(
             )
         else:
             glm = (top_k == 9 and num_expert_group == 1 and topk_group == 1) and (router_logits.shape[1] == 160 or router_logits.shape[1] == 256)
-            if (router_logits.shape[1] // num_expert_group <= 384) and not glm:
+            mimo = (top_k == 8 and num_expert_group == 1 and topk_group == 1) and (router_logits.shape[1] == 256 or router_logits.shape[1] == 256)
+            support = (not glm) and (not mimo)
+            if (router_logits.shape[1] // num_expert_group <= 384) and support:
                 deepseek = (top_k == 8 and num_expert_group == 8 and topk_group == 4) or (top_k == 9 and num_expert_group == 8 and topk_group == 4)
                 kimi = (top_k == 8 and num_expert_group == 1 and topk_group == 1) or (top_k == 9 and num_expert_group == 1 and topk_group == 1)
                 if kimi or deepseek:

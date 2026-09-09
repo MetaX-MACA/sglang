@@ -128,6 +128,12 @@ enable_mctlass_fused_moe_python_api = (
     os.getenv("ENABLE_MCTLASS_FUSED_MOE_PYTHON_API", "0") == "1"
 )
 
+if enable_mctlass_fused_moe_python_api:
+    from mctlassEx import FusedMoeGEMM
+
+    gemm = FusedMoeGEMM()
+
+
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
     return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
 
@@ -623,10 +629,8 @@ def _fused_moe_kernel_sequence(
     #  and envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE
     if use_int8_w8a8 and enable_mctlass_fused_moe:
         # call mctlass gemm_kernel_mnk to calculate kernel_m
+        kernel_m = 0
         if enable_mctlass_fused_moe_python_api:
-            from mctlassEx import FusedMoeGEMM
-
-            gemm = FusedMoeGEMM()
             kernel_m = gemm.get_kernel_m(
                 hidden_states.view(torch.int8),
                 w1,
@@ -643,6 +647,32 @@ def _fused_moe_kernel_sequence(
             )
         assert kernel_m > 0, "cutlass_moe_w8a8 BLOCK_SIZE_M must greater than zero."
         # override kernel_m to config["BLOCK_SIZE_M"]
+        stage1_config["BLOCK_SIZE_M"] = kernel_m
+        stage2_config["BLOCK_SIZE_M"] = kernel_m
+
+    elif (
+        enable_mctlass_fused_moe_python_api
+        and hidden_states.dtype == torch.bfloat16
+        and not any(
+            (use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16)
+        )
+        and b1 is None
+        and b2 is None
+        and not fuse_swiglu_interleaved
+    ):
+        kernel_m = gemm.get_kernel_m(
+            hidden_states,
+            w1,
+            intermediate_cache1,
+            w1.shape[0],
+            hidden_states.shape[0],
+            w1.shape[1],
+            hidden_states.shape[1],
+            topk_ids.shape[1],
+        )
+        assert (
+            kernel_m > 0
+        ), "cutlass_fused_moe_bf16 BLOCK_SIZE_M must greater than zero."
         stage1_config["BLOCK_SIZE_M"] = kernel_m
         stage2_config["BLOCK_SIZE_M"] = kernel_m
 

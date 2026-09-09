@@ -56,6 +56,12 @@ padding_size = get_moe_padding_size(_use_aiter)
 enable_mctlass_fused_moe = (os.getenv("ENABLE_MCTLASS_FUSED_MOE", "0") == "1")
 enable_mctlass_fused_moe_python_api = (os.getenv("ENABLE_MCTLASS_FUSED_MOE_PYTHON_API", "0") == "1")
 
+if enable_mctlass_fused_moe_python_api:
+    from mctlassEx import FusedMoeGEMM
+
+    gemm = FusedMoeGEMM()
+
+
 def support_tensor_descriptor():
     return _support_tensor_descriptor
 
@@ -985,15 +991,8 @@ def invoke_fused_moe_kernel(
         )
     elif use_int8_w8a8  and enable_mctlass_fused_moe:
         if enable_mctlass_fused_moe_python_api:
-            import mctlassEx
-            # stream_ptr = torch.cuda.current_stream().cuda_stream
-            # mctlass_op = mctlassEx.mctlassExHandleWrapper()
-            from mctlassEx import FusedMoeGEMM
-            gemm = FusedMoeGEMM()
             C1 = C.view(-1, C.size(-1)).contiguous()
             gemm(A.shape[0], B.shape[1], A.shape[1], B.shape[0], sorted_token_ids.shape[0], top_k, A, B, C1, A_scale, B_scale, None, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, mul_routed_weight, filter_expert = filter_expert)
-            # kernel_m = mctlass_op.mctlass_fuse_moe_get_kernel_m(A, B, C1, top_k)
-            # mctlass_op.mctlass_fuse_moe_gemm(A, B, C1, A_scale, B_scale, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, sorted_token_ids.shape[0], top_k, mul_routed_weight, stream_ptr)
         else:
             cutlass_moe_mm_w8a8(A, B, C,
                                 A_scale, B_scale, topk_weights, sorted_token_ids, expert_ids,
@@ -1023,6 +1022,43 @@ def invoke_fused_moe_kernel(
             )
         else:
             b_desc = None
+
+        if (
+            enable_mctlass_fused_moe_python_api
+            and A.dtype == torch.bfloat16
+            and not any(
+                (use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16)
+            )
+            and bias is None
+            and not c_sorted
+            and not fuse_add_to_output
+            and not mask_output
+            and not lora_preserve_base
+            and not fuse_sum_all_reduce
+            and not fuse_swiglu
+        ):
+            C1 = C.view(-1, C.size(-1)).contiguous()
+            gemm(
+                A.shape[0],
+                B.shape[1],
+                A.shape[1],
+                B.shape[0],
+                sorted_token_ids.shape[0],
+                top_k,
+                A,
+                B,
+                C1,
+                A_scale,
+                B_scale,
+                None,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                mul_routed_weight,
+                filter_expert=filter_expert,
+            )
+            return
 
         pdl_kwargs = (
             {"USE_GDC": True, "launch_pdl": True, "GDC_EARLY": A.shape[0] <= 512}
