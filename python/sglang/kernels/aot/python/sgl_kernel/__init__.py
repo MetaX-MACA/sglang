@@ -109,10 +109,10 @@ else:
         scaled_int8_quant,
         mx_awq_dequantize,   
     )
-    # from sgl_kernel.sampling import (
-    #     top_k_renorm_prob,
-    #     top_p_renorm_prob,
-    # )
+    from sgl_kernel.sampling import (
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+    )
     from sgl_kernel.speculative import (
         assign_draft_cache_locs_contiguous_cpu,
         assign_extend_cache_locs_cpu,

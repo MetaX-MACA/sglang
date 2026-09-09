@@ -357,6 +357,10 @@ class DraftBlockProposer:
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+
+        idle_batch.is_dsa = is_deepseek_dsa(batch.model_config.hf_config)
+        idle_batch.is_ds_compressed = is_deepseek_v4(batch.model_config.hf_config)
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)

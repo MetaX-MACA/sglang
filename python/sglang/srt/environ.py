@@ -528,6 +528,8 @@ class Envs:
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
+    # FlashInfer does not support the current DSpark temperature path yet.
+    SGLANG_DSPARK_KERNEL_SOFTMAX_TEMP = EnvStr("triton")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
 
     # ===================================================================
