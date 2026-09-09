@@ -1470,6 +1470,8 @@ class Envs:
     )
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    # DSA/NSA indexer cache dtype: int8, fp8, or bf16.
+    MX_NSA_INDEXER_CACHE_DTYPE = EnvStr("int8")
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )

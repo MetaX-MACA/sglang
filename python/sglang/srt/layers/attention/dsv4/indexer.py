@@ -525,6 +525,8 @@ class C4IndexerBackendMixin:
         # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
         if not is_cuda() or is_hip():
             return False
+        if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() != "fp8":
+            return False
         # The gather plan is built from eager, child-local ForwardBatch metadata.
         # Rewritten, TBO-split, and graph-backed batches must use the paged path.
         if (
@@ -992,8 +994,17 @@ class C4Indexer(nn.Module):
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
             )
+        index_cache_type = envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get()
+        if index_cache_type == "fp8":
+            output_dtype = torch.float8_e4m3fn
+        elif index_cache_type == "int8":
+            output_dtype = torch.int8
+        else:
+            raise NotImplementedError(
+                f"DSV4 index cache type {index_cache_type!r} is not supported"
+            )
         return fused_q_indexer_rope_hadamard_quant(
-            q, weight, self.weight_scale, self.freqs_cis, positions
+            q, weight, self.weight_scale, self.freqs_cis, positions, output_dtype
         )
 
     def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:

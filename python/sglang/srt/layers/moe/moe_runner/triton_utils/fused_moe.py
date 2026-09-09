@@ -10,6 +10,7 @@ import functools
 import logging
 import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from sglang.srt.environ import envs
 
 import torch
 import torch.nn.functional as F

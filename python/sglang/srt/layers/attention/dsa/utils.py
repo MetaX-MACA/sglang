@@ -22,6 +22,36 @@ from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 
+def get_nsa_index_cache_dtype() -> str:
+    """Return the normalized DSA indexer-cache dtype selected by the user."""
+    configured_dtype = envs.MX_NSA_INDEXER_CACHE_DTYPE.get()
+    dtype = configured_dtype.strip().lower()
+    aliases = {
+        "bfloat16": "bf16",
+        "float8": "fp8",
+        "fp8_e4m3": "fp8",
+        "fp8_e4m3fn": "fp8",
+        "fp8_e4m3fnuz": "fp8",
+    }
+    dtype = aliases.get(dtype, dtype)
+    if dtype not in ("int8", "fp8", "bf16"):
+        raise ValueError(
+            "MX_NSA_INDEXER_CACHE_DTYPE must be one of int8, fp8, or bf16; "
+            f"got {configured_dtype!r}"
+        )
+    return dtype
+
+
+def get_nsa_index_cache_storage_dtype(cache_dtype: str) -> torch.dtype:
+    """Map the logical cache mode to its page-buffer storage dtype."""
+    return {
+        "int8": torch.int8,
+        # FP8 K and its FP32 scale share one byte-addressable packed buffer.
+        "fp8": torch.uint8,
+        "bf16": torch.bfloat16,
+    }[cache_dtype]
+
+
 @lru_cache(maxsize=1)
 def aiter_can_use_preshuffle_paged_mqa() -> bool:
     """Whether aiter's preshuffle paged MQA / cache kernels can be used on this runtime.

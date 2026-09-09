@@ -10,6 +10,7 @@ from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsv4 import (
     clear_unaccepted_c128_draft_states,
     fused_k_norm_rope_flashmla,
+    fused_norm_rope_inplace,
     fused_store_cache,
 )
 from sglang.kernels.ops.attention.dsv4 import (
@@ -1254,6 +1255,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
+        if self.swa_kv_pool.dtype == torch.bfloat16:
+            # The FlashMLA fused writer requires the packed FP8/uint8 layout.
+            # BF16 pages hold plain KV rows; normalize/rotate first, then use
+            # the dtype-aware store. Fused QKV projection slices need a copy
+            # to satisfy the in-place norm/RoPE and BF16 store stride checks.
+            kv = kv.contiguous()
+            fused_norm_rope_inplace(
+                kv, kv_weight, eps, freqs_cis, positions.to(torch.int64).contiguous()
+            )
+            self.set_swa_key_buffer_radix_fused(layer_id, swa_loc, kv)
+            return
+
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,

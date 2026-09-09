@@ -52,7 +52,11 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.attention.dsa.utils import (
+    aiter_can_use_preshuffle_paged_mqa,
+    get_nsa_index_cache_dtype,
+    get_nsa_index_cache_storage_dtype,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
@@ -4400,8 +4404,12 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
-    int8_cache = True if os.getenv("MX_ENABLE_NSA_INT8") else False
-    index_k_with_scale_buffer_dtype = torch.uint8 if os.getenv("MX_ENABLE_NSA_INT8") else torch.bfloat16
+    index_cache_dtype = get_nsa_index_cache_dtype()
+    fp8_cache = index_cache_dtype == "fp8"
+    int8_cache = index_cache_dtype == "int8"
+    index_k_with_scale_buffer_dtype = get_nsa_index_cache_storage_dtype(
+        index_cache_dtype
+    )
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
     def __init__(

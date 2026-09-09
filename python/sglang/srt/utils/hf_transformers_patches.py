@@ -24,7 +24,7 @@ all patches.  It is safe to import multiple times -- patches are idempotent.
 
 import inspect
 
-from sglang.srt.utils import logger
+from sglang.srt.utils import is_maca, logger
 
 _applied = False
 
@@ -64,11 +64,42 @@ def apply_all():
     # v5 general patches
     _ensure_clean_up_tokenization_compat()
     _ensure_is_torch_fx_available_compat()
+    _patch_dynamic_cache_empty_tensors()
 
     # CI-only: neutralize HF API calls inside tokenizer from_pretrained
     patch_is_base_mistral_in_ci()
 
     logger.debug("transformers compatibility patches applied")
+
+
+def _patch_dynamic_cache_empty_tensors():
+    """Keep empty dynamic K/V caches the same rank as incoming states on MACA."""
+    if not is_maca():
+        return
+
+    from functools import wraps
+
+    from transformers.cache_utils import DynamicLayer
+
+    original = DynamicLayer.lazy_initialization
+    if getattr(original, "_sglang_maca_empty_cache", False):
+        return
+
+    @wraps(original)
+    def lazy_initialization(self, key_states, value_states):
+        original(self, key_states, value_states)
+        # HF initializes with a (0,) sentinel. MACA's cat can reject this
+        # rank-1 tensor when concatenating rank-4 states along dim=-2.
+        # Preserve upstream initialization and only replace empty sentinels;
+        # sliding-window subclasses also use this base initialization.
+        for name, states in (("keys", key_states), ("values", value_states)):
+            cached = getattr(self, name)
+            if cached.ndim == 1 and cached.numel() == 0:
+                shape = (*states.shape[:-2], 0, states.shape[-1])
+                setattr(self, name, states.new_empty(shape))
+
+    lazy_initialization._sglang_maca_empty_cache = True
+    DynamicLayer.lazy_initialization = lazy_initialization
 
 
 # ---------------------------------------------------------------------------

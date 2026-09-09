@@ -315,7 +315,9 @@ def _set_k_bf16_triton_kernel(
     )
     in_offset = token_idx * k_cache_stride + offsets
     values = tl.load(k_cache_ptr + in_offset, mask=mask)
-    tl.store(buf_ptr + out_offset, values, mask=mask)
+    # Match the fused FlashMLA writer: negative locations have no write target
+    # (e.g. padded or out-of-window rows after full-to-SWA translation).
+    tl.store(buf_ptr + out_offset, values, mask=mask & (loc >= 0))
 
 
 class SetK:

@@ -31,8 +31,9 @@ class IndexKeyCache:
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
         pool = self.pool
-        if not pool.int8_cache:
+        if pool.index_k_with_scale_buffer_dtype == torch.bfloat16:
             return (num_pages, pool.page_size * pool.index_head_dim)
+        assert pool.index_k_with_scale_buffer_dtype in (torch.int8, torch.uint8)
         return (
             num_pages,
             pool.page_size

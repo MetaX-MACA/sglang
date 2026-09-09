@@ -14,6 +14,7 @@
 
 #include <bit>
 #include <cstdint>
+#include <type_traits>
 
 namespace sglang {
 
@@ -33,6 +34,18 @@ SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
   idx += ax > 5.0f;
   if (x < 0.0f && idx != 0) idx |= 0x8;
   return idx;
+}
+
+// Clamp to the range representable by signed int8.
+SGL_DEVICE int8_t int8_clip(float val) {
+  namespace math = device::math;
+  return static_cast<int8_t>(
+      math::max(math::min(val, 127.0f), -128.0f));
+}
+
+// Pack two quantized values for the vectorized INT8 store.
+SGL_DEVICE char2 pack_int8(float x, float y) {
+  return char2{int8_clip(x), int8_clip(y)};
 }
 
 // 8 warps per block: warp-per-(token, head) work-item dispatch (Q kernel).
@@ -433,12 +446,12 @@ struct FusedKNormRopeFlashMLAKernel {
 };
 
 // ============================================================================
-// Indexer Q kernel: warp-per-(token, head) RoPE + Hadamard + fp8 act-quant.
+// Indexer Q kernel: warp-per-(token, head) RoPE + Hadamard + quantization.
 // ============================================================================
 
 struct FusedQIndexerRopeHadamardQuantParams {
   const void* __restrict__ q_input;  // (B, num_heads, 128) DType
-  void* __restrict__ q_fp8;          // (B, num_heads, 128) fp8_e4m3
+  void* __restrict__ q_output;       // (B, num_heads, 128) fp8_e4m3 or int8
   // weights_out[b, h] = weight[b, h] * weight_scale * q_scale[b, h].
   // q_scale is computed internally and not exposed -- the only consumer of
   // it is `weights_out`.
@@ -456,7 +469,7 @@ struct FusedQIndexerRopeHadamardQuantParams {
   uint32_t num_heads;
 };
 
-template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
+template <typename DType, typename OutDType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
 Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const FusedQIndexerRopeHadamardQuantParams params) {
   using namespace device;
 
@@ -468,9 +481,12 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const FusedQIndexerRopeHadamar
   static_assert(kRopeDim == kWarpThreads * 2);
   static_assert(kRopeSize <= kWarpThreads);
 
+  constexpr bool kUseFp8Output = std::is_same_v<OutDType, fp8_e4m3_t>;
+  constexpr bool kUseInt8Output = std::is_same_v<OutDType, int8_t>;
+  static_assert(kUseFp8Output || kUseInt8Output, "OutDType must be fp8_e4m3_t or int8_t");
+
   using Storage = AlignedVector<DType, kVecSize>;
   using Float4 = AlignedVector<float, kVecSize>;
-  using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;  // 4 fp8 / lane
 
   const auto warp_id = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
@@ -567,7 +583,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const FusedQIndexerRopeHadamar
       data[i] *= kHadamardScale;
   }
 
-  {
+  if constexpr (kUseFp8Output) {
     float local_max = math::abs(data[0]);
 #pragma unroll
     for (int i = 1; i < kVecSize; ++i) {
@@ -576,25 +592,49 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const FusedQIndexerRopeHadamar
     const auto abs_max = warp::reduce_max(local_max);
     const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
     const auto inv_scale = 1.0f / scale;
+    using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;  // 4 fp8 / lane
     OutStorage result;
     result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
     result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
 
-    // q_fp8 row pointer: 128 fp8 / row = 32 OutStorage / row, one per lane.
-    auto out_row = static_cast<uint8_t*>(params.q_fp8) + work_id * kHeadDim;
+    // FP8 row pointer: 128 fp8 / row = 32 OutStorage / row, one per lane.
+    auto out_row = static_cast<uint8_t*>(params.q_output) + work_id * kHeadDim;
     result.store(out_row, lane_id);
-    params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    if (lane_id == 0) {
+      params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    }
+  } else {
+    float local_max = math::abs(data[0]);
+#pragma unroll
+    for (int i = 1; i < kVecSize; ++i) {
+      local_max = math::max(local_max, math::abs(data[i]));
+    }
+    const auto abs_max = warp::reduce_max(local_max);
+    const auto scale = fmaxf(1e-4f, abs_max) / 127.0f;
+    const auto inv_scale = 1.0f / scale;
+    using OutStorage = AlignedVector<char2, 2>;  // 4 int8 / lane
+    OutStorage result;
+    result[0] = pack_int8(data[0] * inv_scale, data[1] * inv_scale);
+    result[1] = pack_int8(data[2] * inv_scale, data[3] * inv_scale);
+
+    // INT8 row pointer: 128 int8 / row = 32 OutStorage / row, one per lane.
+    auto out_row = static_cast<uint8_t*>(params.q_output) + work_id * kHeadDim;
+    result.store(out_row, lane_id);
+    if (lane_id == 0) {
+      params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    }
   }
 }
 
-template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
+template <typename DType, bool kUsePDL, typename OutDType = fp8_e4m3_t, bool kRopeFirst = false, bool kHadamard = true>
 struct FusedQIndexerRopeHadamardQuantKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard>;
+  static constexpr auto kernel =
+      fused_q_indexer_rope_hadamard_quant<DType, OutDType, PosT, kUsePDL, kRopeFirst, kHadamard>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
-      const tvm::ffi::TensorView q_fp8,
+      const tvm::ffi::TensorView q_output,
       const tvm::ffi::TensorView weight,
       const tvm::ffi::TensorView weights_out,
       double weight_scale,
@@ -610,7 +650,7 @@ struct FusedQIndexerRopeHadamardQuantKernel {
     device_.set_options<kDLCUDA>();
 
     // Caller path is `wq_b(q_lora).view(-1, H, D)` -> contiguous; the kernel
-    // assumes a flat `(B*H, kHeadDim)` layout for both q_input and q_fp8.
+    // assumes a flat `(B*H, kHeadDim)` layout for both q_input and q_output.
     // Pin the head/innermost strides; assert the batch stride below.
     TensorMatcher({B, H, kHeadDim})  //
         .with_strides({-1, kHeadDim, 1})
@@ -619,9 +659,9 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         .verify(q_input);
     TensorMatcher({B, H, kHeadDim})  //
         .with_strides({-1, kHeadDim, 1})
-        .with_dtype<fp8_e4m3_t>()
+        .with_dtype<OutDType>()
         .with_device(device_)
-        .verify(q_fp8);
+        .verify(q_output);
     TensorMatcher({B, H})  //
         .with_strides({-1, 1})
         .with_dtype<DType>()
@@ -653,13 +693,13 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         "q_input must be contiguous (B, H, kHeadDim); got stride[0]=",
         q_input.stride(0));
     RuntimeCheck(
-        q_fp8.stride(0) == expected_batch_stride,
-        "q_fp8 must be contiguous (B, H, kHeadDim); got stride[0]=",
-        q_fp8.stride(0));
+        q_output.stride(0) == expected_batch_stride,
+        "q_output must be contiguous (B, H, kHeadDim); got stride[0]=",
+        q_output.stride(0));
 
     const auto params = FusedQIndexerRopeHadamardQuantParams{
         .q_input = q_input.data_ptr(),
-        .q_fp8 = q_fp8.data_ptr(),
+        .q_output = q_output.data_ptr(),
         .weight = weight.data_ptr(),
         .weights_out = static_cast<float*>(weights_out.data_ptr()),
         .weight_scale = static_cast<float>(weight_scale),
