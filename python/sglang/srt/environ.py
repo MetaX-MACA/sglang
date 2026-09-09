@@ -1602,6 +1602,7 @@ class Envs:
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+    SGLANG_QWEN3_ENABLE_ALT_STREAM = EnvBool(False)
 
     # ===================================================================
     # KV-Canary and Token-Oracle (testing only)

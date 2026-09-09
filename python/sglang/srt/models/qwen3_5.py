@@ -130,6 +130,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
+_enable_alt_stream = envs.SGLANG_QWEN3_ENABLE_ALT_STREAM.get()
 _gdn_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
 )
@@ -1554,7 +1555,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
 
-        alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
+        alt_stream = (
+            get_stream("alt")
+            if (_is_cuda or _hip_use_alt_stream) and _enable_alt_stream
+            else None
+        )
 
         # Embedding layer
         if self.pp_group.is_first_rank:

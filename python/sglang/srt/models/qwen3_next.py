@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 )
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
@@ -70,6 +71,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
+_enable_alt_stream = envs.SGLANG_QWEN3_ENABLE_ALT_STREAM.get()
 
 
 if _is_npu:
@@ -894,7 +896,7 @@ class Qwen3NextModel(nn.Module):
         super().__init__()
         self.config = config
 
-        alt_stream = get_stream("alt") if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda and _enable_alt_stream else None
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,

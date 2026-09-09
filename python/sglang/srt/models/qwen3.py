@@ -8,6 +8,7 @@ from torch import nn
 from sglang.srt.distributed import (
     get_pp_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -43,6 +44,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_enable_alt_stream = envs.SGLANG_QWEN3_ENABLE_ALT_STREAM.get()
 
 _has_fused_qk_norm_mrope = False
 if _use_aiter:
@@ -439,7 +441,7 @@ class Qwen3Model(Qwen2Model):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        alt_stream = get_stream("alt") if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda and _enable_alt_stream else None
         super().__init__(
             config=config,
             quant_config=quant_config,

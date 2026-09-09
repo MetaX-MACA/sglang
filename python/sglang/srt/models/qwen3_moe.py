@@ -31,6 +31,7 @@ from sglang.srt.distributed import (
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -102,6 +103,7 @@ _is_flashinfer_available = is_flashinfer_available()
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_enable_alt_stream = envs.SGLANG_QWEN3_ENABLE_ALT_STREAM.get()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -921,7 +923,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
         prefix: str = "",
         decoder_layer_type=Qwen3MoeDecoderLayer,
     ) -> None:
-        alt_stream = get_stream("alt") if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda and _enable_alt_stream else None
         super().__init__(
             config=config,
             quant_config=quant_config,
