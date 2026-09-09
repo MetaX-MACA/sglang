@@ -4569,7 +4569,11 @@ class DeepseekSparseAttnBackend(
         else:
             topk_transform_method = TopkTransformMethod.PAGED
         return topk_transform_method
-
+    
+    def on_after_cuda_graph_warmup(self):
+        metadata = self.forward_metadata
+        metadata.flashmla_sched_metadata.tile_scheduler_metadata = None
+        
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> Optional[DSAIndexerMetadata]:
@@ -4642,9 +4646,7 @@ class DeepseekSparseAttnMultiStepBackend:
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def on_after_cuda_graph_warmup(self):
-        metadata = self.forward_metadata
-        metadata.flashmla_sched_metadata.tile_scheduler_metadata = None
+
         
     def init_forward_metadata_out_graph(
         self,

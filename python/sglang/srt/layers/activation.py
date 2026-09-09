@@ -46,7 +46,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 from sglang.utils import resolve_obj_by_qualname
-
+from sglang.srt.server_args import get_global_server_args
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_npu = is_npu()

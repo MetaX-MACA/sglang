@@ -371,10 +371,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 f"requires an fp8 indexer cache, got {self.index_cache_dtype!r}."
             )
         self.int8_mqa_logits_backend = (
-            "tilelang"
-            if envs.MX_ENABLE_TILELANG_INT8_MQA_LOGITS.get()
-            else "triton"
+            envs.MX_ENABLE_TILELANG_INT8_MQA_LOGITS.get().strip().lower()
         )
+        supported_int8_mqa_logits_backends = {"maca_c", "tilelang", "triton"}
+        if self.int8_mqa_logits_backend not in supported_int8_mqa_logits_backends:
+            raise ValueError(
+                "MX_ENABLE_TILELANG_INT8_MQA_LOGITS must be one of "
+                f"{sorted(supported_int8_mqa_logits_backends)}, got "
+                f"{self.int8_mqa_logits_backend!r}."
+            )
 
     def _get_index_cache_quantizer(self):
         if self.int8_cache:

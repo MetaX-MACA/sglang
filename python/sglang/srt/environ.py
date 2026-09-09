@@ -1179,7 +1179,13 @@ class Envs:
 
     # Metax
     SGLANG_DSA_DISABLE_FUSED_KERNEL = EnvBool(False)
-    MX_ENABLE_TILELANG_INT8_MQA_LOGITS = EnvBool(False)
+
+    # Backend for INT8 paged MQA logits on MetaX.
+    # Supported values: "maca_c", "tilelang", "triton".
+    MX_ENABLE_TILELANG_INT8_MQA_LOGITS = EnvStr("triton")
+    # Enable fused RMSNorm quantization through the MetaX environment namespace.
+    # When enabled, this sets the legacy FUSED_RMSNORM_QUANT switch globally.
+    MX_ENABLE_FUSE_RMSNORM_QUANT = EnvBool(False)
     MX_FUSED_MLA_ABSORB_ROPE = EnvBool(False)
     MX_ENABLE_FLASH_MLA_METADATA_CACHE = EnvBool(False)
     MX_ENABLE_DSA_INDEXER_GEMM_BF16 = EnvBool(False)

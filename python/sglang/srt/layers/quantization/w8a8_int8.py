@@ -240,14 +240,16 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             )
 
         if isinstance(x, tuple):
-            if len(x) < 3:
-                out_dtype = torch.bfloat16
-                x_q     = x[0]
-                x_scale = x[1]
-            else:
+            if isinstance(x[0], torch.dtype):
+                # 旧约定：(out_dtype, x_q, x_scale)
                 out_dtype = x[0]
-                x_q     = x[1]
+                x_q = x[1]
                 x_scale = x[2]
+            else:
+                # RMSNorm 融合量化：(x_q, x_scale, x_bf16)
+                out_dtype = torch.bfloat16
+                x_q = x[0]
+                x_scale = x[1]
         else:
             x_q, x_scale = per_token_quant_int8(x)
             out_dtype=x.dtype
