@@ -46,18 +46,9 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 from sglang.srt.environ import envs
 
-if _is_cuda:
-    from moe_fused_w4a16 import (
-        mctlass_fused_moe_kernel_w4a16
-    )
-elif _is_cpu and _is_cpu_amx_available:
-    pass
-elif _is_hip:
-    pass
-
 padding_size = get_moe_padding_size(_use_aiter)
-enable_mctlass_fused_moe = (os.getenv("ENABLE_MCTLASS_FUSED_MOE", "0") == "1")
-enable_mctlass_fused_moe_python_api = (os.getenv("ENABLE_MCTLASS_FUSED_MOE_PYTHON_API", "0") == "1")
+enable_mctlass_fused_moe = (os.getenv("ENABLE_MCTLASS_FUSED_MOE", "1") == "1")
+enable_mctlass_fused_moe_python_api = (os.getenv("ENABLE_MCTLASS_FUSED_MOE_PYTHON_API", "1") == "1")
 enable_maca_sglang_fused_moe_mctlass_w4a16 = envs.ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16.get()
 
 if enable_mctlass_fused_moe_python_api:
@@ -949,34 +940,17 @@ def invoke_fused_moe_kernel(
         enable_maca_sglang_fused_moe_mctlass_w4a16 and use_int4_w4a16
         and block_shape is not None
         and block_shape[1] > 0
+        and enable_mctlass_fused_moe_python_api
+        and B_zp is None
     ):
-        if enable_mctlass_fused_moe_python_api and B_zp is None:
-            # if B_zp is not None:
-            #     group_size = 64
-            # else:
-            #     group_size = 32
-            C1 = C.view(-1, C.size(-1)).contiguous()
-            gemm(
-                A.shape[0], B.shape[1], A.shape[1], B.shape[0], sorted_token_ids.shape[0], top_k, A, B.view(dtype=torch.quint4x2), C1, A_scale, B_scale, None,
-                topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, mul_routed_weight, filter_expert = filter_expert,  is_blockwise=True, group_size=32, zp_b=B_zp)
-        else:
-            mctlass_fused_moe_kernel_w4a16(
-                A,
-                B,
-                C,
-                B_scale,
-                B_zp,
-                topk_weights,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-                B.shape[1],
-                A.shape[1],
-                sorted_token_ids.shape[0],
-                topk_ids.numel(),
-                top_k,
-                mul_routed_weight
-            )
+        # if B_zp is not None:
+        #     group_size = 64
+        # else:
+        #     group_size = 32
+        C1 = C.view(-1, C.size(-1)).contiguous()
+        gemm(
+            A.shape[0], B.shape[1], A.shape[1], B.shape[0], sorted_token_ids.shape[0], top_k, A, B.view(dtype=torch.quint4x2), C1, A_scale, B_scale, None,
+            topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, mul_routed_weight, filter_expert = filter_expert,  is_blockwise=True, group_size=32, zp_b=B_zp)
     elif (
         (use_int8_w8a16 or use_int4_w4a16)
         and block_shape is not None

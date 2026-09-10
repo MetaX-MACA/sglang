@@ -16,11 +16,27 @@ else:
     )
 
     # Initialize the ops library based on current GPU
-    common_ops = _load_architecture_specific_ops()
+    # common_ops = _load_architecture_specific_ops()
 
     # Preload the CUDA library to avoid the issue of libcudart.so.12 not found
     if torch.version.cuda is not None:
         _preload_cuda_library()
+
+    try:
+        import mcoplib._C
+    except ImportError as e:
+        print("Failed to import from mcoplib._C with %r", e)
+
+    try:
+        import mcoplib.sgl_kernel as sglang_kernel
+    except ImportError as e:
+        print("Failed to import from sgl_kernel with %r", e)
+
+
+    try:
+        import mcoplib.sgl_grouped_gemm_cuda
+    except ImportError as e:
+        print("Failed to import from sgl_grouped_gemm_cuda with %r", e)
 
     from sgl_kernel.allreduce import *
     from sgl_kernel.attention import (

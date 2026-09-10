@@ -1,0 +1,274 @@
+from typing import Optional
+
+import torch
+
+
+def moe_align_block_size(
+    topk_ids,
+    num_experts,
+    block_size,
+    sorted_token_ids,
+    experts_ids,
+    num_tokens_post_pad,
+    cumsum_buffer,
+    pad_sorted_token_ids=False,
+    ignore_invalid_expert=False,
+):
+    torch.ops.sgl_kernel.moe_align_block_size.default(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_token_ids,
+        experts_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        pad_sorted_token_ids,
+        ignore_invalid_expert,
+    )
+
+
+def topk_softmax(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+    moe_softcapping: float = 0.0,
+    correction_bias: Optional[torch.Tensor] = None,
+) -> None:
+    """
+    Compute top-k softmax for MoE routing.
+
+    Args:
+        topk_weights: Output tensor for top-k weights [num_tokens, topk]
+        topk_ids: Output tensor for top-k expert indices [num_tokens, topk]
+        gating_output: Gating logits [num_tokens, num_experts]
+        renormalize: Whether to renormalize the top-k weights
+        moe_softcapping: Tanh softcapping value (0.0 to disable)
+        correction_bias: Per-expert bias correction [num_experts], must be float32 if provided
+    """
+    torch.ops.sgl_kernel.topk_softmax.default(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        moe_softcapping,
+        correction_bias,
+    )
+
+
+def topk_sigmoid(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+    correction_bias: Optional[torch.Tensor] = None,
+) -> None:
+    """
+    Compute top-k sigmoid for MoE routing.
+
+    Args:
+        topk_weights: Output tensor for top-k weights [num_tokens, topk]
+        topk_ids: Output tensor for top-k expert indices [num_tokens, topk]
+        gating_output: Gating logits [num_tokens, num_experts]
+        renormalize: Whether to renormalize the top-k weights
+        correction_bias: Per-expert bias correction [num_experts], must be float32 if provided
+    """
+    torch.ops.sgl_kernel.topk_sigmoid.default(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        correction_bias,
+    )
+
+
+def moe_sum_reduce(
+    input_tensor,
+    output_tensor,
+    routed_scaling_factor=0,
+):
+    torch.ops.sgl_kernel.moe_sum_reduce.default(
+        input_tensor,
+        output_tensor,
+        routed_scaling_factor,
+    )
+
+
+def moe_sum(
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+):
+    torch.ops.sgl_kernel.moe_sum.default(
+        input_tensor,
+        output_tensor,
+    )
+
+
+# moe_fused_gate / kimi_k2_moe_fused_gate (AOT gate kernels) retired — the gate/topk
+# path is consolidated onto the unified Triton router in
+# python/sglang/kernels/ops/moe/moe_fused_gate.py (sglang issue #26771).
+
+
+# def fp8_blockwise_scaled_grouped_mm(
+#     output,
+#     a_ptrs,
+#     b_ptrs,
+#     out_ptrs,
+#     a_scales_ptrs,
+#     b_scales_ptrs,
+#     a,
+#     b,
+#     scales_a,
+#     scales_b,
+#     stride_a,
+#     stride_b,
+#     stride_c,
+#     layout_sfa,
+#     layout_sfb,
+#     problem_sizes,
+#     expert_offsets,
+#     workspace,
+# ):
+#     torch.ops.sgl_kernel.fp8_blockwise_scaled_grouped_mm.default(
+#         output,
+#         a_ptrs,
+#         b_ptrs,
+#         out_ptrs,
+#         a_scales_ptrs,
+#         b_scales_ptrs,
+#         a,
+#         b,
+#         scales_a,
+#         scales_b,
+#         stride_a,
+#         stride_b,
+#         stride_c,
+#         layout_sfa,
+#         layout_sfb,
+#         problem_sizes,
+#         expert_offsets,
+#         workspace,
+#     )
+
+
+def prepare_moe_input(
+    topk_ids,
+    expert_offsets,
+    problem_sizes1,
+    problem_sizes2,
+    input_permutation,
+    output_permutation,
+    num_experts,
+    n,
+    k,
+    blockscale_offsets: Optional[torch.Tensor] = None,
+):
+    torch.ops.sgl_kernel.prepare_moe_input.default(
+        topk_ids,
+        expert_offsets,
+        blockscale_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        input_permutation,
+        output_permutation,
+        num_experts,
+        n,
+        k,
+    )
+
+
+def apply_shuffle_mul_sum(
+    input,
+    output,
+    permutation,
+    factors,
+):
+    torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(
+        input, output, permutation, factors
+    )
+
+def cutlass_moe_mm_gemm_kernel_m_w8a8(num_valid_tokens: int, N: int, K: int, group: int) -> int:
+    return torch.ops.sgl_kernel.cutlass_moe_mm_gemm_kernel_m_w8a8.default(num_valid_tokens, N, K, group)
+
+def cutlass_moe_mm_w8a8(a: torch.Tensor,
+                        b: torch.Tensor,
+                        c: torch.Tensor,
+                        a_scales: torch.Tensor,
+                        b_scales: torch.Tensor,
+                        moe_weight: torch.Tensor,
+                        token_ids:  torch.Tensor,
+                        expert_ids: torch.Tensor,
+                        num_tokens_post_padded: torch.Tensor,
+                        N: int,
+                        K: int,
+                        EM: int,
+                        num_valid_tokens: int,
+                        topk: int,
+                        mul_routed_weight: bool
+                        ) -> torch.Tensor:
+
+    return torch.ops.sgl_kernel.cutlass_moe_mm_w8a8.default(a, b, c, a_scales, b_scales,
+                        moe_weight, token_ids, expert_ids, num_tokens_post_padded,
+                        N, K, EM, num_valid_tokens, topk, mul_routed_weight)
+
+def fused_qk_norm_rope(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    base: float,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    factor: float,
+    low: float,
+    high: float,
+    attention_factor: float,
+    rotary_dim: Optional[int] = None,
+) -> None:
+    torch.ops.sgl_kernel.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim if rotary_dim is not None else head_dim,
+    )
+
+def fused_moe_gate_opt(
+    gating_outputs: torch.Tensor,
+    correction_bias: torch.Tensor,
+    out_routing_weights: torch.Tensor,
+    out_selected_experts: torch.Tensor,
+    topk: int = None,
+    renormalize: bool = None,
+    num_expert_group: int = None,
+    topk_group: int = None,
+    num_shared_experts: Optional[int] = None,
+    scale_factor: Optional[float] = None,
+) -> int :
+    return torch.ops.sgl_kernel.fused_moe_gate_opt.default(
+        gating_outputs,
+        correction_bias,
+        out_routing_weights,
+        out_selected_experts,
+        topk,
+        renormalize,
+        num_expert_group,
+        topk_group,
+        num_shared_experts,
+        scale_factor
+    )
