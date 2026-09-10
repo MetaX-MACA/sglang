@@ -575,6 +575,8 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if isinstance(x, tuple):
+            x = x[0] 
         if x.numel() == 0:
             if residual is not None:
                 if post_residual_addition is not None:
