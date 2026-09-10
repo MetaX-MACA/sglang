@@ -626,33 +626,33 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     ).view(m, -1)
 
 
-def per_token_cast_to_fp8_3d(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 3, f"Input tensor must be 3D, got shape {x.shape}"
+# def per_token_cast_to_fp8_3d(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+#     assert x.dim() == 3, f"Input tensor must be 3D, got shape {x.shape}"
 
-    num_groups, m, n = x.shape
-    assert n % 128 == 0, f"Input size(2) must be divisible by 128, got {n}"
+#     num_groups, m, n = x.shape
+#     assert n % 128 == 0, f"Input size(2) must be divisible by 128, got {n}"
 
-    quant_list = []
-    scale_list = []
+#     quant_list = []
+#     scale_list = []
 
-    for x_group in x:
-        if _mcoplib_per_token_cast_to_fp8 is not None:
-            x_group_quant = torch.empty(m, n, dtype=fp8_dtype, device=x.device)
-            x_group_scale = torch.empty(
-                m, n // 128, dtype=torch.float32, device=x.device
-            )
-            _mcoplib_per_token_cast_to_fp8(
-                x_group_quant, x_group_scale, x_group
-            )
-        else:
-            x_group_quant, x_group_scale = per_token_cast_to_fp8(x_group)
-        scale_list.append(x_group_scale.unsqueeze(0))
-        quant_list.append(x_group_quant.unsqueeze(0))
+#     for x_group in x:
+#         if _mcoplib_per_token_cast_to_fp8 is not None:
+#             x_group_quant = torch.empty(m, n, dtype=fp8_dtype, device=x.device)
+#             x_group_scale = torch.empty(
+#                 m, n // 128, dtype=torch.float32, device=x.device
+#             )
+#             _mcoplib_per_token_cast_to_fp8(
+#                 x_group_quant, x_group_scale, x_group
+#             )
+#         else:
+#             x_group_quant, x_group_scale = per_token_cast_to_fp8(x_group)
+#         scale_list.append(x_group_scale.unsqueeze(0))
+#         quant_list.append(x_group_quant.unsqueeze(0))
 
-    final_quant_tensor = torch.cat(quant_list, dim=0)
-    final_scales = torch.cat(scale_list, dim=0)
+#     final_quant_tensor = torch.cat(quant_list, dim=0)
+#     final_scales = torch.cat(scale_list, dim=0)
 
-    return final_quant_tensor, final_scales
+#     return final_quant_tensor, final_scales
 
 # AOT v2 (the MUSA path) runtime-switches on these; the JIT
 # per_token_group_quant kernel also templates on 256.

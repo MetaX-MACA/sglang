@@ -41,22 +41,22 @@ if ENABLE_JIT_DEEPGEMM:
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
-# import importlib
-# def try_import_with_message(name: str):
-#     try:
-#         module = importlib.import_module(name)
-#         return module
-#     except ImportError:
-#         print(f"can't import {name}, please use 'pip install {name}'")
-#         return None
+import importlib
+def try_import_with_message(name: str):
+    try:
+        module = importlib.import_module(name)
+        return module
+    except ImportError:
+        print(f"can't import {name}, please use 'pip install {name}'")
+        return None
 
-# if try_import_with_message("mctlassEx") != None :
-#     backend_name = "mctlassEx" 
-#     from deep_gemm import get_mctlass_op
-#     mctlass_op = get_mctlass_op()
+if try_import_with_message("mctlassEx") != None :
+    backend_name = "mctlassEx" 
+    from deep_gemm import get_mctlass_op
+    mctlass_op = get_mctlass_op()
 
-# else:
-backend_name = "torch_bf16"
+else:
+    backend_name = "torch_bf16"
 
 # if try_import_with_message("mctlassEx") != None :
 #     backends.append("mctlassEx")
@@ -76,45 +76,45 @@ def grouped_gemm_nt_f8f8bf16_masked(
 ):
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
+    # kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
 
-    _sanity_check_input(lhs)
-    _sanity_check_input(rhs)
+    # _sanity_check_input(lhs)
+    # _sanity_check_input(rhs)
 
-    lhs = _ensure_cuda(lhs)
-    rhs = _ensure_cuda(rhs)
+    # lhs = _ensure_cuda(lhs)
+    # rhs = _ensure_cuda(rhs)
 
-    with compile_utils.deep_gemm_execution_hook(
-        expected_m, n, k, num_groups, kernel_type
-    ):
-        with configure_deep_gemm_num_sms(
-            overlap_args.num_sms if overlap_args is not None else None
-        ):
+    # with compile_utils.deep_gemm_execution_hook(
+    #     expected_m, n, k, num_groups, kernel_type
+    # ):
+    #     with configure_deep_gemm_num_sms(
+    #         overlap_args.num_sms if overlap_args is not None else None
+    #     ):
 
-            fp4_kwargs = {}
-            if recipe_a is not None:
-                fp4_kwargs["recipe_a"] = recipe_a
-            if recipe_b is not None:
-                fp4_kwargs["recipe_b"] = recipe_b
+    #         fp4_kwargs = {}
+    #         if recipe_a is not None:
+    #             fp4_kwargs["recipe_a"] = recipe_a
+    #         if recipe_b is not None:
+    #             fp4_kwargs["recipe_b"] = recipe_b
 
-            return deep_gemm.fp8_m_grouped_gemm_nt_masked(
-                lhs,
-                rhs,
-                out,
-                masked_m,
-                expected_m,
-                backend=backend_name,
-                **fp4_kwargs,
-                **(
-                    dict(
-                        enable_overlap=True,
-                        max_block_n=max_block_n,
-                        signal=overlap_args.signal,
-                    )
-                    if overlap_args is not None
-                    else {}
-                ),
-            )
+    return deep_gemm.fp8_m_grouped_gemm_nt_masked(
+        lhs,
+        rhs,
+        out,
+        masked_m,
+        expected_m,
+        backend=backend_name,
+        # **fp4_kwargs,
+        # **(
+        #     dict(
+        #         enable_overlap=True,
+        #         max_block_n=max_block_n,
+        #         signal=overlap_args.signal,
+        #     )
+        #     if overlap_args is not None
+        #     else {}
+        # ),
+    )
 
 
 def _ensure_cuda(

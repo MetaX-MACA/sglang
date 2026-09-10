@@ -296,6 +296,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states = self._run_masked_bf16_gemm(
                     runner_input, quant_info, running_state
                 )
+            elif weight_dtype == torch.float8_e4m3fn:
+                hidden_states = self._run_masked_gemm(
+                    runner_input, quant_info, running_state
+                )
             else:
                 hidden_states = self._run_masked_gemm(
                     runner_input, quant_info, running_state

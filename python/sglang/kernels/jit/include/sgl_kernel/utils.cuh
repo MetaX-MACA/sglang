@@ -322,6 +322,7 @@ struct LaunchKernel {
     (void)enabled;
     m_config.numAttrs = 0;
 #else
+    enabled = false; // set enable_pdl to false
     if (enabled) {
       auto& attr = m_attrs[m_config.numAttrs++];
       attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
