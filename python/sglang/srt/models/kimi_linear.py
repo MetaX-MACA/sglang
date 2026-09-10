@@ -1000,7 +1000,23 @@ class KimiLinearForCausalLM(nn.Module):
             w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+
+            if self_attn.kv_b_proj.weight.dtype == torch.int8:
+                w_kc_scale, w_vc_scale = self_attn.kv_b_proj.weight_scale.unflatten(
+                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                self_attn.w_kc_scale = w_kc_scale.transpose(1, 2).contiguous().transpose(1, 2)
+                self_attn.w_vc_scale = w_vc_scale.contiguous().transpose(1, 2)
+
+            # Temporarily hardcode to false as these feature is unsupported
+            use_deep_gemm_bmm = False
+            self.enable_dequant_bf16 = False
+            if not use_deep_gemm_bmm:
+                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                self_attn.w_kc = self_attn.w_kc.contiguous()                
+                if (self.enable_dequant_bf16 is False) and self_attn.w_kc.dtype == torch.int8 and self_attn.w_kc_scale is not None:
+                    self_attn.w_kc = (self_attn.w_kc.to(torch.float32) * self_attn.w_kc_scale).to(torch.bfloat16)   
+                    
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
             if hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
