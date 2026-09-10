@@ -27,6 +27,7 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_config,
     get_deepep_output_dtype,
     is_tbo_enabled,
+    get_moe_runner_backend,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
@@ -74,6 +75,20 @@ logger = logging.getLogger(__name__)
 
 _NVSHMEM_QP_DEPTH_DEFAULT = 1024
 
+def check_deepep_package() -> str:
+    import importlib.metadata
+
+    try:
+        importlib.metadata.distribution("mxmesh")
+        return "mxmesh"
+    except importlib.metadata.PackageNotFoundError:
+        try:
+            importlib.metadata.distribution("deep_ep")
+            return "deep_ep"
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise FileNotFoundError(
+                "Initializing DeepEP requires either the deep_ep or mxmesh package"
+            ) from exc
 
 def _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank: int) -> None:
     min_qp_depth = 2 * (num_max_dispatch_tokens_per_rank + 1)
@@ -85,13 +100,13 @@ def _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank: int) -> None:
     )
 
 
-def _is_mnnvl_fabric_supported() -> bool:
-    if not is_flashinfer_available():
-        return False
+# def _is_mnnvl_fabric_supported() -> bool:
+#     if not is_flashinfer_available():
+#         return False
 
-    from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
+#     from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
 
-    return is_mnnvl_fabric_supported(torch.cuda.current_device())
+#     return is_mnnvl_fabric_supported(torch.cuda.current_device())
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -277,11 +292,11 @@ class DeepEPBuffer:
                     f"Consider using --deepep-config to change the behavior."
                 )
 
-        use_mnnvl_fabric = _is_mnnvl_fabric_supported()
+        # use_mnnvl_fabric = _is_mnnvl_fabric_supported()
         buffer_kwargs = dict(
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
-            allow_mnnvl=use_mnnvl_fabric,
+            # allow_mnnvl=use_mnnvl_fabric,
         )
         # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
         # support, so cross-pod GB200/GB300 EP groups use
@@ -293,9 +308,9 @@ class DeepEPBuffer:
         #   cu12x -> fzyzcjy/DeepEP, which has no use_fabric kwarg but already
         #            auto-enables fabric in C++ when supported, so we skip it:
         #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
-        is_cu12 = get_cuda_version()[0] == 12
-        if not is_cu12 and use_mnnvl_fabric:
-            buffer_kwargs["use_fabric"] = True
+        # is_cu12 = get_cuda_version()[0] == 12
+        # if not is_cu12 and use_mnnvl_fabric:
+        #     buffer_kwargs["use_fabric"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return state.buffer
@@ -737,6 +752,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
+        self.enable_mxmesh = False
+        if check_deepep_package() == "mxmesh":
+            self.enable_mxmesh = True
 
         """
         num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
@@ -808,40 +826,56 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
+       topk_weights: Optional[torch.Tensor]=None,
     ):
+        use_nvfp4 = use_fp8 = False
+        input_global_scale = None
         input_global_scale = self.quant_config.get("input_global_scale", None)
+
+        bf16_dispatch = self.quant_config.get("bf16_dispatch", False)
+        if input_global_scale is not None:
+            use_nvfp4 = True
+        else:
+            backend = get_moe_runner_backend()
+            # BF16 dispatch is needed when:
+            #   - quant_config requests BF16 dispatch explicitly
+            #   - flashinfer_cutedsl: kernel quantizes to NVFP4 internally
+            #   - NPU with SGLANG_DEEPEP_BF16_DISPATCH: INT8 input + BF16 weight GMM not supported
+            #   - deep_gemm with SGLANG_DEEPEP_BF16_DISPATCH: user requests BF16 dispatch
+            need_bf16_dispatch = (
+                bf16_dispatch
+                or backend.is_flashinfer_cutedsl()
+                or (_is_npu and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
+                or (backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
+            )
+            if not need_bf16_dispatch:
+                use_fp8 = True
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific. Dropping use_ue8m0
         # makes DeepEP return fp32 column-major scales the e8m0 cast cannot view.
-        fp8_deepgemm_scale_opts = (
-            dict(
-                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-            )
-            if self.use_fp8
-            else dict()
-        )
+        # fp8_deepgemm_scale_opts = (
+        #     dict(
+        #         round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        #         and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+        #         use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        #         and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+        #     )
+        #     if self.use_fp8
+        #     else dict()
+        # )
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
-        npu_mxfp_quantization_opts = self._get_npu_mxfp_quantization_kwargs(buffer)
+        # npu_mxfp_quantization_opts = self._get_npu_mxfp_quantization_kwargs(buffer)
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
                 topk_ids,
-                self.num_max_dispatch_tokens_per_rank,
-                self.num_experts,
-                use_fp8=self.use_fp8,
-                **npu_mxfp_quantization_opts,
-                **(
-                    dict(topk_weights=topk_weights)
-                    if _is_npu and not _use_zbal
-                    else dict()
-                ),
-                **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
+                **(dict(topk_weights=topk_weights) if self.enable_mxmesh else dict()),
+                num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+                num_experts=self.num_experts,
+                use_fp8=use_fp8,
+                **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)
                     if input_global_scale is not None
@@ -849,7 +883,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 ),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                **fp8_deepgemm_scale_opts,
+                # **fp8_deepgemm_scale_opts,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
