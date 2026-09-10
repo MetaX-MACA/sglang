@@ -159,7 +159,7 @@ def context_attention_fwd(
         # C500X-tuned for non-causal (vision encoder) attention. Validated for
         # head_dim <= 128 (BLOCK_DMODEL <= 128), where 128/32/8/2 fits exactly in
         # the 64 KB shared-memory limit. Larger head_dim would not fit -> shrink.
-        BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 32, 8, 2
+        BLOCK_M, BLOCK_N, num_warps, num_stages = 128, 32, 8, 1
         if BLOCK_DMODEL > 128:
             BLOCK_M, BLOCK_N, num_stages = 64, 32, 1
     else:
