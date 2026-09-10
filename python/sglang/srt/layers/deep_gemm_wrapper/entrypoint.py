@@ -116,6 +116,24 @@ def grouped_gemm_nt_f8f8bf16_masked(
         # ),
     )
 
+def grouped_gemm_nt_fp4bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+):
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    return deep_gemm.m_grouped_gemm_bf16_fp4_bf16_nt_masked(
+        lhs,
+        rhs,
+        out,
+        masked_m,
+        expected_m,
+    )
 
 def _ensure_cuda(
     pair: Tuple[torch.Tensor, torch.Tensor],
