@@ -835,7 +835,9 @@ class ModelRunner:
             num_tokens_per_req = self.decode_num_tokens_per_req(
                 num_draft_tokens=draft_tokens
             )
-            capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
+            capture_bs, _, self.sum_len_bs = get_batch_sizes_to_capture(
+                self, num_tokens_per_req
+            )
             max_rows = max(max_rows, max(capture_bs) * num_tokens_per_req)
         return max_rows
 

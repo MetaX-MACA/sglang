@@ -370,7 +370,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         }
         # Capture draft
         decode_backend = get_exec().graph.cuda_graph_config.decode.backend
-        capture_bs, _ = get_batch_sizes_to_capture(self.draft_runner)
+        capture_bs, _, self.sum_len_bs = get_batch_sizes_to_capture(self.draft_runner)
         if self.speculative_num_steps > 1:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)

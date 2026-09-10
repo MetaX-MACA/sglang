@@ -149,7 +149,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
         # Bucket sizes
-        self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
+        self.capture_bs, _, self.sum_len_bs = get_batch_sizes_to_capture(model_runner)
         # Static capture width.
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_decode")
         self.max_bs = max(self.capture_bs)
@@ -425,6 +425,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             vocab_size=self.model_runner.model_config.vocab_size,
         )
 
+        dp_padding_mode = (
+            DpPaddingMode.SUM_LEN
+            if num_seqs in self.sum_len_bs
+            else DpPaddingMode.get_default_mode_in_cuda_graph()
+        )
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
             batch_size=num_seqs,
@@ -441,7 +446,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             mrope_positions=mrope_positions,
             global_num_tokens_gpu=global_num_tokens,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            dp_padding_mode=dp_padding_mode,
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,

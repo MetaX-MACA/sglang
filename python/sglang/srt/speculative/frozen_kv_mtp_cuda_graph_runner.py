@@ -121,7 +121,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Static capture width.
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_decode")
-        self.capture_bs, _ = get_batch_sizes_to_capture(
+        self.capture_bs, _, self.sum_len_bs = get_batch_sizes_to_capture(
             model_runner, self.captured_req_width
         )
         self.max_bs = max(self.capture_bs)

@@ -335,9 +335,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
 
         # --- bucket sizes ---------------------------------------------
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
-            model_runner, self.captured_req_width
-        )
+        (
+            self.capture_bs,
+            self.compile_bs,
+            self.sum_len_bs,
+        ) = get_batch_sizes_to_capture(model_runner, self.captured_req_width)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
@@ -576,6 +578,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
+
+    def _capture_dp_padding_mode(self, bs: int) -> DpPaddingMode:
+        """Choose the collective layout recorded for a decode graph bucket."""
+        return (
+            DpPaddingMode.SUM_LEN
+            if bs in self.sum_len_bs
+            else DpPaddingMode.get_default_mode_in_cuda_graph()
+        )
 
     def _resolve_dsa_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
         """Host dispatch: pick which pre-captured DSA decode graph to replay
@@ -980,6 +990,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
+        dp_padding_mode = self._capture_dp_padding_mode(bs)
         forward_batch = ForwardBatch(
             forward_mode=self.capture_forward_mode,
             batch_size=bs,
@@ -999,7 +1010,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             positions=positions,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            dp_padding_mode=dp_padding_mode,
             global_dp_buffer_len=global_dp_buffer_len,
             global_num_tokens_cpu=global_num_tokens_cpu,
             mrope_positions=mrope_positions,
@@ -1032,7 +1043,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # is False; recompute the compile bucket so capture matches.
         if self.enable_torch_compile and not (get_flags().capture.enable_torch_compile):
             self.enable_torch_compile = False
-            _, self.compile_bs = get_batch_sizes_to_capture(
+            _, self.compile_bs, _ = get_batch_sizes_to_capture(
                 self.model_runner, self.captured_req_width
             )
         profile_context = empty_context()

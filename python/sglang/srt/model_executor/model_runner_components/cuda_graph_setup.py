@@ -545,7 +545,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     else:
         capture_name = f"{role} decode"
         num_tokens_per_req = 1
-    capture_bs, _ = get_batch_sizes_to_capture(model_runner, num_tokens_per_req)
+    capture_bs, _, _ = get_batch_sizes_to_capture(model_runner, num_tokens_per_req)
     decode_backend = get_exec().graph.cuda_graph_config.decode.backend
     logger.info(
         f"Capture {capture_name} {graph_backend[model_runner.device]} begin. "

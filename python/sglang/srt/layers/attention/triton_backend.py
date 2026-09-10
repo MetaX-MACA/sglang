@@ -259,7 +259,7 @@ class TritonAttnBackend(AttentionBackend):
             # Use start_layer instead of 0 to handle pipeline parallelism.
             # In PP, start_layer may be > 0, so layer 0 isn't in this stage's buffer.
             self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(
-                model_runner.token_to_kv_pool.start_layer
+                model_runner.layer_info.start_layer
             ).shape[-1]
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len

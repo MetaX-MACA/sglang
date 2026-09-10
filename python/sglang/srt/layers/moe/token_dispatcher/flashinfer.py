@@ -36,18 +36,19 @@ from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.runtime_context import get_flags, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-try:
-    from flashinfer import nvfp4_block_scale_interleave
-    from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
-    from flashinfer.comm.mapping import Mapping
-    from flashinfer.comm.mnnvl import MnnvlConfig
+# try:
+#     from flashinfer import nvfp4_block_scale_interleave
+#     from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
+#     from flashinfer.comm.mapping import Mapping
+#     from flashinfer.comm.mnnvl import MnnvlConfig
 
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+    # from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
-    use_flashinfer = True
-except ImportError:
-    use_flashinfer = False
+#     use_flashinfer = True
+# except ImportError:
+#     use_flashinfer = False
 
+use_flashinfer = False
 logger = logging.getLogger(__name__)
 
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()

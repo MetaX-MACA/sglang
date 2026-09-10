@@ -326,6 +326,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
     validate_cutedsl_a2a_token_budget(server_args)
 
+    # Clamp and regenerate decode graph buckets after DP and speculative
+    # settings have reached their final resolved values.
+    from sglang.srt.arg_groups.cuda_graph_hook import (
+        recompute_cuda_graph_decode_max_bs,
+    )
+
+    recompute_cuda_graph_decode_max_bs(server_args)
+
     # Handle model loading format.
     handle_load_format(server_args)
 

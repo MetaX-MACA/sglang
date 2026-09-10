@@ -21,7 +21,7 @@ class _FakeModelRunner:
 
 
 def _alignment_8_capture_bs(runner, width):
-    return ([bs for bs in runner.cuda_graph_bs if bs * width % 8 == 0], [])
+    return ([bs for bs in runner.cuda_graph_bs if bs * width % 8 == 0], [], [])
 
 
 class TestModelRunnerDecodeRows(unittest.TestCase):

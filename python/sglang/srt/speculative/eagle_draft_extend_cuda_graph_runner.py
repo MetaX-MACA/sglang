@@ -130,7 +130,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_forward_mode = self.forward_mode
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
-        self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
+        self.capture_bs, _, self.sum_len_bs = get_batch_sizes_to_capture(model_runner)
 
         # Static capture width: full tree width (num_draft_tokens), not
         # num_steps + 1 -- topk > 1 draft-extend overflows the buffers.
@@ -382,6 +382,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_tokens_per_req=self.captured_req_width,
         )
 
+        dp_padding_mode = (
+            DpPaddingMode.SUM_LEN
+            if bs in self.sum_len_bs
+            else DpPaddingMode.get_default_mode_in_cuda_graph()
+        )
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
             batch_size=bs,
@@ -399,7 +404,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             mrope_positions=mrope_positions,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            dp_padding_mode=dp_padding_mode,
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,

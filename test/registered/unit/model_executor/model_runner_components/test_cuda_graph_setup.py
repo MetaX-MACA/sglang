@@ -77,7 +77,7 @@ def test_model_runner_can_override_decode_graph_runner(monkeypatch):
     monkeypatch.setattr(cuda_graph_setup, "check_cuda_graph_backend", lambda *_: False)
     monkeypatch.setattr(cuda_graph_setup, "get_available_gpu_memory", lambda *_: 10.0)
     monkeypatch.setattr(
-        cuda_graph_setup, "get_batch_sizes_to_capture", lambda *_: ([1], None)
+        cuda_graph_setup, "get_batch_sizes_to_capture", lambda *_: ([1], None, None)
     )
     monkeypatch.setattr(
         cuda_graph_setup.current_platform, "is_out_of_tree", lambda: False

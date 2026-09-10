@@ -476,6 +476,57 @@ def handle_cuda_graph_config(server_args: Any):
         )
 
 
+def recompute_cuda_graph_decode_max_bs(server_args: Any) -> None:
+    """Clamp decode graph batches after DP and speculative resolution."""
+    cfg = resolving_view(server_args)
+    decode_config = cfg.cuda_graph_config.decode
+    if decode_config.max_bs is None:
+        return
+
+    original_max_bs = decode_config.max_bs
+    adjusted_max_bs = original_max_bs
+    if cfg.enable_dp_attention:
+        if cfg.max_running_requests is not None:
+            adjusted_max_bs = min(
+                adjusted_max_bs, cfg.max_running_requests // cfg.dp_size
+            )
+    elif cfg.max_running_requests is not None:
+        adjusted_max_bs = min(adjusted_max_bs, cfg.max_running_requests)
+
+    if adjusted_max_bs == original_max_bs:
+        return
+
+    changes = {"max_bs": adjusted_max_bs}
+    if (Phase.DECODE, "bs") not in server_args._cuda_graph_config_locked:
+        if cfg.device == "cpu":
+            declare_resolution(
+                server_args,
+                "_recompute_cuda_graph_decode_max_bs",
+                torch_compile_max_bs=adjusted_max_bs,
+            )
+            changes["bs"] = generate_cpu_graph_batch_sizes(server_args)
+        else:
+            changes["bs"] = generate_decode_cuda_graph_batch_sizes(
+                server_args, adjusted_max_bs
+            )
+    elif decode_config.bs is not None:
+        batch_sizes = [bs for bs in decode_config.bs if bs <= adjusted_max_bs]
+        if adjusted_max_bs not in batch_sizes:
+            batch_sizes.append(adjusted_max_bs)
+        changes["bs"] = sorted(set(batch_sizes))
+
+    declare_resolution(
+        server_args,
+        "_recompute_cuda_graph_decode_max_bs",
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config,
+            Phase.DECODE,
+            **changes,
+        ),
+    )
+    logger.warning("Cuda graph decode max bs is adjusted to %s.", adjusted_max_bs)
+
+
 def validate_cuda_graph_config(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.cuda_graph_config is None:

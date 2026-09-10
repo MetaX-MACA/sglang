@@ -110,7 +110,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
                 )
             if decode_cuda_graph_config.max_bs is None:
                 if cfg.tp_size < 4:
-                    decode_cuda_graph_config.max_bs = 256
+                    decode_cuda_graph_config.max_bs = 128
                 else:
                     decode_cuda_graph_config.max_bs = 512
         elif gpu_mem < 160 * 1024:
