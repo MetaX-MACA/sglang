@@ -1061,13 +1061,16 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        all_gather_group = (
+            self.attn_tp_group if self.p2p_allgather else None
+        )
+        if msg_type == "proxy" and self.server_args.enable_attn_tp_input_scattered:
+            all_gather_group = None
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
-                all_gather_group=(
-                    self.attn_tp_group if self.p2p_allgather else None
-                ),
+                all_gather_group=all_gather_group,
                 async_send=async_send,
             )
         )
@@ -1113,7 +1116,10 @@ class SchedulerPPMixin:
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
                     all_gather_group=(
-                        self.attn_tp_group if self.p2p_allgather else None
+                        self.attn_tp_group
+                        if self.p2p_allgather
+                        and not self.server_args.enable_attn_tp_input_scattered
+                        else None
                     ),
                 )
             )
