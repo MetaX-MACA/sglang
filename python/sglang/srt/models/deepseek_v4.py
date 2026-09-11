@@ -4085,7 +4085,7 @@ def _prepare_deepseek_v4_weights(
         logger.info("Keep Expert Pack GGUF weights on the streaming load path")
         return weights
 
-    block_size = getattr(self.quant_config, "weight_block_size", None) or [
+    block_size = getattr(quant_config, "weight_block_size", None) or [
         128,
         128,
     ]
