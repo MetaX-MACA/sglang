@@ -20,6 +20,8 @@ from sglang.srt.eplb.expert_location import (
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 
+from sglang.srt.utils import get_bool_env_var
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
@@ -94,6 +96,10 @@ class EPLBManager:
             yield from self.rebalance()
 
     def rebalance(self):
+        if get_bool_env_var("SGLANG_STATIC_EPLB"):
+            logger.info("[EPLBManager] rebalance skip for ENV:[SGLANG_STATIC_EPLB] on")
+            return
+        
         if self._rebalance_disabled_reason is not None:
             if not self._rebalance_disabled_logged:
                 logger.debug(
