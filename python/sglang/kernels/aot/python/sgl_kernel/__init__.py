@@ -61,6 +61,7 @@ else:
         # gemma_fused_add_rmsnorm,
         # gemma_rmsnorm,
         # rmsnorm,
+        rms_norm_dynamic_per_token_quant_custom,
         rotary_embedding,
         silu_and_mul,
     )

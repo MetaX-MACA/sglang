@@ -85,6 +85,8 @@ from sglang.srt.utils import (
     ceil_align,
     is_non_idle_and_non_empty,
     make_layers,
+    align_packed_tensor_size,
+    get_bool_env_var,
 )
 
 MiMoV2Config = None
@@ -337,8 +339,10 @@ class MiMoV2MLP(nn.Module):
         x,
         forward_batch: ForwardBatch = None,
     ):
-        if (self.tp_size == 1) and x.shape[0] == 0:
-            return x
+        if self.tp_size == 1:
+            target = x[0] if isinstance(x, tuple) else x
+            if target.shape[0] == 0:
+                return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
@@ -392,6 +396,7 @@ class MiMoV2MoE(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
+        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
 
         self.config = config
         self.layer_id = layer_id
@@ -510,6 +515,20 @@ class MiMoV2MoE(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        # tensor_scale_tuple = None
+        if isinstance(hidden_states, tuple):
+            packed_hidden = hidden_states[0]
+            # tensor_scale_tuple = hidden_states[2]
+            hidden_states = hidden_states[1]
+        else:
+            packed_hidden = hidden_states
+            if self.use_fused_quant and packed_hidden.shape[0] == 0:
+                packed_hidden = torch.empty(
+                    (0, align_packed_tensor_size(packed_hidden.shape[-1])), 
+                    dtype=hidden_states.dtype, 
+                    device=hidden_states.device
+                )
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
@@ -525,7 +544,7 @@ class MiMoV2MoE(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, topk_output=topk_output
+            hidden_states=packed_hidden, topk_output=topk_output
         )
 
         return final_hidden_states
@@ -858,9 +877,11 @@ class MiMoV2DecoderLayer(nn.Module):
                 tp_size=mlp_tp_size,
             )
 
+        packed_quant = True if self.is_layer_sparse else False
+        fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.layernorm_epsilon
+            config.hidden_size, eps=config.layernorm_epsilon, fused_quant=fused_quant, packed_quant=packed_quant, packed_size=align_packed_tensor_size(config.hidden_size)
         )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
@@ -890,12 +911,20 @@ class MiMoV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+        if isinstance(hidden_states, tuple):
+            if hidden_states[0].shape[0] != 0:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+        else:
+            if hidden_states.shape[0] != 0:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch

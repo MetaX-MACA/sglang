@@ -1056,7 +1056,7 @@ class Envs:
     # ===================================================================
     # DeepGEMM
     # ===================================================================
-    SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(False)
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
