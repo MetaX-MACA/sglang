@@ -42,8 +42,15 @@ using PackageType = decltype(get_mem_package<kUnit>());
 // NVIDIA exposes an explicit "do not allocate in L1" cache hint via PTX. ROCm
 // has no equivalent PTX, but non-temporal (streaming) loads/stores express the
 // same intent for one-shot HiCache write-back traffic that should not pollute
-// the cache. Guard the PTX behind USE_ROCM so the JIT module also compiles with
-// hipcc; see python/sglang/kernels/jit/utils/compile.py for the ROCm build flags.
+// the cache. MACA's CUDA bridge accepts neither the PTX cache-hint instruction
+// nor its "l" pointer constraint, so use portable vector loads/stores there.
+// Guard the PTX so the JIT module compiles with all three toolchains.
+#if defined(__MACA_ARCH__) || defined(__MACACC__) || defined(__MACA__) || defined(__MXCC__)
+#define SGL_HICACHE_USE_PORTABLE_MEMORY_OPS 1
+#else
+#define SGL_HICACHE_USE_PORTABLE_MEMORY_OPS 0
+#endif
+
 #ifdef USE_ROCM
 // Native Clang vector types so a single __builtin_nontemporal_{load,store} maps
 // to one vectorized global_{load,store}_dwordx{2,4}. Issuing N independent
@@ -56,7 +63,9 @@ typedef uint32_t native_uint4 __attribute__((ext_vector_type(4)));
 #endif
 
 SGL_DEVICE uint1 load_nc(const uint1* __restrict__ src) {
-#ifndef USE_ROCM
+#if SGL_HICACHE_USE_PORTABLE_MEMORY_OPS
+  return *src;
+#elif !defined(USE_ROCM)
   uint32_t tmp;
   asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
   return uint1{tmp};
@@ -66,7 +75,9 @@ SGL_DEVICE uint1 load_nc(const uint1* __restrict__ src) {
 }
 
 SGL_DEVICE uint2 load_nc(const uint2* __restrict__ src) {
-#ifndef USE_ROCM
+#if SGL_HICACHE_USE_PORTABLE_MEMORY_OPS
+  return *src;
+#elif !defined(USE_ROCM)
   uint32_t tmp0, tmp1;
   asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
   return uint2{tmp0, tmp1};
@@ -77,7 +88,9 @@ SGL_DEVICE uint2 load_nc(const uint2* __restrict__ src) {
 }
 
 SGL_DEVICE uint4 load_nc(const uint4* __restrict__ src) {
-#ifndef USE_ROCM
+#if SGL_HICACHE_USE_PORTABLE_MEMORY_OPS
+  return *src;
+#elif !defined(USE_ROCM)
   uint32_t tmp0, tmp1, tmp2, tmp3;
   asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];"
                : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3)
@@ -90,7 +103,9 @@ SGL_DEVICE uint4 load_nc(const uint4* __restrict__ src) {
 }
 
 SGL_DEVICE void store_nc(uint1* __restrict__ dst, const uint1& value) {
-#ifndef USE_ROCM
+#if SGL_HICACHE_USE_PORTABLE_MEMORY_OPS
+  *dst = value;
+#elif !defined(USE_ROCM)
   uint32_t tmp = value.x;
   asm volatile("st.global.L1::no_allocate.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
 #else
@@ -99,7 +114,9 @@ SGL_DEVICE void store_nc(uint1* __restrict__ dst, const uint1& value) {
 }
 
 SGL_DEVICE void store_nc(uint2* __restrict__ dst, const uint2& value) {
-#ifndef USE_ROCM
+#if SGL_HICACHE_USE_PORTABLE_MEMORY_OPS
+  *dst = value;
+#elif !defined(USE_ROCM)
   uint32_t tmp0 = value.x;
   uint32_t tmp1 = value.y;
   asm volatile("st.global.L1::no_allocate.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
@@ -109,7 +126,9 @@ SGL_DEVICE void store_nc(uint2* __restrict__ dst, const uint2& value) {
 }
 
 SGL_DEVICE void store_nc(uint4* __restrict__ dst, const uint4& value) {
-#ifndef USE_ROCM
+#if SGL_HICACHE_USE_PORTABLE_MEMORY_OPS
+  *dst = value;
+#elif !defined(USE_ROCM)
   uint32_t tmp0 = value.x;
   uint32_t tmp1 = value.y;
   uint32_t tmp2 = value.z;
@@ -163,7 +182,13 @@ SGL_DEVICE void store_vec(void* __restrict__ dst, const Storage& vec) {
 
 }  // namespace device
 
+namespace {
+
+#if SGL_HICACHE_USE_PORTABLE_MEMORY_OPS
+#define SGL_HICACHE_KERNEL __global__ __launch_bounds__(kBlockSize)
+#else
 #define SGL_HICACHE_KERNEL __global__ __launch_bounds__(kBlockSize, 1)
+#endif
 
 struct HicacheKernelParams {
   void* __restrict__ k_cache_dst;
@@ -520,5 +545,9 @@ struct HiCacheKernel {
 };
 
 #undef SGL_HICACHE_KERNEL
+
+}  // namespace
+
+#undef SGL_HICACHE_USE_PORTABLE_MEMORY_OPS
 
 }  // namespace sglang

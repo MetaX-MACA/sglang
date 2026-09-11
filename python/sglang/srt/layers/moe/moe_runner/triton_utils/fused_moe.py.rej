@@ -1,0 +1,37 @@
+diff a/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py b/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py	(rejected hunks)
+@@ -696,6 +696,35 @@ def _fused_moe_kernel_sequence(
+         stage1_config["BLOCK_SIZE_M"] = kernel_m
+         stage2_config["BLOCK_SIZE_M"] = kernel_m
+         
++    elif use_fp8_w8a8 and enable_mctlass_fused_moe_python_api:
++        hidden_states_fp8 = torch.empty_strided(
++            hidden_states.shape,
++            hidden_states.stride(),
++            dtype=torch.float8_e4m3fn,
++            device=hidden_states.device,
++        )
++        kernel_m_kwargs = {"use_fp8": True}
++        if block_shape is not None:
++            kernel_m_kwargs.update(
++                is_blockwise=True,
++                group_size=block_shape[0],
++            )
++        kernel_m = gemm.get_kernel_m(
++            hidden_states_fp8,
++            w1,
++            intermediate_cache1,
++            w1.shape[0],
++            hidden_states_fp8.shape[0],
++            w1.shape[1],
++            hidden_states_fp8.shape[1],
++            topk_ids.shape[1],
++            **kernel_m_kwargs,
++        )
++        assert kernel_m > 0, (
++            "fp8_w8a8 FusedMoeGEMM.get_kernel_m kernel_m must greater than zero."
++        )
++        del hidden_states_fp8
++
+     elif (
+         enable_mctlass_fused_moe_python_api
+         and hidden_states.dtype == torch.bfloat16

@@ -106,9 +106,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             element_size=self.element_dim * self.dtype.itemsize
         )
 
-        if self.layout == "page_first":
-            # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
-            # This swaps strides without copying data
+        if self.layout in ("page_first", "page_first_direct"):
+            # Transpose [page, layer, ...] -> [layer, page, ...] to get
+            # per-layer views. This swaps strides without copying data.
             k_transposed = self.k_buffer.transpose(0, 1)
             v_transposed = self.v_buffer.transpose(0, 1)
             self.k_data_refs = [k_transposed[i] for i in range(self.layer_num)]

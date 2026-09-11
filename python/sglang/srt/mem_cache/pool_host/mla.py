@@ -92,9 +92,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             element_size=self.kv_cache_dim * self.dtype.itemsize
         )
 
-        if self.layout == "page_first":
-            # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
-            # This swaps strides without copying data
+        if self.layout in ("page_first", "page_first_direct"):
+            # Transpose [page, layer, ...] -> [layer, page, ...] to get
+            # per-layer views. This swaps strides without copying data.
             transposed = self.kv_buffer.transpose(0, 1)
             self.data_refs = [transposed[i] for i in range(self.layer_num)]
         else:

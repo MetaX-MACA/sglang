@@ -19,9 +19,9 @@ constexpr int WARP_SIZE = 64;
 using BallotMask = uint64_t;
 constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFFFFFFFFFull;
 #else
-constexpr int WARP_SIZE = 32;
-using BallotMask = unsigned int;
-constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
+constexpr int WARP_SIZE = 64;  // MetaX C600 wavefront width (NVIDIA was 32)
+using BallotMask = unsigned long long;
+constexpr BallotMask FULL_WARP_MASK = ~0ULL;  // all WARP_SIZE(=64) lanes participate
 #endif
 constexpr int32_t TOKEN_HIT = 0xFFFFFFFF;
 constexpr int32_t HASH_EMPTY = -1;
@@ -145,11 +145,12 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
     const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
     uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
     for (int j = lane_id; j < total_pairs; j += WARP_SIZE) {
-      uint64_t lo, hi;
       const uint64_t* s = src + j * 2;
-      asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(s) : "memory");
       uint64_t* d = dst + j * 2;
-      asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo), "l"(hi) : "memory");
+      const uint64_t lo = s[0];
+      const uint64_t hi = s[1];
+      d[0] = lo;
+      d[1] = hi;
     }
   }
 
@@ -159,9 +160,10 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
     const uint64_t* __restrict__ src8 =
         reinterpret_cast<const uint64_t*>(static_cast<const char*>(src_addr) + total_pairs * 16);
     uint64_t* __restrict__ dst8 = reinterpret_cast<uint64_t*>(static_cast<char*>(dst_addr) + total_pairs * 16);
-    uint64_t tmp;
-    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src8 + lane_id) : "memory");
-    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
+    // uint64_t tmp;
+    // asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src8 + lane_id) : "memory");
+    // asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
+    dst8[lane_id] = src8[lane_id];
   }
 }
 #endif
@@ -170,7 +172,7 @@ __device__ __forceinline__ int popc_mask(BallotMask mask) {
 #ifdef USE_ROCM
   return __popcll(mask);
 #else
-  return __popc(mask);
+  return __popcll(mask);
 #endif
 }
 
@@ -279,20 +281,20 @@ void transfer_cache_dsv4_mla(
       num_layers);
 }
 
-__device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int accumulator) {
+__device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int width, int accumulator) {
   int idx = lane_id + offset;
-  int val = (idx < count) ? s_data[idx] : 0;
+  int val = (lane_id < width && idx < count) ? s_data[idx] : 0;
 
 #pragma unroll
   for (int i = 1; i < WARP_SIZE; i *= 2) {
     int n = __shfl_up_sync(FULL_WARP_MASK, val, i);
-    if (lane_id >= i) val += n;
+    if (lane_id >= i && lane_id < width) val += n;
   }
   val += accumulator;
-  if (idx < count) {
+  if (lane_id < width && idx < count) {
     s_data[idx] = val;
   }
-  accumulator = __shfl_sync(FULL_WARP_MASK, val, WARP_SIZE - 1);
+  accumulator = __shfl_sync(FULL_WARP_MASK, val, width - 1);
   return accumulator;
 }
 
@@ -541,9 +543,9 @@ __global__ void load_cache_to_device_buffer_kernel(
           warp_inclusive_scan(s_evict_chunk_offset, lane_id, scan_offset, scan_count, total_evict_count);
 #else
       total_hit_count =
-          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
+          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, NUM_WARPS, total_hit_count);
       total_evict_count =
-          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
+          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, NUM_WARPS, total_evict_count);
 #endif
       if (tid == 0) {
         s_total_hits = total_hit_count;
@@ -608,7 +610,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       const int scan_count = min(scan_offset + NUM_WARPS, NUM_TOKEN_CHUNKS + 1);
       total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_misses);
 #else
-      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
+      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, NUM_WARPS, total_misses);
 #endif
     }
     __syncthreads();

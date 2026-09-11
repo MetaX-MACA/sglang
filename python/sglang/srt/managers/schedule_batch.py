@@ -3333,6 +3333,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum = None
 
         if self.hisparse_coordinator is not None:
+            self.req_pool_indices_cpu = self.req_pool_indices.cpu()
             self.hisparse_coordinator.map_last_loc_to_buffer(
                 self.seq_lens,
                 self.out_cache_loc,
