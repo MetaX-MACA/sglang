@@ -468,6 +468,8 @@ class MistralModel(MistralPreTrainedModel):
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
+            if "cache_position" in inspect.signature(mask_function).parameters:
+                mask_kwargs["cache_position"] = cache_position
             causal_mask = mask_function(**mask_kwargs)
 
         hidden_states = inputs_embeds

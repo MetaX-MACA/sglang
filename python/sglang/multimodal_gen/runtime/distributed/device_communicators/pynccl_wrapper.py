@@ -65,7 +65,7 @@ def _find_nccl_library() -> str:
         )
     else:
         if torch.version.cuda is not None:
-            so_file = "libnccl.so.2"
+            so_file = "libmccl.so"
         elif torch.version.hip is not None:
             so_file = "librccl.so.1"
         elif vars(torch.version).get("musa") is not None:

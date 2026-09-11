@@ -404,6 +404,10 @@ class GroupCoordinator:
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
+        # all_gather_into_tensor requires a contiguous input. Sequence-parallel
+        # callers commonly pass a sliced view (for example, a KV prefix/suffix).
+        if not input_.is_contiguous():
+            input_ = input_.contiguous()
         # Allocate output tensor.
         input_size = list(input_.size())
         input_size[0] *= world_size

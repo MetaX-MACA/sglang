@@ -1,5 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import inspect
+
 from transformers import (
     Cache,
     DynamicCache,
@@ -40,6 +42,10 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLMLP
+
+_CACHE_POSITION_REQUIRED = (
+    "cache_position" in inspect.signature(create_causal_mask).parameters
+)
 
 # coding=utf-8
 # Adapted from
@@ -564,6 +570,8 @@ class Qwen2_5_VLTextModel(nn.Module):
                 "past_key_values": past_key_values,
                 "position_ids": text_position_ids,
             }
+            if _CACHE_POSITION_REQUIRED:
+                mask_kwargs["cache_position"] = cache_position
             # Create the masks
             causal_mask_mapping = {
                 "full_attention": create_causal_mask(**mask_kwargs),

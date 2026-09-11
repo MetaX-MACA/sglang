@@ -21,7 +21,10 @@ _is_xpu = current_platform.is_xpu()
 if _is_cuda:
     from sglang.kernels.ops.activation.activation import silu_and_mul
 elif _is_hip or _is_xpu:
-    from sgl_kernel import silu_and_mul
+    try:
+        from flashinfer.activation import silu_and_mul
+    except ImportError:
+        from sgl_kernel import silu_and_mul
 
 
 if _is_npu:

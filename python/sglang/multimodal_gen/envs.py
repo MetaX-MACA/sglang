@@ -51,10 +51,10 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
-    # on by default; engages only on 2 ranks with peer-to-peer access and falls
+    # Off by default; when enabled, engages only on 2 ranks with peer-to-peer access and falls
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
     # the resolver below -- that is the value the runtime reads.
-    SGLANG_DIFFUSION_IPC_A2A: bool = True
+    SGLANG_DIFFUSION_IPC_A2A: bool = False
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
     # retires the transport on every rank and fails the request
@@ -103,7 +103,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION: bool = True
     SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS: int = 3
     SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_LAST_STEPS: int = 3
-    SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
+    SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = False
+    SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
@@ -340,8 +341,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND"
     ),
-    "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
-        "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
+    "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_bool(
+        "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "false"
     ),
     # Kill-switch: keep VAE decoder weights in their checkpoint dtype at load
     # instead of the decode compute dtype the decode stage would round them to
@@ -384,7 +385,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
-    "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
+    "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "false"),
     "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
         "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 10000.0
     ),
