@@ -301,7 +301,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     runner_input, quant_info, running_state
                 )
             else:
-                if quant_info.is_fp4_experts:
+                if getattr(quant_info, "is_fp4_experts", False) and quant_info.is_fp4_experts:
                     hidden_states = self._run_masked_gemm_mx_fp4(
                         runner_input, quant_info, running_state
                     )
