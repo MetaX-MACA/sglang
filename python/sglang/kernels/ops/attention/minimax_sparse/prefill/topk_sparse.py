@@ -1,6 +1,17 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
+"""Standalone prefill sparse-attention kernels (bf16 / fp16 only).
 
-from typing import Optional
+Step 1 (lightning indexer): ``flash_prefill_with_topk_index`` — score every KV
+block with the index head and select the top-k blocks (in-kernel bitonic top-k).
+Optionally also produces the index-head attention output.
+
+Step 3 (main sparse attention): ``flash_prefill_with_gqa_share_sparse`` —
+attend only to the selected top-k blocks with the main head.
+
+No fp8, no sglang, no project utils. Paged KV via ``req_to_token`` / ``slot_ids``.
+"""
+
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -31,13 +42,13 @@ from ..common.utils import (
 )
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=nw, num_stages=ns)
-        for nw in (2, 4, 8)
+        triton.Config({"BLOCK_SIZE_K": bsk}, num_warps=nw, num_stages=ns)
+        for bsk in (16, 32, 64)
+        for nw in (4, 8)
         for ns in (1, 2)
     ],
     key=[
         "BLOCK_SIZE_Q",
-        "BLOCK_SIZE_K",
         "qk_head_dim",
         "v_head_dim",
         "gqa_group_size",
@@ -117,6 +128,8 @@ def _gqa_share_sparse_fwd_kernel(
     q_block_len = tl.load(cu_seqblocks_q + pid_b + 1) - q_block_start
     seq_len = tl.load(seq_lens + pid_b)
     prefix_len = tl.load(prefix_lens + pid_b)
+    # number of KV blocks; used to clamp stray topk_idx entries (see below).
+    num_blocks = (seq_len + block_size - 1) // block_size
     sid = (
         tl.load(slot_ids + pid_b).to(tl.int64) + max_slots
     ) % max_slots  # safety against negative
@@ -183,9 +196,24 @@ def _gqa_share_sparse_fwd_kernel(
             lse_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
         acc_o = tl.full((BLOCK_SIZE_QH, BLOCK_SIZE_VD), 0, dtype=tl.float32)
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_KD)
-        for i in range(real_topk):
-            # get current block start index (absolute K position)
-            c = tl.load(t_ptr_j).to(tl.int32) * block_size
+        # sparse attention. Each selected topk block holds `block_size` (=bsk)
+        # tokens but we load/dot it in K/V tiles of BLOCK_SIZE_K (<= block_size)
+        # to shrink the shared-mem tile (16KB -> 8KB) and so raise occupancy:
+        # on a 64KB-smem/SM device, 24KB/block pinned occupancy at ~6% and left
+        # every paged-gather stall exposed; halving the tile doubles the
+        # programs/SM and lets them interleave the gathers. Online softmax
+        # accumulates m/lse/acc across sub-tiles, so the split is exact.
+        for i in tl.range(real_topk):
+            # block start (absolute K position). Clamp out-of-range ids to 0:
+            # under cuda-graph capture the topk_idx buffer may be uninitialized,
+            # and a huge positive entry makes `raw * block_size` overflow int32
+            # to a negative c; then `pos = c + ... < seq_len` is spuriously true
+            # and the masked req_to_token gather dereferences an unmapped address
+            # (MetaX Xnack/ATU fault). Clamping keeps c in [0, seq_len). Legal
+            # ids (0..num_blocks-1) are untouched on the real path; -1 padding
+            # is mapped to block 0 (harmless: captured output is discarded).
+            raw = tl.load(t_ptr_j).to(tl.int32)
+            c = tl.where((raw >= 0) & (raw < num_blocks), raw, 0).to(tl.int32) * block_size
             t_ptr_j = t_ptr_j + stride_tk
             for s in tl.static_range(0, block_size, BLOCK_SIZE_K):
                 # paged load K via req_to_token: pos -> slot -> k_cache
@@ -321,7 +349,13 @@ def flash_prefill_with_gqa_share_sparse(
         max_seqblock_q // 131072 + 1
     )  # calculate multiple queries in one kernel if seqlence length is too long
     BLOCK_SIZE_Q = triton.next_power_of_2(block_size_q)
-    BLOCK_SIZE_K = min(16, triton.next_power_of_2(block_size_k))
+    # K/V tile for the inner dot. Independent of block_size_k (the topk block
+    # size): a selected block of `block_size_k` tokens is processed in
+    # sub-tiles of BLOCK_SIZE_K. Smaller tile -> smaller shared-mem footprint
+    # -> higher occupancy on the 64KB-smem/SM device (see kernel comment).
+    # BLOCK_SIZE_K (K/V sub-tile) is now an autotune dimension (16/32/64);
+    # num_stages=1/2 and num_warps=4/8 too. ns=2 pipelines the topk loop's
+    # next-block gather to hide latency. Prefill: 4 or 8 warps only.
     grid = (
         triton.cdiv(triton.cdiv(max_seqlen_q, block_size_q), num_q_loop),
         num_k_heads,
@@ -371,6 +405,5 @@ def flash_prefill_with_gqa_share_sparse(
         IS_FP8=is_fp8,
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         block_size=block_size_k,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
     return o

@@ -516,8 +516,8 @@ class MiniMaxM3MoE(nn.Module):
                 # NPU lacks aten::mm.dtype; bf16 mm then cast keeps topk semantics.
                 return torch.mm(hidden_states, self.gate.weight.t()).float()
             return torch.mm(
-                hidden_states, self.gate.weight.t(), out_dtype=torch.float32
-            )
+                hidden_states, self.gate.weight.t()
+            ).to(torch.float32)
         router_logits, _ = self.gate(hidden_states.to(torch.float32))
         return router_logits
 
