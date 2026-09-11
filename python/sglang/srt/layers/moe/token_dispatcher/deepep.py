@@ -39,6 +39,12 @@ from sglang.srt.utils import (
     is_npu,
     load_json_config,
 )
+import triton
+from sglang.kernels.ops.moe.ep_moe_kernels import (
+    deepep_permute_triton_kernel_opt,
+    deepep_post_reorder_triton_kernel,
+    deepep_run_moe_deep_preprocess,
+)
 
 _is_npu = is_npu()
 _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
@@ -132,6 +138,8 @@ class DeepEPNormalDispatchOutput(NamedTuple):
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     num_recv_tokens_per_expert: List[int]
+    reorder_topk_ids: Optional[torch.Tensor]
+    seg_indptr: Optional[torch.Tensor]
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -298,6 +306,7 @@ class DeepEPBuffer:
             num_qps_per_rank=num_qps_per_rank,
             # allow_mnnvl=use_mnnvl_fabric,
         )
+        logger.error(f'## DeepEPBuffer {group.size()=} {num_nvl_bytes=} {num_rdma_bytes=} {num_qps_per_rank=} low_latency_mode={deepep_mode.enable_low_latency()}')
         # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
         # support, so cross-pod GB200/GB300 EP groups use
         # cuMemImportFromShareableHandle instead of the intra-node-only
@@ -312,7 +321,8 @@ class DeepEPBuffer:
         # if not is_cu12 and use_mnnvl_fabric:
         #     buffer_kwargs["use_fabric"] = True
 
-        state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        if state.buffer is None:
+            state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return state.buffer
 
     @classmethod
@@ -420,6 +430,59 @@ class _DeepEPDispatcherImplBase:
         self.meta_overlap_args: Optional[dict] = None
 
         self.set_deepep_dispatcher_dtype()
+
+    def _deepep_permute(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        fp8_dtype: Optional[torch.dtype] = None,
+        use_fp8_w8a8: bool = False,
+        use_block_quant: bool = False,
+    ):
+        """
+        Copy from Megatron-Core token_dispatcher MoEFlexTokenDispatcher
+        https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py
+        """
+
+        reorder_topk_ids, self.src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
+            topk_idx, self.num_local_experts
+        )
+        num_total_tokens = reorder_topk_ids.numel()
+        gateup_input = torch.empty(
+            (int(num_total_tokens), hidden_states.shape[1]),
+            device=hidden_states.device,
+            dtype=(
+                fp8_dtype
+                if (use_fp8_w8a8 and not use_block_quant)
+                else hidden_states.dtype
+            ),
+        )
+        # PreReorder
+        # deepep_permute_triton_kernel[(hidden_states.shape[0],)](
+        #     hidden_states,
+        #     gateup_input,
+        #     self.src2dst,
+        #     topk_idx,
+        #     None,
+        #     self.router_topk,
+        #     hidden_states.shape[1],
+        #     BLOCK_SIZE=512,
+        # )
+        # TOPK = triton.next_power_of_2(self.router_topk)
+        deepep_permute_triton_kernel_opt[(hidden_states.shape[0],)](
+            hidden_states,
+            gateup_input,
+            self.src2dst,
+            topk_idx,
+            None,
+            self.router_topk,
+            hidden_states.shape[1],
+            BLOCK_SIZE=512,
+            K=self.K,
+            num_warps = 8
+        )
+
+        return reorder_topk_ids, seg_indptr, gateup_input
 
     def dispatch_a(
         self,
@@ -558,6 +621,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self.async_finish = async_finish
         self.src2dst = None
         self.quant_config = {}
+        self.K = triton.next_power_of_2(self.router_topk)
 
     def dispatch_a(
         self,
@@ -627,12 +691,28 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         else:
             hidden_states_scale = None
 
+        if hidden_states.shape[0] > 0:
+            reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
+                hidden_states, topk_ids, fp8_dtype=hidden_states.dtype
+            )
+        else:
+            reorder_topk_ids = torch.empty(
+                (0,), device=hidden_states.device, dtype=torch.int64
+            )
+            seg_indptr = torch.zeros(
+                (self.num_local_experts + 1,),
+                device=hidden_states.device,
+                dtype=torch.int64,
+            )
+
         return DeepEPNormalDispatchOutput(
             hidden_states,
             hidden_states_scale,
             topk_ids,
             topk_weights,
             num_recv_tokens_per_expert,
+            reorder_topk_ids,
+            seg_indptr
         )
 
     def _dispatch_core(
@@ -709,7 +789,31 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
-            raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
+            # raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
+            if hidden_states.shape[0] > 0:
+                num_tokens = self.src2dst.shape[0] // self.router_topk
+                output = torch.empty(
+                    (num_tokens, hidden_states.shape[1]),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+                deepep_post_reorder_triton_kernel[(num_tokens,)](
+                    hidden_states,
+                    output,
+                    self.src2dst,
+                    topk_ids,
+                    topk_weights,
+                    self.router_topk,
+                    hidden_states.shape[1],
+                    routed_scaling_factor=1.0,
+                    BLOCK_SIZE=512,
+                )
+            else:
+                output = torch.zeros(
+                    (0, hidden_states.shape[1]),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
 
         previous_event = Buffer.capture() if self.async_finish else None
         return output, previous_event
@@ -830,7 +934,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         use_nvfp4 = use_fp8 = False
         input_global_scale = None
-        input_global_scale = self.quant_config.get("input_global_scale", None)
+        # input_global_scale = self.quant_config.get("input_global_scale", None)
 
         bf16_dispatch = self.quant_config.get("bf16_dispatch", False)
         if input_global_scale is not None:

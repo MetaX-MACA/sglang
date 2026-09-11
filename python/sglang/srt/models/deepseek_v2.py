@@ -211,6 +211,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     make_layers,
     use_intel_amx_backend,
+    align_packed_tensor_size,
 )
 from sglang.srt.utils.common import is_maca
 from sglang.srt.utils.custom_op import register_custom_op
@@ -306,7 +307,8 @@ class DeepseekV2MLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        self.fused_quant = envs.MX_ENABLE_FUSE_SILUMUL_QUANT.get()
+        self.act_fn = SiluAndMul(fused_quant=self.fused_quant)
         self.use_fused_clamp_act_mul = _is_hip
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
@@ -318,8 +320,10 @@ class DeepseekV2MLP(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         gateup_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        if (self.tp_size == 1) and x.shape[0] == 0:
-            return x
+        if self.tp_size == 1:
+            target = x[0] if isinstance(x, tuple) else x
+            if target.shape[0] == 0:
+                return x
 
         if (
             getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False)
@@ -454,10 +458,20 @@ class DeepseekV2MLP(nn.Module):
                     bias=0,
                     interleaved=False,
                 )
+            if self.fused_quant:
+                x = self.act_fn(gate_up, self.swiglu_limit)
             else:
-                M, N = gate_up.shape
-                x = gate_up.new_empty((M, N // 2))
-                silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+                if _is_npu:
+                    _g, _u = gate_up.chunk(2, dim=-1)
+                    _lim = float(self.swiglu_limit)
+                    gate_up = torch.cat(
+                        [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+                    )
+                    x = self.act_fn(gate_up)
+                else:
+                    M, N = gate_up.shape
+                    x = gate_up.new_empty((M, N // 2))
+                    silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
             x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -629,6 +643,7 @@ class DeepseekV2MoE(nn.Module):
             and get_platform().is_blackwell
             and self.tp_size == 4
         )
+        self.use_fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
@@ -1469,6 +1484,20 @@ class DeepseekV2MoE(nn.Module):
             sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
         )
 
+        tensor_scale_tuple = None
+        if isinstance(hidden_states, tuple):
+            packed_hidden = hidden_states[0]
+            tensor_scale_tuple = hidden_states[2]
+            hidden_states = hidden_states[1]
+        else:
+            packed_hidden = hidden_states
+            if self.use_fused_quant and packed_hidden.shape[0] == 0:
+                packed_hidden = torch.empty(
+                    (0, align_packed_tensor_size(packed_hidden.shape[-1], envs.MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE.get())), 
+                    dtype=hidden_states.dtype, 
+                    device=hidden_states.device
+                )
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
@@ -1489,7 +1518,7 @@ class DeepseekV2MoE(nn.Module):
                         # allocator recycles shared_output across the break.
                         torch.cuda.current_stream().wait_event(shared_event)
                 else:
-                    shared_output = self._forward_shared_experts(hidden_states)
+                    shared_output = self._forward_shared_experts(tensor_scale_tuple if (self.use_fused_quant and tensor_scale_tuple is not None) else hidden_states)
             topk_kwargs = (
                 {"input_ids": input_ids_global}
                 if getattr(self, "is_hash", False)
@@ -1659,7 +1688,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         final_hidden_states = self.experts(
-            hidden_states=hidden_states,
+            hidden_states=packed_hidden,
             topk_output=topk_output,
         )
 
@@ -1696,7 +1725,8 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+        bs = hidden_states[0].shape[0] if isinstance(hidden_states, tuple) else hidden_states.shape[0]
+        if (bs > 0) and (self.num_fused_shared_experts == 0):
             if pre_quant_input is not None:
                 # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
                 # multiple of 4; the padded rows flow through the MLP (all ops
@@ -2630,10 +2660,15 @@ class DeepseekV2DecoderLayer(nn.Module):
                 swiglu_limit=getattr(config, "swiglu_limit", None),
             )
 
+        # self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.post_attention_layernorm = RMSNorm(
+        #     config.hidden_size, eps=config.rms_norm_eps
+        # )
+        packed_quant = True if self.is_layer_sparse else False
+        fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+            config.hidden_size, eps=config.rms_norm_eps, fused_quant=fused_quant, packed_quant=packed_quant, packed_size=align_packed_tensor_size(config.hidden_size))
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 

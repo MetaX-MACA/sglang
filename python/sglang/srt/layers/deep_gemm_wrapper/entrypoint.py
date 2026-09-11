@@ -164,7 +164,6 @@ def grouped_gemm_nt_int8int8bf16_masked(
         expected_m,
     )
 
-
 def _ensure_cuda(
     pair: Tuple[torch.Tensor, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:

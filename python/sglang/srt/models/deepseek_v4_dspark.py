@@ -771,8 +771,8 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         return hidden_states, ffn_pre
 
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
-        shape = x.shape
-        x = x.reshape(-1, self.dim)
+        shape = x[1].shape if isinstance(x, tuple) else x.shape
+        # x = x.reshape(-1, self.dim)
         y = self._run_moe_ffn_dp_sync(
             x, forward_batch, input_ids=None, input_ids_global=None
         )

@@ -46,6 +46,66 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+from mcoplib.custom_ops import (
+    fused_add_rms_norm_dynamic_per_token_quant_padding_output as _mocop_fused_add_rms_norm_quant_pad,
+)
+from sgl_kernel import (
+    rms_norm_dynamic_per_token_quant_custom,
+)
+
+# Register mcoplib op as torch.library custom op for torch.compile / PCG.
+# Packed INT8 values/scales are bytes, not BF16 numbers: expose bytes to AOT
+# so arbitrary payload bit patterns are not compared as floating-point NaNs.
+# Declare the residual mutation explicitly; the custom op returns only fresh
+# tensors so AOT functionalization can handle the in-place residual update.
+_mocop_op_name = "fused_add_rms_norm_dynamic_per_token_quant_padding_output"
+if not hasattr(torch.ops.sglang, _mocop_op_name):
+    _sglib = torch.library.Library("sglang", "FRAGMENT")
+    _sglib.define(
+        f"{_mocop_op_name}("
+        "Tensor input, Tensor(a!)? residual, Tensor weight, int pad_size, float epsilon"
+        ") -> (Tensor, Tensor, Tensor, Tensor)"
+    )
+
+    def _mocop_cuda_impl(input, residual, weight, pad_size, epsilon):
+        output, _, output_rms, output_quant_int8, scales = (
+            _mocop_fused_add_rms_norm_quant_pad(input, residual, weight, pad_size, epsilon)
+        )
+        # MCOP writes INT8 values plus one FP32 scale per row. Initialize
+        # alignment padding as well: AOT functionalization compares complete
+        # outputs, and allocator contents are not part of the op's semantics.
+        output.view(torch.uint8)[..., input.shape[-1] + 4 :].zero_()
+        return output.view(torch.uint8), output_rms, output_quant_int8, scales
+
+    def _mocop_fake_impl(input, residual, weight, pad_size, epsilon):
+        shape = list(input.shape)
+        shape[-1] = pad_size * 2
+        output = torch.empty(shape, dtype=torch.uint8, device=input.device)
+        output_rms = torch.empty_like(input)
+        output_quant_int8 = torch.empty_like(input, dtype=torch.int8)
+        scales = torch.empty(
+            (input.numel() // input.shape[-1], 1),
+            device=input.device,
+            dtype=torch.float32,
+        )
+        return output, output_rms, output_quant_int8, scales
+
+    _sglib.impl(_mocop_op_name, _mocop_cuda_impl, "CUDA")
+    _sglib._register_fake(_mocop_op_name, _mocop_fake_impl)
+
+
+def fused_add_rms_norm_dynamic_per_token_quant_padding_output(
+    input, residual, weight, pad_size, epsilon
+):
+    # Keep the alias outside the custom op so functionalization can track the
+    # residual mutation without an unsupported aliased custom-op output.
+    output, output_rms, output_quant_int8, scales = (
+        torch.ops.sglang.fused_add_rms_norm_dynamic_per_token_quant_padding_output(
+            input, residual, weight, pad_size, epsilon
+        )
+    )
+    return output.view(torch.bfloat16), residual, output_rms, output_quant_int8, scales
+
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
@@ -475,6 +535,9 @@ class RMSNorm(BaseFusedOp):
         override_orig_dtype: Optional = None,
         x_pad_to_multiple: int = 0,
         force_native: bool = False,
+        fused_quant: bool = False,
+        packed_quant: bool = False,
+        packed_size: int = 3840
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
@@ -512,6 +575,9 @@ class RMSNorm(BaseFusedOp):
             self._forward_method = self.forward_aiter
         if force_native:
             self._forward_method = self.forward_native
+        self.fused_quant = fused_quant
+        self.packed_quant = packed_quant
+        self.packed_size = packed_size
 
     def forward_cuda(
         self,
@@ -526,8 +592,36 @@ class RMSNorm(BaseFusedOp):
                     residual = residual + post_residual_addition
                 return x, residual
             return x
-        if self.variance_size_override is not None:
-            return self.forward_native(x, residual, post_residual_addition)
+
+        if self.fused_quant: 
+            if self.packed_quant:
+                packed_out, residual, out, quant_out, quant_scale = \
+                    fused_add_rms_norm_dynamic_per_token_quant_padding_output(
+                        x,
+                        residual,
+                        self.weight.data,
+                        self.packed_size,
+                        self.variance_epsilon,
+                    )
+                if residual is not None:
+                    return (packed_out, out, (quant_out, quant_scale)), residual
+                else:
+                    return (packed_out, out, (quant_out, quant_scale))
+            else:
+                quant_out, out, quant_scale = rms_norm_dynamic_per_token_quant_custom(
+                    x.contiguous(),
+                    self.weight.data,
+                    self.variance_epsilon,
+                    quant_dtype=torch.int8,
+                    residual=residual,
+                )
+                if residual is not None:
+                    return (quant_out, quant_scale, out), residual
+                else:
+                    return (quant_out, quant_scale, out)
+        else:
+            if self.variance_size_override is not None:
+                return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
             if (
                 residual is not None

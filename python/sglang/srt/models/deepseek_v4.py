@@ -197,6 +197,8 @@ from sglang.srt.utils import (
     is_gfx1250_supported,
     log_info_on_rank0,
     make_layers,
+    get_int_env_var,
+    align_packed_tensor_size,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -859,7 +861,12 @@ class MqaAttentionBase(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("wkv", prefix),
             )
-        self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
+        self.fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+        self.q_norm = RMSNorm(
+            self.q_lora_rank, 
+            eps=self.eps,
+            fused_quant=self.fused_quant,
+        )
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -1982,8 +1989,13 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
-            q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
-            q = self._compute_q_b(q_for_wqb, positions, q_out)
+            q_lora = self.q_norm(q_lora)
+            if isinstance(q_lora, tuple):
+                q_linear = (q_lora[0], q_lora[1])
+                q_lora = q_lora[2]
+            else:
+                q_linear = q_lora
+            q = self._compute_q_b(q_linear, positions, q_out)
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
@@ -2655,9 +2667,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             and config.vision_n_layers > 0,
         )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.fused_quant,
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.fused_quant,
+            packed_quant=True,
+            packed_size=align_packed_tensor_size(config.hidden_size, envs.MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE.get()),
         )
 
         self.hc_mult = hc_mult = config.hc_mult
@@ -3109,7 +3130,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                     )
                 else:
                     hidden_states = self.input_layernorm(hidden_states)
-                    x_quant = None
+                    if isinstance(hidden_states, tuple):
+                        x_quant = hidden_states[:2]
+                        hidden_states = hidden_states[2]
+                    else:
+                        x_quant = None
             else:
                 x_quant = None
 
@@ -3157,7 +3182,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_ffn_fn,
                     self.hc_ffn_scale,
                     self.hc_ffn_base,
-                    norm=self.post_attention_layernorm,
+                    norm=(
+                        None
+                        if self.post_attention_layernorm.fused_quant
+                        else self.post_attention_layernorm
+                    ),
                     forward_batch=forward_batch,
                 )
                 if not norm_fused:
@@ -3170,7 +3199,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_ffn_fn,
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
-                norm=self.post_attention_layernorm,
+                norm=(
+                        None
+                        if self.post_attention_layernorm.fused_quant
+                        else self.post_attention_layernorm
+                    ),
                 forward_batch=forward_batch,
             )
             if not norm_fused:
@@ -3844,8 +3877,20 @@ class DeepseekV4DecoderLayer(nn.Module):
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
-            _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
-            hidden_states = _a2a_scatter_chunks[r].contiguous()
+            if isinstance(hidden_states, tuple):
+                packed_out, out, (quant_out, quant_scale) = hidden_states
+                _a2a_scatter_chunks = list(out.tensor_split(s))
+                hidden_states = (
+                    packed_out.tensor_split(s)[r].contiguous(),
+                    _a2a_scatter_chunks[r].contiguous(),
+                    (
+                        quant_out.tensor_split(s)[r].contiguous(),
+                        quant_scale.tensor_split(s)[r].contiguous(),
+                    ),
+                )
+            else:
+                _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
+                hidden_states = _a2a_scatter_chunks[r].contiguous()
             # DSpark next-token layers are not hash-routed and intentionally do not
             # carry token IDs. Only split IDs for callers that actually provide them.
             if input_ids is not None:
@@ -4232,11 +4277,14 @@ class DeepseekV4Model(nn.Module):
         )
         device_module = torch.get_device_module()
         num_alt_streams = 5 if (_is_cuda or _is_npu) else 2
-        self.alt_streams = (
-            [device_module.Stream() for _ in range(num_alt_streams)]
-            if use_stream_pool
-            else None
-        )
+        if envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get():
+            self.alt_streams = (
+                [torch.cuda.Stream() for _ in range(num_alt_streams)]
+                if use_stream_pool
+                else None
+            )
+        else:
+            self.alt_streams = None
         # Routed-MoE input pre-quant, separate from the attention/indexer and
         # shared-expert streams.
         self.moe_routed_quant_stream = (

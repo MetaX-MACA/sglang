@@ -4992,3 +4992,7 @@ def init_cublas():
     b = torch.ones((16, 16), dtype=dtype, device=device)
     c = a @ b
     return c
+
+def align_packed_tensor_size(k, align_size: int=256):
+    valid_size = k // 2 + 2
+    return math.ceil(valid_size / align_size) * align_size

@@ -410,16 +410,19 @@ class _SinglePassGatherer(ABC):
                 raise NotImplementedError
 
         if get_exec().moe.moe_a2a_backend == "deepep":
-            if get_exec().moe.deepep_mode == "normal":
-                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
-            elif get_exec().moe.deepep_mode == "low_latency":
-                return _DeepepLowLatencySinglePassGatherer(
-                    expert_location_metadata,
-                    rank,
-                    elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
-                )
-            else:
-                raise NotImplementedError
+            return _DeepepLowLatencySinglePassGatherer(
+                expert_location_metadata, rank
+            )
+            # if get_exec().moe.deepep_mode == "normal":
+            #     return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
+            # elif get_exec().moe.deepep_mode == "low_latency":
+            #     return _DeepepLowLatencySinglePassGatherer(
+            #         expert_location_metadata,
+            #         rank,
+            #         elastic_ep_enabled=get_exec().moe.elastic_ep_backend is not None,
+            #     )
+            # else:
+            #     raise NotImplementedError
 
         # Non-DeepEP a2a backends (flashinfer / nixl / mooncake / megamoe) and
         # no-a2a path dispatch through the standard topk select_experts.
