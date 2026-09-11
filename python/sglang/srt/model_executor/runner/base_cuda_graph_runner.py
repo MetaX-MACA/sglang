@@ -27,6 +27,7 @@ from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import (
@@ -92,7 +93,11 @@ def get_batch_sizes_to_capture(
         capture_bs += [num_max_requests]
 
     sum_len_bs = []
-    if get_spec().speculative_algorithm is None and get_moe_a2a_backend().is_none():
+    if (
+        get_spec().speculative_algorithm is None
+        and get_moe_a2a_backend().is_none()
+        and get_parallel().attn_cp_size <= 1
+    ):
         sum_len_bs = [bs for bs in capture_bs if bs < 10 and bs % mul_base != 0]
 
     # Model input token count = bs * alignment_width; must be a multiple of attn_tp_size.
