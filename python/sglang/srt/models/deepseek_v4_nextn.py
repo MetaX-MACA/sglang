@@ -24,6 +24,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -75,18 +76,21 @@ class DeepseekV4ModelNextN(nn.Module):
         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
+        w8a8_ignore = (
+            quant_config.ignore if isinstance(quant_config, W8A8Int8Config) else ()
+        )
         self.e_proj = ReplicatedLinear(
             config.hidden_size,
             config.hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None if "mtp.0.e_proj" in w8a8_ignore else quant_config,
             prefix=add_prefix("e_proj", prefix),
         )
         self.h_proj = ReplicatedLinear(
             config.hidden_size,
             config.hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None if "mtp.0.h_proj" in w8a8_ignore else quant_config,
             prefix=add_prefix("h_proj", prefix),
         )
         if isinstance(quant_config, ModelSlimConfig):

@@ -3730,10 +3730,16 @@ class Scheduler(
             running_batch = prefill_plan.running_batch
 
         need_mlp_sync = self.require_mlp_sync
+
         if (
             need_mlp_sync
-            and not self.spec_algorithm.is_none()
-            and not get_spec().speculative_skip_dp_mlp_sync
+            and (
+                (
+                    not self.spec_algorithm.is_none()
+                    and not get_spec().speculative_skip_dp_mlp_sync
+                )
+                or is_deepseek_v4(self.model_config.hf_config)
+            )
             and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         ):
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
