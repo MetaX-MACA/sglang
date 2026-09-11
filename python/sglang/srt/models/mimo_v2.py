@@ -98,6 +98,7 @@ def load_mimo_v2_qkv_proj_weight(
     loaded_weight,
     expected_fused_tp_size: Optional[int] = None,
     deferred_scale_inv: Optional[Dict[str, torch.Tensor]] = None,
+    config=None,
 ):
     tp_size = get_parallel().attn_tp_size
     tp_rank = get_parallel().attn_tp_rank
@@ -143,10 +144,18 @@ def load_mimo_v2_qkv_proj_weight(
     else:
         shards_per_rank = ckpt_tp // tp_size
         shards = loaded_weight.chunk(ckpt_tp, dim=0)
-        merged = torch.cat(
-            shards[tp_rank * shards_per_rank : (tp_rank + 1) * shards_per_rank],
-            dim=0,
+        local_shards = shards[
+            tp_rank * shards_per_rank : (tp_rank + 1) * shards_per_rank
+        ]
+        qkv_shard_sizes = (
+            _get_ckpt_qkv_shard_sizes(config, name, ckpt_tp)
+            if config is not None
+            else None
         )
+        if qkv_shard_sizes is not None:
+            merged = _deinterleave_qkv_shards(local_shards, *qkv_shard_sizes)
+        else:
+            merged = torch.cat(local_shards, dim=0)
         default_weight_loader(param, merged)
 
 
@@ -1563,6 +1572,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                         loaded_weight,
                         expected_fused_tp_size,
                         deferred_scale_inv=deferred_qkv_scale_inv,
+                        config=self.config,
                     )
                 continue
 
