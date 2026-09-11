@@ -52,12 +52,13 @@ def _jit_main_q_norm_rope_module(
 @cache_once
 def _jit_main_k_norm_rope_flashmla_module(
     dtype: torch.dtype,
+    cache_dtype: torch.dtype,
     head_dim: int,
     rope_dim: int,
     page_size: int,
 ):
     """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache."""
-    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    args = make_cpp_args(dtype, cache_dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
     return load_jit(
         make_name("main_k_norm_rope_flashmla"),
         *args,
@@ -296,6 +297,6 @@ def fused_k_norm_rope_flashmla(
         )
     else:
         module = _jit_main_k_norm_rope_flashmla_module(
-            kv.dtype, head_dim, rope_dim, page_size
+            kv.dtype, kvcache.dtype, head_dim, rope_dim, page_size
         )
         module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)

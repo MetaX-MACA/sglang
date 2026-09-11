@@ -263,7 +263,7 @@ struct FusedKNormRopeFlashMLAParams {
   const float* __restrict__ freqs_cis;  // (max_pos, kRopeDim) fp32
   const void* __restrict__ positions;   // (B,) PosT
   const int32_t* __restrict__ out_loc;  // (B,) int32 -> cache slot id
-  uint8_t* __restrict__ kvcache;        // (npages, kPageBytes) uint8
+  void* __restrict__ kvcache;           // uint8 fp8-mixed cache or bf16 cache
   // Row stride for `kv` in elements. Required because the upstream caller often
   // passes `qkv_a[..., q_lora_rank:]`, a non-contiguous slice whose stride[0]
   // equals `q_lora_rank + kHeadDim` rather than `kHeadDim`.
@@ -272,16 +272,19 @@ struct FusedKNormRopeFlashMLAParams {
   float eps;
 };
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, int32_t kPageBits, bool kUsePDL>
+template <typename DType, typename CacheDType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, int32_t kPageBits, bool kUsePDL>
 K_KERNEL void fused_k_norm_rope_flashmla(const FusedKNormRopeFlashMLAParams params) {
   using namespace device;
 
   constexpr int64_t kVecSize = 2;
   constexpr uint32_t kRopeWarp = kFusedKNumWarps - 1;
-  constexpr int64_t kPageBytes = host::div_ceil(584ll << kPageBits, 576) * 576;
+  constexpr bool kUseFp8Cache = std::is_same_v<CacheDType, uint8_t>;
+  constexpr int64_t kFp8PageBytes = host::div_ceil(584ll << kPageBits, 576) * 576;
+  constexpr int64_t kBf16PageElems = kHeadDim << kPageBits;
   static_assert(kHeadDim == kFusedKBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
+  static_assert(kUseFp8Cache || std::is_same_v<CacheDType, bf16_t>, "CacheDType must be uint8_t or bf16_t");
   using Storage = AlignedVector<DType, kVecSize>;
   using Float2 = AlignedVector<float, kVecSize>;
 
@@ -340,46 +343,64 @@ K_KERNEL void fused_k_norm_rope_flashmla(const FusedKNormRopeFlashMLAParams para
 
   const int32_t page = out_loc >> kPageBits;
   const int32_t offset = out_loc & ((1 << kPageBits) - 1);
-  const auto page_ptr = params.kvcache + page * kPageBytes;
-  const auto value_ptr = page_ptr + offset * 576;
 
   PDLTriggerSecondary<kUsePDL>();
 
-  // part 2: rope on warp 7 (BF16 store), per-warp UE8M0 quant + store on warps 0..6.
-  if (warp_id == kRopeWarp) {
-    const auto x_real = data[0];
-    const auto x_imag = data[1];
-    const auto freq_real = freq[0];
-    const auto freq_imag = freq[1];
-    data[0] = x_real * freq_real - x_imag * freq_imag;
-    data[1] = x_real * freq_imag + x_imag * freq_real;
-    const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
-    const auto rope_ptr = value_ptr + 448;
-    reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
+  // part 2: rope on warp 7. The default DSV4 FlashMLA cache stores nope as
+  // fp8 + scale and rope as bf16; the bf16 cache path stores the full 512-dim
+  // normalized/rotated key without quantization.
+  if constexpr (!kUseFp8Cache) {
+    if (warp_id == kRopeWarp) {
+      const auto x_real = data[0];
+      const auto x_imag = data[1];
+      const auto freq_real = freq[0];
+      const auto freq_imag = freq[1];
+      data[0] = x_real * freq_real - x_imag * freq_imag;
+      data[1] = x_real * freq_imag + x_imag * freq_real;
+    }
+    const auto cache_ptr = static_cast<CacheDType*>(params.kvcache) + page * kBf16PageElems + offset * kHeadDim;
+    reinterpret_cast<packed_t<CacheDType>*>(cache_ptr)[tx] = cast<packed_t<CacheDType>>(fp32x2_t{data[0], data[1]});
   } else {
-    const auto x = data[0];
-    const auto y = data[1];
-    const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
-    const auto scale_raw = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
-    const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
-    const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
-    const auto result = pack_fp8(x * inv_scale, y * inv_scale);
-    const auto scale_ptr = page_ptr + (576 << kPageBits) + offset * 8;
-    reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = result;
-    if (lane_id == 0) static_cast<uint8_t*>(scale_ptr)[warp_id] = scale_ue8m0;
+    const auto page_ptr = static_cast<uint8_t*>(params.kvcache) + page * kFp8PageBytes;
+    const auto value_ptr = page_ptr + offset * 576;
+    if (warp_id == kRopeWarp) {
+      const auto x_real = data[0];
+      const auto x_imag = data[1];
+      const auto freq_real = freq[0];
+      const auto freq_imag = freq[1];
+      data[0] = x_real * freq_real - x_imag * freq_imag;
+      data[1] = x_real * freq_imag + x_imag * freq_real;
+      const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
+      const auto rope_ptr = value_ptr + 448;
+      reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
+    } else {
+      const auto x = data[0];
+      const auto y = data[1];
+      const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
+      const auto scale_raw = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+      const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
+      const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
+      const auto result = pack_fp8(x * inv_scale, y * inv_scale);
+      const auto scale_ptr = page_ptr + (576 << kPageBits) + offset * 8;
+      reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = result;
+      if (lane_id == 0) static_cast<uint8_t*>(scale_ptr)[warp_id] = scale_ue8m0;
+    }
   }
 }
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
+template <typename DType, typename CacheDType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
 struct FusedKNormRopeFlashMLAKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
-  static constexpr int64_t kPageBytes = host::div_ceil(584 * kPageSize, 576) * 576;
+  static constexpr bool kUseFp8Cache = std::is_same_v<CacheDType, uint8_t>;
+  static constexpr int64_t kFp8PageBytes = host::div_ceil(584 * kPageSize, 576) * 576;
+  static constexpr int64_t kBf16PageElems = kHeadDim * kPageSize;
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogPageSize == kPageSize);
   static_assert(kHeadDim == 512 && kRopeDim == 64, "FlashMLA layout requires (512, 64)");
+  static_assert(kUseFp8Cache || std::is_same_v<CacheDType, bf16_t>, "CacheDType must be uint8_t or bf16_t");
 
   template <typename PosT>
-  static constexpr auto kernel = fused_k_norm_rope_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kUsePDL>;
+  static constexpr auto kernel = fused_k_norm_rope_flashmla<DType, CacheDType, kHeadDim, kRopeDim, PosT, kLogPageSize, kUsePDL>;
 
   static void forward(
       const tvm::ffi::TensorView kv,
@@ -418,8 +439,8 @@ struct FusedKNormRopeFlashMLAKernel {
         .with_device(device_)
         .verify(out_loc);
     TensorMatcher({-1, -1})  //
-        .with_strides({kPageBytes, 1})
-        .with_dtype<uint8_t>()
+        .with_strides({kUseFp8Cache ? kFp8PageBytes : kBf16PageElems, 1})
+        .with_dtype<CacheDType>()
         .with_device(device_)
         .verify(kvcache);
 
@@ -432,7 +453,7 @@ struct FusedKNormRopeFlashMLAKernel {
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
         .positions = positions.data_ptr(),
         .out_loc = static_cast<const int32_t*>(out_loc.data_ptr()),
-        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .kvcache = kvcache.data_ptr(),
         .kv_stride_batch = kv.stride(0),
         .batch_size = batch_size,
         .eps = eps,
@@ -446,15 +467,18 @@ struct FusedKNormRopeFlashMLAKernel {
 };
 
 // ============================================================================
-// Indexer Q kernel: warp-per-(token, head) RoPE + Hadamard + quantization.
+// Indexer Q kernel: warp-per-(token, head) RoPE + Hadamard + optional quantization.
 // ============================================================================
 
 struct FusedQIndexerRopeHadamardQuantParams {
   const void* __restrict__ q_input;  // (B, num_heads, 128) DType
-  void* __restrict__ q_output;       // (B, num_heads, 128) fp8_e4m3 or int8
+  void* __restrict__ q_output;       // (B, num_heads, 128) fp8_e4m3, int8, or bf16
+  // Quantized paths:
   // weights_out[b, h] = weight[b, h] * weight_scale * q_scale[b, h].
   // q_scale is computed internally and not exposed -- the only consumer of
   // it is `weights_out`.
+  // BF16 path:
+  // no quant scale is needed, so weights_out[b, h] = weight[b, h] * weight_scale.
   const void* __restrict__ weight;  // (B, num_heads) DType
   float* __restrict__ weights_out;  // (B, num_heads) fp32 (== (B, H, 1) flat)
   float weight_scale;               // scalar c4_indexer.weight_scale
@@ -483,7 +507,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const FusedQIndexerRopeHadamar
 
   constexpr bool kUseFp8Output = std::is_same_v<OutDType, fp8_e4m3_t>;
   constexpr bool kUseInt8Output = std::is_same_v<OutDType, int8_t>;
-  static_assert(kUseFp8Output || kUseInt8Output, "OutDType must be fp8_e4m3_t or int8_t");
+  static_assert(kUseFp8Output || kUseInt8Output || std::is_same_v<OutDType, bf16_t>, "OutDType must be fp8_e4m3_t or bf16_t or int8_t");
 
   using Storage = AlignedVector<DType, kVecSize>;
   using Float4 = AlignedVector<float, kVecSize>;
@@ -603,7 +627,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const FusedQIndexerRopeHadamar
     if (lane_id == 0) {
       params.weights_out[work_id] = weight_val * params.weight_scale * scale;
     }
-  } else {
+  } else if constexpr (kUseInt8Output) {
     float local_max = math::abs(data[0]);
 #pragma unroll
     for (int i = 1; i < kVecSize; ++i) {
@@ -622,6 +646,19 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const FusedQIndexerRopeHadamar
     result.store(out_row, lane_id);
     if (lane_id == 0) {
       params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    }
+  } else {
+    using OutStorage = AlignedVector<OutDType, kVecSize>;
+    OutStorage result;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      result[i] = cast<OutDType>(data[i]);
+    }
+
+    auto out_row = static_cast<OutDType*>(params.q_output) + work_id * kHeadDim;
+    result.store(out_row, lane_id);
+    if (lane_id == 0) {
+      params.weights_out[work_id] = weight_val * params.weight_scale;
     }
   }
 }
