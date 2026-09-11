@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.utils import is_maca
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -50,7 +51,15 @@ class DSATopKBackend(Enum):
         return self == DSATopKBackend.FLASHINFER
 
     def should_use_topk_v2(self) -> bool:
-        return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        # MACA can compile the portable (non-cluster) implementation, but its
+        # long-sequence streaming kernel currently faults in device address
+        # translation. Keep the legacy fused transform selected until that
+        # kernel is validated on MACA.
+        return (
+            self.is_sgl_kernel()
+            and not is_maca()
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        )
 
     def topk_func(
         self,

@@ -38,7 +38,7 @@ class GraphSharedOutput:
 
         max_rows = 0
         decode = cuda_graph_config.decode
-        if decode.backend != Backend.DISABLED and decode.bs:
+        if decode.backend != Backend.DISABLED:
             max_rows = max(max_rows, model_runner.max_decode_logits_rows())
 
         if max_rows <= 0:

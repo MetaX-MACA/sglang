@@ -1565,11 +1565,12 @@ class ModelRunner:
             and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
             and original_forward_mode is not None
             and original_forward_mode.is_idle()
-            and forward_batch.batch_size == 0
+            and forward_batch._original_batch_size is not None
+            and forward_batch._original_batch_size == 0
             and forward_batch.spec_info is None
-            and forward_batch.seq_lens.numel() == 0
-            and forward_batch.req_pool_indices.numel() == 0
-            and forward_batch.input_ids.numel() > 0
+            # and forward_batch.seq_lens.numel() == 0
+            # and forward_batch.req_pool_indices.numel() == 0
+            # and forward_batch.input_ids.numel() > 0
         )
 
     def forward_split_prefill(
