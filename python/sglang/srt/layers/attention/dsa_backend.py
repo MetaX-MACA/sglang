@@ -1043,7 +1043,11 @@ class DeepseekSparseAttnBackend(
             dsa_cu_seqlens_q=dsa_cu_seqlens_q,
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
-            dsa_extend_seq_lens_list=extend_seq_lens_cpu,
+            # Eager MTP plans DSA metadata before DP/MLP-sync padding.  The
+            # padding path extends ForwardBatch.extend_seq_lens_cpu in place;
+            # keep this pre-pad metadata immutable so q_offset still matches
+            # dsa_seqlens_expanded and the DeepGEMM logits row count.
+            dsa_extend_seq_lens_list=list(extend_seq_lens_cpu),
             real_page_table=self._transform_table_1_to_real(page_table),
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,

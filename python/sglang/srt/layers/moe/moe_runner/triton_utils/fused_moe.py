@@ -723,6 +723,12 @@ def _fused_moe_kernel_sequence(
         assert kernel_m > 0, (
             "fp8_w8a8 FusedMoeGEMM.get_kernel_m kernel_m must greater than zero."
         )
+        # FusedMoeGEMM consumes the routing metadata in tiles of kernel_m rows.
+        # Keep moe_align_block_size and both GEMM stages on that same tile;
+        # otherwise DSpark CUDA-graph shapes can make the kernel read past the
+        # expert_ids/sorted_token_ids layout produced with the stale config.
+        stage1_config["BLOCK_SIZE_M"] = kernel_m
+        stage2_config["BLOCK_SIZE_M"] = kernel_m
         del hidden_states_fp8
 
     elif (

@@ -363,10 +363,9 @@ def _set_k_and_s_triton(
 
     assert loc.dtype == torch.int64, f"{loc.dtype=}"  # can be int32
     if index_k.dtype == torch.int8:
-        # Quantized DSA index caches use uint8 as their common byte-storage
-        # container. Interpret those bytes according to the selected cache
-        # format instead of requiring the container itself to be signed.
-        assert buf.dtype == torch.uint8
+        # INT8 and FP8 caches have the same packed byte layout, but keep their
+        # logical storage dtypes so downstream dispatch can distinguish them.
+        assert buf.dtype == torch.int8
     elif _is_fp8_fnuz:
         assert buf.dtype == torch.uint8
         assert index_k.dtype == torch.float8_e4m3fnuz
@@ -381,7 +380,7 @@ def _set_k_and_s_triton(
     assert index_k_scale.is_contiguous()
 
     if index_k.dtype == torch.int8:
-        buf_fp8 = buf.view(torch.int8)
+        buf_fp8 = buf
     elif _is_fp8_fnuz:
         buf_fp8 = buf.view(torch.float8_e4m3fnuz)
     else:
