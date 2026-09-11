@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -115,6 +116,8 @@ def validate_hisparse(server_args: ServerArgs) -> None:
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
+    if is_v4_hisparse:
+        envs.MX_DSV4_HISPARSE_CACHE_DTYPE.set(server_args.kv_cache_dtype)
     if is_hip and is_v4_hisparse:
         # TEMPORARY GUARD: DSv4 HiSparse is not supported on the unified-KV path.
         # In unified-KV mode c4_kv_pool is None, so DeepSeekV4HiSparseTokenToKVPoolAllocator
