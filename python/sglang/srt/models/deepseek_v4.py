@@ -724,6 +724,7 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wo_b", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
+            use_dp_attention_reduce=self.attn_tp_size != get_parallel().tp_size,
         )
 
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
@@ -2156,13 +2157,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            hidden_states = self.self_attn(
-                x=hidden_states,
-                positions=positions,
-                forward_batch=forward_batch,
-                x_quant=x_quant,
-            )
+        if not forward_batch.forward_mode.is_idle():
+            with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+                hidden_states = self.self_attn(
+                    x=hidden_states,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    x_quant=x_quant,
+                )
 
         if use_fused:
             post_attn_norm_weight = (

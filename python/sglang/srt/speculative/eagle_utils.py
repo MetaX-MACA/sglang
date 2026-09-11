@@ -873,19 +873,19 @@ def eagle_sample(
                 coins_for_final_sampling,
             )
 
-        # Sync sampling results across TP ranks: different GPUs may
-        # produce slightly different target_probs due to floating-point
-        # non-determinism in softmax/top_k/top_p, causing different
-        # sampled tokens. Broadcast from rank 0 to ensure consistency.
-        tp_group = (
-            get_parallel().attn_tp_group
-            if is_dp_attention_enabled()
-            else get_tp_group()
-        )
-        if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+    # Sync sampling results across TP ranks: different GPUs may
+    # produce slightly different target_probs due to floating-point
+    # non-determinism in softmax/top_k/top_p, causing different
+    # sampled tokens. Broadcast from rank 0 to ensure consistency.
+    tp_group = (
+        get_parallel().attn_tp_group
+        if is_dp_attention_enabled()
+        else get_tp_group()
+    )
+    if tp_group.world_size > 1:
+        tp_group.broadcast(predict, src=0)
+        tp_group.broadcast(accept_index, src=0)
+        tp_group.broadcast(num_correct_drafts, src=0)
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
