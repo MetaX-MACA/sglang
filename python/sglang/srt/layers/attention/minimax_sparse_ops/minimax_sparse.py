@@ -236,7 +236,9 @@ def minimax_sparse_decode(
     # Step 1: Flash decode with topk index (using index head). When the dense main
     # attention is used, the indexer emits the page table directly (fused
     # transform) instead of block ids, plus the per-query effective KV length.
-    idx_o, topk_idx, real_seq_lens = flash_decode_with_topk_idx(
+
+    # JIT kernel minimax_decode_topk returns only two values
+    idx_o, topk_idx = flash_decode_with_topk_idx(
         q=idx_q,
         sink=idx_sink,
         k_cache=idx_k_cache,

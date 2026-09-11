@@ -847,21 +847,21 @@ def flash_decode_with_topk_idx(
         min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, batch_size * num_kv_heads)),
     )
     NUM_KV_CHUNKS = 1 << (target.bit_length() - 1)
-    score_kv_len = min(max_seqlen, max_kv_len)
+    # score_kv_len = min(max_seqlen, max_kv_len)
     # The score producers below write every valid block column
     # [0, ceil(seq_len / block_size)) for each (head, batch) row. All consumers
     # clamp their scan to the same per-row valid block count, so columns beyond
     # seq_len are never read. Avoid a full-tensor -inf memset here; on CUDA graph
     # capture the static score shape can be much larger than the live context.
     score = torch.empty(
-        (num_q_heads, batch_size, triton.cdiv(score_kv_len, block_size)),
+        (num_q_heads, batch_size, triton.cdiv(max_kv_len, block_size)),
         dtype=torch.float32,
         device=q.device,
     )
     use_jit_topk = (
         envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
-        and score.shape[2] <= 4096
-        and topk <= 32
+        # and score.shape[2] <= 4096
+        # and topk <= 32
     )
     # If the live context has <= topk sparse blocks, the downstream dense
     # page-table/JIT top-k kernels select every block from seq_lens directly
@@ -970,32 +970,38 @@ def flash_decode_with_topk_idx(
     # Fused top-k + page-table transform: emit the dense backend's page table
     # directly (page-size-aware) instead of block ids, skipping a separate gather.
     # The page table + per-query effective KV length are allocated and returned.
-    real_seq_lens = None
-    if use_dense_main_attn:
-        from sglang.kernels.ops.attention.minimax_decode_topk import (
-            minimax_decode_topk_page_table,
+    topk_idx = torch.empty(
+        (num_q_heads, batch_size, topk),
+        device=score.device,
+        dtype=torch.int32,
         )
-
-        # num_q_heads (= num index/kv heads) may be > 1 for DP attention; the
-        # kernel emits a flattened [batch*num_q_heads] page table + seq_lens with
-        # the kv head head-encoded (head-minor) into the page index.
-        topk_idx, real_seq_lens = minimax_decode_topk_page_table(
-            score, seq_lens, req_to_token, slot_ids, block_size, topk, page_size
+    real_seq_lens = None
+    # if use_dense_main_attn:
+    if use_jit_topk:
+        from sglang.kernels.ops.attention.minimax_decode_topk import (
+            # minimax_decode_topk_page_table, 
+            minimax_decode_topk
+        )
+        # topk_idx, real_seq_lens = minimax_decode_topk_page_table(
+        #     score, seq_lens, req_to_token, slot_ids, block_size, topk, page_size
+        # )
+        topk_idx = minimax_decode_topk(
+            score, seq_lens, block_size, topk, topk_idx
         )
         if disable_index_value:
-            return None, topk_idx, real_seq_lens
+            return None, topk_idx
         # fall through to the idx_o (index value) merge, then return
         _skip_block_topk = True
     else:
         _skip_block_topk = False
 
     # get topk index
-    if not _skip_block_topk:
-        topk_idx = torch.empty(
-            (num_q_heads, batch_size, topk),
-            device=score.device,
-            dtype=torch.int32,
-        )
+    # if not _skip_block_topk:
+    #     topk_idx = torch.empty(
+    #         (num_q_heads, batch_size, topk),
+    #         device=score.device,
+    #         dtype=torch.int32,
+    #     )
 
     if _skip_block_topk:
         pass

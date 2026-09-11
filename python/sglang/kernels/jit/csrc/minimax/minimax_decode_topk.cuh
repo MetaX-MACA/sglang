@@ -9,12 +9,13 @@
 
 #include <cfloat>
 #include <cstdint>
-#ifdef USE_ROCM
+// #ifdef USE_ROCM
+// static constexpr unsigned long long kWarpSyncMask = 0xFFFFFFFFFFFFFFFFull;
+// #else
+// #include <math_constants.h>
+// static constexpr unsigned int kWarpSyncMask = 0xFFFFFFFFu;
+// #endif
 static constexpr unsigned long long kWarpSyncMask = 0xFFFFFFFFFFFFFFFFull;
-#else
-#include <math_constants.h>
-static constexpr unsigned int kWarpSyncMask = 0xFFFFFFFFu;
-#endif
 
 namespace sglang {
 
