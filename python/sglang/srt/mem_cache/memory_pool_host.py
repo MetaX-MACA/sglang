@@ -186,6 +186,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         pin_memory: bool = True,
         allocator_type: str = "default",
     ):
+        # Mirror the device page as bytes, including BF16's two-byte elements.
+        if device_buffers:
+            item_bytes *= device_buffers[0].element_size()
+            device_buffers = [buffer.view(torch.uint8) for buffer in device_buffers]
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
         self.item_bytes = item_bytes
@@ -215,7 +219,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        alloc_func = ALLOC_MEMORY_FUNCS[torch.device(self.gpu_device).type]
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [

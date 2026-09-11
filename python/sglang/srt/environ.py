@@ -373,6 +373,7 @@ class Envs:
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
+    MX_DSV4_HISPARSE_CACHE_DTYPE = EnvStr("fp8")
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
     # ===================================================================

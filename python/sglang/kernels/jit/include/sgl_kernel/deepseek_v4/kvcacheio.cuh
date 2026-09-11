@@ -10,18 +10,24 @@ namespace sglang {
 namespace device::hisparse {
 
 /// NOTE: We call nope+rope as a "value" here.
-/// Paged C4 cache layout:
+inline constexpr int64_t kPageSize = 64;
+inline constexpr int64_t kPageBits = 6;  // log2(kPageSize)
+inline constexpr int64_t WarpSize = 64;
+
+/// FP8 Paged C4 cache layout:
 /// VALUE 0, VALUE 1, ..., VALUE 63,
 /// SCALE 0, SCALE 1, ..., SCALE 63,
 /// [Padding to align to 576 bytes]
-inline constexpr int64_t kPageSize = 64;
-inline constexpr int64_t kPageBits = 6;  // log2(kPageSize)
 inline constexpr int64_t kValueBytes = 576;
 inline constexpr int64_t kScaleBytes = 8;
 /// NOTE: FlashMLA requires each page to be aligned to 576 bytes
 inline constexpr int64_t kItemBytes = kValueBytes + kScaleBytes;
 inline constexpr int64_t kPageBytes = host::div_ceil(kItemBytes * kPageSize, 576) * 576;
 inline constexpr int64_t kScaleOffset = kValueBytes * kPageSize;
+
+/// BF16
+inline constexpr int64_t BF16_kValueBytes = 1024;
+inline constexpr int64_t BF16_kPageBytes = BF16_kValueBytes * kPageSize;
 
 struct PointerInfo {
   int64_t* value_ptr;
@@ -75,6 +81,27 @@ SGL_DEVICE void transfer_item(void* dst_cache, void* src_cache, const int32_t ds
   *tail_dst_ptr = tail_item;
 }
 
+SGL_DEVICE int64_t* get_pointer_paged_bf16(void* cache, int32_t index) {
+  using namespace device;
+  static_assert(1 << kPageBits == kPageSize);
+  const int32_t page_num = index >> kPageBits;
+  const int32_t page_offset = index & (kPageSize - 1);
+  const auto page_ptr = pointer::offset(cache, page_num * BF16_kPageBytes);
+  const auto value_ptr = pointer::offset(page_ptr, page_offset * BF16_kValueBytes);
+  return static_cast<int64_t*>(value_ptr);
+}
+
+SGL_DEVICE void transfer_item_bf16(void* dst_cache, void* src_cache, const int32_t dst_index, const int32_t src_index) {
+  const auto dst_value_ptr = get_pointer_paged_bf16(dst_cache, dst_index);
+  const auto src_value_ptr = get_pointer_paged_bf16(src_cache, src_index);
+
+  const int32_t lane_id = threadIdx.x % WarpSize;
+
+  for (int i = 0; i < 2; ++i) {
+    const auto j = lane_id + i * WarpSize;
+    dst_value_ptr[j] = src_value_ptr[j];
+  }
+}
 }  // namespace device::hisparse
 
 }  // namespace sglang

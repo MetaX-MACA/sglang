@@ -998,7 +998,10 @@ class HiSparseCoordinator:
             device_buffer=self.mem_pool_device.kv_buffer[skip_layer],
             item_size_bytes=self.item_size_bytes,
             num_blocks=self._prefetch_copy_blocks,
-            is_dsv4_layout=self.is_dsv4_hisparse,
+            is_dsv4_layout=(
+                self.is_dsv4_hisparse
+                and self.mem_pool_device.dtype != torch.bfloat16
+            ),
             skip_io=self.skip_io,
         )
 

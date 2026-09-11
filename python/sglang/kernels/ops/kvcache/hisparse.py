@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from sglang.srt.environ import envs
+
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -236,11 +238,12 @@ def _jit_copy_planned_module(
 
 
 @functools.cache
-def _jit_dsv4_transfer_module(block_size: int) -> Module:
-    template_args = make_cpp_args(block_size)
+def _jit_dsv4_transfer_module(block_size: int, is_bf16: bool) -> Module:
+    template_args = make_cpp_args(block_size, is_bf16)
     return load_jit(
         "sparse_cache_dsv4_transfer",
         block_size,
+        is_bf16,
         cuda_files=["kvcacheio/hisparse.cuh"],
         cuda_wrappers=[
             (
@@ -259,7 +262,9 @@ def transfer_cache_dsv4_mla(
     block_size: int = 1024,
 ) -> None:
     """Transfer DSv4 C4 tokens between page-padded C4 buffers."""
-    module = _jit_dsv4_transfer_module(block_size)
+    module = _jit_dsv4_transfer_module(
+        block_size, envs.MX_DSV4_HISPARSE_CACHE_DTYPE.get() == "bfloat16"
+    )
     module.transfer_cache_dsv4_mla(
         src_ptrs,
         dst_ptrs,
@@ -460,7 +465,8 @@ def load_cache_to_device_buffer_dsv4_mla(
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
-        is_dsv4_layout=True,
+        # BF16 pages are contiguous; FP8 pages separate values and scales.
+        is_dsv4_layout=envs.MX_DSV4_HISPARSE_CACHE_DTYPE.get() != "bfloat16",
         top_k_tokens=top_k_tokens,
         device_buffer_tokens=device_buffer_tokens,
         host_cache_locs=host_cache_locs,
