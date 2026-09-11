@@ -89,7 +89,7 @@ __device__ __forceinline__ int popc_mask(BallotMask mask) {
 #endif
 }
 
-template <int BLOCK_SIZE>
+template <int BLOCK_SIZE, bool IsBF16>
 __global__ __launch_bounds__(BLOCK_SIZE, 1) void transfer_cache_dsv4_mla_kernel(
     void** src_caches,
     void** dst_caches,
@@ -105,16 +105,18 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void transfer_cache_dsv4_mla_kernel(
     const int32_t src_index = static_cast<int32_t>(src_indices[i]);
     const int32_t dst_index = static_cast<int32_t>(dst_indices[i]);
     for (uint32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
-      device::hisparse::transfer_item(
-          /*dst_cache=*/dst_caches[layer_id],
-          /*src_cache=*/src_caches[layer_id],
-          /*dst_index=*/dst_index,
-          /*src_index=*/src_index);
+      if constexpr (IsBF16) {
+        device::hisparse::transfer_item_bf16(
+            dst_caches[layer_id], src_caches[layer_id], dst_index, src_index);
+      } else {
+        device::hisparse::transfer_item(
+            dst_caches[layer_id], src_caches[layer_id], dst_index, src_index);
+      }
     }
   }
 }
 
-template <int BLOCK_SIZE>
+template <int BLOCK_SIZE, bool IsBF16>
 void transfer_cache_dsv4_mla(
     tvm::ffi::TensorView src_ptrs,
     tvm::ffi::TensorView dst_ptrs,
@@ -136,7 +138,7 @@ void transfer_cache_dsv4_mla(
   const int num_warps = BLOCK_SIZE / WARP_SIZE;
   const int grid = (num_items + num_warps - 1) / num_warps;
   LaunchKernel(grid, BLOCK_SIZE, device.unwrap())(
-      transfer_cache_dsv4_mla_kernel<BLOCK_SIZE>,
+      transfer_cache_dsv4_mla_kernel<BLOCK_SIZE, IsBF16>,
       static_cast<void**>(src_ptrs.data_ptr()),
       static_cast<void**>(dst_ptrs.data_ptr()),
       static_cast<const int64_t*>(src_indices.data_ptr()),

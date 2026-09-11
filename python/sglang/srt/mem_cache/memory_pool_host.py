@@ -5,7 +5,7 @@ import os
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
-
+from sglang.srt.environ import envs
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
 
@@ -2498,7 +2498,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.item_bytes = item_bytes
         self.num_host_pages = num_host_pages
         self.slot_page_size = slot_page_size
-        self.dtype = torch.uint8
+        kv_dtype = envs.MX_DSV4_HISPARSE_CACHE_DTYPE.get()
+        if kv_dtype == 'bfloat16':
+            self.dtype = torch.bfloat16
+        else:
+            self.dtype = torch.uint8
         self.device = device
         self.pin_memory = pin_memory
         self.allocator = get_allocator_from_storage(allocator_type)
@@ -2523,7 +2527,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        device_key = torch.device(self.gpu_device).type
+        alloc_func = ALLOC_MEMORY_FUNCS[device_key]
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [

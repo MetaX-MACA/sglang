@@ -695,6 +695,7 @@ class Envs:
     MX_INT8_MQA_LOGITS_BACKEND = EnvStr("triton")
     MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE = EnvInt(256)
     MX_MOE_FUSED_GATE_BACKEND = EnvStr("triton")
+    MX_DSV4_HISPARSE_CACHE_DTYPE = EnvStr("fp8")
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

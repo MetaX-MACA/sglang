@@ -9,10 +9,10 @@ from sglang.jit_kernel.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
-    HiSparseTokenToKVPoolAllocator,
+    HiSparseTokenToKVPoolAllocator, 
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
@@ -23,6 +23,11 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.utils import get_device_module, is_hip
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
 device_module = get_device_module()
 
@@ -841,3 +846,37 @@ class HiSparseCoordinator:
             num_real_reqs=self.num_real_reqs,
         )
         return top_k_indices
+
+    @staticmethod
+    def build_draft_input_from_future_map(
+        batch: ScheduleBatch,
+        server_args: ServerArgs,
+        last_tokens_tensor: torch.Tensor,
+        future_map: FutureMap,
+        spec_algorithm: SpeculativeAlgorithm
+    ) -> EagleDraftInput:
+        if spec_algorithm is SpeculativeAlgorithm.NONE:
+            return None
+
+        if spec_algorithm.is_eagle():
+            spec_info = EagleDraftInput(
+                topk_p=None,
+                topk_index=None,
+                hidden_states=None,
+                bonus_tokens=None,
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+
+        elif spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                make_next_draft_input,
+            )
+            spec_info = make_next_draft_input(
+                bonus_tokens=last_tokens_tensor,
+                new_seq_lens=batch.seq_lens,
+            )
+
+        if batch.enable_overlap:
+            spec_info.future_indices = batch.req_pool_indices
+
+        return spec_info

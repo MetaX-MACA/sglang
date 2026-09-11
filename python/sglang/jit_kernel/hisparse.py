@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 from typing import TYPE_CHECKING
+from sglang.srt.environ import envs
 
 import torch
 
@@ -41,7 +42,9 @@ def _jit_sparse_module(
 
 @functools.cache
 def _jit_dsv4_transfer_module(block_size: int) -> Module:
-    template_args = make_cpp_args(block_size)
+    kv_dtype = envs.MX_DSV4_HISPARSE_CACHE_DTYPE.get()
+    is_bf16 = (kv_dtype == "bfloat16")
+    template_args = make_cpp_args(block_size, is_bf16)
     return load_jit(
         "sparse_cache_dsv4_transfer",
         block_size,
