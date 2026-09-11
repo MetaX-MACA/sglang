@@ -128,7 +128,7 @@ logger = logging.getLogger(__name__)
 
 
 class SiluAndMul(BaseFusedOp):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, fused_quant=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if (
             publish_role() is not None
@@ -137,17 +137,24 @@ class SiluAndMul(BaseFusedOp):
             self._forward_method = self.forward_native
         elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter
+        self.fused_quant = fused_quant
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
-        return out
+    def forward_cuda(self, x: torch.Tensor, limit: Optional[float]=None) -> torch.Tensor:
+        if self.fused_quant:
+            output = torch.empty((x.shape[0], x.shape[1] // 2), device=x.device, dtype=torch.int8)
+            scale = torch.empty((x.shape[0],1), device=x.device, dtype=torch.float32)
+            torch.ops.sgl_kernel.fused_silu_mul_dq_nomask_quant_nopack.default(output, scale, x, limit, None)
+            return (output, scale)
+        else:
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            silu_and_mul(x, out)
+            return out
 
     def forward_aiter(self, x: torch.Tensor, limit: float = 0.0) -> torch.Tensor:
         d = x.shape[-1] // 2
