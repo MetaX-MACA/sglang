@@ -11,7 +11,6 @@ from ..common.utils import (
     _sort_ids_ascending,
     check_sparse_kv_fp8,
     get_cu_seqblocks,
-    robust_allocator,
     sparse_out_dtype,
     unit_scale,
 )
@@ -26,44 +25,47 @@ from ..common.utils import (
 )
 @triton.autotune(
     configs=[
+        triton.Config(
+            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=1, num_stages=1
+        ),
         # Small block (64x64): low shared mem, can use higher num_stages
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=4
-        ),
-        # Medium block (64x128, 128x64): moderate shared mem, ns=2,3
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=3
-        ),
-        # Large block (128x128): high shared mem, ns=2,3 only, nw=8
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3
-        ),
+        # triton.Config(
+        #     {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=2
+        # ),
+        # triton.Config(
+        #     {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=3
+        # ),
+        # triton.Config(
+        #     {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=4
+        # ),
+        # # Medium block (64x128, 128x64): moderate shared mem, ns=2,3
+        # triton.Config(
+        #     {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
+        # ),
+        # triton.Config(
+        #     {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3
+        # ),
+        # triton.Config(
+        #     {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=2
+        # ),
+        # triton.Config(
+        #     {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 64}, num_warps=8, num_stages=3
+        # ),
+        # # Large block (128x128): high shared mem, ns=2,3 only, nw=8
+        # triton.Config(
+        #     {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2
+        # ),
+        # triton.Config(
+        #     {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3
+        # ),
     ],
     key=[
         "qk_head_dim",
         "v_head_dim",
-        "block_size",
-        "use_gumbel_topk",
-        "SCORE_TYPE",
-        "DISABLE_INDEX_VALUE",
+        # "block_size",
+        # "use_gumbel_topk",
+        # "SCORE_TYPE",
+        # "DISABLE_INDEX_VALUE",
     ],
 )
 @triton.jit
@@ -300,14 +302,14 @@ def _flash_attn_fwd_with_block_score_kernel(
 @triton.autotune(
     configs=[
         # Large configs for H200/B200 to support larger topk
-        triton.Config({"BLOCK_SIZE_K": 2048}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 1024}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 512}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_SIZE_K": 64}, num_warps=2, num_stages=2),
+        # triton.Config({"BLOCK_SIZE_K": 2048}, num_warps=8, num_stages=2),
+        # triton.Config({"BLOCK_SIZE_K": 1024}, num_warps=8, num_stages=2),
+        # triton.Config({"BLOCK_SIZE_K": 512}, num_warps=8, num_stages=2),
+        # triton.Config({"BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
+        # triton.Config({"BLOCK_SIZE_K": 256}, num_warps=4, num_stages=2),
+        # triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
+        # triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=1, num_stages=1),
     ],
     key=[
         "BLOCK_SIZE_T"
@@ -472,7 +474,7 @@ def flash_prefill_with_topk_index(
         "max",
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
-    triton.set_allocator(robust_allocator)
+    # triton.set_allocator(robust_allocator)
     # dtype check (v_cache is None under disable_index_value)
     is_fp8 = check_sparse_kv_fp8(
         q, k_cache, None if disable_index_value else v_cache, label="prefill indexer"

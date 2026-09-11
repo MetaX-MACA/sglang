@@ -169,7 +169,7 @@ def context_attention_fwd(
             BLOCK_M = BLOCK_N = 64
         num_warps = 4 if Lk <= 64 else 8
         num_stages = 1
-
+    num_stages = 1
     if sm_scale is None:
         sm_scale = 1.0 / (Lq ** 0.5)
     batch, head = b_seq_len.shape[0], q.shape[1]

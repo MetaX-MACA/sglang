@@ -29,17 +29,17 @@ from ..common.utils import (
 )
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_SIZE_N": BN}, num_warps=nw, num_stages=ns)
-        for BN in [64, 128, 256, 512]
-        for nw in [4, 8, 16]
-        for ns in [1, 2, 3]
+        triton.Config({"BLOCK_SIZE_N": 128}, num_warps=1, num_stages=1)
+        # for BN in [64, 128, 256, 512]
+        # for nw in [4, 8, 16]
+        # for ns in [1, 2, 3]
     ],
     key=[
         "BATCH_SIZE_BUCKET",
         "gqa_group_size",
         "head_dim",
-        "block_size",
-        "SCORE_TYPE",
+        # "block_size",
+        # "SCORE_TYPE",
     ],
 )
 @triton.jit
@@ -216,17 +216,17 @@ def _decode_score_kernel(
 )
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_SIZE_N": BN}, num_warps=nw, num_stages=ns)
-        for BN in [64, 128, 256, 512]
-        for nw in [4, 8, 16]
-        for ns in [1, 2, 3]
+        triton.Config({"BLOCK_SIZE_N": 64}, num_warps=1, num_stages=1)
+        # for BN in [64, 128, 256, 512]
+        # for nw in [4, 8, 16]
+        # for ns in [1, 2, 3]
     ],
     key=[
         "gqa_group_size",
         "head_dim",
-        "block_size",
+        # "block_size",
         "HAS_SINK",
-        "SCORE_TYPE",
+        # "SCORE_TYPE",
     ],
 )
 @triton.jit

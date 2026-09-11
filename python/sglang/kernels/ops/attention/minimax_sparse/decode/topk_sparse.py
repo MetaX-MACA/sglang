@@ -8,7 +8,6 @@ import triton.language as tl
 
 from ..common.utils import (
     check_sparse_kv_fp8,
-    robust_allocator,
     sparse_out_dtype,
     unit_scale,
 )
@@ -21,17 +20,16 @@ from ..common.utils import (
         ),
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
-        "HAS_SINK": lambda args: args["sink_ptr"] is not None,
         "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(args["batch_size"]),
     }
 )
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=nw, num_stages=ns)
-        for nw in [4, 8]
-        for ns in [2, 3, 4, 5]
+        triton.Config({}, num_warps=1, num_stages=1),
+        # triton.Config({}, num_warps=8, num_stages=1),
     ],
-    key=["BATCH_SIZE_BUCKET", "gqa_group_size", "head_dim", "block_size", "HAS_SINK"],
+    # key=["gqa_group_size", "head_dim"],
+    key=["BATCH_SIZE_BUCKET", "gqa_group_size", "head_dim", "BLOCK_SIZE_N", "HAS_SINK"],
 )
 @triton.jit
 def _gqa_share_sparse_decode_kernel(
@@ -112,8 +110,10 @@ def _gqa_share_sparse_decode_kernel(
     off_t = tl.arange(0, BLOCK_SIZE_T)
     idx_base = idx_ptr + pid_kh * stride_ti_h + pid_b * stride_ti_b
     topk_idx = tl.load(idx_base + off_t * stride_ti_t, mask=off_t < max_topk, other=-1)
-    valid_idx = tl.where(topk_idx >= 0, off_t, -1)
-    real_topk = tl.sum(valid_idx != -1, axis=0)
+
+    real_topk_mask = tl.where(topk_idx >= 0, 1, 0)
+    real_topk = tl.sum(real_topk_mask, axis=0)
+
     chunk_end_topk = tl.minimum(chunk_end_topk_compiletime, real_topk)
     # init pointer
     off_n = tl.arange(0, BLOCK_SIZE_N)
@@ -121,42 +121,42 @@ def _gqa_share_sparse_decode_kernel(
     dim_mask = off_d < head_dim
     # init statistics — kept at -inf so empty chunks (chunk_start >= real_topk)
     # naturally fall out as weight=0 in the merge step.
-    if HAS_SINK and pid_c == 0:
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
-            shape=(gqa_group_size, head_dim),
-            strides=(stride_q_h, stride_q_d),
-            offsets=(0, 0),
-            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(1, 0),
-        )
-        q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
-        sink_ptrs = tl.make_block_ptr(
-            base=sink_ptr + pid_h * stride_sink_h,
-            shape=(gqa_group_size, head_dim),
-            strides=(stride_sink_h, stride_sink_d),
-            offsets=(0, 0),
-            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(1, 0),
-        )
-        sink = tl.load(sink_ptrs, boundary_check=(0, 1), padding_option="zero").to(
-            tl.float32
-        )
-        qsink = tl.sum(q.to(tl.float32) * sink, axis=1) * sm_scale  # (BLOCK_SIZE_H,)
-        m_i = qsink
-        lse_i = qsink
-    else:
-        m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
-        lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
-            shape=(gqa_group_size, head_dim),
-            strides=(stride_q_h, stride_q_d),
-            offsets=(0, 0),
-            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(1, 0),
-        )
-        q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    # if HAS_SINK and pid_c == 0:
+    #     q_ptrs = tl.make_block_ptr(
+    #         base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
+    #         shape=(gqa_group_size, head_dim),
+    #         strides=(stride_q_h, stride_q_d),
+    #         offsets=(0, 0),
+    #         block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+    #         order=(1, 0),
+    #     )
+    #     q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    #     sink_ptrs = tl.make_block_ptr(
+    #         base=sink_ptr + pid_h * stride_sink_h,
+    #         shape=(gqa_group_size, head_dim),
+    #         strides=(stride_sink_h, stride_sink_d),
+    #         offsets=(0, 0),
+    #         block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+    #         order=(1, 0),
+    #     )
+    #     sink = tl.load(sink_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+    #         tl.float32
+    #     )
+    #     qsink = tl.sum(q.to(tl.float32) * sink, axis=1) * sm_scale  # (BLOCK_SIZE_H,)
+    #     m_i = qsink
+    #     lse_i = qsink
+    # else:
+    m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+    lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+    q_ptrs = tl.make_block_ptr(
+        base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
+        shape=(gqa_group_size, head_dim),
+        strides=(stride_q_h, stride_q_d),
+        offsets=(0, 0),
+        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(1, 0),
+    )
+    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
     acc_o = tl.full((BLOCK_SIZE_H, BLOCK_SIZE_D), 0, dtype=tl.float32)
     # only iterate over this chunk's topk slice. the load must respect the
     # per-chunk start offset.
@@ -317,12 +317,12 @@ def flash_decode_with_gqa_share_sparse(
     block_size: int,
     topk_idx: torch.Tensor,  # [num_kv_heads, batch_size, topk]
     sm_scale: Optional[float] = None,
-    use_tma: bool = True,
+    use_tma: bool = False,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    triton.set_allocator(robust_allocator)
+    # triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
     k_scale = unit_scale(k_scale)
     v_scale = unit_scale(v_scale)
@@ -417,6 +417,7 @@ def flash_decode_with_gqa_share_sparse(
         lse_partial.stride(0),
         lse_partial.stride(1),
         lse_partial.stride(2),
+        HAS_SINK=False,
         BLOCK_SIZE_N=block_size,
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,

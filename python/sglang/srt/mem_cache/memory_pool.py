@@ -1797,6 +1797,7 @@ class KVCache(abc.ABC):
         fallback = None
         for pool in (
             self,
+            getattr(self, "main_pool", None),
             getattr(self, "full_kv_pool", None),
             getattr(self, "swa_kv_pool", None),
         ):
@@ -1808,7 +1809,16 @@ class KVCache(abc.ABC):
             if getattr(quant_method, "name", None) != "unquantized":
                 return quant_method
             fallback = quant_method
-        return fallback
+        if fallback is not None:
+            return fallback
+        if is_float4_e2m1fn_x2(self.dtype):
+            raise ValueError(
+                f"FP4 KV pool {type(self).__name__} does not expose its "
+                "KV cache quantization method."
+            )
+        # Older and out-of-tree pools may not expose quant_method. Their
+        # BF16/FP16/FP8 caches use the identity attention-access policy.
+        return UnquantizedKVCacheMethod()
 
     def maybe_get_custom_mem_pool(self):
         return self.custom_mem_pool

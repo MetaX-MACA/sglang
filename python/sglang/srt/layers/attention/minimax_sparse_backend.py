@@ -154,6 +154,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
+        self.block_size_k = 64
         if "sparse_init_block" in sparse_cfg:
             self.init_blocks = sparse_cfg["sparse_init_block"]
         else:
