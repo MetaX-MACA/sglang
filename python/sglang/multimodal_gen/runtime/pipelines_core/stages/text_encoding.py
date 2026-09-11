@@ -708,6 +708,10 @@ class TextEncodingStage(ConditionEncodingStage):
             }
             if attention_mask is not None:
                 encoder_forward_kwargs["attention_mask"] = attention_mask
+            # Text encoding consumes the complete prompt in one pass, so an
+            # autoregressive KV cache is unnecessary. Pass the flag only when
+            # the encoder exposes it to remain compatible with encoders whose
+            # forward signature does not accept ``use_cache``.
             if "use_cache" in inspect.signature(text_encoder.forward).parameters:
                 encoder_forward_kwargs["use_cache"] = False
             self._begin_text_encoder_use(i)

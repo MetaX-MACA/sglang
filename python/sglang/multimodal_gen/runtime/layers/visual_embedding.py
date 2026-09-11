@@ -22,7 +22,16 @@ from diffusers.models.embeddings import (
     get_timestep_embedding as timestep_embedding_diffusers,
 )
 
-from sglang.kernels.ops.diffusion import timestep_embedding as timestep_embedding_cuda
+try:
+    from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
+except Exception:
+    try:
+        from sglang.kernels.ops.diffusion import (
+            timestep_embedding as timestep_embedding_cuda,
+        )
+    except Exception:
+        # Keep model construction usable when optional GPU kernels are absent.
+        timestep_embedding_cuda = timestep_embedding_diffusers
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
