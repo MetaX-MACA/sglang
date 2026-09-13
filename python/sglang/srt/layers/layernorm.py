@@ -46,7 +46,49 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from mcoplib.custom_ops import fused_add_rms_norm_dynamic_per_token_quant_padding_output
+from mcoplib.custom_ops import (
+    fused_add_rms_norm_dynamic_per_token_quant_padding_output as _mocop_fused_add_rms_norm_quant_pad,
+)
+
+# Register mcoplib op as torch.library custom op for torch.compile / PCG.
+# Cannot use register_custom_op_from_extern because infer_schema does not
+# support Tuple return types. Register manually via Library.define with
+# hand-written schema to bypass infer_schema.
+_mocop_op_name = "fused_add_rms_norm_dynamic_per_token_quant_padding_output"
+if not hasattr(torch.ops.sglang, _mocop_op_name):
+    _sglib = torch.library.Library("sglang", "FRAGMENT")
+    _sglib.define(
+        f"{_mocop_op_name}("
+        "Tensor input, Tensor? residual, Tensor weight, int pad_size, float epsilon"
+        ") -> (Tensor, Tensor?, Tensor, Tensor, Tensor)"
+    )
+
+    def _mocop_cuda_impl(input, residual, weight, pad_size, epsilon):
+        return _mocop_fused_add_rms_norm_quant_pad(
+            input, residual, weight, pad_size, epsilon,
+        )
+
+    def _mocop_fake_impl(input, residual, weight, pad_size, epsilon):
+        shape = list(input.shape)
+        shape[-1] = pad_size
+        output = torch.empty(shape, dtype=torch.bfloat16, device=input.device)
+        output_rms = torch.empty_like(input)
+        output_quant_int8 = torch.empty_like(input, dtype=torch.int8)
+        scales = torch.empty(
+            (input.numel() // input.shape[-1], 1),
+            device=input.device,
+            dtype=torch.float32,
+        )
+        residual_out = residual if residual is not None else None
+        return output, residual_out, output_rms, output_quant_int8, scales
+
+    _sglib.impl(_mocop_op_name, _mocop_cuda_impl, "CUDA")
+    _sglib._register_fake(_mocop_op_name, _mocop_fake_impl)
+
+fused_add_rms_norm_dynamic_per_token_quant_padding_output = (
+    torch.ops.sglang.fused_add_rms_norm_dynamic_per_token_quant_padding_output
+)
+
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
