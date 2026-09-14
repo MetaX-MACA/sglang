@@ -32,7 +32,7 @@
 
 import concurrent.futures
 import logging
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -43,13 +43,18 @@ from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.distributed import (
+    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    enable_moe_dense_fully_dp,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -76,11 +81,12 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.utils import (
     maybe_executor_submit,
     should_async_load,
@@ -104,6 +110,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    make_layers,
 )
 
 _is_hip = is_hip()
@@ -164,14 +171,19 @@ class LongcatFlashMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = False,
         prefix: str = "",
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
+        self.tp_size = get_parallel().tp_size if tp_size is None else tp_size
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -180,6 +192,8 @@ class LongcatFlashMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -410,6 +424,11 @@ class LongcatFlashDecoderLayer(nn.Module):
             [RMSNorm(config.hidden_size, eps=config.rms_norm_eps) for i in range(2)]
         )
 
+        if enable_moe_dense_fully_dp():
+            dense_mlp_tp_rank, dense_mlp_tp_size = 0, 1
+        else:
+            dense_mlp_tp_rank, dense_mlp_tp_size = None, None
+
         self.mlps = nn.ModuleList(
             [
                 LongcatFlashMLP(
@@ -422,6 +441,8 @@ class LongcatFlashDecoderLayer(nn.Module):
                         else quant_config
                     ),
                     prefix=add_prefix(f"mlps.{i}", prefix),
+                    tp_rank=dense_mlp_tp_rank,
+                    tp_size=dense_mlp_tp_size,
                 )
                 for i in range(2)
             ]
@@ -434,17 +455,13 @@ class LongcatFlashDecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-
         self.mlp_layer_scatter_modes = [
             LayerScatterModes.init_new(
                 layer_id=self.layer_id * 2 + i,
-                num_layers=config.num_hidden_layers,
+                num_layers=config.num_hidden_layers * 2,
                 is_layer_sparse=False,
-                is_previous_layer_sparse=False,
-                # TODO: Check if the following is correct.
-                is_next_layer_sparse=False,
+                is_previous_layer_sparse=(i == 0),
+                is_next_layer_sparse=(i == 1),
             )
             for i in range(2)
         ]
@@ -500,20 +517,31 @@ class LongcatFlashDecoderLayer(nn.Module):
                 hidden_states = attn_out
 
         # moe
-        hidden_states, residual = self.moe_layer_communicator.prepare_mlp(
+        # ScMoE forks after attention 0. The MoE and dense branches need
+        # different token layouts under DP attention, so prepare each branch
+        # with its own communicator instead of sharing the MoE-layout tensors.
+        dense_hidden_states = hidden_states.clone()
+        dense_residual = None if residual is None else residual.clone()
+
+        moe_hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        moe_hidden_states = hidden_states.clone()
-        moe_residual = residual.clone()
         moe_hidden_states = self.mlp(moe_hidden_states)
         moe_hidden_states, moe_residual = self.moe_layer_communicator.postprocess_layer(
             moe_hidden_states, moe_residual, forward_batch
         )
 
+        dense_hidden_states, dense_residual = self.mlp_layer_communicator[
+            0
+        ].prepare_mlp(
+            dense_hidden_states,
+            dense_residual,
+            forward_batch,
+        )
         hidden_states, residual, prev_topk_indices = self.forward_mlp(
-            hidden_states,
+            dense_hidden_states,
             positions,
-            residual,
+            dense_residual,
             forward_batch,
             zero_allocator,
             prev_topk_indices,
@@ -536,25 +564,13 @@ class LongcatFlashDecoderLayer(nn.Module):
         zero_allocator,
         prev_topk_indices,
     ):
-        # SCMOE_ATTN1_GATHER: gather the dense-branch hidden(+residual) to full
-        # tokens before mlps[0] so its all_reduce is valid; slice back at the merge.
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend as _scmoe_gab
-
-        _scmoe_ats = self.attn_tp_size
-        _scmoe_do = (
-            not _scmoe_gab().is_none()
-            and _scmoe_ats > 1
-            and hidden_states.shape[0] != 0
-            and hidden_states.shape[0] * _scmoe_ats == positions.shape[0]
-        )
-        if _scmoe_do:
-            hidden_states = _scmoe_align_rows(hidden_states, positions.shape[0])
-            residual = _scmoe_align_rows(residual, positions.shape[0])
-
         # first_mlp
         hidden_states = self.mlps[0](hidden_states)
-        # TP all_reduce
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        if self.mlps[0].tp_size > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states, residual = self.mlp_layer_communicator[0].postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
 
         # second_attn
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_attn(
@@ -578,8 +594,8 @@ class LongcatFlashDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
         hidden_states = self.mlps[1](hidden_states)
-        # TP all_reduce
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        if self.mlps[1].tp_size > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         hidden_states, residual = self.mlp_layer_communicator[1].postprocess_layer(
             hidden_states, residual, forward_batch
@@ -598,40 +614,47 @@ class LongcatFlashModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.pp_group = get_pp_group()
         self.vocab_size = config.vocab_size
 
-        if config.use_ngram_embedding:
-            self.use_ngram_embedding = True
-            self.embed_tokens = NgramEmbedding(
-                num_embeddings=config.vocab_size,
-                embedding_dim=config.hidden_size,
-                over_embedding_m=config.ngram_embedding_m,
-                over_embedding_k=config.ngram_embedding_k,
-                over_embedding_n=config.ngram_embedding_n,
-                eos_token_id=config.eos_token_id,
-            )
+        self.use_ngram_embedding = config.use_ngram_embedding
+        if self.pp_group.is_first_rank:
+            if self.use_ngram_embedding:
+                self.embed_tokens = NgramEmbedding(
+                    num_embeddings=config.vocab_size,
+                    embedding_dim=config.hidden_size,
+                    over_embedding_m=config.ngram_embedding_m,
+                    over_embedding_k=config.ngram_embedding_k,
+                    over_embedding_n=config.ngram_embedding_n,
+                    eos_token_id=config.eos_token_id,
+                )
+            else:
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    use_attn_tp_group=is_dp_attention_enabled(),
+                )
         else:
-            self.use_ngram_embedding = False
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                use_attn_tp_group=is_dp_attention_enabled(),
-            )
+            self.embed_tokens = PPMissingLayer()
 
         self.alt_stream = get_stream("alt")
-        self.layers = nn.ModuleList(
-            [
-                LongcatFlashDecoderLayer(
-                    config,
-                    layer_id,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
-                    alt_stream=self.alt_stream,
-                )
-                for layer_id in range(config.num_hidden_layers)
-            ]
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: LongcatFlashDecoderLayer(
+                config,
+                idx,
+                quant_config=quant_config,
+                prefix=prefix,
+                alt_stream=self.alt_stream,
+            ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix=add_prefix("layers", prefix),
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
         self.layers_to_capture = []
 
     def get_input_embeddings(self) -> torch.Tensor:
@@ -643,29 +666,51 @@ class LongcatFlashModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
-        total_num_layers = len(self.layers)
-        device = input_embeds.device if input_embeds is not None else input_ids.device
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[
+        torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors
+    ]:
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                if self.use_ngram_embedding:
+                    hidden_states = self.embed_tokens(input_ids, forward_batch)
+                else:
+                    hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
+        else:
+            assert pp_proxy_tensors is not None, (
+                "pp_proxy_tensors is required on non-first PP ranks"
+            )
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
+
+        # PP boundaries are decoder-block boundaries. Each LongCat block starts
+        # with attention layer 2 * block_id, which computes its own DSA top-k;
+        # only the second attention inside the block reuses these indices.
+        topk_indices = None
+
+        num_local_decoder_layers = self.end_layer - self.start_layer
+        num_local_attention_layers = num_local_decoder_layers * 2
+        device = hidden_states.device
         zero_allocator = BumpAllocator(
-            buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
+            # Each FP8 MLA attention can consume two scalar-zero scratch slots
+            # (Q and attention-output quantization). LongCat has two attention
+            # modules per decoder block, and TBO can execute two subbatches.
+            buffer_size=num_local_attention_layers
+            * 2
+            * (2 if forward_batch.can_run_tbo else 1),
             dtype=torch.float32,
             device=device,
         )
-        if input_embeds is None:
-            if self.use_ngram_embedding:
-                hidden_states = self.embed_tokens(input_ids, forward_batch)
-            else:
-                hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
-
-        residual = None
 
         aux_hidden_states = []
-        topk_indices = None
-        for i in range(total_num_layers):
+        for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
+                aux_hidden_states.append(
+                    hidden_states if residual is None else hidden_states + residual
+                )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
@@ -676,6 +721,14 @@ class LongcatFlashModel(nn.Module):
                     zero_allocator,
                     topk_indices,
                 )
+
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
 
         if hidden_states.shape[0] != 0:
             if residual is None:
@@ -700,6 +753,7 @@ class LongcatFlashForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.pp_group = get_pp_group()
 
         # for quark model load
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
@@ -719,13 +773,16 @@ class LongcatFlashForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.use_ngram_embedding = config.use_ngram_embedding
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_parallel().enable_dp_lm_head,
-        )
+        if self.pp_group.is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
 
@@ -739,8 +796,18 @@ class LongcatFlashForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+        if not self.pp_group.is_last_rank:
+            return hidden_states
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
@@ -750,17 +817,29 @@ class LongcatFlashForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
+    @property
+    def start_layer(self):
+        # LongCat has two attention/KV-cache layers per decoder block. The
+        # model runner consumes attention-layer indices when sizing PP-local
+        # KV pools, while model construction and checkpoint loading consume
+        # decoder-layer indices.
+        return self.model.start_layer * 2
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer * 2
+
     def post_load_weights(self, weight_names=None):
 
         # Perform post-processing after loading weights
         if weight_names is None:
-            layer_ids = range(self.config.num_hidden_layers)
+            layer_ids = range(self.model.start_layer, self.model.end_layer)
         else:
             layer_ids = set()
             for name in weight_names:
                 if "kv_b_proj" in name:
                     layer_id = int(name.split(".")[2])
-                    if layer_id < self.config.num_hidden_layers:
+                    if self.model.start_layer <= layer_id < self.model.end_layer:
                         layer_ids.add(layer_id)
 
         for layer_id in layer_ids:
@@ -920,7 +999,7 @@ class LongcatFlashForCausalLM(nn.Module):
     def _weight_requant_ue8m0(self):
         weight_block_size = self.quant_config.weight_block_size
 
-        for layer_id in range(self.config.num_hidden_layers):
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             for i in range(2):
                 self_attn = layer.self_attn[i]
@@ -953,7 +1032,8 @@ class LongcatFlashForCausalLM(nn.Module):
                             module.weight, module.weight_scale_inv, weight_block_size
                         )
 
-        for layer_id in range(self.config.num_hidden_layers):
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            layer = self.model.layers[layer_id]
             experts = layer.mlp.experts
             if isinstance(experts, DeepEPMoE):
                 for w in [
@@ -990,8 +1070,31 @@ class LongcatFlashForCausalLM(nn.Module):
             weight_names = []
             for name, loaded_weight in weights:
                 use_async_loading = should_async_load(loaded_weight)
+
                 if "mtp" in name:
                     continue
+
+                # Skip checkpoint layers not owned by this PP stage. This also
+                # handles checkpoint layers omitted by num_hidden_layers override.
+                if name.startswith("model.layers."):
+                    layer_id = int(name.split(".")[2])
+                    if not self.model.start_layer <= layer_id < self.model.end_layer:
+                        continue
+
+                if not self.pp_group.is_first_rank and (
+                    ".embed_tokens." in name or ".ngram_embeddings" in name
+                ):
+                    continue
+
+                if not self.pp_group.is_last_rank and (
+                    name.startswith("model.norm.") or name.startswith("lm_head.")
+                ):
+                    continue
+
+                # Skip N-gram weights when N-gram embedding is disabled.
+                if not self.use_ngram_embedding and ".ngram_embeddings." in name:
+                    continue
+
                 if self.use_ngram_embedding:
                     if ".embed_tokens." in name:
                         name = "model.embed_tokens.word_embeder.weight"
@@ -1161,6 +1264,9 @@ class LongcatFlashForCausalLM(nn.Module):
         )
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
         if layer_ids is None:
             self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers
