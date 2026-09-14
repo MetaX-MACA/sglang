@@ -45,6 +45,9 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
 )
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.distributed.device_communicators.pynccl_allocator import use_symmetric_memory
 from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
@@ -84,10 +87,8 @@ elif _is_musa:
 else:
     _legacy_silu_and_mul = None
 
-
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
-
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
@@ -414,21 +415,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         gateup_width = w13_weight.shape[1]
         assert w13_weight.shape[0] == num_groups
         assert w2_weight.shape[0] == num_groups
-        input_width = w13_weight.shape[2] * 2
-        packed_input_width = (input_width // 2 + 257) // 256 * 256
-        assert hidden_states.shape[2] == packed_input_width, (
-            "W4A8 gate/up packed activation width mismatch: expected "
-            f"{packed_input_width} BF16 elements for K={input_width}, "
-            f"got {hidden_states.shape[2]}"
-        )
-        assert w13_scale.shape == (num_groups, gateup_width, 1), (
-            "DeepGEMM W4A8 requires per-channel w13 scales shaped [E, N, 1], "
-            f"got {tuple(w13_scale.shape)}"
-        )
-        assert w2_scale.shape == (num_groups, w2_weight.shape[1], 1), (
-            "DeepGEMM W4A8 requires per-channel w2 scales shaped [E, N, 1], "
-            f"got {tuple(w2_scale.shape)}"
-        )
+        if self.config.activation == "situ":
+            input_width = w13_weight.shape[2] * 2
+            packed_input_width = (input_width // 2 + 257) // 256 * 256
+            assert hidden_states.shape[2] == packed_input_width, (
+                "W4A8 gate/up packed activation width mismatch: expected "
+                f"{packed_input_width} BF16 elements for K={input_width}, "
+                f"got {hidden_states.shape[2]}"
+            )
+            assert w13_scale.shape == (num_groups, gateup_width, 1), (
+                "DeepGEMM W4A8 requires per-channel w13 scales shaped [E, N, 1], "
+                f"got {tuple(w13_scale.shape)}"
+            )
+            assert w2_scale.shape == (num_groups, w2_weight.shape[1], 1), (
+                "DeepGEMM W4A8 requires per-channel w2 scales shaped [E, N, 1], "
+                f"got {tuple(w2_scale.shape)}"
+            )
         # Both the GEMM and fused activation skip rows outside masked_m.
         gateup_output = torch.empty(
             (num_groups, max_tokens, gateup_width),
@@ -468,25 +470,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
         else:
             from sglang.kernels.ops.moe.ep_moe_kernels import (
-                silu_and_mul_masked_fwd_no_pack,
+                silu_and_mul_masked,
             )
-            from sglang.kernels.ops.quantization.int8_kernel import (
-                per_token_quant_int8,
-            )
-
-            down_input = torch.zeros(
-                (num_groups, max_tokens, down_width),
-                device=gateup_output.device,
-                dtype=torch.bfloat16,
-            )
-            silu_and_mul_masked_fwd_no_pack(gateup_output, down_input, masked_m)
-            down_input_q, down_input_scale = per_token_quant_int8(down_input)
-            down_input_packed = _pack_int8_activation_scale(
-                down_input_q, down_input_scale
-            )
-            dispose_tensor(down_input)
-            dispose_tensor(down_input_q)
-            dispose_tensor(down_input_scale)
+            down_input_packed = silu_and_mul_masked(gateup_output, masked_m)
         del gateup_output
 
         down_input_device = down_input_packed.device
