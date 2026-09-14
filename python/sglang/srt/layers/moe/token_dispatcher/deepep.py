@@ -322,7 +322,8 @@ class DeepEPBuffer:
         # if not is_cu12 and use_mnnvl_fabric:
         #     buffer_kwargs["use_fabric"] = True
 
-        # state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        if state.buffer is None:
+            state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return state.buffer
 
     @classmethod
@@ -445,7 +446,7 @@ class _DeepEPDispatcherImplBase:
         """
 
         reorder_topk_ids, self.src2dst, seg_indptr = deepep_run_moe_deep_preprocess(
-            topk_idx, self.num_experts
+            topk_idx, self.num_local_experts
         )
         num_total_tokens = reorder_topk_ids.numel()
         gateup_input = torch.empty(
@@ -596,6 +597,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self.async_finish = async_finish
         self.src2dst = None
         self.quant_config = {}
+        self.K = triton.next_power_of_2(self.router_topk)
 
     def dispatch_a(
         self,
@@ -640,7 +642,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 (0,), device=hidden_states.device, dtype=torch.int64
             )
             seg_indptr = torch.zeros(
-                (self.num_experts + 1,),
+                (self.num_local_experts + 1,),
                 device=hidden_states.device,
                 dtype=torch.int64,
             )
@@ -651,6 +653,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             topk_ids,
             topk_weights,
             num_recv_tokens_per_expert,
+            reorder_topk_ids,
+            seg_indptr
         )
 
     def _dispatch_core(
@@ -741,6 +745,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     topk_weights,
                     self.router_topk,
                     hidden_states.shape[1],
+                    routed_scaling_factor=1.0,
                     BLOCK_SIZE=512,
                 )
             else:

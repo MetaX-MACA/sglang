@@ -27,7 +27,7 @@ _is_musa = is_musa()
 import triton.language as tl
 
 import os
-from mctlassEx import MaskedGroupedGEMM
+from mctlassEx import MaskedGroupedGEMM, ContinuousGroupedGEMM
 import mcoplib
 # from mcoplib.sgl_grouped_gemm_mctlass_int8 import (
 from mcoplib.sgl_grouped_gemm_mctlass_int8 import (
@@ -214,14 +214,14 @@ def deepep_compute_src2dst_triton_kernel(
     tl.store(src2dst + src_id, dst_id - num_invalid, mask=mask)
 
 
-def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
+def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_local_experts: int):
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
-    seg_indptr = torch.empty(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
+    seg_indptr = torch.empty(num_local_experts + 1, device=topk_ids.device, dtype=torch.int64)
     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int64)
 
     # Find offset
     expert_ids = torch.arange(
-        num_experts + 1, device=topk_ids.device, dtype=reorder_topk_ids.dtype
+        num_local_experts + 1, device=topk_ids.device, dtype=reorder_topk_ids.dtype
     )
     torch.searchsorted(reorder_topk_ids, expert_ids, out=seg_indptr)
     num_minus_one = seg_indptr[0]
@@ -2940,20 +2940,16 @@ def grouped_gemm_triton(
                 a_quant_scale = torch.ones(a.size(0), 1, dtype=torch.float32)
             if scale_b == None:
                 scale_b = torch.ones(batch_size, b.size(1), 1, dtype=torch.float32)
-            grouped_gemm_mctlass_kernel_int8(
-                a_quant_val,
-                b,
-                c,
-                batch_size,
-                a.size(0),
-                b.size(1),
-                b.size(2),
-                seg_indptr.to(torch.int32),
-                weight_indices.to(torch.int32),
-                m_num_tiles_indptr.to(torch.int32),
-                a_quant_scale,
-                scale_b,
-            )
+
+            M, N, K = a.size(0),b.size(1),b.size(2)
+            seg_indptr=seg_indptr.to(torch.int32)
+            weight_indices=weight_indices.to(torch.int32)
+            m_num_tiles_indptr=m_num_tiles_indptr.to(torch.int32)
+
+            gemm = ContinuousGroupedGEMM()
+            blocksizeM = gemm.get_blocksize_m(a_quant_val, b, c, a_quant_scale, scale_b)
+            gemm.compute_m_num_tiles_indptr(a_quant_val, b, c, seg_indptr, m_num_tiles_indptr, blocksizeM)
+            gemm([M, N, K], a_quant_val, b, c, a_quant_scale, scale_b, None, seg_indptr, weight_indices, m_num_tiles_indptr)
         else:
             grouped_gemm_triton_kernel_int8[grid](
                 a = a_quant_val,

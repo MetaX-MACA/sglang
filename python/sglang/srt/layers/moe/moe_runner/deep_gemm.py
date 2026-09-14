@@ -976,10 +976,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.ep_moe.kernels import (
+        from sglang.kernels.ops.moe.ep_moe_kernels import (
             silu_and_mul_masked_fwd,
         )
-        from sglang.srt.layers.quantization.int8_kernel import (
+        from sglang.kernels.ops.quantization.int8_kernel import (
             per_token_quant_int8,
         )
 
