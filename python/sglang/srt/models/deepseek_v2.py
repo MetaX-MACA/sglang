@@ -225,6 +225,7 @@ from sglang.srt.utils import (
     make_pp_layers,
     use_intel_amx_backend,
     align_packed_tensor_size,
+    get_bool_env_var
 )
 from sglang.srt.utils.common import is_maca
 from sglang.srt.utils.custom_op import register_custom_op
@@ -343,7 +344,7 @@ class DeepseekV2MLP(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         gateup_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        if self.tp_size == 1:
+        if self.is_replicated:
             target = x[0] if isinstance(x, tuple) else x
             if target.shape[0] == 0:
                 return x

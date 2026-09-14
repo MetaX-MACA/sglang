@@ -50,6 +50,9 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
 )
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.distributed.device_communicators.pynccl_allocator import use_symmetric_memory
 from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
@@ -87,10 +90,8 @@ elif _is_musa:
 else:
     _legacy_silu_and_mul = None
 
-
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
-
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
@@ -322,6 +323,7 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     is_fp4_experts: bool = False
     use_int4_w4a8: bool = False
     use_mxfp8: bool = False
+    use_int4_w4a8: bool = False
 
     def __post_init__(self):
         if self.use_mxfp8:
@@ -398,10 +400,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             else None
         )
         with deep_gemm_wrapper.contiguous_layout_alignment_scope(alignment):
-            if quant_info.use_int4_w4a8:
+            if getattr(quant_info, "use_int4_w4a8", False):
                 if not runner_input.use_masked_gemm:
                     raise NotImplementedError(
-                        "W4A8 DeepGEMM requires DeepEP low_latency"
+                        "DeepGEMM W4A8 currently requires a masked expert layout. "
+                        "Use DeepEP with --deepep-mode low_latency."
                     )
                 hidden_states = self._run_masked_int8_int4_gemm(
                     runner_input, quant_info, running_state
@@ -443,7 +446,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         hidden_states = runner_input.hidden_states
         masked_m = runner_input.masked_m
-        assert masked_m is not None
+        expected_m = runner_input.expected_m
+        assert masked_m is not None and expected_m is not None
         assert hidden_states.dtype == torch.bfloat16, (
             "DeepGEMM W4A8 expects BF16 activations from DeepEP, "
             f"got {hidden_states.dtype}"
@@ -468,17 +472,19 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=running_state["hidden_states_device"],
             dtype=torch.bfloat16,
         )
+        hidden_states_packed = hidden_states
+        
         gemm = MaskedGroupedGEMM()
         gemm(
             [max_tokens, gateup_width, w13_weight.shape[-1] * 2],
-            hidden_states.view(torch.int8),
+            hidden_states_packed.view(torch.int8),
             w13_weight,
             gateup_output,
             masked_m,
             A_packed=True,
             scale_b=w13_scale,
         )
-        dispose_tensor(hidden_states)
+        dispose_tensor(hidden_states_packed)
 
         down_width = gateup_width // 2
         assert w2_weight.shape[2] * 2 == down_width, (
