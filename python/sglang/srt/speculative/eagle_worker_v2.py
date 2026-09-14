@@ -859,6 +859,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
         # Prepare for draft extend in a separate stream
+        if self.plan_stream:
+            fwd_stream = torch.get_device_module(self.device).current_stream()
+            self.plan_stream.wait_stream(fwd_stream)
         with self.plan_stream_ctx:
             forward_batch = self.prepare_for_draft_extend(
                 draft_extend_input,
@@ -1470,6 +1473,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
+        if self.plan_stream:
+            self.plan_stream.wait_stream(fwd_stream)
         schedule_seq_lens_ready = getattr(batch, "schedule_seq_lens_ready", None)
         with self.plan_stream_ctx:
             if schedule_seq_lens_ready is not None:
