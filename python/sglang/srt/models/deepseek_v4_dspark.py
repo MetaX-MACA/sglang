@@ -262,10 +262,17 @@ class DSparkAttention(MqaAttentionBase):
         attn_backend = get_attn_backend()
         rd = self.rope_head_dim
 
+        # Fused RMSNorm can return a quantized tuple. Keep that tuple as the
+        # input to the quantized linear layers, but use its BF16 tensor for
+        # shape queries and temporary buffer allocation.
+        hidden_states_bf16 = (
+            hidden_states[2] if isinstance(hidden_states, tuple) else hidden_states
+        )
+
         enable_multi_stream = (
             self.alt_streams is not None
             and get_is_capture_mode()
-            and hidden_states.shape[0] <= self._multi_stream_bs_limit
+            and hidden_states_bf16.shape[0] <= self._multi_stream_bs_limit
         )
 
         q_padded: Optional[torch.Tensor] = None
@@ -281,8 +288,8 @@ class DSparkAttention(MqaAttentionBase):
                 device=hidden_states.device,
             )
         elif self.n_local_heads < _PAD_NUM_HEADS:
-            q_padded = hidden_states.new_empty(
-                hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
+            q_padded = hidden_states_bf16.new_empty(
+                hidden_states_bf16.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
             q_out = q_padded[:, : self.n_local_heads, :]
 
@@ -865,23 +872,26 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
         elif self.uses_own_vocab_modules:
             self.pp_group = get_parallel().pp_group
+            # embed
             if self.pp_group.is_first_rank:
                 self.embed_tokens = VocabParallelEmbedding(
-                    config.vocab_size,
-                    config.hidden_size,
+                    self.config.vocab_size,
+                    self.config.hidden_size,
                     enable_tp=not is_dp_attention_enabled(),
                     prefix=self.separate_emb_name,
                 )
             else:
                 self.embed_tokens = PPMissingLayer()
+
+            # lm_head
             if self.pp_group.is_last_rank:
-                if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
                     self.lm_head = self.embed_tokens
                 else:
                     self.lm_head = ParallelLMHead(
-                        config.vocab_size,
-                        config.hidden_size,
-                        quant_config=quant_config,
+                        self.config.vocab_size,
+                        self.config.hidden_size,
+                        quant_config=self.quant_config,
                         prefix=self.separate_lmhead_name,
                         use_attn_tp_group=get_parallel().enable_dp_lm_head,
                     )
@@ -905,6 +915,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if not self.uses_own_vocab_modules:
             self.embed_tokens = embed_tokens
             self.lm_head = lm_head
+        else:
+            assert self.embed_tokens is not None
+            assert self.lm_head is not None
         self.markov_head.configure_tp_shard(lm_head=self.lm_head)
 
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
@@ -1138,6 +1151,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "weights or disable SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD."
             )
 
+        self._assert_embed_and_lmhead_loaded(
+            params_dict=params_dict, loaded_params=loaded_params
+        )
+
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set
     ) -> None:
@@ -1180,10 +1197,37 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 suffix = "weight_scale_inv"
             return target + suffix
         return None
+    def _assert_embed_and_lmhead_loaded(
+        self, *, params_dict: dict, loaded_params: set
+    ) -> None:
+        if not envs.SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD.get():
+            return
+        embed_and_lmhead_names = {"embed_tokens.weight", "lm_head.weight"}
+        missing = embed_and_lmhead_names - loaded_params
+        if missing:
+            raise ValueError(
+                f"DSpark V4 separate embed_tokens and lm_head is enabled but the checkpoint is missing "
+                f"{sorted(missing)}. Provide a checkpoint with separate embed_tokens and lm_head weights, "
+                f"or disable env SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD "
+            )
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
         if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
             return None
+
+        if name.startswith((self.separate_lmhead_name, self.separate_emb_name)):
+            if not envs.SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD.get():
+                raise ValueError(
+                    "DSpark V4 find separate embed_tokens and lm_head weight in "
+                    "checkpoint, please set "
+                    "SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD=True"
+                )
+            separate_dict = {
+                self.separate_lmhead_name + ".weight": "lm_head.weight",
+                self.separate_emb_name + ".weight": "embed_tokens.weight",
+            }
+            return separate_dict[name]
+
         if "rotary_emb.inv_freq" in name:
             return None
 

@@ -340,7 +340,7 @@ class MiMoV2MLP(nn.Module):
         x,
         forward_batch: ForwardBatch = None,
     ):
-        if self.tp_size == 1:
+        if self.is_replicated:
             target = x[0] if isinstance(x, tuple) else x
             if target.shape[0] == 0:
                 return x
