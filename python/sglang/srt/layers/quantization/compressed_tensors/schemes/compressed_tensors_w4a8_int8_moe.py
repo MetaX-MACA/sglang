@@ -9,7 +9,12 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8Int8MoEMethod,
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
+    get_deepep_mode,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
@@ -141,27 +146,79 @@ class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        requested_backend = get_moe_runner_backend()
+        runner_backend = (
+            MoeRunnerBackend.DEEP_GEMM
+            if requested_backend.is_deep_gemm()
+            else MoeRunnerBackend.TRITON
+        )
+        if runner_backend.is_deep_gemm():
+            if not (
+                get_moe_a2a_backend().is_deepep()
+                and get_deepep_mode().is_low_latency()
+            ):
+                raise ValueError(
+                    "W4A8 INT8 DeepGEMM requires --moe-a2a-backend deepep "
+                    "and --deepep-mode low_latency."
+                )
+            logger.info(
+                "Using DeepGEMM INT8xINT4 masked grouped GEMM for "
+                "compressed-tensors W4A8 MoE"
+            )
+        self.runner = MoeRunner(runner_backend, moe_runner_config)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Note: Has been done in FusedMoE weight loader, do nothing here
-        pass
+        # Quantize and pack once before DeepEP; dispatch transports the BF16
+        # byte carrier directly to the masked W4A8 GEMM.
+        from sglang.srt.configs.model_config import is_kimi_k3
+        if self.runner.runner_backend.is_deep_gemm() and hasattr(layer, "dispatcher"):
+            if is_kimi_k3((self.quant_config.config or {}).get("hf_config")):
+                layer.dispatcher.set_quant_config(
+                    {
+                        "bf16_dispatch": True,
+                        "per_token_quant_int8_pack": True,
+                    }
+                )
+            else:
+                layer.dispatcher.set_quant_config(
+                    {
+                        "bf16_dispatch": True,
+                        "per_token_quant_int8_pack": False,
+                    }
+                )
 
     def apply_weights(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        quant_info = TritonMoeQuantInfo(
-            w13_weight=layer.w13_weight_packed,
-            w2_weight=layer.w2_weight_packed,
-            use_int4_w4a8=True,
-            per_channel_quant=True,
-            w13_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a13_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-        )
+        if self.runner.runner_backend.is_deep_gemm():
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                DeepGemmMoeQuantInfo,
+            )
+
+            quant_info = DeepGemmMoeQuantInfo(
+                # The checkpoint packs eight INT4 values per INT32.  Viewing
+                # the same storage as quint4x2 exposes the [E, N, K//2]
+                # contract required by DeepGEMM without a repack or copy.
+                w13_weight=layer.w13_weight_packed.view(torch.quint4x2),
+                w2_weight=layer.w2_weight_packed.view(torch.quint4x2),
+                use_fp8=False,
+                use_int4_w4a8=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+            )
+        else:
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight_packed,
+                w2_weight=layer.w2_weight_packed,
+                use_int4_w4a8=True,
+                per_channel_quant=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
         return self.runner.run(dispatch_output, quant_info)
 
 

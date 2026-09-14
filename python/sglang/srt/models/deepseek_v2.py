@@ -212,6 +212,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
     align_packed_tensor_size,
+    get_bool_env_var
 )
 from sglang.srt.utils.common import is_maca
 from sglang.srt.utils.custom_op import register_custom_op

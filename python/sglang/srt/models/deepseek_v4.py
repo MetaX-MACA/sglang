@@ -3879,20 +3879,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
             if isinstance(hidden_states, tuple):
                 packed_out, out, (quant_out, quant_scale) = hidden_states
+                _a2a_scatter_chunks_packed_out = list(packed_out.tensor_split(s))
                 _a2a_scatter_chunks = list(out.tensor_split(s))
-                hidden_states = (
-                    packed_out.tensor_split(s)[r].contiguous(),
-                    _a2a_scatter_chunks[r].contiguous(),
-                    (
-                        quant_out.tensor_split(s)[r].contiguous(),
-                        quant_scale.tensor_split(s)[r].contiguous(),
-                    ),
-                )
+                _a2a_scatter_chunks_quant_out = list(quant_out.tensor_split(s))
+                _a2a_scatter_chunks_quant_scale = list(quant_scale.tensor_split(s))
+                packed_out = _a2a_scatter_chunks_packed_out[r].contiguous()
+                out = _a2a_scatter_chunks[r].contiguous()
+                quant_out = _a2a_scatter_chunks_quant_out[r].contiguous()
+                quant_scale = _a2a_scatter_chunks_quant_scale[r].contiguous()
+                hidden_states = (packed_out, out, (quant_out, quant_scale))
             else:
                 _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
                 hidden_states = _a2a_scatter_chunks[r].contiguous()
-            # DSpark next-token layers are not hash-routed and intentionally do not
-            # carry token IDs. Only split IDs for callers that actually provide them.
             if input_ids is not None:
                 input_ids = input_ids.tensor_split(s)[r].contiguous()
             if input_ids_global is not None:
