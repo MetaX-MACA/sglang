@@ -495,6 +495,8 @@ def run_eagle_verify(
 
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
+    if plan_stream:
+        plan_stream.wait_stream(fwd_stream)
     with plan_stream_ctx:
         if plan_stream is not None:
             if verify_handoff_event is not None:
