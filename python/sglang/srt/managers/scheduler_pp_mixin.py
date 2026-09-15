@@ -570,7 +570,7 @@ class SchedulerPPMixin:
         self.require_attn_tp_allgather = (
             not get_parallel().enable_dsa_prefill_context_parallel
         )
-        self.require_attn_tp_gather = require_attn_tp_gather(self.server_args)
+        self.require_attn_tp_gather = require_attn_tp_gather()
         self.p2p_allgather = self.require_attn_tp_allgather and not self.require_attn_tp_gather
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size

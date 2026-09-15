@@ -32,6 +32,15 @@ _is_hip = is_hip()
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
+def get_dsv4_indexer_bytes_per_token(
+    index_head_dim: int, use_fp4_indexer: bool
+) -> int:
+    """Return indexer payload and quantization-scale bytes per token."""
+    if use_fp4_indexer:
+        return index_head_dim // 2 + index_head_dim // 32
+    return index_head_dim + index_head_dim // 128 * 4
+
+
 def get_compress_state_ring_size(
     compress_ratio: int, is_speculative: bool = False
 ) -> int:
@@ -332,9 +341,9 @@ class DeepSeekV4IndexerPool(KVCache):
         self._create_buffer()
 
     def get_bytes_per_token(self) -> int:
-        if self.use_fp4_indexer:
-            return self.index_head_dim // 2 + 4
-        return self.index_head_dim + 4
+        return get_dsv4_indexer_bytes_per_token(
+            self.index_head_dim, self.use_fp4_indexer
+        )
 
     def _create_buffer(self):
         page_bytes = self.page_size * self.get_bytes_per_token()

@@ -90,17 +90,17 @@ __global__ __launch_bounds__(K / kTinyNGemmVecSize, 1)  // 1 block per SM
   }
 }
 
-SGL_DEVICE void cp_async_cg_16(void* smem_dst, const void* gmem_src, int32_t vec_offset) {
-  const uint32_t offset = static_cast<uint32_t>(vec_offset * 16);
-#if defined(USE_ROCM)
-  *reinterpret_cast<uint4*>(static_cast<char*>(smem_dst) + offset) =
-      *reinterpret_cast<const uint4*>(static_cast<const char*>(gmem_src) + offset);
-#else
-  const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst)) + offset;
-  const uint64_t gmem_addr = static_cast<uint64_t>(__cvta_generic_to_global(gmem_src)) + offset;
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" : : "r"(smem_addr), "l"(gmem_addr) : "memory");
-#endif
-}
+// SGL_DEVICE void cp_async_cg_16(void* smem_dst, const void* gmem_src, int32_t vec_offset) {
+//   const uint32_t offset = static_cast<uint32_t>(vec_offset * 16);
+// #if defined(USE_ROCM)
+//   *reinterpret_cast<uint4*>(static_cast<char*>(smem_dst) + offset) =
+//       *reinterpret_cast<const uint4*>(static_cast<const char*>(gmem_src) + offset);
+// #else
+//   const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst)) + offset;
+//   const uint64_t gmem_addr = static_cast<uint64_t>(__cvta_generic_to_global(gmem_src)) + offset;
+//   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" : : "r"(smem_addr), "l"(gmem_addr) : "memory");
+// #endif
+// }
 
 constexpr uint32_t kTinyKGemmVecSize = 16 / sizeof(bf16_t);  // NOTE: no need to be large
 
