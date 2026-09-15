@@ -2417,7 +2417,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             b13=getattr(layer, "w13_weight_bias", None),
             b2=getattr(layer, "w2_weight_bias", None),
             use_mxfp8=use_rocm_mxfp8,
-            use_fp8_w8a8=not use_rocm_mxfp8,
+            use_fp8_w8a8=not use_rocm_mxfp8 and not self.is_fp4_expert,
             w13_scale=(
                 layer.w13_weight_scale_inv
                 if self.block_quant
@@ -2428,7 +2428,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ),
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            block_shape=self.weight_block_size,
+            block_shape=(
+                [0, 32] if self.is_fp4_expert else self.weight_block_size
+            ),
+            is_fp4_experts=self.is_fp4_expert,
+            
         )
 
     def apply(
