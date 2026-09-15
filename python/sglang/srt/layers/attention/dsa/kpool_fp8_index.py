@@ -72,9 +72,10 @@ def gather_index_k_scale_prefix_into(
     k_out: torch.Tensor,
     scale_out: torch.Tensor,
 ) -> None:
-    assert buf.dtype == torch.uint8
+    assert buf.dtype in [torch.uint8, torch.int8]
     assert page_indices.dtype in (torch.int32, torch.int64)
-    assert k_out.dtype == torch.uint8
+    assert k_out.dtype in [torch.uint8, torch.int8]
+    assert buf.dtype == k_out.dtype
     assert scale_out.dtype == torch.float32
     assert pool.page_size == BLOCK_SIZE_K
     assert k_out.shape[0] >= seq_len
@@ -104,7 +105,7 @@ def gather_index_k_scale_prefix_into(
 
 @triton.jit
 def _gather_index_k_scale_prefix_into_kernel(
-    buf_u8_ptr,
+    buf_u8_or_i8_ptr,
     buf_fp32_ptr,
     page_indices_ptr,
     k_out_ptr,
@@ -132,7 +133,7 @@ def _gather_index_k_scale_prefix_into_kernel(
         PRESHUFFLE_TILE,
     )
     dst_k_offsets = token_id * HEAD_DIM + offs
-    k = tl.load(buf_u8_ptr + src_k_offsets, mask=mask)
+    k = tl.load(buf_u8_or_i8_ptr + src_k_offsets, mask=mask)
     tl.store(k_out_ptr + dst_k_offsets, k, mask=mask)
 
     src_s_offset = (

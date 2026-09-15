@@ -201,6 +201,26 @@ class IndexerKPool(MultiPlatformOp):
         )
 
     @staticmethod
+    def _int8_mqa_logits(
+        q_fp8: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        starts: torch.Tensor,
+        ends: torch.Tensor,
+        *,
+        clean_logits: bool,
+    ) -> torch.Tensor:
+        return deep_gemm.int8_mqa_logits(
+            q_fp8,
+            (k_fp8, k_scale),
+            weights,
+            starts,
+            ends,
+            clean_logits=clean_logits,
+        )
+
+    @staticmethod
     def _cp_gather_concat(
         tensors: List[torch.Tensor],
         cp_size: int,
@@ -1013,7 +1033,7 @@ class IndexerKPool(MultiPlatformOp):
         self,
         forward_batch: ForwardBatch,
         layer_id: int,
-        q_fp8: torch.Tensor,
+        q_fp8_or_i8: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
@@ -1026,8 +1046,8 @@ class IndexerKPool(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
 
-        device = q_fp8.device
-        total_q = q_fp8.shape[0]
+        device = q_fp8_or_i8.device
+        total_q = q_fp8_or_i8.shape[0]
         seq_lens_expanded = plan.seq_lens_expanded
         pool_lens = plan.pooled_seq_lens_expanded
         ks_per_q = plan.ragged_q_ks
@@ -1046,31 +1066,43 @@ class IndexerKPool(MultiPlatformOp):
                 n_real = seq_lens_expanded.shape[0]
         assert (
             n_real <= total_q
-        ), f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
+        ), f"plan has more real rows ({n_real}) than q_fp8_or_i8 ({total_q})"
 
         if total_k_rows > 0:
-            k_u8 = plan.ragged_k_u8
+            k_u8_or_i8 = plan.ragged_k_u8_or_i8
             k_scale = plan.ragged_k_scale
-            assert k_u8 is not None and k_scale is not None
+            assert k_u8_or_i8 is not None and k_scale is not None
             pool = get_token_to_kv_pool()
             gather_index_k_scale_prefix_into(
                 pool=pool,
                 buf=self._get_index_k_read_buffer(pool, layer_id),
                 page_indices=plan.ragged_concat_page_table,
                 seq_len=total_k_rows,
-                k_out=k_u8,
+                k_out=k_u8_or_i8,
                 scale_out=k_scale,
             )
-            k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            logits = self._fp8_mqa_logits(
-                q_fp8[:n_real].contiguous(),
-                k_fp8.contiguous(),
-                k_scale.contiguous(),
-                weights[:n_real].contiguous(),
-                ks_per_q,
-                ke_per_q,
-                clean_logits=True,
-            )
+            if k_u8_or_i8.dtype == torch.uint8:
+                k_fp8 = k_u8_or_i8.view(torch.float8_e4m3fn)
+                logits = self._fp8_mqa_logits(
+                    q_fp8_or_i8[:n_real].contiguous(),
+                    k_fp8.contiguous(),
+                    k_scale.contiguous(),
+                    weights[:n_real].contiguous(),
+                    ks_per_q,
+                    ke_per_q,
+                    clean_logits=True,
+                )
+            else:
+                assert k_u8_or_i8.dtype == torch.int8
+                logits = self._int8_mqa_logits(
+                    q_fp8_or_i8[:n_real].contiguous(),
+                    k_u8_or_i8.contiguous(),
+                    k_scale.contiguous(),
+                    weights[:n_real].contiguous(),
+                    ks_per_q,
+                    ke_per_q,
+                    clean_logits=True,
+                )
         else:
             logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
 
@@ -1116,6 +1148,7 @@ class IndexerKPool(MultiPlatformOp):
         actual_seq_q: int,
         cp_index: Optional[List[Tuple[int, int, int]]] = None,
     ) -> torch.Tensor:
+        assert q_fp8.dtpye == torch.uint8, f"Only support fp8 when cp enable"
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             build_pooled_page_table_64,
             gather_index_k_scale_prefix_into,
@@ -1499,6 +1532,7 @@ class IndexerKPool(MultiPlatformOp):
                 weights,
                 metadata,
             )
+        assert q_fp8.dtype==torch.uint8, f"only support fp8"
         return self._get_topk_ragged_kpool(
             forward_batch,
             layer_id,
@@ -1788,7 +1822,7 @@ class IndexerKPool(MultiPlatformOp):
                     actual_seq_q_next = (
                         forward_batch.attn_cp_metadata.actual_seq_q_next_list[0]
                     )
-                    q_fp8_prev, q_fp8_next = torch.split(
+                    q_quant_prev, q_quant_next = torch.split(
                         q_quant, (q_quant.shape[0] + 1) // 2, dim=0
                     )
                     weights_prev, weights_next = torch.split(
@@ -1797,7 +1831,7 @@ class IndexerKPool(MultiPlatformOp):
                     topk_result_prev = self._get_topk_ragged_with_cp(
                         forward_batch,
                         layer_id,
-                        q_fp8_prev,
+                        q_quant_prev,
                         weights_prev,
                         metadata,
                         kv_len_prev,
@@ -1806,7 +1840,7 @@ class IndexerKPool(MultiPlatformOp):
                     topk_result_next = self._get_topk_ragged_with_cp(
                         forward_batch,
                         layer_id,
-                        q_fp8_next,
+                        q_quant_next,
                         weights_next,
                         metadata,
                         kv_len_next,
