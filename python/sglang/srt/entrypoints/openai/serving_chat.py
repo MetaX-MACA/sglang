@@ -368,7 +368,13 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
             reasoning_text, delta = self._process_reasoning_stream(
-                index, delta, reasoning_parser_dict, content, request
+                index,
+                delta,
+                reasoning_parser_dict,
+                content,
+                request,
+                flush=finish_reason_type is not None
+                and finish_reason_type != "abort",
             )
             if reasoning_text:
                 usage = None
@@ -400,6 +406,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
                 has_tool_calls,
                 continuous_usage_stats,
+                flush=finish_reason_type is not None
+                and finish_reason_type != "abort",
             ):
                 if chunk:
                     yield chunk
@@ -1598,8 +1606,13 @@ class OpenAIServingChat(OpenAIServingBase):
         reasoning_parser_dict: Dict[int, ReasoningParser],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
+        flush: bool = False,
     ) -> tuple[Optional[str], str]:
-        """Process reasoning content in streaming response"""
+        """Process reasoning content in streaming response.
+
+        With flush=True (the terminal delta), the parser also releases text it
+        held back waiting for a marker that can no longer arrive.
+        """
         if index not in reasoning_parser_dict:
             is_force_reasoning = (
                 self.template_manager.force_reasoning
@@ -1612,7 +1625,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
             )
         reasoning_parser = reasoning_parser_dict[index]
-        return reasoning_parser.parse_stream_chunk(delta)
+        reasoning_text, normal_text = reasoning_parser.parse_stream_chunk(delta)
+        if flush:
+            end_reasoning, end_normal = reasoning_parser.parse_stream_end()
+            reasoning_text = (reasoning_text or "") + end_reasoning
+            normal_text = (normal_text or "") + end_normal
+        return reasoning_text, normal_text
 
     def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
         """Counts the number of tool calls in the request's message history.
@@ -1844,8 +1862,13 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],
         continuous_usage_stats: bool = False,
+        flush: bool = False,
     ):
-        """Process tool calls in streaming response"""
+        """Process tool calls in streaming response.
+
+        With flush=True (the terminal delta), the parser also drains text it
+        held back waiting for a marker that can no longer arrive.
+        """
         if index not in parser_dict:
             is_required = request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice
@@ -1881,6 +1904,10 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
+            if flush:
+                end_text, end_calls = parser.parse_stream_end()
+                normal_text = (normal_text or "") + end_text
+                calls = list(calls) + end_calls
 
         # Yield normal text
         if normal_text:
