@@ -46,7 +46,7 @@ from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .moe_align_block_size import moe_align_block_size
-from mcoplib.sgl_moe_fused_w4a16 import mctlass_moe_w4a16_gemm_kernel_mnk
+from mcoplib.triton_situ_and_mul import situ_and_mul
 from sgl_kernel import cutlass_moe_mm_gemm_kernel_m_w8a8
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -693,27 +693,10 @@ def _fused_moe_kernel_sequence(
         # override kernel_m to config["BLOCK_SIZE_M"]
         stage1_config["BLOCK_SIZE_M"] = kernel_m
         stage2_config["BLOCK_SIZE_M"] = kernel_m
-    elif enable_maca_sglang_fused_moe_mctlass_w4a16 and use_int4_w4a16:
-        if enable_mctlass_fused_moe_python_api and w1_zp is None:
-            kernel_m = gemm.get_kernel_m(
-                hidden_states,
-                w1.view(dtype=torch.quint4x2),
-                intermediate_cache1,
-                w1.shape[0],
-                hidden_states.shape[0],
-                w1.shape[1],
-                hidden_states.shape[1],
-                topk_ids.shape[1],
-                is_blockwise=True,
-                group_size=32,
-            )
-        else:
-            kernel_m = mctlass_moe_w4a16_gemm_kernel_mnk(
-                topk_ids.numel(), N, hidden_states.shape[1], E
-            )
-        assert (
-            kernel_m > 0
-        ), "cutlass_fused_moe_w4a16 BLOCK_SIZE_M must greater than zero."
+    elif enable_maca_sglang_fused_moe_mctlass_w4a16 and use_int4_w4a16 and enable_mctlass_fused_moe_python_api and w1_zp is None:
+        kernel_m = gemm.get_kernel_m(
+            hidden_states, w1.view(dtype=torch.quint4x2), intermediate_cache1, w1.shape[0], hidden_states.shape[0], w1.shape[1], hidden_states.shape[1], topk_ids.shape[1],  is_blockwise=True, group_size=32)
+        assert kernel_m > 0, ("cutlass_fused_moe_w4a16 BLOCK_SIZE_M must greater than zero.")
         stage1_config["BLOCK_SIZE_M"] = kernel_m
         stage2_config["BLOCK_SIZE_M"] = kernel_m
         
@@ -937,16 +920,12 @@ def _fused_moe_kernel_sequence(
                 d = x.shape[-1] // 2
                 intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
     elif activation == "situ" and is_gated:
-        d = N // 2
-        x = intermediate_cache1.view(-1, N)
-        gate = x[..., :d].float()
-        up = x[..., d:].float()
-        situ_beta = gemm1_alpha if gemm1_alpha is not None else 4.0
-        gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
-        situ_linear_beta = gemm1_limit
-        if situ_linear_beta is not None:
-            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
-        intermediate_cache2.copy_((gate * up).to(intermediate_cache1.dtype))
+        situ_and_mul(
+            intermediate_cache1.view(-1, N),
+            situ_beta=(gemm1_alpha if gemm1_alpha is not None else 4.0),
+            situ_linear_beta=gemm1_limit,
+            out=intermediate_cache2.view(-1, N // 2),
+        )
     elif activation == "gelu" and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"

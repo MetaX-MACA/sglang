@@ -1588,6 +1588,10 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Shard Kimi-K3 shared experts across the attention TP group.
+    SGLANG_K3_ATTN_TP_SHARDED_SHARED_EXPERTS = EnvBool(True)
+    # Shard Kimi-K3 latent up/down projections across the attention TP group.
+    SGLANG_K3_ATTN_TP_SHARDED_LATENT_PROJ = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)

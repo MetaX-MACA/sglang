@@ -228,11 +228,17 @@ def _mix_fused(
             cw,
             score_norm.variance_epsilon,
         )
+    from mcoplib.triton_sglang_score_kernel import _combine_kernel, _score_kernel
+
     n_h_blocks = H // _BLOCK_H
 
-    # Step 1: score each row (2D grid, full row-parallelism)
+    # Step 1: score every row of each token in one program (cw chunk loaded
+    # once, reused across the [MAXR, BLOCK_H] register tile), so
+    # MAXR = next_pow2(nvb+1). BLOCK_H/num_warps come from the kernel's
+    # NVB-keyed autotune.
     scores = torch.empty((T, _MAX_ROWS), dtype=torch.float32, device=prefix_sum.device)
-    _score_kernel[(T, nvb + 1)](
+    maxr = 1 << (nvb + 1 - 1).bit_length()  # next_pow2(nvb+1)
+    _score_kernel[(T,)](
         prefix_sum,
         bank,
         cw,
@@ -244,23 +250,24 @@ def _mix_fused(
         bank.stride(1),
         scores.stride(0),
         H=H,
-        BLOCK_H=_BLOCK_H,
-        num_warps=8,
+        MAXR=maxr,
     )
 
-    # Step 2: softmax + weighted sum (2D grid, full H-parallelism)
+    # Step 2: softmax + weighted sum (2D grid, full H-parallelism). NVB is
+    # constexpr in the mcoplib kernel (unrolled row loop), so each nvb value
+    # compiles its own specialization.
     out = torch.empty_like(prefix_sum)
     _combine_kernel[(T, n_h_blocks)](
         prefix_sum,
         bank,
         scores,
         out,
-        nvb,
         prefix_sum.stride(0),
         bank.stride(0),
         bank.stride(1),
         scores.stride(0),
         out.stride(0),
+        NVB=nvb,
         BLOCK_H=_BLOCK_H,
         MAX_ROWS=_MAX_ROWS,
         num_warps=4,

@@ -128,6 +128,7 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
     get_bool_env_var,
+    get_int_env_var,
     rank0_log,
     require_mlp_sync,
     set_weight_attrs,
@@ -137,6 +138,8 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_k3_attn_tp_sharded_shared_experts = envs.SGLANG_K3_ATTN_TP_SHARDED_SHARED_EXPERTS.get()
+_k3_attn_tp_sharded_latent_proj = envs.SGLANG_K3_ATTN_TP_SHARDED_LATENT_PROJ.get()
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -295,6 +298,262 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
     group = get_parallel().attn_tp_group
     lo = group.rank_in_group * hidden_states.shape[0]
     return slice(lo, lo + hidden_states.shape[0])
+
+
+_attn_tp_sharded_bufs: dict = {}
+
+
+def _get_attn_tp_sharded_buf(
+    name: str, numel: int, dtype: torch.dtype, device
+) -> torch.Tensor:
+    key = (name, str(device), dtype)
+    buf = _attn_tp_sharded_bufs.get(key)
+    if buf is None or buf.numel() < numel:
+        buf = torch.empty(numel, dtype=dtype, device=device)
+        _attn_tp_sharded_bufs[key] = buf
+    return buf
+
+
+def _reduce_scatter_attn_tp_rows(
+    group, partial: torch.Tensor, num_local: int, output_buf: torch.Tensor
+) -> torch.Tensor:
+    """Stage BF16 RS through temporary tensors, then copy into local output."""
+    assert partial.dtype == torch.bfloat16 and partial.is_contiguous()
+    assert partial.ndim == 2
+    assert num_local >= 0 and partial.shape[0] == num_local * group.world_size
+    assert output_buf.dtype == partial.dtype and output_buf.device == partial.device
+    assert output_buf.ndim == 1 and output_buf.is_contiguous()
+
+    width = partial.shape[1]
+    assert output_buf.numel() >= num_local * width
+    local = output_buf[: num_local * width].view(num_local, width)
+    if group.world_size == 1:
+        local.copy_(partial)
+    else:
+        # Keep the per-call communication staging from the validated path:
+        # neither the GEMM partial nor the persistent output is an RS buffer.
+        group.reduce_scatter_tensor(local, partial)
+    return local
+
+
+class _AttnTpShardedSharedExperts(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        prefix: str,
+        activation_situ_beta: float | None = None,
+        activation_situ_linear_beta: float | None = None,
+    ):
+        super().__init__()
+        from sglang.srt.distributed.parallel_state import get_attn_tp_group
+        from sglang.srt.layers.activation import SiluAndMul, SituAndMul
+
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self._group = get_attn_tp_group()
+        self.attn_tp_rank = self._group.rank_in_group
+        self.attn_tp_size = self._group.world_size
+
+        assert intermediate_size % self.attn_tp_size == 0, (
+            f"shared intermediate_size {intermediate_size} must be divisible by "
+            f"attn_tp_size {self.attn_tp_size}"
+        )
+        self.local_intermediate = intermediate_size // self.attn_tp_size
+
+        self.gate_up_proj = torch.nn.Linear(
+            hidden_size, self.local_intermediate * 2, bias=False
+        )
+        self.down_proj = torch.nn.Linear(
+            self.local_intermediate, hidden_size, bias=False
+        )
+
+        self._max_rows = (
+            get_int_env_var("SGLANG_ATTN_TP_SHARDED_MAX_BS", 512) * self.attn_tp_size
+        )
+        numel = self._max_rows * hidden_size
+        self._gather_buf = _get_attn_tp_sharded_buf(
+            "gather_bf16", numel, torch.bfloat16, "cuda"
+        )
+        self._out_buf = _get_attn_tp_sharded_buf(
+            "shared_out_bf16",
+            self._max_rows // self.attn_tp_size * hidden_size,
+            torch.bfloat16,
+            "cuda",
+        )
+
+        if hidden_act == "silu":
+            self.act_fn = SiluAndMul()
+        elif hidden_act == "situ":
+            self.act_fn = SituAndMul(
+                beta=activation_situ_beta or 1.0,
+                linear_beta=activation_situ_linear_beta,
+            )
+        else:
+            raise ValueError(f"Unsupported activation: {hidden_act}")
+
+    def load_attn_tp_sharded_weight(
+        self, name: str, loaded_weight: torch.Tensor
+    ) -> None:
+        if name.endswith("gate_proj.weight") or name.endswith("up_proj.weight"):
+            assert tuple(loaded_weight.shape) == (
+                self.intermediate_size,
+                self.hidden_size,
+            ), (
+                f"What shared_experts {name} expected shape: "
+                f"[{self.intermediate_size}, {self.hidden_size}]，"
+                f"actual is {tuple(loaded_weight.shape)}"
+            )
+            slice_ = loaded_weight[
+                self.attn_tp_rank * self.local_intermediate : (self.attn_tp_rank + 1)
+                * self.local_intermediate,
+                :,
+            ]
+            if name.endswith("gate_proj.weight"):
+                self.gate_up_proj.weight.data[: self.local_intermediate].copy_(slice_)
+            else:
+                self.gate_up_proj.weight.data[self.local_intermediate :].copy_(slice_)
+        elif name.endswith("down_proj.weight"):
+            assert tuple(loaded_weight.shape) == (
+                self.hidden_size,
+                self.intermediate_size,
+            ), (
+                f"What shared_experts {name} expected shape: "
+                f"[{self.hidden_size}, {self.intermediate_size}]，"
+                f"actual is {tuple(loaded_weight.shape)}"
+            )
+            self.down_proj.weight.data.copy_(
+                loaded_weight[
+                    :,
+                    self.attn_tp_rank * self.local_intermediate : (
+                        self.attn_tp_rank + 1
+                    )
+                    * self.local_intermediate,
+                ]
+            )
+        else:
+            raise ValueError(f"Unexpected shared expert weight: {name}")
+
+    def _all_gather(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_local = hidden_states.shape[0]
+        total = num_local * self.attn_tp_size
+        assert total <= self._max_rows, (
+            f"total tokens {total}（{num_local}×attn_tp{self.attn_tp_size}）"
+            f"exceeds the pre-allocated buffer row count {self._max_rows}，"
+            f"please increase SGLANG_ATTN_TP_SHARDED_MAX_BS"
+        )
+        assert hidden_states.is_contiguous()
+        h = self.hidden_size
+
+        gathered = self._gather_buf[: total * h].view(total, h)
+        self._group.all_gather_into_tensor(gathered, hidden_states)
+        return gathered
+
+    def _partial(self, gathered: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up_proj(gathered)  # [total, 2 * local_intermediate]
+        act = self.act_fn(gate_up)  # [total, local_intermediate]
+        return self.down_proj(act)  # [total, H] bf16 partial sum
+
+    def _reduce_partial(self, partial: torch.Tensor, num_local: int) -> torch.Tensor:
+        return _reduce_scatter_attn_tp_rows(
+            self._group, partial, num_local, self._out_buf
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_local = hidden_states.shape[0]
+        gathered = self._all_gather(hidden_states)
+        partial = self._partial(gathered)
+        return self._reduce_partial(partial, num_local)
+
+
+class _AttnTpShardedLatentProj(nn.Module):
+    def __init__(
+        self,
+        in_features: int,  # down: 7168, up: 3584
+        out_features: int,  # down: 3584, up: 7168
+        is_down: bool,
+    ):
+        super().__init__()
+        from sglang.srt.distributed.parallel_state import get_attn_tp_group
+
+        self._group = get_attn_tp_group()
+        self.attn_tp_size = self._group.world_size
+        self.attn_tp_rank = self._group.rank_in_group
+        self.is_down = is_down
+        self.in_features = in_features
+        self.out_features = out_features
+
+        assert in_features % self.attn_tp_size == 0, (
+            f"in_features {in_features} must be divisible by "
+            f"attn_tp_size {self.attn_tp_size}"
+        )
+        self.local_in = in_features // self.attn_tp_size
+        self.proj = torch.nn.Linear(self.local_in, out_features, bias=False)
+
+        self._max_rows = (
+            get_int_env_var("SGLANG_ATTN_TP_SHARDED_MAX_BS", 512) * self.attn_tp_size
+        )
+        self._gather_buf = _get_attn_tp_sharded_buf(
+            "gather_bf16", self._max_rows * in_features, torch.bfloat16, "cuda"
+        )
+        max_local_rows = self._max_rows // self.attn_tp_size
+        self._out_buf = _get_attn_tp_sharded_buf(
+            f"latent_{'down' if is_down else 'up'}_out_bf16",
+            max_local_rows * out_features,
+            torch.bfloat16,
+            "cuda",
+        )
+
+    def load_attn_tp_sharded_weight(
+        self, name: str, loaded_weight: torch.Tensor
+    ) -> None:
+        if name.endswith("weight"):
+            assert tuple(loaded_weight.shape) == (
+                self.out_features,
+                self.in_features,
+            ), (
+                f"proj expects [{self.out_features}, {self.in_features}]，"
+                f"actual is {tuple(loaded_weight.shape)}"
+            )
+            self.proj.weight.data.copy_(
+                loaded_weight[
+                    :,
+                    self.attn_tp_rank * self.local_in : (self.attn_tp_rank + 1)
+                    * self.local_in,
+                ]
+            )
+        else:
+            raise ValueError(f"Unexpected latent proj weight: {name}")
+
+    def _all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        n = x.shape[0]
+        total = n * self.attn_tp_size
+        assert total <= self._max_rows, (
+            f"total tokens {total}（{n}×attn_tp{self.attn_tp_size}）"
+            f"exceeds the pre-allocated buffer row count {self._max_rows}，"
+            f"please increase SGLANG_ATTN_TP_SHARDED_MAX_BS"
+        )
+        assert x.is_contiguous()
+
+        gathered = self._gather_buf[: total * self.in_features].view(
+            total, self.in_features
+        )
+        self._group.all_gather_into_tensor(gathered, x)
+        return gathered
+
+    def _partial(self, gathered: torch.Tensor) -> torch.Tensor:
+        col_lo = self.attn_tp_rank * self.local_in
+        return self.proj(gathered[:, col_lo : col_lo + self.local_in])
+
+    def _reduce_partial(self, partial: torch.Tensor, n: int) -> torch.Tensor:
+        return _reduce_scatter_attn_tp_rows(self._group, partial, n, self._out_buf)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        n = x.shape[0]
+        gathered = self._all_gather(x)
+        partial = self._partial(gathered)
+        return self._reduce_partial(partial, n), None
 
 
 class KimiK3MLP(nn.Module):
@@ -548,12 +807,12 @@ class KimiK3MoE(nn.Module):
                 "got a checkpoint with different constants"
             )
 
-        # EP a2a backends (megamoe / DeepEP / Mooncake / Ascend-FuseEP / MoRI)
-        # move each row to its experts directly, so the MoE region can consume
-        # whatever rows this rank holds — an SP-MoE token shard (attn_tp > 1) or
-        # the DP-local batch (DP attention) — with every global token dispatched
-        # exactly once. No DP gather and no TP reduce is needed anywhere in the
-        # region.
+        # EP a2a backends move each row to its experts directly, so the MoE
+        # region can consume an SP-MoE token shard or the DP-local batch with
+        # every global token dispatched exactly once.
+        # No DP gather or TP reduce is needed by the routed EP path itself.
+        # Optional attn-TP-sharded shared/latent projections add their own
+        # all-gather/reduce-scatter pairs around the weight-sharded GEMMs.
         _a2a_backend = get_moe_a2a_backend()
         self._ep_a2a = (
             _a2a_backend.is_megamoe()
@@ -561,6 +820,9 @@ class KimiK3MoE(nn.Module):
             or _a2a_backend.is_mooncake()
             or _a2a_backend.is_ascend_fuseep()
             or _a2a_backend.is_mori()
+        )
+        attn_tp_sharded_a2a = (
+            _a2a_backend.is_megamoe() or _a2a_backend.is_deepep()
         )
 
         # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
@@ -575,21 +837,24 @@ class KimiK3MoE(nn.Module):
         )
 
         # Shared experts (operate in original hidden_size space).
-        # Replicate the shared-expert weights (tp1, DSv2 convention) under EP
-        # a2a: the block runs on partial batches (shard / DP-local rows), and
-        # a TP-sharded partial sum could never be reduced across ranks that
-        # hold different tokens.
-        self._shared_experts_tp1 = (
-            self._ep_a2a and not get_parallel().enable_shared_experts_attn_tp
+        self._attn_tp_sharded_shared_experts = (
+            attn_tp_sharded_a2a
+            and not _is_npu
+            and _k3_attn_tp_sharded_shared_experts
         )
         # NPU compatibility mode keeps DeepEP's DP-local token dispatch but
         # uses the original TP-sharded shared MLP. Gather only that branch's
         # inputs, then reduce-scatter its output back to the DP-local rows.
         self._shared_experts_attn_tp_comm = (
-            get_parallel().enable_shared_experts_attn_tp
+            not self._attn_tp_sharded_shared_experts
+            and get_parallel().enable_shared_experts_attn_tp
             and self._ep_a2a
             and self._dp_attention
             and get_parallel().attn_tp_size > 1
+        )
+        # Otherwise EP-a2a uses replicated shared-expert weights (TP1).
+        self._shared_experts_tp1 = self._ep_a2a and not (
+            self._attn_tp_sharded_shared_experts or self._shared_experts_attn_tp_comm
         )
         shared_experts_tp_kwargs = {}
         if self._shared_experts_tp1:
@@ -601,17 +866,27 @@ class KimiK3MoE(nn.Module):
             )
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
-            self.shared_experts = KimiK3MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=shared_intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                reduce_results=False,
-                prefix=f"{prefix}.shared_experts",
-                activation_situ_beta=config.activation_situ_beta,
-                activation_situ_linear_beta=config.activation_situ_linear_beta,
-                **shared_experts_tp_kwargs,
-            )
+            if self._attn_tp_sharded_shared_experts:
+                self.shared_experts = _AttnTpShardedSharedExperts(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=shared_intermediate_size,
+                    hidden_act=config.hidden_act,
+                    prefix=f"{prefix}.shared_experts",
+                    activation_situ_beta=config.activation_situ_beta,
+                    activation_situ_linear_beta=config.activation_situ_linear_beta,
+                )
+            else:
+                self.shared_experts = KimiK3MLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=shared_intermediate_size,
+                    hidden_act=config.hidden_act,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                    prefix=f"{prefix}.shared_experts",
+                    activation_situ_beta=config.activation_situ_beta,
+                    activation_situ_linear_beta=config.activation_situ_linear_beta,
+                    **shared_experts_tp_kwargs,
+                )
         else:
             self.shared_experts = None
 
@@ -630,6 +905,7 @@ class KimiK3MoE(nn.Module):
         # overlap than two streams.
         self._sbo_shared_overlap = (
             self._ep_a2a
+            and not self._attn_tp_sharded_shared_experts
             and not self._shared_experts_attn_tp_comm
             and self.shared_experts is not None
             and self.alt_stream is not None
@@ -645,29 +921,60 @@ class KimiK3MoE(nn.Module):
                 )
                 else None
             )
-            self.routed_expert_down_proj = ReplicatedLinear(
-                hidden_size,
-                self.moe_hidden_size,
-                bias=False,
-                quant_config=latent_quant_config,
-                prefix=f"{prefix}.routed_expert_down_proj",
+            self._attn_tp_sharded_latent_proj = (
+                attn_tp_sharded_a2a
+                and not _is_npu
+                and _k3_attn_tp_sharded_latent_proj
+                and latent_quant_config is None
             )
+            if self._attn_tp_sharded_latent_proj:
+                self.routed_expert_down_proj = _AttnTpShardedLatentProj(
+                    hidden_size,
+                    self.moe_hidden_size,
+                    is_down=True,
+                )
+                self.routed_expert_up_proj = _AttnTpShardedLatentProj(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    is_down=False,
+                )
+            else:
+                self.routed_expert_down_proj = ReplicatedLinear(
+                    hidden_size,
+                    self.moe_hidden_size,
+                    bias=False,
+                    quant_config=latent_quant_config,
+                    prefix=f"{prefix}.routed_expert_down_proj",
+                )
+                self.routed_expert_up_proj = ReplicatedLinear(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    bias=False,
+                    quant_config=latent_quant_config,
+                    prefix=f"{prefix}.routed_expert_up_proj",
+                )
             self.routed_expert_norm = (
                 RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps)
                 if config.latent_moe_use_norm
                 else None
             )
-            self.routed_expert_up_proj = ReplicatedLinear(
-                self.moe_hidden_size,
-                hidden_size,
-                bias=False,
-                quant_config=latent_quant_config,
-                prefix=f"{prefix}.routed_expert_up_proj",
-            )
         else:
+            self._attn_tp_sharded_latent_proj = False
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
             self.routed_expert_up_proj = None
+
+        self._attn_tp_sharded_front = (
+            isinstance(self.shared_experts, _AttnTpShardedSharedExperts)
+            and isinstance(self.routed_expert_down_proj, _AttnTpShardedLatentProj)
+            and self.routed_expert_down_proj.is_down
+        )
+        if self._attn_tp_sharded_front:
+            shared = self.shared_experts
+            down = self.routed_expert_down_proj
+            assert shared._group is down._group
+            assert shared.hidden_size == down.in_features
+            assert shared._max_rows == down._max_rows
 
         # Static eligibility for fusing the fused-front latent all-reduce with
         # the RMSNorm epilogue (SGLANG_K3_AR_FUSION). The kernel views the flat
@@ -1029,6 +1336,27 @@ class KimiK3MoE(nn.Module):
         attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
         return shared_output
 
+    def _forward_attn_tp_sharded_front(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run shared experts and latent down-proj with one shared AG.
+
+        Both projections consume the same token-sharded hidden states. Their
+        partial outputs are reduce-scattered independently, so each rank
+        receives only its local rows without materializing full reduced output.
+        """
+        assert self._attn_tp_sharded_front
+        assert isinstance(self.shared_experts, _AttnTpShardedSharedExperts)
+        assert isinstance(self.routed_expert_down_proj, _AttnTpShardedLatentProj)
+
+        shared = self.shared_experts
+        down = self.routed_expert_down_proj
+        num_local = hidden_states.shape[0]
+        gathered = shared._all_gather(hidden_states)
+        shared_output = shared._reduce_partial(shared._partial(gathered), num_local)
+        routed_input = down._reduce_partial(down._partial(gathered), num_local)
+        return shared_output, routed_input
+
     def _forward_unfused(
         self,
         hidden_states: torch.Tensor,
@@ -1077,7 +1405,16 @@ class KimiK3MoE(nn.Module):
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
-        issue_shared()
+        if (
+            routed_input is None
+            and self._attn_tp_sharded_front
+            and hidden_states.shape[0] > 0
+        ):
+            shared_output, routed_input = self._forward_attn_tp_sharded_front(
+                hidden_states
+            )
+        else:
+            issue_shared()
 
         if not self.use_latent_moe:
             expert_output = self.experts(hidden_states, topk_output)
@@ -1119,19 +1456,22 @@ class KimiK3MoE(nn.Module):
             out = hidden_states.new_empty((0, hidden_states.shape[1]))
         else:
             latent = self._reduce_latent(expert_output)
-            # up_proj is replicated, so the routed output is now fully reduced.
+            # Both up-proj implementations return complete sums for local rows:
+            # replicated weights directly, attn-TP-sharded weights via RS.
             out, _ = self.routed_expert_up_proj(latent)
         if shared_event is not None:
             # SBO join: as late as possible, so the side-stream shared experts
             # get the whole routed a2a + latent tail to hide under.
             torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
-            # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
-            # ones need the partial-sum reduction.
+            # EP-a2a shared experts are complete here: replicated weights
+            # compute local rows directly, while either attn-TP-sharded path
+            # has already reduce-scattered its partial sums. Plain TP needs AR.
             if (
                 self.tp_size > 1
                 and not self._shared_experts_tp1
                 and not self._shared_experts_attn_tp_comm
+                and not self._attn_tp_sharded_shared_experts
             ):
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
             out = _add3(out, shared_output, prefix_sum)
@@ -3069,6 +3409,31 @@ class KimiK3LinearForCausalLM(nn.Module):
             # Mxfp4MoEMethod consumes weight. INT W4A8, however, registers
             # w13_weight_packed/w2_weight_packed and must preserve the suffix.
             name = _remap_mxfp4_weight_name(name, self.quant_config)
+
+            if ".shared_experts." in name and layer_id is not None:
+                layer = self.model.layers[layer_id]
+                shared = getattr(getattr(layer, "mlp", None), "shared_experts", None)
+                if isinstance(shared, _AttnTpShardedSharedExperts):
+                    sub_name = name.split(".shared_experts.", 1)[1]
+                    shared.load_attn_tp_sharded_weight(sub_name, loaded_weight)
+                    loaded_params.add(name)
+                    continue
+
+            if (
+                ".routed_expert_down_proj." in name or ".routed_expert_up_proj." in name
+            ) and layer_id is not None:
+                layer = self.model.layers[layer_id]
+                mlp = getattr(layer, "mlp", None)
+                if ".routed_expert_down_proj." in name:
+                    proj = getattr(mlp, "routed_expert_down_proj", None)
+                else:
+                    proj = getattr(mlp, "routed_expert_up_proj", None)
+                if isinstance(proj, _AttnTpShardedLatentProj):
+                    proj.load_attn_tp_sharded_weight(
+                        name.rsplit(".", 1)[-1], loaded_weight
+                    )
+                    loaded_params.add(name)
+                    continue
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa
             if ".q_a_proj." in name or ".kv_a_proj_with_mqa." in name:

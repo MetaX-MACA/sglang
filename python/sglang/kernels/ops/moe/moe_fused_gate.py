@@ -273,6 +273,8 @@ def moe_fused_gate(
     within). The first argument is named ``scores`` (raw GEMM logits) to match
     the existing call sites.
     """
+    from mcoplib.triton_sglang_moe_fused_gate import _router_triton_kernel
+
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
     assert (
         scoring_func_int is not None
@@ -336,16 +338,11 @@ def moe_fused_gate(
 
     BLOCK_N = triton.next_power_of_2(N)  # 256 -> 256, 384 -> 512
     BLOCK_K = triton.next_power_of_2(K)  # 6 -> 8, 8 -> 8
-    # Single warp per program keeps the per-row top-k reductions on cheap warp
-    # shuffles; pack a few rows per program only when N is small so tiny launches
-    # stay occupancy-bound. Swept on H100/B200: this beats the AOT kernels across
-    # shapes, whereas larger tiles / more warps regress (register pressure).
-    BLOCK_M = max(1, min(4, 256 // BLOCK_N))
-    # For wide rows (e.g. Kimi K3: 896 experts, BLOCK_N 1024) the K sequential
-    # argmax passes dominate and benefit from more warps despite the
-    # cross-warp reduction cost.
-    num_warps = 1 if BLOCK_N <= 512 else 4
-    grid = (triton.cdiv(M, BLOCK_M),)
+    # BLOCK_M / num_warps / num_stages are picked by the mcoplib kernel's
+    # @triton.autotune (keyed on N/K/SCORING_FUNC/N_GROUP), so they must not be
+    # passed explicitly; the grid reads BLOCK_M back from the chosen config.
+    log_n = BLOCK_N.bit_length() - 1
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
     use_pdl = is_arch_support_pdl()
     extra = {"launch_pdl": True} if use_pdl else {}
     _router_triton_kernel[grid](
@@ -359,7 +356,6 @@ def moe_fused_gate(
         N=N,
         K=K,
         K_ROUTED=K_routed,
-        BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         N_GROUP=num_expert_group,
@@ -371,13 +367,14 @@ def moe_fused_gate(
         RENORMALIZE=bool(renormalize),
         APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
         USE_PDL=use_pdl,
+        USE_BITONIC=False,
+        LOGN=log_n,
         stride_sm=scores.stride(0),
         stride_sn=scores.stride(1),
         stride_wm=weights.stride(0),
         stride_wk=weights.stride(1),
         stride_im=indices.stride(0),
         stride_ik=indices.stride(1),
-        num_warps=num_warps,
         **extra,
     )
     return weights, indices
