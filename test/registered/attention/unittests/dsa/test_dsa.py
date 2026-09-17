@@ -293,6 +293,16 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
         page_size=DSA_PAGE_SIZE,
         prefix_lens=(128,),
     )
+    INT8_PREFILL_NO_PREFIX_CASE = DSAAttentionCase(
+        name="dsa_sparse_int8_prefill_no_prefix",
+        backend="dsa",
+        forward_mode=ForwardMode.EXTEND,
+        num_heads=4,
+        num_kv_heads=1,
+        page_size=DSA_PAGE_SIZE,
+        prefix_lens=(0,),
+        extend_lens=(32,),
+    )
 
     def test_sparse_fp8_prefill_cases(self):
         for impl in DSA_PREFILL_IMPL_VARIANTS:
@@ -314,6 +324,30 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                 run_dsa_sparse_fp8_decode_case(
                     self, self.FP8_DECODE_CASE, dsa_decode_backend=impl
                 )
+
+    def test_sparse_int8_prefill_with_prefix(self):
+        run_dsa_sparse_attention_case(
+            self,
+            self.FP8_PREFILL_RAGGED_CASE,
+            dsa_prefill_backend="flashmla_sparse",
+            int8_kv_cache=True,
+        )
+
+    def test_sparse_int8_prefill_without_prefix(self):
+        run_dsa_sparse_attention_case(
+            self,
+            self.INT8_PREFILL_NO_PREFIX_CASE,
+            dsa_prefill_backend="flashmla_sparse",
+            int8_kv_cache=True,
+        )
+
+    def test_sparse_int8_decode(self):
+        run_dsa_sparse_attention_case(
+            self,
+            self.FP8_DECODE_CASE,
+            dsa_decode_backend="flashmla_kv",
+            int8_kv_cache=True,
+        )
 
     # Tilelang sparse cases — dedicated topk=2048 fixture.
     # `tilelang_sparse_fwd` asserts `topk == 2048` at

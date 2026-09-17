@@ -278,6 +278,7 @@ class DSAMockModelRunner(ModelRunner):
         dsa_prefill_backend: str = "flashmla_auto",
         dsa_decode_backend: str = "flashmla_kv",
         fp8_kv_cache: bool = False,
+        int8_kv_cache: bool = False,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
@@ -286,7 +287,13 @@ class DSAMockModelRunner(ModelRunner):
         # cache the pool stores packed FP8 nope + scales + BF16 rope at
         # 656 bytes/token while the model still projects K/V in BF16;
         # `set_mla_kv_buffer` does the quantize on the way in.
-        self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
+        if fp8_kv_cache and int8_kv_cache:
+            raise ValueError("FP8 and INT8 KV-cache fixtures are mutually exclusive")
+        self.kv_cache_dtype = (
+            torch.int8
+            if int8_kv_cache
+            else torch.float8_e4m3fn if fp8_kv_cache else dtype
+        )
         # For TARGET_VERIFY / DRAFT_EXTEND, the DSA backend uses
         # `self.speculative_num_draft_tokens` to size `seqlens_expanded`
         # (`dsa_backend.py:482-486,510-515`). When zero, deep_gemm's
@@ -337,7 +344,9 @@ class DSAMockModelRunner(ModelRunner):
             enable_dsa_prefill_context_parallel=False,
             enable_mis=False,
             is_embedding=False,
-            kv_cache_dtype="auto",
+            kv_cache_dtype=(
+                "int8" if int8_kv_cache else "fp8_e4m3" if fp8_kv_cache else "auto"
+            ),
             max_running_requests=None,
             mem_fraction_static=0.8,
             model_path=None,
@@ -365,8 +374,8 @@ class DSAMockModelRunner(ModelRunner):
         # flips `dsa_kv_cache_store_fp8=True` iff
         # `dtype=torch.float8_e4m3fn AND override_kv_cache_dim is not None`
         # (`DSATokenToKVPool.__init__`), so both must be passed in tandem.
-        if fp8_kv_cache:
-            pool_dtype = torch.float8_e4m3fn
+        if fp8_kv_cache or int8_kv_cache:
+            pool_dtype = torch.int8 if int8_kv_cache else torch.float8_e4m3fn
             dim_nope = model_config.kv_lora_rank
             dim_rope = model_config.qk_rope_head_dim
             num_tiles = dim_nope // DSATokenToKVPool.quant_block_size
@@ -806,6 +815,7 @@ def build_dsa_sparse_attention_fixture(
     dsa_prefill_backend: str = "flashmla_auto",
     dsa_decode_backend: str = "flashmla_kv",
     fp8_kv_cache: bool = False,
+    int8_kv_cache: bool = False,
     index_topk: int = DSA_SPARSE_INDEX_TOPK,
     index_pattern: str = "trailing",
     loc_layout: str = "shuffled_pages",
@@ -845,6 +855,7 @@ def build_dsa_sparse_attention_fixture(
         dsa_prefill_backend=dsa_prefill_backend,
         dsa_decode_backend=dsa_decode_backend,
         fp8_kv_cache=fp8_kv_cache,
+        int8_kv_cache=int8_kv_cache,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -1054,6 +1065,7 @@ def run_dsa_sparse_attention_case(
     dsa_prefill_backend: str = "flashmla_auto",
     dsa_decode_backend: str = "flashmla_kv",
     fp8_kv_cache: bool = False,
+    int8_kv_cache: bool = False,
     index_topk: int = DSA_SPARSE_INDEX_TOPK,
     index_pattern: str = "trailing",
     loc_layout: str = "shuffled_pages",
@@ -1068,14 +1080,16 @@ def run_dsa_sparse_attention_case(
         dsa_prefill_backend=dsa_prefill_backend,
         dsa_decode_backend=dsa_decode_backend,
         fp8_kv_cache=fp8_kv_cache,
+        int8_kv_cache=int8_kv_cache,
         index_topk=index_topk,
         index_pattern=index_pattern,
         loc_layout=loc_layout,
     )
     actual = run_dsa_sparse_fixture_eager(fixture, testcase)
     expected = expected_dsa_sparse_fixture_output(fixture)
-    atol = DSA_SPARSE_FP8_ATOL if fp8_kv_cache else DSA_SPARSE_ATOL
-    rtol = DSA_SPARSE_FP8_RTOL if fp8_kv_cache else DSA_SPARSE_RTOL
+    quantized_kv_cache = fp8_kv_cache or int8_kv_cache
+    atol = DSA_SPARSE_FP8_ATOL if quantized_kv_cache else DSA_SPARSE_ATOL
+    rtol = DSA_SPARSE_FP8_RTOL if quantized_kv_cache else DSA_SPARSE_RTOL
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
 

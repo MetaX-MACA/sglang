@@ -179,11 +179,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_attention_tp_size()
 
         if mr.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
+            kv_cache_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
+            if is_deepseek_dsa(model_config.hf_config) and kv_cache_dtype in (
+                torch.float8_e4m3fn,
+                torch.int8,
+            ):
+                # DSA FP8/INT8 uses a packed row with FP32 scales and BF16 RoPE.
+                # Match the dimension used by the allocated KV pool.
+                kv_cache_dim = mr.calculate_mla_kv_cache_dim()
+            cell_size = kv_cache_dim * num_layers * kv_size
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
