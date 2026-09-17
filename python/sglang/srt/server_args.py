@@ -602,9 +602,9 @@ class ServerArgs:
         Arg(
             help=(
                 'Data type for kv cache storage. "auto" will use model data type. '
-                '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
-                '"fp8_e4m3" are supported for CUDA 11.8+. "int8" enables the '
-                'basic CUDA DSA packed KV-cache path. "fp4_e2m1" (only '
+                '"bf16" or "bfloat16" for BF16 KV cache. "int8" enables an '
+                'INT8 KV cache on supported backends. "fp8_e5m2" and '
+                '"fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only '
                 "mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+"
             ),
             choices=[
