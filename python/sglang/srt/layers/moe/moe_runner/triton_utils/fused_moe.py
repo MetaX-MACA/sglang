@@ -752,8 +752,8 @@ def _fused_moe_kernel_sequence(
         stage2_config["BLOCK_SIZE_M"] = kernel_m
         del hidden_states_fp8
     elif is_fp4_experts and enable_mctlass_fused_moe_python_api:
-        # The C600U MXFP4 kernel currently uses a fixed routing tile.
-        kernel_m = 16
+        kernel_m = gemm.get_kernel_m(hidden_states, w1.view(dtype=torch.quint4x2), intermediate_cache1, w1.shape[0], hidden_states.shape[0], w1.shape[1], hidden_states.shape[1], topk_ids.shape[1], is_blockwise=True, group_size=32)
+        assert kernel_m > 0, ("FusedMoeGEMM.get_kernel_m kernel_m  must greater than zero.")
         stage1_config["BLOCK_SIZE_M"] = kernel_m
         stage2_config["BLOCK_SIZE_M"] = kernel_m
 
