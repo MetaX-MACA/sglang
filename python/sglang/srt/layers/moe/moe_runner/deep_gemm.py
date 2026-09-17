@@ -879,11 +879,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             swiglu_limit_arg = self.swiglu_limit
 
         # Act
-        down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant_bf16(
-            gateup_output,
-            masked_m,
-            swiglu_limit_arg,
-        )
+        if self.config.activation == "situ":
+            down_input, down_input_scale = _varlen_deep_gemm_situ_mul_w4a16(
+                gateup_output=gateup_output,
+                masked_m=masked_m,
+                beta=self.config.gemm1_alpha,
+                linear_beta=self.config.gemm1_clamp_limit,
+            )
+        else:
+            down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant_bf16(
+                gateup_output,
+                masked_m,
+                swiglu_limit_arg,
+            )
+
         del gateup_output
 
         # GroupGemm-1
@@ -1738,6 +1747,33 @@ def _varlen_deep_gemm_silu_mul_quant_bf16(
     silu_mul_mask(down_input, gateup_output, masked_m, swiglu_limit)
 
     return down_input, None
+
+
+def _varlen_deep_gemm_situ_mul_w4a16(
+    gateup_output: torch.Tensor,
+    masked_m: Optional[torch.Tensor],
+    beta: float,
+    linear_beta: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    assert masked_m is not None
+    hidden_states_device = gateup_output.device
+    E, N, D_2 = gateup_output.shape
+    down_input = torch.empty(
+        (E, N, D_2 // 2),
+        device=hidden_states_device,
+        dtype=torch.bfloat16,
+    )
+    torch.ops._C.masked_situ_and_mul(
+        down_input,
+        gateup_output,
+        masked_m,
+        beta,
+        linear_beta,
+    )
+
+    return down_input, None
+
 
 @register_pre_permute("deepep_v2", "deep_gemm")
 def pre_permute_deepep_v2_to_deep_gemm(

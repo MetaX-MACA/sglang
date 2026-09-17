@@ -2391,7 +2391,11 @@ def select_experts(
             support = (not glm) and (not mimo)
             if (router_logits.shape[1] // num_expert_group <= 384) and support:
                 deepseek = (top_k == 8 and num_expert_group == 8 and topk_group == 4) or (top_k == 9 and num_expert_group == 8 and topk_group == 4)
-                kimi = (top_k == 8 and num_expert_group == 1 and topk_group == 1) or (top_k == 9 and num_expert_group == 1 and topk_group == 1)
+                kimi = (
+                    top_k in (8, 9, 16)
+                    and num_expert_group == 1
+                    and topk_group == 1
+                )
                 if kimi or deepseek:
                     topk_ids = torch.empty((hidden_states.shape[0], top_k), dtype=torch.int, device=hidden_states.device)
                     topk_weights = torch.empty((hidden_states.shape[0], top_k), dtype=torch.float, device=hidden_states.device)

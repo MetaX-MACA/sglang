@@ -1863,8 +1863,8 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
             )
 
-        self.skip_topk = False
-        self.next_skip_topk = False
+        self.skip_topk = None
+        self.next_skip_topk = None
         self.indexer = None
         if self.use_dsa:
             # Refer: https://arxiv.org/abs/2603.12201 for more details.

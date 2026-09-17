@@ -829,6 +829,7 @@ def invoke_fused_moe_kernel(
     mask_output: bool = False,
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
+    is_fp4_experts: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -897,7 +898,7 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
-    elif use_int8_w8a16 or use_int4_w4a16:
+    elif use_int8_w8a16 or use_int4_w4a16 or is_fp4_experts:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
     else:
@@ -1076,6 +1077,35 @@ def invoke_fused_moe_kernel(
             expert_ids,
             num_tokens_post_padded,
             mul_routed_weight,
+        )
+    elif is_fp4_experts and enable_mctlass_fused_moe_python_api:
+        C1 = C.view(-1, C.size(-1)).contiguous()
+        gemm(
+            A.shape[0],
+            B.shape[1],
+            A.shape[1],
+            B.shape[0],
+            sorted_token_ids.shape[0],
+            top_k,
+            A,
+            B.view(dtype=torch.quint4x2),
+            C1,
+            A_scale,
+            B_scale,
+            None,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            is_blockwise=True,
+            group_size=32,
+            use_fp8=True,
+            is_scale_a_1d=True,
+            is_scale_b_1d=True,
+            scale_b_layout="n-major",
+            is_scale_ue8m0=True,
+            is_b_e2m1fp4x2=True,
         )
     else:
         if a_use_tma or b_use_tma:

@@ -73,6 +73,7 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     # w13 rows were permuted to interleave gate/up at load, so the activation
     # must be applied by the fused up-GEMM epilogue (see fused_moe_kernel).
     fuse_swiglu_interleaved: bool = False
+    is_fp4_experts: bool = False
 
 
 class TritonRunnerCore(MoeRunnerCore):
@@ -170,6 +171,7 @@ class TritonRunnerCore(MoeRunnerCore):
             hooks=hooks,
             swiglu_limit=self.config.swiglu_limit,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
+            is_fp4_experts=quant_info.is_fp4_experts,
         )
 
         return TritonRunnerOutput(hidden_states=out)
@@ -256,6 +258,7 @@ def fused_experts_none_to_triton(
             block_shape=quant_info.block_shape,
             a1_q=a1_q,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
+            is_fp4_experts=quant_info.is_fp4_experts,
         )
 
     return StandardCombineInput(

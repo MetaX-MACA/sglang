@@ -118,16 +118,27 @@ def _prepare_flashinfer_mxfp8_activations(
     return x, prepared_packed_topk, x_quant, x_scale
 
 
+_FI_HAS_TRTLLM_MXFP4 = False
+_FI_TRTLLM_MXFP4_IMPORT_ERROR = None
 if is_flashinfer_available():
-    from flashinfer import (
-        nvfp4_block_scale_interleave,
-        trtllm_fp4_block_scale_moe,
-    )
-    from flashinfer.fused_moe import (
-        trtllm_fp4_block_scale_routed_moe,
-    )
-    from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
-    from flashinfer.tllm_enums import ActivationType, RoutingMethodType
+    # FlashInfer may be installed without its NVFP4/TRT-LLM MoE APIs (for
+    # example, a platform-specific build). This module is imported by the
+    # general EP MoE layer even for BF16 models using DeepGEMM, so missing
+    # optional MXFP4 symbols must not prevent the server from starting.
+    try:
+        from flashinfer import (
+            nvfp4_block_scale_interleave,
+            trtllm_fp4_block_scale_moe,
+        )
+        from flashinfer.fused_moe import (
+            trtllm_fp4_block_scale_routed_moe,
+        )
+        from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
+        from flashinfer.tllm_enums import ActivationType, RoutingMethodType
+
+        _FI_HAS_TRTLLM_MXFP4 = True
+    except ImportError as e:
+        _FI_TRTLLM_MXFP4_IMPORT_ERROR = e
 
     # SM90 mixed-input helpers landed in FlashInfer #3084 (post-0.6.10). Older
     # versions don't ship them; gate at import so unrelated code paths still load.
@@ -419,6 +430,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # paths already run MXFP8 activations, so the flag is inert there
             # rather than an error -- one config can move across hardware.
             if get_platform().is_sm100:
+                if not _FI_HAS_TRTLLM_MXFP4:
+                    raise RuntimeError(
+                        "moe_runner_backend=flashinfer_mxfp4 on SM100 requires "
+                        "FlashInfer's NVFP4/TRT-LLM MoE APIs. Install a compatible "
+                        "flashinfer-python build or select another MoE runner."
+                    ) from _FI_TRTLLM_MXFP4_IMPORT_ERROR
                 self._fi_kernel = "trtllm_sm100"
             elif get_platform().is_sm120:
                 self._fi_kernel = "cutlass_sm120"
@@ -1061,26 +1078,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
             return
         else:
-            from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
-
-            w13_weight = upcast_from_mxfp(
-                layer.w13_weight,
-                layer.w13_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
+            layer.w13_weight_scale.data = (
+                layer.w13_weight_scale.data.transpose(1, 2).contiguous()
             )
-            w2_weight = upcast_from_mxfp(
-                layer.w2_weight,
-                layer.w2_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
+            layer.w2_weight_scale.data = (
+                layer.w2_weight_scale.data.transpose(1, 2).contiguous()
             )
-            del layer.w13_weight
-            del layer.w2_weight
-            del layer.w13_weight_scale
-            del layer.w2_weight_scale
-            layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
-            layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
@@ -1527,7 +1530,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
-                block_shape=[128, 128],
+                block_shape=[0, 32],
                 is_fp4_experts=True,
             )
             return self.runner.run(dispatch_output, quant_info)
@@ -1846,8 +1849,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                block_shape=[0, 32],
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
+                is_fp4_experts=True,
             )
         return self.runner.run(dispatch_output, quant_info)
 

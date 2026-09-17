@@ -46,6 +46,7 @@ from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .moe_align_block_size import moe_align_block_size
+from mcoplib.sgl_moe_fused_w4a16 import mctlass_moe_w4a16_gemm_kernel_mnk
 from sgl_kernel import cutlass_moe_mm_gemm_kernel_m_w8a8
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -173,6 +174,7 @@ def inplace_fused_experts(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    is_fp4_experts: bool = False,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -208,6 +210,7 @@ def inplace_fused_experts(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        is_fp4_experts=is_fp4_experts,
     )
 
 
@@ -306,6 +309,7 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    is_fp4_experts: bool = False,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -346,6 +350,7 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            is_fp4_experts=is_fp4_experts,
         )
         return hidden_states
     else:
@@ -537,6 +542,7 @@ def _fused_moe_kernel_sequence(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    is_fp4_experts: bool = False,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -687,10 +693,27 @@ def _fused_moe_kernel_sequence(
         # override kernel_m to config["BLOCK_SIZE_M"]
         stage1_config["BLOCK_SIZE_M"] = kernel_m
         stage2_config["BLOCK_SIZE_M"] = kernel_m
-    elif enable_maca_sglang_fused_moe_mctlass_w4a16 and use_int4_w4a16 and enable_mctlass_fused_moe_python_api and w1_zp is None:
-        kernel_m = gemm.get_kernel_m(
-            hidden_states, w1.view(dtype=torch.quint4x2), intermediate_cache1, w1.shape[0], hidden_states.shape[0], w1.shape[1], hidden_states.shape[1], topk_ids.shape[1],  is_blockwise=True, group_size=32)
-        assert kernel_m > 0, ("cutlass_fused_moe_w4a16 BLOCK_SIZE_M must greater than zero.")
+    elif enable_maca_sglang_fused_moe_mctlass_w4a16 and use_int4_w4a16:
+        if enable_mctlass_fused_moe_python_api and w1_zp is None:
+            kernel_m = gemm.get_kernel_m(
+                hidden_states,
+                w1.view(dtype=torch.quint4x2),
+                intermediate_cache1,
+                w1.shape[0],
+                hidden_states.shape[0],
+                w1.shape[1],
+                hidden_states.shape[1],
+                topk_ids.shape[1],
+                is_blockwise=True,
+                group_size=32,
+            )
+        else:
+            kernel_m = mctlass_moe_w4a16_gemm_kernel_mnk(
+                topk_ids.numel(), N, hidden_states.shape[1], E
+            )
+        assert (
+            kernel_m > 0
+        ), "cutlass_fused_moe_w4a16 BLOCK_SIZE_M must greater than zero."
         stage1_config["BLOCK_SIZE_M"] = kernel_m
         stage2_config["BLOCK_SIZE_M"] = kernel_m
         
@@ -728,12 +751,23 @@ def _fused_moe_kernel_sequence(
         stage1_config["BLOCK_SIZE_M"] = kernel_m
         stage2_config["BLOCK_SIZE_M"] = kernel_m
         del hidden_states_fp8
+    elif is_fp4_experts and enable_mctlass_fused_moe_python_api:
+        # The C600U MXFP4 kernel currently uses a fixed routing tile.
+        kernel_m = 16
+        stage1_config["BLOCK_SIZE_M"] = kernel_m
+        stage2_config["BLOCK_SIZE_M"] = kernel_m
 
     elif (
         enable_mctlass_fused_moe_python_api
         and hidden_states.dtype == torch.bfloat16
         and not any(
-            (use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16)
+            (
+                use_fp8_w8a8,
+                use_int8_w8a8,
+                use_int8_w8a16,
+                use_int4_w4a16,
+                is_fp4_experts,
+            )
         )
         and b1 is None
         and b2 is None
@@ -758,7 +792,6 @@ def _fused_moe_kernel_sequence(
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, stage1_config["BLOCK_SIZE_M"], E
     )
-
     invoke_fused_moe_kernel(
         a1_q if a1_q is not None else hidden_states,
         w1,
@@ -787,6 +820,7 @@ def _fused_moe_kernel_sequence(
         b_use_tma=up_moe_use_tma,
         filter_expert=filter_expert,
         fuse_swiglu=fuse_swiglu_interleaved,
+        is_fp4_experts=is_fp4_experts,
     )
 
     if hooks and hooks.after_gate_up:
@@ -1000,6 +1034,7 @@ def _fused_moe_kernel_sequence(
         filter_expert=filter_expert,
         fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
         router_topk=topk,
+        is_fp4_experts=is_fp4_experts,
     )
 
     if hooks and hooks.after_down:
@@ -1132,6 +1167,7 @@ def fused_experts_impl(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    is_fp4_experts: bool = False,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1140,7 +1176,7 @@ def fused_experts_impl(
     # Check constraints.
     if use_int4_w4a8:
         assert hidden_states.size(1) // 8 == w1.size(2), "hidden size mismatch"
-    elif use_int4_w4a16:
+    elif use_int4_w4a16 or is_fp4_experts:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert (
@@ -1210,6 +1246,7 @@ def fused_experts_impl(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        is_fp4_experts=is_fp4_experts,
     )
 
 

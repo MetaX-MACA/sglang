@@ -41,6 +41,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
@@ -196,9 +197,12 @@ class DeepEPMoE(FusedMoE):
         elif _is_npu:
             self.deprecate_flag = True
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            if (isinstance(quant_config, Fp8Config) or \
-            isinstance(quant_config, CompressedTensorsConfig) or \
-            isinstance(quant_config, W8A8Int8Config)):
+            if (
+                isinstance(quant_config, Fp8Config)
+                or isinstance(quant_config, CompressedTensorsConfig)
+                or isinstance(quant_config, W8A8Int8Config)
+                or isinstance(quant_config, Mxfp4Config)
+            ):
                 self.deprecate_flag = True
             else:
                 self.deprecate_flag = False
