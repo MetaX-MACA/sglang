@@ -100,7 +100,11 @@ from sglang.srt.speculative.dspark_components.kernels.finalize_accept_lens impor
     FinalizeAcceptLens,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
-from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
+    build_grammar_vocab_mask,
+    draft_tp_context,
+)
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
@@ -858,6 +862,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
+        # Grammar-constrained decoding: the verify chain is linear, so the mask is
+        # built over it directly. Build the tree before the target verify launch so
+        # its async D2H overlaps that forward.
+        grammar_tree = (
+            GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
+        )
+
         if self._sps_recorder is not None:
             sps_dp_tier = self._dp_verify_tier_num_tokens(batch)
             self._sps_recorder.observe_decode_step(
@@ -884,6 +895,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
             and (self._block_accept_recorder is None or proposal.folded)
+            # A live grammar is masked on the verify logits below, which the
+            # native compact accept path does not read.
+            and not batch.has_grammar
         )
         fold_eligible = (
             not self._qwen3_5_family_enabled
@@ -891,6 +905,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             and proposal.folded
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
+            # The folded epilogue accepts inside the cuda graph off its own
+            # buffers, where the mask below never lands.
+            and not batch.has_grammar
         )
         compact_output = None
         hidden_strided = None
@@ -933,6 +950,22 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+
+        if batch.has_grammar:
+            # Host-side tree traversal; overlaps the target verify forward above.
+            vocab_mask = build_grammar_vocab_mask(
+                reqs=batch.reqs,
+                verify_input=draft_input,
+                tree=grammar_tree,
+                sampling_info=sampling_info,
+                device=logits_output.next_token_logits.device,
+            )
+            if vocab_mask is not None:
+                assert draft_input.grammar is not None
+                draft_input.grammar.apply_vocab_mask(
+                    logits=logits_output.next_token_logits, vocab_mask=vocab_mask
+                )
+
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
         if folded_accept:

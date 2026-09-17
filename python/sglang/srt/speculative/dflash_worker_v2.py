@@ -34,7 +34,11 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
+    assign_req_to_token_pool_func,
+    build_grammar_vocab_mask,
+)
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.speculative.triton_ops.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
@@ -1483,6 +1487,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
+        # Grammar-constrained decoding: the draft chain is a linear verify tree.
+        # Build it before the target verify launch so its async D2H overlaps the forward.
+        grammar_tree = (
+            GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
+        )
+
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
@@ -1532,11 +1542,29 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
+        vocab_mask = None
+        if batch.has_grammar:
+            # Host-side tree traversal, overlaps the target verify forward above.
+            vocab_mask = build_grammar_vocab_mask(
+                reqs=batch.reqs,
+                verify_input=verify_input,
+                tree=grammar_tree,
+                sampling_info=sampling_info,
+                device=logits_output.next_token_logits.device,
+            )
+
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
+            )
+
+        # Constrain every chain position before accept picks from it.
+        if vocab_mask is not None:
+            assert verify_input.grammar is not None
+            verify_input.grammar.apply_vocab_mask(
+                logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
 
         candidates = draft_tokens
