@@ -164,6 +164,17 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
+    def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
+        """Flush detector state once the stream ends.
+
+        Text a detector held back waiting for a marker (which can no longer
+        arrive) is released as normal text; see BaseFormatDetector.finish().
+        """
+        if not self.tools:
+            return "", []
+        sp_result = self.detector.finish(self.tools)
+        return sp_result.normal_text, sp_result.calls
+
     def get_legacy_structural_tag(
         self, at_least_one: bool = False
     ) -> StructuralTagResponseFormat:
