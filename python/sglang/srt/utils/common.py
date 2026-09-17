@@ -1935,6 +1935,10 @@ def _load_image(
     """
     if image_file != "":
         image_bytes = get_image_bytes(image_file)
+
+    if is_maca():
+        gpu_image_decode = False
+        logger.info("[Load image] is_maca=True, gpu_image_decode = False")
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
             if gpu_image_decode == "nvjpeg_fancy":
