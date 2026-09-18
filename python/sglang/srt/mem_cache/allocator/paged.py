@@ -264,12 +264,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        return self._kvcache.get_cpu_copy(
+            indices, mamba_indices=mamba_indices, req_pool_index=req_pool_index
+        )
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None):
         return self._kvcache.load_cpu_copy(
-            kv_cache_cpu, indices, mamba_indices=mamba_indices
+            kv_cache_cpu, indices, mamba_indices=mamba_indices, req_pool_index=req_pool_index
         )
 
 # expand page-size to page-size * dcp_world_size
@@ -316,12 +318,14 @@ class DcpTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def merge_and_sort_free(self):
         return self.real_allocator.merge_and_sort_free()
 
-    def get_cpu_copy(self, indices):
-        return self.real_allocator.get_cpu_copy(self.filter_local_indices(indices))
+    def get_cpu_copy(self, indices, req_pool_index=None):
+        return self.real_allocator.get_cpu_copy(
+            self.filter_local_indices(indices), req_pool_index=req_pool_index
+        )
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
+    def load_cpu_copy(self, kv_cache_cpu, indices, req_pool_index=None):
         return self.real_allocator.load_cpu_copy(
-            kv_cache_cpu, self.filter_local_indices(indices)
+            kv_cache_cpu, self.filter_local_indices(indices), req_pool_index=req_pool_index
         )
 
     def alloc_extend(self, *args, **kwargs):
