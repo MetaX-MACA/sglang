@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
-from sglang.srt.environ import envs
 
 from sglang.srt.arg_groups.overrides import (
     model_config_of,
     resolved_view,
     resolving_view,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
