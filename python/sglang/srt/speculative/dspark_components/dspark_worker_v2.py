@@ -105,6 +105,7 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_tp_context,
 )
+from sglang.srt.speculative.spec_utils import draft_tp_context, record_stream_each
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
@@ -776,8 +777,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._run_idle_verify_participation(batch)
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
+        # batch.seq_lens.record_stream(
+        #     torch.get_device_module(self.device).current_stream()
+        # )
+        fwd_stream = torch.get_device_module(self.device).current_stream()
+        record_stream_each(
+            (batch.seq_lens, batch.req_pool_indices),
+            fwd_stream,
         )
         bs = len(batch.seq_lens)
         device = self.device
@@ -1036,6 +1042,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 seq_lens_post_verify=new_seq_lens,
                 commit_lens=commit_lens,
             )
+        online_c128 = getattr(self.model_runner.attn_backend, "online_c128_mtp", None)
+        if online_c128 is not None and online_c128.enabled():
+            online_c128.commit_pending(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=new_seq_lens,
+            )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(
@@ -1187,6 +1199,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=new_seq_lens,
+            extra_keep_alive_refs=[target_verify.verify_forward_batch],
         )
 
     def _simulated_correct_len(

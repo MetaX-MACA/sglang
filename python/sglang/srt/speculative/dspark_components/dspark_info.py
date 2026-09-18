@@ -19,6 +19,7 @@ class RaggedVerifyWindow(msgspec.Struct, frozen=True):
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    verify_forward_batch: object
 
 
 class CompactVerifyOutput(msgspec.Struct, frozen=True):

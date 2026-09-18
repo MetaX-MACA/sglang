@@ -16,6 +16,11 @@ from sglang.srt.speculative.dspark_components.dspark_info import VerifyWindow
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 
+from sglang.srt.speculative.spec_utils import (
+    record_stream_each,
+    record_stream_for_v2_verify,
+)
+
 
 def local_verify_tier_num_tokens(
     *,
