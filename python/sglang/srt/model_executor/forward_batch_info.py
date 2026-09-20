@@ -47,6 +47,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
     world_dp_gather_enabled,
+    get_attention_dp_size,
 )
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
@@ -55,6 +56,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_parallel,
+    get_flags,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
@@ -1340,6 +1342,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
+
+        hybrid_ssm = mambaish_config(model_runner.model_config) is not None
+        if hybrid_ssm:
+            dp_size = get_attention_dp_size()
+            if self.is_extend_in_batch and dp_size > 1:
+                if get_flags().dp.max_len_with_idle and min(global_num_tokens) == 0:
+                    dp_padding_mode = DpPaddingMode.MAX_LEN
+                dp_padding_mode = DpPaddingMode.SUM_LEN
+
         if _elastic_should_preserve_local_token_counts(
             model_runner=model_runner,
             dp_padding_mode=dp_padding_mode,

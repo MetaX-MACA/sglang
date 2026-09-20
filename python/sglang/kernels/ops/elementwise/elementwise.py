@@ -530,8 +530,9 @@ def _launch_fused_gate_sigmoid_mul(
         ),
     }
 
-    if num_tokens >= 1024:
-        config["num_warps"] = min(config["num_warps"], 8)
+    # if num_tokens >= 1024:
+    #     config["num_warps"] = min(config["num_warps"], 8)
+    config["num_warps"] = min(config["num_warps"], 8)
 
     use_pdl = is_arch_support_pdl()
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
