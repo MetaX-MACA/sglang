@@ -12,9 +12,10 @@ logger = logging.getLogger(__name__)
 HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE = {
     "bfloat16": {"flashmla_sparse"},
     "fp8_e4m3": {"flashmla_kv"},
+    "int8": {"flashmla_kv"},
 }
 HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "aiter"}
-HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
+HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3", "int8")
 
 
 def _is_hip() -> bool:
@@ -26,7 +27,11 @@ def _is_hip() -> bool:
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
     if _is_hip():
         return "tilelang"
-    return "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
+    return (
+        "flashmla_kv"
+        if kv_cache_dtype in ("fp8_e4m3", "int8")
+        else "flashmla_sparse"
+    )
 
 
 def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
@@ -137,7 +142,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
             )
         return
 
-    if server_args.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):
+    if server_args.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3", "int8"):
         validate_hisparse_kv_cache_dtype(server_args)
 
     for attr, label in [

@@ -603,10 +603,19 @@ class ServerArgs:
             help=(
                 'Data type for kv cache storage. "auto" will use model data type. '
                 '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
-                '"fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only '
+                '"fp8_e4m3" are supported for CUDA 11.8+. "int8" enables the '
+                'basic CUDA DSA packed KV-cache path. "fp4_e2m1" (only '
                 "mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+"
             ),
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "int8",
+                "bf16",
+                "bfloat16",
+                "fp4_e2m1",
+            ],
         ),
     ] = "auto"
     enable_fp32_lm_head: A[
@@ -3618,10 +3627,18 @@ class ServerArgs:
             )
         if self.kv_cache_dtype == "bf16":
             self.kv_cache_dtype = "bfloat16"
+        if self.kv_cache_dtype == "int8" and is_hip():
+            raise ValueError(
+                "The basic DSA INT8 main KV cache currently supports CUDA only"
+            )
         assert self.kv_cache_dtype in [
             "bfloat16",
             "fp8_e4m3",
-        ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+            "int8",
+        ], (
+            "DeepSeek DSA only supports bf16/bfloat16, fp8_e4m3, "
+            "or int8 kv_cache_dtype"
+        )
 
     def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> str:
         from sglang.srt.arg_groups.hisparse_hook import (
@@ -3639,6 +3656,11 @@ class ServerArgs:
         if not user_set_prefill and not user_set_decode and is_hip():
             self.dsa_prefill_backend = "tilelang"
             self.dsa_decode_backend = "tilelang"
+        elif kv_cache_dtype == "int8":
+            if not user_set_prefill:
+                self.dsa_prefill_backend = "flashmla_sparse"
+            if not user_set_decode:
+                self.dsa_decode_backend = "flashmla_kv"
         elif kv_cache_dtype == "fp8_e4m3":
             if major >= 10:
                 if not user_set_prefill:

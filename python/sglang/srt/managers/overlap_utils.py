@@ -471,11 +471,17 @@ class FutureMap:
         )
 
         if self.need_topk:
-            self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
-            self.topk_index_buf[indices] = payload.topk_index.to(
-                self.topk_index_buf.dtype
-            )
-        if self.need_hidden_states:
+            # The hisparse staging-to-decode transition relays only bonus_tokens
+            # and has no draft topk yet (topk appears on the next normal decode
+            # iteration). Tolerate a missing topk instead of crashing.
+            if payload.topk_p is not None and payload.topk_index is not None:
+                self.topk_p_buf[indices] = payload.topk_p.to(
+                    self.topk_p_buf.dtype
+                )
+                self.topk_index_buf[indices] = payload.topk_index.to(
+                    self.topk_index_buf.dtype
+                )
+        if self.need_hidden_states and payload.hidden_states is not None:
             self.hidden_states_buf[indices] = payload.hidden_states.to(
                 self.hidden_states_buf.dtype
             )

@@ -48,6 +48,10 @@ SGL_DEVICE char2 pack_int8(float x, float y) {
   return char2{int8_clip(x), int8_clip(y)};
 }
 
+SGL_DEVICE char2 pack_int8_round(float x, float y) {
+  return char2{int8_clip(roundf(x)), int8_clip(roundf(y))};
+}
+
 
 // 4 warps per block: warp-per-(token, head) work-item dispatch (Q kernel).
 constexpr uint32_t kFusedQBlockSize = 128;
@@ -264,12 +268,15 @@ K_KERNEL void fused_k_norm_rope_flashmla(const FusedKNormRopeFlashMLAParams para
   constexpr int64_t kVecSize = 2;
   constexpr uint32_t kRopeWarp = kFusedKNumWarps - 1;
   constexpr bool kUseFp8Cache = std::is_same_v<CacheDType, uint8_t>;
+  constexpr bool kUseInt8Cache = std::is_same_v<CacheDType, int8_t>;
+  constexpr bool kUsePackedCache = kUseFp8Cache || kUseInt8Cache;
   constexpr int64_t kFp8PageBytes = host::div_ceil(584ll << kPageBits, 576) * 576;
+  constexpr int64_t kInt8PageBytes = host::div_ceil(608ll << kPageBits, 576) * 576;
   constexpr int64_t kBf16PageElems = kHeadDim << kPageBits;
   static_assert(kHeadDim == kFusedKBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
-  static_assert(kUseFp8Cache || std::is_same_v<CacheDType, bf16_t>, "CacheDType must be uint8_t or bf16_t");
+  static_assert(kUsePackedCache || std::is_same_v<CacheDType, bf16_t>, "CacheDType must be uint8_t, int8_t, or bf16_t");
   using Storage = AlignedVector<DType, kVecSize>;
   using Float2 = AlignedVector<float, kVecSize>;
 
@@ -329,7 +336,7 @@ K_KERNEL void fused_k_norm_rope_flashmla(const FusedKNormRopeFlashMLAParams para
   // part 2: rope on warp 7. The default DSV4 FlashMLA cache stores nope as
   // fp8 + scale and rope as bf16; the bf16 cache path stores the full 512-dim
   // normalized/rotated key without quantization.
-  if constexpr (!kUseFp8Cache) {
+  if constexpr (!kUsePackedCache) {
     if (warp_id == kRopeWarp) {
       const auto x_real = data[0];
       const auto x_imag = data[1];
@@ -341,7 +348,8 @@ K_KERNEL void fused_k_norm_rope_flashmla(const FusedKNormRopeFlashMLAParams para
     const auto cache_ptr = static_cast<CacheDType*>(params.kvcache) + page * kBf16PageElems + offset * kHeadDim;
     reinterpret_cast<packed_t<CacheDType>*>(cache_ptr)[tx] = cast<packed_t<CacheDType>>(fp32x2_t{data[0], data[1]});
   } else {
-    const auto page_ptr = static_cast<uint8_t*>(params.kvcache) + page * kFp8PageBytes;
+    constexpr int64_t kPackedPageBytes = kUseFp8Cache ? kFp8PageBytes : kInt8PageBytes;
+    const auto page_ptr = static_cast<uint8_t*>(params.kvcache) + page * kPackedPageBytes;
     const auto value_ptr = page_ptr + offset * 576;
     if (warp_id == kRopeWarp) {
       const auto x_real = data[0];
@@ -353,7 +361,7 @@ K_KERNEL void fused_k_norm_rope_flashmla(const FusedKNormRopeFlashMLAParams para
       const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
       const auto rope_ptr = value_ptr + 448;
       reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
-    } else {
+    } else if constexpr (kUseFp8Cache) {
       const auto x = data[0];
       const auto y = data[1];
       const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
@@ -364,6 +372,15 @@ K_KERNEL void fused_k_norm_rope_flashmla(const FusedKNormRopeFlashMLAParams para
       const auto scale_ptr = page_ptr + (576 << kPageBits) + offset * 8;
       reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = result;
       if (lane_id == 0) static_cast<uint8_t*>(scale_ptr)[warp_id] = scale_ue8m0;
+    } else {
+      const auto x = data[0];
+      const auto y = data[1];
+      const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
+      const auto scale = fmaxf(1e-4f, abs_max) / 127.0f;
+      const auto result = pack_int8_round(x / scale, y / scale);
+      const auto scale_ptr = page_ptr + (576 << kPageBits) + offset * 32;
+      reinterpret_cast<char2*>(value_ptr)[tx] = result;
+      if (lane_id == 0) reinterpret_cast<float*>(scale_ptr)[warp_id] = scale;
     }
   }
 }
@@ -372,12 +389,16 @@ template <typename DType, typename CacheDType, int64_t kHeadDim, int64_t kRopeDi
 struct FusedKNormRopeFlashMLAKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr bool kUseFp8Cache = std::is_same_v<CacheDType, uint8_t>;
+  static constexpr bool kUseInt8Cache = std::is_same_v<CacheDType, int8_t>;
   static constexpr int64_t kFp8PageBytes = host::div_ceil(584 * kPageSize, 576) * 576;
+  static constexpr int64_t kInt8PageBytes = host::div_ceil(608 * kPageSize, 576) * 576;
   static constexpr int64_t kBf16PageElems = kHeadDim * kPageSize;
+  static constexpr int64_t kPageStride =
+      kUseFp8Cache ? kFp8PageBytes : (kUseInt8Cache ? kInt8PageBytes : kBf16PageElems);
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogPageSize == kPageSize);
   static_assert(kHeadDim == 512 && kRopeDim == 64, "FlashMLA layout requires (512, 64)");
-  static_assert(kUseFp8Cache || std::is_same_v<CacheDType, bf16_t>, "CacheDType must be uint8_t or bf16_t");
+  static_assert(kUseFp8Cache || kUseInt8Cache || std::is_same_v<CacheDType, bf16_t>, "CacheDType must be uint8_t, int8_t, or bf16_t");
 
   template <typename PosT>
   static constexpr auto kernel = fused_k_norm_rope_flashmla<DType, CacheDType, kHeadDim, kRopeDim, PosT, kLogPageSize, kUsePDL>;
@@ -419,7 +440,7 @@ struct FusedKNormRopeFlashMLAKernel {
         .with_device(device_)
         .verify(out_loc);
     TensorMatcher({-1, -1})  //
-        .with_strides({kUseFp8Cache ? kFp8PageBytes : kBf16PageElems, 1})
+        .with_strides({kPageStride, 1})
         .with_dtype<CacheDType>()
         .with_device(device_)
         .verify(kvcache);

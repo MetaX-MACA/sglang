@@ -6,8 +6,8 @@ is not available, so this module provides alternative implementations:
 - A fused Triton kernel (default, ``SGLANG_SM120_TRITON_FLASHMLA=1``)
 - A pure-PyTorch fallback (``SGLANG_SM120_TRITON_FLASHMLA=0``)
 
-The FP8 KV cache uses a page-internal layout where NOPE+ROPE data has
-stride (nope_dim + rope_dim*2) per token, and scales are stored in a
+The FP8 and INT8 KV caches use a page-internal layout where NOPE+ROPE data
+has stride (nope_dim + rope_dim*2) per token, and scales are stored in a
 separate region at the end of each page.
 """
 
@@ -16,21 +16,34 @@ import os
 
 import torch
 
+from sglang.srt.layers.attention.dsv4.kv_cache_layout import (
+    DSV4KVCacheFormat,
+    FP8_SCALE_BYTES_PER_TOKEN,
+    INT8_SCALE_BYTES_PER_TOKEN,
+    NOPE_DIM,
+    NUM_QUANT_GROUPS,
+    QUANT_GROUP_SIZE,
+    ROPE_DIM,
+    VALUE_BYTES_PER_TOKEN,
+    get_kv_cache_format,
+)
+
 logger = logging.getLogger(__name__)
 
-# Page layout constants for DSv4-Flash (MODEL1):
+# FP8 page layout constants for DSv4-Flash (MODEL1). INT8 shares the
+# 576-byte value stride but uses a 32-byte FP32-scale record.
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
 #   nope_rope_stride = 448 + 64*2 = 576 bytes per token
 #   scale_stride = ceil(448/64) + 1 = 8 bytes per token (7 scales + 1 pad)
 #   bytes_per_token = 448 + 128 + 8 = 584
 #   page_bytes = ceil_div(page_size * 584, 576) * 576
 
-_NOPE_DIM = 448
-_ROPE_DIM = 64
-_NOPE_ROPE_STRIDE = _NOPE_DIM + _ROPE_DIM * 2  # 576
-_TILE_SIZE = 64
-_NUM_TILES = _NOPE_DIM // _TILE_SIZE  # 7
-_SCALE_STRIDE = _NUM_TILES + 1  # 8 (7 scales + 1 pad)
+_NOPE_DIM = NOPE_DIM
+_ROPE_DIM = ROPE_DIM
+_NOPE_ROPE_STRIDE = VALUE_BYTES_PER_TOKEN
+_TILE_SIZE = QUANT_GROUP_SIZE
+_NUM_TILES = NUM_QUANT_GROUPS
+_SCALE_STRIDE = FP8_SCALE_BYTES_PER_TOKEN  # compatibility for FP8 tests/tools
 _D = _NOPE_DIM + _ROPE_DIM  # 512
 
 
@@ -50,6 +63,14 @@ def _gather_and_dequant(k_cache, indices, page_size):
     flat_idx = indices.reshape(-1)  # (N,)
     N = flat_idx.shape[0]
     device = k_cache.device
+    cache_format = get_kv_cache_format(k_cache.dtype)
+    if cache_format == DSV4KVCacheFormat.BF16:
+        raise ValueError("Packed gather only accepts an FP8 or INT8 KV cache")
+    scale_stride = (
+        FP8_SCALE_BYTES_PER_TOKEN
+        if cache_format == DSV4KVCacheFormat.FP8
+        else INT8_SCALE_BYTES_PER_TOKEN
+    )
 
     # Page-level addressing
     page_bytes = k_cache.stride(0)  # actual byte stride between pages
@@ -86,10 +107,12 @@ def _gather_and_dequant(k_cache, indices, page_size):
     )  # (N, 128)
 
     scale_section_offset = page_size * _NOPE_ROPE_STRIDE  # 147456
-    scale_base = scale_section_offset + safe_offsets * _SCALE_STRIDE  # (N,)
+    scale_base = scale_section_offset + safe_offsets * scale_stride  # (N,)
     scale_offsets = scale_base.unsqueeze(-1) + torch.arange(
-        _NUM_TILES, device=device, dtype=torch.long
-    )  # (N, 7)
+        _NUM_TILES if cache_format == DSV4KVCacheFormat.FP8 else _NUM_TILES * 4,
+        device=device,
+        dtype=torch.long,
+    )
 
     # Gather bytes per page — use advanced indexing
     # raw_pages[safe_pages, nope_offsets] → (N, 448)
@@ -103,16 +126,20 @@ def _gather_and_dequant(k_cache, indices, page_size):
     scale_bytes = raw_pages[page_idx_scale, scale_offsets]  # (N, 7) uint8
 
     # Reinterpret dtypes
-    nope_fp8 = nope_bytes.view(torch.float8_e4m3fn)  # (N, 448)
     rope_bf16 = rope_bytes.contiguous().view(torch.bfloat16)  # (N, 64)
-    scale_e8m0 = scale_bytes.view(torch.float8_e8m0fnu)  # (N, 7)
+    if cache_format == DSV4KVCacheFormat.FP8:
+        nope_quant = nope_bytes.view(torch.float8_e4m3fn).float()
+        scales = scale_bytes.view(torch.float8_e8m0fnu).float()
+    else:
+        nope_quant = nope_bytes.view(torch.int8).float()
+        scales = scale_bytes.contiguous().view(torch.float32)
 
     # Dequantize: nope_tile * scale_tile → bf16 (vectorized)
     result = torch.empty(N, _D, dtype=torch.bfloat16, device=device)
     result[:, :_NOPE_DIM] = (
         (
-            nope_fp8.view(N, _NUM_TILES, _TILE_SIZE).float()
-            * scale_e8m0.view(N, _NUM_TILES, 1).float()
+            nope_quant.view(N, _NUM_TILES, _TILE_SIZE)
+            * scales.view(N, _NUM_TILES, 1)
         )
         .view(N, _NOPE_DIM)
         .to(torch.bfloat16)

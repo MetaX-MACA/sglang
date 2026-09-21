@@ -2043,8 +2043,6 @@ class DeepseekV4AttnBackend(
 
             assert attn_sink is not None
 
-            flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
-
             assert (
                 swa_page_indices.shape[-1] % 64 == 0
             ), f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
@@ -2091,7 +2089,32 @@ class DeepseekV4AttnBackend(
                         attn_sink=attn_sink,
                     )
 
-            if _is_sm120:
+            use_triton_decode = (
+                self.token_to_kv_pool.dtype is torch.int8
+                or (
+                    envs.SGLANG_HACK_FLASHMLA_BACKEND.get() == "triton"
+                    and self.token_to_kv_pool.dtype
+                    in (torch.float8_e5m2, torch.float8_e4m3fn)
+                )
+            )
+            if use_triton_decode:
+                from sglang.srt.layers.attention.flash_mla_sm120_triton import (
+                    flash_mla_sparse_decode_triton,
+                )
+
+                o = flash_mla_sparse_decode_triton(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    softmax_scale=self.softmax_scale,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
+            elif _is_sm120:
                 from sglang.srt.layers.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )
@@ -2111,6 +2134,10 @@ class DeepseekV4AttnBackend(
             else:
                 # import sgl_kernel.flash_mla as flash_mla
                 import flash_mla
+
+                flashmla_metadata = core_attn_metadata.get_flashmla_metadata(
+                    compress_ratio
+                )
 
                 o = flash_mla.flash_mla_with_kvcache(
                     q=q,

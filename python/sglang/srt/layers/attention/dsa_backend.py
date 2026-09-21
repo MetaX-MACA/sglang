@@ -21,7 +21,9 @@ from sglang.srt.runtime_context import get_parallel
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.srt.layers.attention.dsa.dequant_k_cache import (
+    dequantize_k_cache_paged as _dequantize_k_cache_paged_generic,
+)
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
@@ -59,10 +61,25 @@ from sglang.srt.utils import (
     is_sm100_supported,
 )
 
+_dequantize_k_cache_paged_fp8_optimized = None
 if envs.MX_ENABLE_NSA_FP8_KV_OPTIMIZED_QDQ.get():
     from sglang.srt.layers.attention.dsa.quant_k_cache_optimized import (
-        dequantize_k_cache_paged_optimized as dequantize_k_cache_paged,
+        dequantize_k_cache_paged_optimized as _dequantize_k_cache_paged_fp8_optimized,
     )
+
+
+def dequantize_k_cache_paged(
+    kv_cache: torch.Tensor, page_table_1_flattened: torch.Tensor
+) -> torch.Tensor:
+    """Dispatch optimized FP8 QDQ without routing INT8 rows through FP8 code."""
+    if (
+        kv_cache.dtype is torch.float8_e4m3fn
+        and _dequantize_k_cache_paged_fp8_optimized is not None
+    ):
+        return _dequantize_k_cache_paged_fp8_optimized(
+            kv_cache, page_table_1_flattened
+        )
+    return _dequantize_k_cache_paged_generic(kv_cache, page_table_1_flattened)
 
 # Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
 # per-query flash kernel instead of TileLang. Validated on gfx950 (GLM-5.1 @
@@ -454,6 +471,12 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
+        self.dsa_kv_cache_store_int8 = (
+            model_runner.token_to_kv_pool.dsa_kv_cache_store_int8
+        )
+        self.dsa_kv_cache_is_quantized = (
+            self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8
+        )
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
@@ -463,6 +486,15 @@ class DeepseekSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        if self.dsa_kv_cache_store_int8:
+            assert (
+                self.kv_lora_rank == 512
+                and self.qk_rope_head_dim == 64
+                and self.kv_cache_dim == 656
+            ), (
+                "The basic DSA INT8 cache implementation requires "
+                "kv_lora_rank=512, qk_rope_head_dim=64, and kv_cache_dim=656"
+            )
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -1682,7 +1714,7 @@ class DeepseekSparseAttnBackend(
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        if not self.dsa_kv_cache_store_fp8:
+        if not self.dsa_kv_cache_is_quantized:
             assert kv_cache.dtype == q.dtype
         
         if q_rope is not None:
@@ -1793,6 +1825,18 @@ class DeepseekSparseAttnBackend(
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
                     page_table_1 = topk_indices
+            elif self.dsa_kv_cache_store_int8 or (
+                self.dsa_kv_cache_store_fp8
+                and envs.MX_ENABLE_NSA_FP8_KV_STORE.get()
+            ):
+                # MTP/TARGET_VERIFY (and other non-EXTEND prefill-style paths)
+                # come through here with PAGED topk_transform_method. Dequantize
+                # the quantized sparse-selected KV to bf16, mirroring the decode
+                # path, so flash_mla_sparse_fwd receives a compact bf16 cache
+                # with local page indices instead of raw packed int8/fp8 rows.
+                kv_cache, page_table_1 = _dequantize_selected_kv_cache(
+                    kv_cache, page_table_1
+                )
 
             return self._forward_flashmla_sparse(
                 q_all=q_all,
@@ -1940,8 +1984,11 @@ class DeepseekSparseAttnBackend(
 
         if self.dsa_decode_impl == "flashmla_sparse":
             if (
-                self.dsa_kv_cache_store_fp8
-                and envs.MX_ENABLE_NSA_FP8_KV_STORE.get()
+                self.dsa_kv_cache_store_int8
+                or (
+                    self.dsa_kv_cache_store_fp8
+                    and envs.MX_ENABLE_NSA_FP8_KV_STORE.get()
+                )
             ):
                 kv_cache, page_table_1 = _dequantize_selected_kv_cache(
                     kv_cache, page_table_1
@@ -2119,6 +2166,9 @@ class DeepseekSparseAttnBackend(
         self, kv_cache: torch.Tensor, page_table_1: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         kv_cache_is_fp8 = self.dsa_kv_cache_store_fp8
+        if self.dsa_kv_cache_store_int8:
+            # The in-tree functional decoder reads the packed INT8 row directly.
+            return kv_cache, page_table_1, False
         if (
             kv_cache_is_fp8
             and envs.MX_ENABLE_NSA_FP8_KV_STORE.get()
@@ -2141,6 +2191,40 @@ class DeepseekSparseAttnBackend(
         page_table_1,
         kv_cache_is_fp8: bool,
     ) -> torch.Tensor:
+        # Correctness-first replacement for third-party FlashMLA. It reads both
+        # FP8 and INT8 656-byte rows directly and keeps the vendor ABI untouched.
+        use_functional_triton = self.dsa_kv_cache_is_quantized and get_bool_env_var(
+            "SGLANG_DSA_TRITON_FLASHMLA_KV", default="true"
+        )
+        if use_functional_triton:
+            from sglang.srt.layers.attention.dsa.triton_flashmla_kv import (
+                flash_mla_with_kvcache_triton,
+            )
+
+            q_input = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+            paged_cache = kv_cache.view(
+                -1, self.real_page_size, 1, kv_cache.shape[-1]
+            )
+            assert self.real_page_size == 64, "only page size 64 is supported"
+            indices = page_table_1.unsqueeze(1)
+            assert indices.shape[-1] == self.dsa_index_topk
+            o, _ = flash_mla_with_kvcache_triton(
+                q=q_input,
+                k_cache=paged_cache,
+                cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                head_dim_v=v_head_dim,
+                softmax_scale=sm_scale,
+                indices=indices,
+                block_table=None,
+                is_fp8_kvcache=self.dsa_kv_cache_store_fp8,
+            )
+            return o
+
+        if self.dsa_kv_cache_store_int8:
+            raise RuntimeError(
+                "INT8 DSA KV cache requires SGLANG_DSA_TRITON_FLASHMLA_KV=1"
+            )
+
         from flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32
@@ -2681,7 +2765,7 @@ class DeepseekSparseAttnBackend(
 
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
-            if self.dsa_kv_cache_store_fp8:
+            if self.dsa_kv_cache_is_quantized:
                 if (
                     is_blackwell()
                     and forward_batch is not None
@@ -2706,14 +2790,15 @@ class DeepseekSparseAttnBackend(
         This method is used to select the topk transform method which can be fused or unfused.
         """
         if (
-            self.dsa_kv_cache_store_fp8
+            self.dsa_kv_cache_is_quantized
             and self.dsa_prefill_impl == "flashmla_sparse"
             and (
                 forward_mode == ForwardMode.EXTEND
                 or (
                     # Keep forced-FP8 bulk prefill dequantization proportional
                     # to resident KV tokens instead of query_count * topk.
-                    envs.MX_ENABLE_NSA_FP8_KV_STORE.get()
+                    self.dsa_kv_cache_store_fp8
+                    and envs.MX_ENABLE_NSA_FP8_KV_STORE.get()
                     and forward_mode is not None
                     and forward_mode.is_extend_without_speculative()
                 )

@@ -1891,9 +1891,19 @@ class Scheduler(
 
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
+        requested_max_new_tokens = req.sampling_params.max_new_tokens
+        token_capacity = self.max_total_num_tokens
+        # Direct-to-host HiSparse decode stores the full sequence in the logical
+        # pool. The physical GPU pool only needs to hold the hot device buffer.
+        # Normal prefill still allocates the full input on GPU.
+        if (
+            self.enable_hisparse
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+        ):
+            token_capacity = self.token_to_kv_pool_allocator.size_full
         # Keep this bound consistent with PrefillAdder's admission budget:
         # ceil_page(input_len) + max_new_tokens + page_size must be strictly
-        # smaller than max_total_num_tokens. Otherwise a request can be accepted
+        # smaller than token_capacity. Otherwise a request can be accepted
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
@@ -1906,9 +1916,29 @@ class Scheduler(
                     else 1 << 30
                 ),
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens - paged_input_len - self.page_size - 1,
+                token_capacity - paged_input_len - self.page_size - 1,
             ),
         )
+        if (
+            requested_max_new_tokens is not None
+            and req.sampling_params.max_new_tokens < requested_max_new_tokens
+        ):
+            logger.warning(
+                "Clipped max_new_tokens for rid=%s: requested=%s, effective=%s, "
+                "input_len=%s, max_req_len=%s, token_capacity=%s, "
+                "gpu_token_capacity=%s, page_size=%s, disaggregation_mode=%s, "
+                "enable_hisparse=%s",
+                req.rid,
+                requested_max_new_tokens,
+                req.sampling_params.max_new_tokens,
+                input_len,
+                self.max_req_len,
+                token_capacity,
+                self.max_total_num_tokens,
+                self.page_size,
+                self.disaggregation_mode,
+                self.enable_hisparse,
+            )
 
     def _process_and_broadcast_mm_inputs(
         self,
@@ -2598,6 +2628,30 @@ class Scheduler(
         self.future_map.stash(
             batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
         )
+        # HiSparse staging->decode is the FIRST decode for these reqs: no prior
+        # draft captured topk/hidden exist, so the NEXTN worker's idle-input
+        # fallback (``if batch.spec_info is None``) would substitute a (0, topk)
+        # stub and the draft cuda-graph copy of ``topk_p[:raw_bs]`` would then
+        # mismatch the real batch. Bootstrap a shape-correct topk=1 draft input
+        # (probability 1 on the last-sampled bonus token), mirroring
+        # ``build_eagle_disagg_draft_input``. Leave ``future_indices`` unset so
+        # overlap's ``_resolve_spec_extras`` (which gathers from future-map bufs
+        # that were never published for these brand-new seqs) leaves it intact.
+        if not self.spec_algorithm.is_none() and not self.spec_algorithm.is_ngram():
+            from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            _topk = self.server_args.speculative_eagle_topk
+            spec_info = EagleDraftInput(
+                topk_p=torch.ones(
+                    (len(reqs), _topk), dtype=torch.float32, device=device
+                ),
+                topk_index=last_tokens.unsqueeze(1).repeat(1, _topk).to(torch.int64),
+                bonus_tokens=last_tokens,
+                hidden_states=None,
+            )
+            spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+            batch.spec_info = spec_info
         batch.input_ids = None
 
         if batch.return_logprob:

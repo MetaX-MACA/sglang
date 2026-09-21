@@ -2,6 +2,16 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.dsa.kv_cache_layout import (
+    INT8_QMAX,
+    INT8_SCALE_EPS,
+    NOPE_DIM,
+    NUM_QUANT_GROUPS,
+    PACKED_BYTES_PER_TOKEN,
+    QUANT_GROUP_SIZE,
+    ROPE_DIM,
+)
+
 
 def quantize_k_cache(cache_k):
     return _quantize_k_cache_fast_wrapped(cache_k)
@@ -53,6 +63,164 @@ def quantize_k_cache_separate(
     return _quantize_k_cache_fast_separate(
         k_nope=k_nope_2d, k_rope=k_rope_2d, group_size=tile_size
     )
+
+
+def quantize_k_cache_int8_separate(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    group_size: int = QUANT_GROUP_SIZE,
+):
+    """Pack BF16 MLA KV into the DSA INT8 656-byte row format."""
+    k_nope_2d = k_nope.squeeze(1) if k_nope.ndim == 3 else k_nope
+    k_rope_2d = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
+    if k_nope_2d.ndim != 2 or k_nope_2d.shape[1] != NOPE_DIM:
+        raise ValueError(
+            f"Expected k_nope shape (num_tokens, {NOPE_DIM}), got {k_nope.shape}"
+        )
+    if k_rope_2d.ndim != 2 or k_rope_2d.shape[1] != ROPE_DIM:
+        raise ValueError(
+            f"Expected k_rope shape (num_tokens, {ROPE_DIM}), got {k_rope.shape}"
+        )
+    if k_nope_2d.shape[0] != k_rope_2d.shape[0]:
+        raise ValueError("k_nope and k_rope must have the same number of tokens")
+    if k_nope_2d.dtype is not torch.bfloat16 or k_rope_2d.dtype is not torch.bfloat16:
+        raise TypeError("The basic DSA INT8 writer expects BF16 k_nope and k_rope")
+    if group_size != QUANT_GROUP_SIZE:
+        raise ValueError(
+            f"The DSA INT8 ABI requires group_size={QUANT_GROUP_SIZE}, got {group_size}"
+        )
+    return _quantize_k_cache_int8_fast_separate(
+        k_nope_2d.contiguous(), k_rope_2d.contiguous()
+    )
+
+
+def quantize_k_cache_int8_ref(k_nope: torch.Tensor, k_rope: torch.Tensor):
+    """Pure-Torch reference for the INT8 packer, usable on CPU or CUDA."""
+    k_nope_2d = k_nope.squeeze(1) if k_nope.ndim == 3 else k_nope
+    k_rope_2d = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
+    if k_nope_2d.shape[-1] != NOPE_DIM or k_rope_2d.shape[-1] != ROPE_DIM:
+        raise ValueError(
+            f"Expected DSA dimensions {NOPE_DIM}+{ROPE_DIM}, got "
+            f"{k_nope_2d.shape[-1]}+{k_rope_2d.shape[-1]}"
+        )
+    if k_nope_2d.dtype is not torch.bfloat16 or k_rope_2d.dtype is not torch.bfloat16:
+        raise TypeError("The DSA INT8 reference packer expects BF16 inputs")
+
+    num_tokens = k_nope_2d.shape[0]
+    grouped = k_nope_2d.float().reshape(
+        num_tokens, NUM_QUANT_GROUPS, QUANT_GROUP_SIZE
+    )
+    scales = grouped.abs().amax(dim=-1).clamp(min=INT8_SCALE_EPS) / INT8_QMAX
+    quant = (
+        torch.round(grouped / scales.unsqueeze(-1))
+        .clamp(-INT8_QMAX, INT8_QMAX)
+        .to(torch.int8)
+        .reshape(num_tokens, NOPE_DIM)
+    )
+    nope_part = torch.empty(
+        (num_tokens, NOPE_DIM + NUM_QUANT_GROUPS * torch.float32.itemsize),
+        dtype=torch.uint8,
+        device=k_nope.device,
+    )
+    nope_part[:, :NOPE_DIM] = quant.contiguous().view(torch.uint8)
+    nope_part[:, NOPE_DIM:] = scales.contiguous().view(torch.uint8)
+    rope_part = k_rope_2d.contiguous().view(torch.uint8)
+    assert nope_part.shape[-1] + rope_part.shape[-1] == PACKED_BYTES_PER_TOKEN
+    return nope_part.unsqueeze(1), rope_part.unsqueeze(1)
+
+
+def _quantize_k_cache_int8_fast_separate(
+    k_nope: torch.Tensor, k_rope: torch.Tensor
+):
+    num_tokens = k_nope.shape[0]
+    nope_part = torch.empty(
+        (num_tokens, NOPE_DIM + NUM_QUANT_GROUPS * torch.float32.itemsize),
+        dtype=torch.uint8,
+        device=k_nope.device,
+    )
+    rope_part = torch.empty(
+        (num_tokens, ROPE_DIM * torch.bfloat16.itemsize),
+        dtype=torch.uint8,
+        device=k_rope.device,
+    )
+    nope_q = nope_part[:, :NOPE_DIM].view(torch.int8)
+    nope_s = nope_part[:, NOPE_DIM:].view(torch.float32)
+    rope_bf16 = rope_part.view(torch.bfloat16)
+    _quantize_k_cache_int8_kernel[(num_tokens, NUM_QUANT_GROUPS + 1)](
+        nope_q,
+        nope_s,
+        rope_bf16,
+        k_nope,
+        k_rope,
+        nope_q.stride(0),
+        nope_s.stride(0),
+        rope_bf16.stride(0),
+        k_nope.stride(0),
+        k_rope.stride(0),
+        GROUP_SIZE=QUANT_GROUP_SIZE,
+        NUM_GROUPS=NUM_QUANT_GROUPS,
+        NOPE_DIM=NOPE_DIM,
+        ROPE_DIM=ROPE_DIM,
+        SCALE_EPS=INT8_SCALE_EPS,
+        QMAX=INT8_QMAX,
+    )
+    return nope_part.unsqueeze(1), rope_part.unsqueeze(1)
+
+
+@triton.jit
+def _quantize_k_cache_int8_kernel(
+    output_nope_q_ptr,
+    output_nope_s_ptr,
+    output_rope_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    output_nope_q_stride_0: int,
+    output_nope_s_stride_0: int,
+    output_rope_stride_0: int,
+    k_nope_stride_0: int,
+    k_rope_stride_0: int,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    SCALE_EPS: tl.constexpr,
+    QMAX: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    group_id = tl.program_id(1)
+    offs = tl.arange(0, GROUP_SIZE)
+    if group_id < NUM_GROUPS:
+        dim_offs = group_id * GROUP_SIZE + offs
+        values = tl.load(
+            k_nope_ptr + token_id * k_nope_stride_0 + dim_offs,
+            mask=dim_offs < NOPE_DIM,
+            other=0.0,
+        ).to(tl.float32)
+        abs_max = tl.max(tl.abs(values))
+        scale = tl.maximum(abs_max, SCALE_EPS) / QMAX
+        quant = tl.extra.cuda.libdevice.round(values / scale)
+        quant = tl.maximum(tl.minimum(quant, QMAX), -QMAX).to(tl.int8)
+        tl.store(
+            output_nope_q_ptr + token_id * output_nope_q_stride_0 + dim_offs,
+            quant,
+            mask=dim_offs < NOPE_DIM,
+        )
+        tl.store(
+            output_nope_s_ptr + token_id * output_nope_s_stride_0 + group_id,
+            scale,
+        )
+    else:
+        rope_offs = offs
+        rope = tl.load(
+            k_rope_ptr + token_id * k_rope_stride_0 + rope_offs,
+            mask=rope_offs < ROPE_DIM,
+            other=0.0,
+        )
+        tl.store(
+            output_rope_ptr + token_id * output_rope_stride_0 + rope_offs,
+            rope,
+            mask=rope_offs < ROPE_DIM,
+        )
 
 
 # Copied from original

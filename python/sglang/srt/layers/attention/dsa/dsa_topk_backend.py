@@ -41,11 +41,12 @@ class DSATopKBackend(Enum):
         topk: int,
         row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.is_sgl_kernel():
-            from sgl_kernel import fast_topk_v2
-
-            return fast_topk_v2(score, lengths, topk, row_starts=row_starts)
-        if self.is_torch():
+        # if self.is_sgl_kernel():
+        #     from sgl_kernel import fast_topk_v2
+        #
+        #     return fast_topk_v2(score, lengths, topk, row_starts=row_starts)
+        # if self.is_torch():
+        if True:
             return _topk_unfused(
                 score,
                 lengths,

@@ -27,6 +27,11 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.attention import flash_mla_sm120 as fmod
+from sglang.srt.layers.attention.dsv4.kv_cache_layout import (
+    FP8_BYTES_PER_TOKEN,
+    INT8_BYTES_PER_TOKEN,
+    packed_page_bytes,
+)
 from sglang.srt.layers.attention.flash_mla_sm120 import (
     _D,
     _NOPE_DIM,
@@ -52,6 +57,16 @@ register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
 
 # Per-token byte layout
 _BYTES_PER_TOKEN = _NOPE_ROPE_STRIDE + _SCALE_STRIDE  # 576 + 8 = 584
+
+
+class TestDSV4PackedLayout(unittest.TestCase):
+    def test_token_and_page_sizes(self):
+        self.assertEqual(FP8_BYTES_PER_TOKEN, 584)
+        self.assertEqual(INT8_BYTES_PER_TOKEN, 608)
+        self.assertEqual(packed_page_bytes(256, torch.float8_e4m3fn), 149760)
+        self.assertEqual(packed_page_bytes(256, torch.int8), 156096)
+        self.assertEqual(packed_page_bytes(64, torch.int8), 39168)
+        self.assertEqual(packed_page_bytes(2, torch.int8), 1728)
 
 
 def _build_kvcache(
@@ -153,6 +168,84 @@ def _build_kvcache(
     return k_cache, ref_per_token
 
 
+def _build_int8_kvcache(
+    num_pages: int,
+    page_size: int,
+    *,
+    device: torch.device,
+    seed: int = 0,
+):
+    """Build the production-style 608 B/token INT8/BF16/FP32 layout."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    value_bytes = 576
+    scale_bytes = 32
+    bpt = value_bytes + scale_bytes
+    logical_page_bytes = page_size * bpt
+    page_bytes = ((logical_page_bytes + 575) // 576) * 576
+    flat = torch.zeros(num_pages, page_bytes, dtype=torch.uint8, device=device)
+
+    source = (
+        torch.randn(
+            num_pages,
+            page_size,
+            _NOPE_DIM,
+            generator=g,
+            dtype=torch.float32,
+        )
+        .clamp(-3.0, 3.0)
+        .to(device)
+    )
+    grouped = source.view(num_pages, page_size, _NUM_TILES, _TILE_SIZE)
+    scales = grouped.abs().amax(dim=-1).clamp(min=1.0e-4) / 127.0
+    nope_int8 = torch.round(grouped / scales.unsqueeze(-1)).clamp(-127, 127).to(
+        torch.int8
+    )
+    rope = (
+        torch.randn(
+            num_pages,
+            page_size,
+            _ROPE_DIM,
+            generator=g,
+            dtype=torch.float32,
+        )
+        .clamp(-2.0, 2.0)
+        .to(torch.bfloat16)
+        .to(device)
+    )
+
+    values = torch.zeros(
+        num_pages, page_size, value_bytes, dtype=torch.uint8, device=device
+    )
+    values[:, :, :_NOPE_DIM] = nope_int8.reshape(
+        num_pages, page_size, _NOPE_DIM
+    ).contiguous().view(torch.uint8)
+    values[:, :, _NOPE_DIM:] = rope.contiguous().view(torch.uint8)
+    flat[:, : page_size * value_bytes] = values.reshape(
+        num_pages, page_size * value_bytes
+    )
+
+    scale_records = torch.zeros(
+        num_pages, page_size, 8, dtype=torch.float32, device=device
+    )
+    scale_records[:, :, :_NUM_TILES] = scales
+    flat[:, page_size * value_bytes : logical_page_bytes] = (
+        scale_records.contiguous()
+        .view(torch.uint8)
+        .reshape(num_pages, page_size * scale_bytes)
+    )
+
+    # Match the backend: slice away page-end alignment, then form a logical
+    # token view while retaining the physical stride(0).
+    cache = flat[:, :logical_page_bytes].view(
+        num_pages, page_size, 1, bpt
+    ).view(torch.int8)
+    ref_nope = (
+        nope_int8.float() * scales.unsqueeze(-1)
+    ).reshape(num_pages, page_size, _NOPE_DIM)
+    ref = torch.cat([ref_nope.to(torch.bfloat16), rope], dim=-1)
+    return cache, ref
+
+
 def _build_q_indices(
     batch_size: int,
     num_heads: int,
@@ -212,6 +305,17 @@ class TestGatherAndDequant(CustomTestCase):
         # bf16 dequant: allow up to 1 ULP per element.  Scales are integral
         # powers of 2 so the only loss is the fp8 -> bf16 mantissa rounding.
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    def test_int8_dequant_matches_manual(self):
+        k_cache, ref = _build_int8_kvcache(
+            3, 64, device=self.device, seed=142
+        )
+        token_ids = torch.tensor(
+            [[0, 64 + 32, 2 * 64 + 63]], dtype=torch.int32, device=self.device
+        )
+        out = _gather_and_dequant(k_cache, token_ids, 64)
+        expected = torch.stack([ref[0, 0], ref[1, 32], ref[2, 63]], dim=0)
+        torch.testing.assert_close(out[0], expected, atol=1e-2, rtol=1e-2)
 
     def test_dequant_handles_full_page_range(self):
         """All token positions in a single page produce correct output."""
@@ -308,6 +412,22 @@ class TestSparseDecodeTritonVsTorch(CustomTestCase):
 
     def test_triton_vs_torch_basic(self):
         self._run()
+
+    def test_int8_triton_vs_torch_basic(self):
+        k_cache, _ = _build_int8_kvcache(4, 64, device=self.device, seed=17)
+        q, indices = _build_q_indices(
+            2, 4, 64, 4, 64, device=self.device, seed=19
+        )
+        topk_length = torch.tensor([64, 41], dtype=torch.int32, device=self.device)
+        ref_out, _ = _sm120_sparse_decode_fwd(
+            q, k_cache, indices, topk_length, None, _D, _D**-0.5
+        )
+        tri_out, _ = flash_mla_sparse_decode_triton(
+            q, k_cache, indices, topk_length, None, _D, _D**-0.5
+        )
+        torch.testing.assert_close(
+            tri_out.float(), ref_out.float(), atol=5e-2, rtol=5e-2
+        )
 
     def test_triton_vs_torch_no_topk_length(self):
         self._run(with_topk_length=False)

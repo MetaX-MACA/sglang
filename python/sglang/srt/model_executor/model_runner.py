@@ -61,6 +61,7 @@ from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
     get_num_indexer_layers,
     is_deepseek_dsa,
+    is_deepseek_v4,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
@@ -282,6 +283,7 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
     torch.float8_e4m3fnuz: "fp8_e4m3",
     torch.float8_e5m2: "fp8_e5m2",
     torch.bfloat16: "bf16",
+    torch.int8: "int8",
 }
 
 
@@ -1020,7 +1022,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 enable=get_global_server_args().enable_return_routed_experts,
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1047,7 +1049,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 enable=enable,
                 num_indexer_layers=num_indexer_layers,
                 index_topk=index_topk,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -2384,6 +2386,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def max_token_pool_size(self):
+        """Return the max token pool size considering hybrid swa and hisparse settings."""
+        if self.enable_hisparse:
+            # HiSparse uses the host-backed full pool capacity.
+            size_full = getattr(self.token_to_kv_pool_allocator, "size_full", None)
+            if size_full is not None:
+                return size_full
+
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
@@ -2454,6 +2463,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.kv_cache_dtype = torch.float8_e4m3fn
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
+        elif self.server_args.kv_cache_dtype == "int8":
+            if not is_deepseek_dsa(
+                self.model_config.hf_config
+            ) and not is_deepseek_v4(self.model_config.hf_config):
+                raise ValueError(
+                    "INT8 KV cache is currently supported only by DSA / DSV4"
+                )
+            self.kv_cache_dtype = torch.int8
         elif self.server_args.kv_cache_dtype == "fp4_e2m1":
             if hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2

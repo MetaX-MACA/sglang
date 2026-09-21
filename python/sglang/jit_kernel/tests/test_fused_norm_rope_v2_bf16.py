@@ -10,6 +10,9 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
+    dequantize_k_cache_paged,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -270,6 +273,56 @@ def test_fused_norm_rope_v2_flashmla_bf16_cache_decode() -> None:
 
 def _flashmla_fp8_page_bytes(page_size: int) -> int:
     return math.ceil(584 * page_size / 576) * 576
+
+
+def _flashmla_int8_page_bytes(page_size: int) -> int:
+    return math.ceil(608 * page_size / 576) * 576
+
+
+def test_fused_norm_rope_v2_int8_flashmla_cache() -> None:
+    torch.manual_seed(13)
+    batch_size = 5
+    head_dim = 512
+    page_size = 8
+    compress_ratio = 4
+    out_loc = torch.tensor([0, 1, 7, 9, 17], device=DEVICE, dtype=torch.int64)
+    num_pages = int(out_loc.max().item()) // page_size + 1
+    seq_lens = torch.tensor([4, 8, 12, 16, 20], device=DEVICE, dtype=torch.int32)
+    positions = seq_lens.long() - compress_ratio
+    x = torch.randn(batch_size, head_dim, device=DEVICE, dtype=DTYPE)
+    weight = torch.randn(head_dim, device=DEVICE, dtype=DTYPE)
+    freqs_cis = _make_freqs_cis()
+    cache = torch.zeros(
+        (num_pages, _flashmla_int8_page_bytes(page_size)),
+        device=DEVICE,
+        dtype=torch.int8,
+    )
+
+    _run_kernel_decode(
+        head_dim=head_dim,
+        page_size=page_size,
+        input_tensor=x,
+        weight=weight,
+        freqs_real=_freqs_real(freqs_cis),
+        seq_lens=seq_lens,
+        out_loc=out_loc,
+        kvcache=cache,
+        compress_ratio=compress_ratio,
+    )
+    torch.cuda.synchronize()
+
+    out = dequantize_k_cache_paged(cache, out_loc, page_size)[:, 0]
+    ref = _apply_tail_rope(_rmsnorm_weighted(x, weight), freqs_cis, positions)
+    groups = ref[:, :448].view(batch_size, 7, 64)
+    scales = groups.abs().amax(dim=-1).clamp(min=1.0e-4) / 127.0
+    quant = torch.round(groups / scales.unsqueeze(-1)).clamp(-127, 127)
+    expected = ref.to(torch.bfloat16)
+    expected[:, :448] = (quant * scales.unsqueeze(-1)).reshape(
+        batch_size, 448
+    ).to(torch.bfloat16)
+    triton.testing.assert_close(
+        out.float(), expected.float(), atol=4e-2, rtol=4e-2
+    )
 
 
 def test_fused_norm_rope_v2_existing_fp8_cache_interfaces_still_run() -> None:

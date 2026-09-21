@@ -177,8 +177,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         if mr.use_mla_backend:
             kv_cache_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
-            if is_deepseek_dsa(model_config.hf_config):
-                # DSA FP8 uses a packed row with scales and keeps RoPE in BF16.
+            if is_deepseek_dsa(model_config.hf_config) and kv_cache_dtype in (
+                torch.float8_e4m3fn,
+                torch.int8,
+            ):
+                # DSA FP8/INT8 uses a packed row with FP32 scales and BF16 RoPE.
                 # Match the dimension used by the allocated KV pool.
                 kv_cache_dim = mr.calculate_mla_kv_cache_dim()
             cell_size = kv_cache_dim * num_layers * kv_size
@@ -584,6 +587,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_bytes_per_full_token(self) -> float:
         if self.kv_cache_dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
             kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        elif self.kv_cache_dtype is torch.int8:
+            # 448 INT8 NOPE + 64 BF16 RoPE + 7 FP32 scales + 4-byte pad.
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 32
         else:
             assert self.kv_cache_dtype is torch.bfloat16
             kv_bytes = (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2

@@ -1186,6 +1186,23 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
         self.assertEqual(config.compiler, "eager")
 
 
+class TestDsaInt8Policy(unittest.TestCase):
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_int8_is_accepted_and_uses_basic_backends(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", kv_cache_dtype="int8")
+        server_args._set_default_dsa_kv_cache_dtype(major=9, quantization="")
+        server_args._set_default_dsa_backends(kv_cache_dtype="int8", major=9)
+        self.assertEqual(server_args.kv_cache_dtype, "int8")
+        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_sparse")
+        self.assertEqual(server_args.dsa_decode_backend, "flashmla_kv")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_int8_basic_path_rejects_rocm(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", kv_cache_dtype="int8")
+        with self.assertRaisesRegex(ValueError, "CUDA only"):
+            server_args._set_default_dsa_kv_cache_dtype(major=9, quantization="")
+
+
 class TestCutedslMoeMaxNumTokens(CustomTestCase):
     """The shared CuteDSL MoE per-forward token bound. Fields are set directly
     to exercise the math independently of __post_init__ resolution.

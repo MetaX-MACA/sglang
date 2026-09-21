@@ -40,7 +40,8 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     assert server_args.kv_cache_dtype in [
         "fp8_e4m3",
         "bfloat16",
-        "bf16"
+        "bf16",
+        "int8",
     ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
     if server_args.max_running_requests is None:
