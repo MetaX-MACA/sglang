@@ -49,15 +49,19 @@ def topk_transform_512(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    if is_hip_runtime():
-        torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
-            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
-        )
-    else:
-        module = _jit_topk_v1_module(out_page_indices.shape[1])
-        module.topk_transform(
-            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
-        )
+    torch.ops.sgl_kernel.topk_transform_v1.default(
+        scores, seq_lens, out_page_indices, page_tables, page_size, out_raw_indices
+    )
+
+    # if is_hip_runtime():
+    #     torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
+    #         scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+    #     )
+    # else:
+    #     module = _jit_topk_v1_module(out_page_indices.shape[1])
+    #     module.topk_transform(
+    #         scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+    #     )
 
 
 _WORKSPACE_INTS_PER_BATCH = 2 + 1024 * 2
