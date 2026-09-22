@@ -1,4 +1,4 @@
-"""Fused Q per-head RMSNorm + KV RMSNorm + RoPE + FP8 nope quant + paged SWA store.
+"""Fused Q/KV RMSNorm + RoPE + FP8/INT8 NOPE quant + paged SWA store.
 
 Single Triton kernel replacing the 2-kernel path:
   1. fused_reduce_qk_norm_rope_swa_write (norm + RoPE)
@@ -6,7 +6,7 @@ Single Triton kernel replacing the 2-kernel path:
 
 Grid: (cdiv(M, BLOCK_SIZE_M), num_local_heads + 1).
   pid_h < num_local_heads: Q head programs (split-K reduce + norm + RoPE)
-  pid_h == num_local_heads: KV program (norm + RoPE + FP8 quant nope + paged scatter)
+  pid_h == num_local_heads: KV program (norm + RoPE + quantized paged scatter)
 """
 
 from typing import Optional
@@ -15,6 +15,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.dsv4.kv_cache_layout import (
+    INT8_SCALE_BYTES_PER_TOKEN,
+    NOPE_DIM,
+    NUM_QUANT_GROUPS,
+    QUANT_GROUP_SIZE,
+    ROPE_DIM,
+)
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
 _fp8_fnuz = is_fp8_fnuz()
@@ -96,6 +103,7 @@ def _fused_qk_norm_rope_store_kernel(
     BYTES_PER_TOKEN: tl.constexpr,
     SWA_PAGE_SIZE: tl.constexpr,
     BF16_STORE: tl.constexpr,
+    INT8_STORE: tl.constexpr,
 ):
     pid_m = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1).to(tl.int64)
@@ -197,15 +205,14 @@ def _fused_qk_norm_rope_store_kernel(
         mask=src_mask[:, None],
     )
 
-    # ===== Paged SWA store: FP8 quant nope + BF16 rope + scales =====
-    # Layout within a page (matches fused_store_flashmla_cache CUDA kernel):
+    # ===== Paged SWA store: quantized nope + BF16 rope + scales =====
+    # Layout within a page:
     #   Values region: [page_size tokens * 576 bytes/token]
-    #     Per token: 448 bytes FP8 nope + 128 bytes BF16 rope
-    #   Scales region: [page_size tokens * 8 bytes/token]
-    #     Per token: 7 scale bytes + 1 pad byte
-    # Total per page before padding: page_size * 584
+    #     Per token: 448 bytes FP8/INT8 nope + 128 bytes BF16 rope
+    #   FP8 scale record: 7 UE8M0 bytes + 1 pad byte
+    #   INT8 scale record: 7 FP32 values + 4 pad bytes
     VALUE_STRIDE: tl.constexpr = DIM_NOPE + ROPE_DIM * 2
-    SCALE_BYTES: tl.constexpr = NUM_NOPE_TILES + 1
+    SCALE_BYTES: tl.constexpr = 32 if INT8_STORE else NUM_NOPE_TILES + 1
 
     if HAS_SWA_STORE and BF16_STORE:
         # unified_kv unified_kv: write the whole head_dim as plain bf16 into a
@@ -250,30 +257,55 @@ def _fused_qk_norm_rope_store_kernel(
             ).to(tl.float32)
 
             abs_max = tl.max(tl.abs(tile_data), axis=-1)
-            abs_max_c = tl.maximum(abs_max, EPS)
-            scale_f = abs_max_c / FP8_MAX
-            log2_s = tl.log2(scale_f)
-            ceil_log2 = tl.math.ceil(log2_s)
-            scale_pow2 = tl.exp2(ceil_log2)
-            inv_scale = 1.0 / scale_pow2
-            x_scaled = tile_data * inv_scale[:, None]
-            x_fp8 = tl.clamp(x_scaled, FP8_MIN, FP8_MAX)
+            if INT8_STORE:
+                scale_f = tl.maximum(abs_max, 1.0e-4) / 127.0
+                x_scaled = tile_data / scale_f[:, None]
+                x_int8 = tl.extra.cuda.libdevice.round(x_scaled).to(tl.int8)
+                x_bytes = x_int8.to(tl.uint8, bitcast=True)
+                value_byte_offs = (
+                    value_base[:, None] + tile_start + nope_tile_offs[None, :]
+                )
+                tl.store(
+                    swa_cache_ptr + value_byte_offs,
+                    x_bytes,
+                    mask=src_mask[:, None],
+                )
 
-            x_fp8_cast = x_fp8.to(tl.float8e4nv)
-            x_fp8_bytes = x_fp8_cast.to(tl.uint8, bitcast=True)
-            fp8_byte_offs = value_base[:, None] + tile_start + nope_tile_offs[None, :]
-            tl.store(
-                swa_cache_ptr + fp8_byte_offs,
-                x_fp8_bytes,
-                mask=src_mask[:, None],
-            )
+                scale_bits = scale_f.to(tl.int32, bitcast=True)
+                for byte_i in tl.static_range(4):
+                    scale_byte = ((scale_bits >> (byte_i * 8)) & 0xFF).to(tl.uint8)
+                    tl.store(
+                        swa_cache_ptr + scale_base + tile_i * 4 + byte_i,
+                        scale_byte,
+                        mask=src_mask,
+                    )
+            else:
+                abs_max_c = tl.maximum(abs_max, EPS)
+                scale_f = abs_max_c / FP8_MAX
+                log2_s = tl.log2(scale_f)
+                ceil_log2 = tl.math.ceil(log2_s)
+                scale_pow2 = tl.exp2(ceil_log2)
+                inv_scale = 1.0 / scale_pow2
+                x_scaled = tile_data * inv_scale[:, None]
+                x_fp8 = tl.clamp(x_scaled, FP8_MIN, FP8_MAX)
 
-            scale_uint8 = (ceil_log2.to(tl.int32) + 127).to(tl.uint8)
-            tl.store(
-                swa_cache_ptr + scale_base + tile_i,
-                scale_uint8,
-                mask=src_mask,
-            )
+                x_fp8_cast = x_fp8.to(tl.float8e4nv)
+                x_fp8_bytes = x_fp8_cast.to(tl.uint8, bitcast=True)
+                fp8_byte_offs = (
+                    value_base[:, None] + tile_start + nope_tile_offs[None, :]
+                )
+                tl.store(
+                    swa_cache_ptr + fp8_byte_offs,
+                    x_fp8_bytes,
+                    mask=src_mask[:, None],
+                )
+
+                scale_uint8 = (ceil_log2.to(tl.int32) + 127).to(tl.uint8)
+                tl.store(
+                    swa_cache_ptr + scale_base + tile_i,
+                    scale_uint8,
+                    mask=src_mask,
+                )
 
         rope_data = kv_pe.to(tl.bfloat16)
         rope_offs = tl.arange(0, ROPE_DIM)
@@ -313,7 +345,7 @@ def fused_qk_norm_rope_swa_store(
     Args:
         q: [M, N] or [splitk, M, N] where N = num_local_heads * head_dim
         kv: [M, head_dim=512] mutated in-place (norm + RoPE)
-        swa_cache: paged SWA KV pool buffer [num_pages, bytes_per_page] uint8 OR a plain [num_slots, head_dim] bf16 cache
+        swa_cache: paged FP8/INT8 SWA buffer, or a plain BF16 cache.
         swa_loc: [M] int32 pre-translated paged indices
         swa_page_size: tokens per SWA page (default 128)
         bf16_store: write the whole head_dim as plain bf16 at swa_cache[swa_loc]
@@ -340,13 +372,14 @@ def fused_qk_norm_rope_swa_store(
         )
 
     HAS_SWA_STORE = swa_cache is not None and swa_loc is not None
+    int8_store = HAS_SWA_STORE and swa_cache.dtype is torch.int8 and not bf16_store
 
-    dim_nope = 448
-    dim_rope = 64
-    tile_size = 64
-    num_nope_tiles = dim_nope // tile_size
-    scale_pad = 1
-    bytes_per_token = dim_nope + dim_rope * 2 + num_nope_tiles + scale_pad
+    dim_nope = NOPE_DIM
+    dim_rope = ROPE_DIM
+    tile_size = QUANT_GROUP_SIZE
+    num_nope_tiles = NUM_QUANT_GROUPS
+    scale_bytes = INT8_SCALE_BYTES_PER_TOKEN if int8_store else num_nope_tiles + 1
+    bytes_per_token = dim_nope + dim_rope * 2 + scale_bytes
 
     if _fp8_fnuz:
         fp8_info = torch.finfo(torch.float8_e4m3fnuz)
@@ -366,7 +399,11 @@ def fused_qk_norm_rope_swa_store(
         positions,
         cos_cache,
         sin_cache,
-        swa_cache if HAS_SWA_STORE else None,
+        (
+            swa_cache.view(torch.uint8)
+            if int8_store
+            else (swa_cache if HAS_SWA_STORE else None)
+        ),
         swa_loc if HAS_SWA_STORE else None,
         M,
         q_in_splitk_stride,
@@ -396,6 +433,7 @@ def fused_qk_norm_rope_swa_store(
         BYTES_PER_TOKEN=bytes_per_token,
         SWA_PAGE_SIZE=swa_page_size,
         BF16_STORE=bf16_store,
+        INT8_STORE=int8_store,
         num_warps=num_warps,
     )
     return q_out
