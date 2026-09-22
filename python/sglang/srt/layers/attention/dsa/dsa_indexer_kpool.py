@@ -52,6 +52,14 @@ from sglang.srt.runtime_context import get_device, get_parallel
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
+# Index-k cache storage dtypes by SGLANG_DSA_INDEX_CACHE_TYPE:
+#   "fp8"  -> raw storage uint8,  real value dtype float8_e4m3fn
+#   "int8" -> raw storage int8,   real value dtype int8
+_INDEX_CACHE_DTYPES: Dict[str, Tuple[torch.dtype, torch.dtype]] = {
+    "fp8": (torch.uint8, torch.float8_e4m3fn),
+    "int8": (torch.int8, torch.int8),
+}
+
 
 class IndexerKPool(MultiPlatformOp):
     def __init__(
@@ -160,6 +168,26 @@ class IndexerKPool(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+    @staticmethod
+    def _get_index_k_cache_type() -> Tuple[torch.dtype, torch.dtype]:
+        """Return (raw storage dtype, real value dtype) of the index-k cache."""
+        cache_type = envs.SGLANG_DSA_INDEX_CACHE_TYPE.get()
+        if cache_type not in _INDEX_CACHE_DTYPES:
+            raise NotImplementedError(
+                f"index cache only support fp8 and int8, got {cache_type}"
+            )
+        return _INDEX_CACHE_DTYPES[cache_type]
+
+    @staticmethod
+    def _assert_index_k_buf_dtype(buf: torch.Tensor) -> None:
+        """Assert the raw index-k buffer dtype matches SGLANG_DSA_INDEX_CACHE_TYPE."""
+        storage_dtype, real_dtype = IndexerKPool._get_index_k_cache_type()
+        assert buf.dtype in (storage_dtype, real_dtype), (
+            f"index-k buffer dtype mismatch: got {buf.dtype}, "
+            f"expected {storage_dtype} (raw) or {real_dtype} (real) "
+            f"for SGLANG_DSA_INDEX_CACHE_TYPE={envs.SGLANG_DSA_INDEX_CACHE_TYPE.get()}"
+        )
+
     @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x.float())
@@ -202,8 +230,8 @@ class IndexerKPool(MultiPlatformOp):
 
     @staticmethod
     def _int8_mqa_logits(
-        q_fp8: torch.Tensor,
-        k_fp8: torch.Tensor,
+        q_int8: torch.Tensor,
+        k_int8: torch.Tensor,
         k_scale: torch.Tensor,
         weights: torch.Tensor,
         starts: torch.Tensor,
@@ -212,8 +240,8 @@ class IndexerKPool(MultiPlatformOp):
         clean_logits: bool,
     ) -> torch.Tensor:
         return deep_gemm.int8_mqa_logits(
-            q_fp8,
-            (k_fp8, k_scale),
+            q_int8,
+            (k_int8, k_scale),
             weights,
             starts,
             ends,
@@ -270,10 +298,12 @@ class IndexerKPool(MultiPlatformOp):
     ):
         if slot_k.shape[0] == 0:
             if return_compressed:
+                # Follow the configured index cache dtype instead of hardcoding fp8.
+                _, k_real_dtype = self._get_index_k_cache_type()
                 return (
                     torch.empty(
                         (0, self.head_dim),
-                        dtype=torch.float8_e4m3fn,
+                        dtype=k_real_dtype,
                         device=slot_k.device,
                     ),
                     torch.empty((0,), dtype=torch.float32, device=slot_k.device),
@@ -292,6 +322,7 @@ class IndexerKPool(MultiPlatformOp):
             write_cache = False
 
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+        self._assert_index_k_buf_dtype(buf)
         return kpool_softmax_rotate_write_cache(
             pool=pool,
             buf=buf,
@@ -307,14 +338,15 @@ class IndexerKPool(MultiPlatformOp):
 
     @staticmethod
     def _write_returned_compressed_pooled_index_cache(
-        forward_batch, layer_id, write_locs, k_fp8, k_scale
+        forward_batch, layer_id, write_locs, k_value, k_scale
     ):
-        if k_fp8.shape[0] == 0:
+        """Write compressed entries (value dtype) back into the raw cache."""
+        if k_value.shape[0] == 0:
             return
         get_token_to_kv_pool().set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=write_locs.contiguous(),
-            index_k=k_fp8.contiguous(),
+            index_k=k_value.contiguous(),
             index_k_scale=k_scale.contiguous(),
         )
 
@@ -460,6 +492,7 @@ class IndexerKPool(MultiPlatformOp):
                         )
             if not writes.is_empty:
                 buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+                self._assert_index_k_buf_dtype(buf)
                 kpool_assemble_softmax_rotate_write_cache(
                     pool=pool,
                     buf=buf,
@@ -479,6 +512,7 @@ class IndexerKPool(MultiPlatformOp):
                     round_scale=self.scale_fmt is not None,
                 )
                 if cache_cp is not None and write_cache:
+                    self._assert_index_k_buf_dtype(buf)
                     all_gather_and_scatter_pool_slots(
                         buf=buf,
                         local_locs=writes.write_loc,
@@ -908,6 +942,11 @@ class IndexerKPool(MultiPlatformOp):
         block_tables = metadata.get_page_table_64()
 
         kv_cache = self._get_index_k_read_buffer(pool, layer_id)
+        k_raw_dtype, k_real_dtype = self._get_index_k_cache_type()
+        assert kv_cache.dtype in (
+            k_raw_dtype,
+            k_real_dtype,
+        ), f"index-k cache dtype {kv_cache.dtype} does not match SGLANG_DSA_INDEX_CACHE_TYPE"
 
         blocksize = page_size
         if (
@@ -935,9 +974,13 @@ class IndexerKPool(MultiPlatformOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        use_aiter_paged_mqa = is_hip()
+        # AITER / tilelang paged-MQA kernels are fp8-only; fall back to
+        # deep_gemm dispatch below for int8 caches.
+        is_fp8_cache = k_real_dtype == torch.float8_e4m3fn
+        use_aiter_paged_mqa = is_hip() and is_fp8_cache
         use_tilelang_paged_mqa = (
             not use_aiter_paged_mqa
+            and is_fp8_cache
             and self._should_use_tilelang_paged_mqa_logits(q)
         )
 
@@ -992,8 +1035,8 @@ class IndexerKPool(MultiPlatformOp):
                 from deep_gemm import int8_paged_mqa_logits as fn
             else:
                 assert kv_cache.dtype == torch.bfloat16
-                from deep_gemm import bf16_paged_mqa_logits  as fn
-            
+                from deep_gemm import bf16_paged_mqa_logits as fn
+
             logits = fn(
                 q.unsqueeze(1),
                 kv_cache,
@@ -1148,7 +1191,7 @@ class IndexerKPool(MultiPlatformOp):
         actual_seq_q: int,
         cp_index: Optional[List[Tuple[int, int, int]]] = None,
     ) -> torch.Tensor:
-        assert q_fp8.dtpye == torch.uint8, f"Only support fp8 when cp enable"
+        # q dtype follows the configured index cache type (fp8 or int8).
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             build_pooled_page_table_64,
             gather_index_k_scale_prefix_into,
@@ -1193,8 +1236,11 @@ class IndexerKPool(MultiPlatformOp):
                 .to(torch.int32)
                 .contiguous()
             )
-            k_u8 = torch.empty(
-                (pool_kv_len, self.head_dim), dtype=torch.uint8, device=device
+
+            k_raw_dtype, k_real_dtype = self._get_index_k_cache_type()
+
+            k_u8_or_i8 = torch.empty(
+                (pool_kv_len, self.head_dim), dtype=k_raw_dtype, device=device
             )
             k_scale = torch.empty((pool_kv_len,), dtype=torch.float32, device=device)
             gather_index_k_scale_prefix_into(
@@ -1202,23 +1248,36 @@ class IndexerKPool(MultiPlatformOp):
                 buf=self._get_index_k_read_buffer(pool, layer_id),
                 page_indices=packed_page_indices,
                 seq_len=pool_kv_len,
-                k_out=k_u8,
+                k_out=k_u8_or_i8,
                 scale_out=k_scale,
             )
-            k_fp8 = k_u8.view(torch.float8_e4m3fn)
             ks = torch.zeros((actual_seq_q,), dtype=torch.int32, device=device)
             ke = torch.div(tail_tokens, pool_size, rounding_mode="floor").to(
                 torch.int32
             )
-            logits = self._fp8_mqa_logits(
-                q_work,
-                k_fp8.contiguous(),
-                k_scale.contiguous(),
-                weights_work,
-                ks,
-                ke,
-                clean_logits=True,
-            )
+            if k_raw_dtype == torch.uint8:
+                k_fp8 = k_u8_or_i8.view(k_real_dtype)
+                logits = self._fp8_mqa_logits(
+                    q_work,
+                    k_fp8.contiguous(),
+                    k_scale.contiguous(),
+                    weights_work,
+                    ks,
+                    ke,
+                    clean_logits=True,
+                )
+            else:
+                assert k_raw_dtype == torch.int8
+                logits = self._int8_mqa_logits(
+                    q_work,
+                    k_u8_or_i8.contiguous(),
+                    k_scale.contiguous(),
+                    weights_work,
+                    ks,
+                    ke,
+                    clean_logits=True,
+                )
+
             pool_lens = ke
         else:
             logits = torch.empty((actual_seq_q, 0), dtype=torch.float32, device=device)
@@ -1290,10 +1349,13 @@ class IndexerKPool(MultiPlatformOp):
             attn_metadata, "kpool_seqlens_expanded", None
         )
 
+        k_raw_dtype, k_real_dtype = self._get_index_k_cache_type()
+
         q_offset = 0
         cache_write_stream = None
         pending_cache_req_pool_indices = set()
         pending_cache_tensors = []
+
         for i in range(forward_batch.batch_size):
             q_len = int(forward_batch.extend_seq_lens_cpu[i])
             if q_len == 0:
@@ -1326,12 +1388,12 @@ class IndexerKPool(MultiPlatformOp):
                 )
                 deferred_cache_write = None
                 if cached_current is not None:
-                    curr_pool_start, curr_k_fp8, curr_k_scale = cached_current[:3]
-                    curr_pool_len = curr_k_fp8.shape[0]
+                    curr_pool_start, curr_k_value, curr_k_scale = cached_current[:3]
+                    curr_pool_len = curr_k_value.shape[0]
                     if len(cached_current) == 4:
                         deferred_cache_write = (
                             cached_current[3],
-                            curr_k_fp8,
+                            curr_k_value,
                             curr_k_scale,
                         )
                 else:
@@ -1342,18 +1404,18 @@ class IndexerKPool(MultiPlatformOp):
                     and self.alt_stream is not None
                     and not get_is_capture_mode()
                 ):
-                    write_locs, write_k_fp8, write_k_scale = deferred_cache_write
+                    write_locs, write_k_value, write_k_scale = deferred_cache_write
                     current_stream = torch.cuda.current_stream()
                     self.alt_stream.wait_stream(current_stream)
                     pending_cache_tensors.append(
-                        (write_locs, write_k_fp8, write_k_scale)
+                        (write_locs, write_k_value, write_k_scale)
                     )
                     with torch.cuda.stream(self.alt_stream):
                         self._write_returned_compressed_pooled_index_cache(
                             forward_batch,
                             layer_id,
                             write_locs,
-                            write_k_fp8,
+                            write_k_value,
                             write_k_scale,
                         )
                     cache_write_stream = self.alt_stream
@@ -1365,7 +1427,9 @@ class IndexerKPool(MultiPlatformOp):
                     and curr_pool_start == 0
                     and curr_pool_len == pool_seq_len
                 ):
-                    k_fp8 = curr_k_fp8
+                    # Normalize dtype in case the cached tensor was produced
+                    # under a different view (e.g. raw uint8 vs real fp8).
+                    k_value = curr_k_value.view(k_real_dtype)
                     k_scale = curr_k_scale
                 elif (
                     cached_current is not None
@@ -1387,9 +1451,9 @@ class IndexerKPool(MultiPlatformOp):
                             pooled_page_table = build_pooled_page_table_64(
                                 token_page_table, pool_size
                             )[:pool_pages].contiguous()
-                        k_u8 = torch.empty(
+                        k_u8_or_i8 = torch.empty(
                             (pool_seq_len, self.head_dim),
-                            dtype=torch.uint8,
+                            dtype=k_raw_dtype,
                             device=q_fp8.device,
                         )
                         k_scale = torch.empty(
@@ -1401,16 +1465,19 @@ class IndexerKPool(MultiPlatformOp):
                             buf=self._get_index_k_read_buffer(pool, layer_id),
                             page_indices=pooled_page_table,
                             seq_len=curr_pool_start,
-                            k_out=k_u8,
+                            k_out=k_u8_or_i8,
                             scale_out=k_scale,
                         )
-                        k_u8[curr_pool_start:pool_seq_len].copy_(
-                            curr_k_fp8.view(torch.uint8)
+                        k_u8_or_i8[curr_pool_start:pool_seq_len].copy_(
+                            curr_k_value.view(k_raw_dtype)
                         )
                         k_scale[curr_pool_start:pool_seq_len].copy_(curr_k_scale)
-                        k_fp8 = k_u8.view(torch.float8_e4m3fn)
+                        if k_raw_dtype == torch.uint8:
+                            k_fp8 = k_u8_or_i8.view(k_real_dtype)
+                        else:
+                            k_fp8 = k_u8_or_i8
                     else:
-                        k_fp8 = curr_k_fp8
+                        k_fp8 = curr_k_value.view(k_real_dtype)
                         k_scale = curr_k_scale
                 else:
                     pooled_page_table = (
@@ -1430,14 +1497,14 @@ class IndexerKPool(MultiPlatformOp):
                     seq_len_t = torch.tensor(
                         [pool_seq_len], dtype=torch.int32, device=q_fp8.device
                     )
-                    k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
+                    k_raw, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
                         layer_id,
                         seq_len_t,
                         pooled_page_table.unsqueeze(0),
                         pool_seq_len,
                         pool_seq_len,
                     )
-                    k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+                    k_raw = k_raw.view(k_real_dtype)
                     k_scale = k_scale.view(torch.float32).squeeze(-1)
                 row_starts = (
                     zero_starts_by_batch[i]
@@ -1445,15 +1512,26 @@ class IndexerKPool(MultiPlatformOp):
                     and zero_starts_by_batch[i] is not None
                     else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
                 )
-                local_logits = self._fp8_mqa_logits(
-                    q_fp8[q_slice].contiguous(),
-                    k_fp8.contiguous(),
-                    k_scale.contiguous(),
-                    weights[q_slice].contiguous(),
-                    row_starts,
-                    local_pool_lens,
-                    clean_logits=True,
-                )
+                if k_raw_dtype == torch.uint8:
+                    local_logits = self._fp8_mqa_logits(
+                        q_fp8[q_slice].contiguous(),
+                        k_fp8.contiguous(),
+                        k_scale.contiguous(),
+                        weights[q_slice].contiguous(),
+                        row_starts,
+                        local_pool_lens,
+                        clean_logits=True,
+                    )
+                else:
+                    local_logits = self._int8_mqa_logits(
+                        q_fp8[q_slice].contiguous(),
+                        k_fp8.contiguous(),
+                        k_scale.contiguous(),
+                        weights[q_slice].contiguous(),
+                        row_starts,
+                        local_pool_lens,
+                        clean_logits=True,
+                    )
             else:
                 local_logits = torch.empty(
                     (q_len, 0), dtype=torch.float32, device=q_fp8.device
@@ -1488,12 +1566,12 @@ class IndexerKPool(MultiPlatformOp):
 
             topk_result[q_slice] = local_topk
             if pool_seq_len > 0 and deferred_cache_write is not None:
-                write_locs, curr_k_fp8, curr_k_scale = deferred_cache_write
+                write_locs, curr_k_value, curr_k_scale = deferred_cache_write
                 self._write_returned_compressed_pooled_index_cache(
                     forward_batch,
                     layer_id,
                     write_locs,
-                    curr_k_fp8,
+                    curr_k_value,
                     curr_k_scale,
                 )
             q_offset += q_len
@@ -1532,7 +1610,13 @@ class IndexerKPool(MultiPlatformOp):
                 weights,
                 metadata,
             )
-        assert q_fp8.dtype==torch.uint8, f"only support fp8"
+        # q dtype follows the configured index cache type (fp8 or int8).
+        k_raw_dtype, k_real_dtype = self._get_index_k_cache_type()
+        assert q_fp8.dtype in (k_raw_dtype, k_real_dtype), (
+            f"only support q dtype {k_raw_dtype}/{k_real_dtype} for "
+            f"SGLANG_DSA_INDEX_CACHE_TYPE={envs.SGLANG_DSA_INDEX_CACHE_TYPE.get()}, "
+            f"got {q_fp8.dtype}"
+        )
         return self._get_topk_ragged_kpool(
             forward_batch,
             layer_id,
@@ -1605,6 +1689,7 @@ class IndexerKPool(MultiPlatformOp):
         )
 
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+        self._assert_index_k_buf_dtype(buf)
 
         def _compress_write() -> None:
             kpool_write_tail_and_maybe_compress(
@@ -1662,7 +1747,9 @@ class IndexerKPool(MultiPlatformOp):
             if envs.SGLANG_DSA_INDEX_CACHE_TYPE.get() == "fp8":
                 from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
             elif envs.SGLANG_DSA_INDEX_CACHE_TYPE.get() == "int8":
-                from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant_int8 as act_quant
+                from sglang.kernels.ops.attention.dsa.triton_kernel import (
+                    act_quant_int8 as act_quant,
+                )
             else:
                 raise NotImplementedError("index cache only support fp8 and int8")
 

@@ -7,7 +7,7 @@ import tilelang.language as T
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_maca
 
 tilelang.set_log_level("WARNING")
 
@@ -44,6 +44,7 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
     pass_configs[tilelang.PassConfigKey.TL_ENABLE_FAST_MATH] = False
 
 _is_hip = is_hip()
+_is_maca = is_maca()
 _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
 
@@ -311,8 +312,14 @@ def sparse_attention_fwd_kernel_v1(
     dtype = "bfloat16"
     accum_dtype = "float"
 
+    # C500x & C588 has a strict 64 KiB block limit.  With D=512, H=32 and BI=32,
+    # Q_shared + KV_shared + S_shared still compiles to 68,608 bytes.  Split
+    # the local heads into groups of 16 on MACA; retain the upstream 32-head
+    # tiling on other platforms.
+    head_tile = 16 if _is_maca else 32
+
     H = head_kv
-    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)  # 8 -> 16
+    padded_H = max(tilelang.math.next_power_of_2(head_kv), head_tile)  # 8 -> 16
     if padded_H != H:
         assert kv_group == 1
     BI = block_I
@@ -320,9 +327,9 @@ def sparse_attention_fwd_kernel_v1(
     D = dim
     D_tail = tail_dim
 
-    if head_kv > 64:
-        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
-        REPLICATE_H = head_kv // 64
+    if head_kv > head_tile:
+        assert (head_kv % head_tile == 0), f"head_kv should be a multiple of {head_tile}"
+        REPLICATE_H = head_kv // head_tile
     else:
         REPLICATE_H = 1
 
@@ -368,7 +375,7 @@ def sparse_attention_fwd_kernel_v1(
             q_i = s_i
             max_kv_i = q_i
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
+            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * head_tile)
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
