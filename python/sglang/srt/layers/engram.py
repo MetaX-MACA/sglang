@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
+from sglang.kernels.ops.attention.dsv4.torch_quant import FP8_BLOCK_SIZE, INT8_BLOCK_SIZE
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import engram_gather
 from sglang.kernels.ops.embeddings.engram_hash import (
@@ -719,8 +719,12 @@ class EngramEmbedding(nn.Module):
     one shared copy or one shard per rank (see _HostTable). Loading is sharded
     in every layout: a rank writes only its own row range.
     """
+    _DTYPE_MAP = {
+        0: (torch.float8_e4m3fn, torch.float8_e8m0fnu,  FP8_BLOCK_SIZE),
+        1: (torch.int8,          torch.bfloat16,        INT8_BLOCK_SIZE),
+    }
 
-    def __init__(self, num_embeddings: int, dim: int, layer_id: int):
+    def __init__(self, num_embeddings: int, dim: int, layer_id: int, use_int8: bool=False):
         super().__init__()
         self.dim = dim
         self.tp_size = get_parallel().tp_size
@@ -728,19 +732,18 @@ class EngramEmbedding(nn.Module):
         self.row_start = num_embeddings * tp_rank // self.tp_size
         row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
+        self.use_int8 = use_int8
+        w_dtype, s_dtype, block_size = self._DTYPE_MAP[use_int8]
+        self.quant_block_size = block_size
         self.host_table: Optional[_HostTable] = None
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
             self.weight = nn.Parameter(
-                torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
-                requires_grad=False,
+                torch.empty(self.rows, dim, dtype=w_dtype), requires_grad=False
             )
             self.scale = nn.Parameter(
-                torch.empty(
-                    self.rows, dim // FP8_BLOCK_SIZE, dtype=torch.float8_e8m0fnu
-                ),
-                requires_grad=False,
+                torch.empty(self.rows, dim // block_size, dtype=s_dtype), requires_grad=False
             )
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
@@ -748,8 +751,9 @@ class EngramEmbedding(nn.Module):
     def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
         layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
         n = num_embeddings if layout == "shared" else self.rows
+        w_dtype, s_dtype, block_size = self._DTYPE_MAP[self.use_int8]
         w_bytes = n * dim
-        s_bytes = n * (dim // FP8_BLOCK_SIZE)
+        s_bytes = n * (dim // block_size) * s_dtype.itemsize
         self.host_table = _HostTable(
             layout,
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
@@ -757,8 +761,8 @@ class EngramEmbedding(nn.Module):
             get_parallel().tp_group,
         )
         raw = self.host_table.bytes[: w_bytes + s_bytes]
-        weight = raw[:w_bytes].view(torch.float8_e4m3fn).view(n, dim)
-        scale = raw[w_bytes:].view(torch.float8_e8m0fnu).view(n, dim // FP8_BLOCK_SIZE)
+        weight = raw[:w_bytes].view(w_dtype).view(n, dim)
+        scale = raw[w_bytes:].view(s_dtype).view(n, dim // block_size)
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.scale = nn.Parameter(scale, requires_grad=False)
 
@@ -798,7 +802,8 @@ class EngramEmbedding(nn.Module):
                 indices.reshape(-1),
                 out.view(-1, self.dim),
                 self.dim,
-                FP8_BLOCK_SIZE,
+                self.quant_block_size,
+                use_int8=self.use_int8
             )
             return out
         if cp_all_tokens and self.tp_size > 1:
@@ -847,7 +852,7 @@ class EngramEmbedding(nn.Module):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
-            rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
+            rows = self.weight[local].float().unflatten(-1, (-1, self.quant_block_size))
             values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self._empty(indices)
@@ -858,9 +863,10 @@ class EngramEmbedding(nn.Module):
             indices.reshape(-1),
             out.view(-1, self.dim),
             self.dim,
-            FP8_BLOCK_SIZE,
+            self.quant_block_size,
             row_lo=self.row_start,
             row_hi=self.row_start + self.rows,
+            use_int8=self.use_int8
         )
         return out
 
@@ -946,8 +952,12 @@ class Engram(nn.Module):
         self.eps = config.rms_norm_eps
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
+        use_int8 = (
+            quant_config is not None
+            and quant_config.get_name() == "w8a8_int8"
+        )
         self.embed = EngramEmbedding(
-            layout.num_embeddings[self.layer_hash_index], layout.head_dim, layer_id
+            layout.num_embeddings[self.layer_hash_index], layout.head_dim, layer_id, use_int8
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
