@@ -47,11 +47,27 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils import add_prefix, is_cuda, is_maca, load_library_fn
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
+# MADV_HUGEPAGE is part of the Linux userspace ABI (value 14), but some Python
+# builds do not expose the symbolic constant even when mmap.madvise is present.
+_MADV_HUGEPAGE = getattr(mmap, "MADV_HUGEPAGE", 14)
+_is_maca = is_maca()
 
+if not hasattr(os, "memfd_create"):
+    import ctypes
+    import ctypes.util
+    _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+    _libc.memfd_create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    _libc.memfd_create.restype = ctypes.c_int
+    def _memfd_create(name, flags=0):
+        fd = _libc.memfd_create(name.encode() if isinstance(name, str) else name, flags)
+        if fd < 0:
+            raise OSError(ctypes.get_errno() or errno.EINVAL, "memfd_create failed")
+        return fd
+    os.memfd_create = _memfd_create
 
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
@@ -589,7 +605,12 @@ class _HostTable:
                 prot=mmap.PROT_READ | mmap.PROT_WRITE,
             )
         # Advisory before the first touch: pages are allocated huge at fault time.
-        self.mm.madvise(mmap.MADV_HUGEPAGE)
+        try:
+            self.mm.madvise(_MADV_HUGEPAGE)
+        except:
+            logger.warning(
+                "Engram host table: MADV_HUGEPAGE unavailable, continuing without huge-page advice"
+            )
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
         if layout == "per_rank":
             # Cached checkpoint pages, left by a previous server or by the loader,
@@ -603,6 +624,21 @@ class _HostTable:
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
         if int(err) != 0:
             raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+        # Host-side addresses cannot be used directly on MACA
+        if _is_maca:
+            fn = load_library_fn(
+                "libcuda.so",
+                "cudaHostGetDevicePointer",
+                argtypes=[ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint],
+                restype=ctypes.c_int,
+            )
+            device_ptr = ctypes.c_void_p()
+            host_ptr = self.bytes.data_ptr()
+            err = int(fn(ctypes.byref(device_ptr), ctypes.c_void_p(host_ptr), ctypes.c_uint(0)))
+            if err == 0 and device_ptr.value is not None:
+                self.device_ptr = device_ptr.value
+            else:
+                raise RuntimeError(f"cudaHostGetDevicePointer failed: err={err}")
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -755,9 +791,10 @@ class EngramEmbedding(nn.Module):
             if indices.shape[0] == 0:
                 return self._empty(indices)
             out = self._empty(indices)
+            weight_ptr, scale_ptr = self._table_device_ptrs()
             engram_gather(
-                self.weight.data_ptr(),
-                self.scale.data_ptr(),
+                weight_ptr,
+                scale_ptr,
                 indices.reshape(-1),
                 out.view(-1, self.dim),
                 self.dim,
@@ -794,6 +831,14 @@ class EngramEmbedding(nn.Module):
             *indices.shape, self.dim, dtype=torch.bfloat16, device=indices.device
         )
 
+    def _table_device_ptrs(self) -> tuple[int, int]:
+        if _is_maca:
+            assert self.host_table.device_ptr is not None
+            weight_ptr = self.host_table.device_ptr
+            scale_ptr = weight_ptr + self.weight.numel() * self.weight.element_size()
+            return weight_ptr, scale_ptr
+        return self.weight.data_ptr(), self.scale.data_ptr()
+
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
@@ -806,9 +851,10 @@ class EngramEmbedding(nn.Module):
             values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self._empty(indices)
+        weight_ptr, scale_ptr = self._table_device_ptrs()
         engram_gather(
-            self.weight.data_ptr(),
-            self.scale.data_ptr(),
+            weight_ptr,
+            scale_ptr,
             indices.reshape(-1),
             out.view(-1, self.dim),
             self.dim,
