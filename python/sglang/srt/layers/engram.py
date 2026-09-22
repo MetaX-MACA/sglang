@@ -57,11 +57,27 @@ from sglang.srt.models.deepseek_common.online_rotation import (
     get_online_rotation_module_config,
 )
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
-from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.utils import add_prefix, is_cuda, is_maca, load_library_fn, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
+# MADV_HUGEPAGE is part of the Linux userspace ABI (value 14), but some Python
+# builds do not expose the symbolic constant even when mmap.madvise is present.
+_MADV_HUGEPAGE = getattr(mmap, "MADV_HUGEPAGE", 14)
+_is_maca = is_maca()
 
+if not hasattr(os, "memfd_create"):
+    import ctypes
+    import ctypes.util
+    _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+    _libc.memfd_create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    _libc.memfd_create.restype = ctypes.c_int
+    def _memfd_create(name, flags=0):
+        fd = _libc.memfd_create(name.encode() if isinstance(name, str) else name, flags)
+        if fd < 0:
+            raise OSError(ctypes.get_errno() or errno.EINVAL, "memfd_create failed")
+        return fd
+    os.memfd_create = _memfd_create
 
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
@@ -619,6 +635,25 @@ def _registered_device_ptr(host_ptr: int) -> int:
     Address kernels must use for registered host memory.
     UVA makes it the host address on CUDA; HIP may map it elsewhere.
     """
+    # Host-side addresses cannot be used directly on MACA
+    if _is_maca:
+        fn = load_library_fn(
+            "libcuda.so",
+            "cudaHostGetDevicePointer",
+            argtypes=[ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint],
+            restype=ctypes.c_int,
+        )
+        device_ptr = ctypes.c_void_p()
+        err = int(fn(ctypes.byref(device_ptr), ctypes.c_void_p(host_ptr), ctypes.c_uint(0)))
+        if err == 0 and device_ptr.value is not None:
+            return device_ptr.value
+        else:
+            raise RuntimeError(
+                    "cudaHostGetDevicePointer failed.\n"
+                    f"  err         : {err} \n"
+                    "  likely cause: MACA cu-bridge runtime not found by the dynamic loader\n"
+                    "  fix         : export LD_LIBRARY_PATH=/opt/maca/tools/cu-bridge/lib/:$LD_LIBRARY_PATH\n"
+                )
     if not _is_hip:
         return host_ptr
     device_ptr = ctypes.c_void_p()
@@ -662,7 +697,12 @@ class _HostTable:
                 prot=mmap.PROT_READ | mmap.PROT_WRITE,
             )
         # Advisory before the first touch: pages are allocated huge at fault time.
-        self.mm.madvise(mmap.MADV_HUGEPAGE)
+        try:
+            self.mm.madvise(_MADV_HUGEPAGE)
+        except:
+            logger.warning(
+                "Engram host table: MADV_HUGEPAGE unavailable, continuing without huge-page advice"
+            )
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
         if layout == "per_rank":
             # Cached checkpoint pages, left by a previous server or by the loader,
