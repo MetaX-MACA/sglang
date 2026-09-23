@@ -37,7 +37,7 @@ def _jit_fused_store_module(
     )
     cname = "FlashMLA" if name == "flashmla" else "Indexer"
     if name == "flashmla":
-        assert store_dtype is torch.uint8
+        assert store_dtype in (torch.uint8, torch.int8)
     else:
         assert store_dtype in (torch.uint8, torch.int8)
     kernel_class = f"FusedStoreCache{cname}Kernel<{args}>"
