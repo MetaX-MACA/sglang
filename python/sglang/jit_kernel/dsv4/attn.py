@@ -35,7 +35,7 @@ def _jit_fused_store_module(
     args = make_cpp_args(input_dtype, index_dtype, store_dtype, page_size, is_arch_support_pdl())
     cname = "FlashMLA" if name == "flashmla" else "Indexer"
     if cname == "FlashMLA":
-        assert store_dtype is torch.uint8
+        assert store_dtype in (torch.uint8, torch.int8)
     else:
         from sglang.srt.environ import envs
         if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":

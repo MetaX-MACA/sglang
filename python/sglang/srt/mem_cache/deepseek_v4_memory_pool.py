@@ -179,8 +179,8 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        if self.dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
-            return fused_store_cache(       # only support fp8 now
+        if self.dtype in (torch.float8_e5m2, torch.float8_e4m3fn) or self.dtype is torch.int8:
+            return fused_store_cache(       # support fp8 and int8 (e.g. attn-CP store path)
                 input=cache_k,
                 cache=self.kv_buffer[layer_id],
                 indices=loc,

@@ -109,6 +109,12 @@ def triton_fused_store_flashmla(
     page_size: int,
 ) -> None:
     """Fused FP8 quantise + paged scatter for the SWA (flashmla) KV cache."""
+    if cache.dtype != torch.uint8:
+        # The triton fallback only implements the fp8 layout (584B/token);
+        # an int8 pool (608B/token) must use the CUDA JIT kernel instead.
+        raise NotImplementedError(
+            f"triton_fused_store_flashmla only supports fp8 cache, got {cache.dtype}"
+        )
     N = input.shape[0]
     if N == 0:
         return

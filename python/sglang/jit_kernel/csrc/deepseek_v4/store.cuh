@@ -34,6 +34,12 @@ SGL_DEVICE char2 pack_int8(float x, float y) {
   return char2{int8_clip(x), int8_clip(y)};
 }
 
+// Pack two fp32 values into a single int8x2 with round-to-nearest and clamping.
+// Matches the int8 SWA (flashmla) cache write convention in main_norm_rope.cuh.
+SGL_DEVICE char2 pack_int8_round(float x, float y) {
+  return char2{int8_clip(roundf(x)), int8_clip(roundf(y))};
+}
+
 struct FusedStoreCacheParam {
   const void* __restrict__ input;
   void* __restrict__ cache;
@@ -45,8 +51,13 @@ template <typename Float, typename IndicesT, typename StoreT, uint32_t kPageBits
 __global__ void fused_store_flashmla_cache(const  FusedStoreCacheParam param) {
   using namespace device;
 
-  /// NOTE: 584 = 576 + 8
-  constexpr int64_t kPageBytes = host::div_ceil(584 << kPageBits, 576) * 576;
+  constexpr bool kStoreInt8 = std::is_same_v<StoreT, int8_t>;
+
+  /// NOTE: value section is 576B/token; fp8 adds 8B/token of UE8M0 scales,
+  /// int8 adds 32B/token (7 fp32 scales + 4B pad), each padded to 576B pages.
+  constexpr int64_t kPageBytes = kStoreInt8
+      ? host::div_ceil(608 << kPageBits, 576) * 576
+      : host::div_ceil(584 << kPageBits, 576) * 576;
 
   // each warp handles 64 elements, 8 warps, each block handles 1 row
   const auto& [input, cache, indices, num_tokens] = param;
@@ -64,17 +75,26 @@ __global__ void fused_store_flashmla_cache(const  FusedStoreCacheParam param) {
   if (wid != 7) {
     const auto [x, y] = cast<fp32x2_t>(elems);
     const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
-    const auto scale_raw = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
-    const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
-    const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
-    const auto result = pack_fp8(x * inv_scale, y * inv_scale);
     const int32_t page = index >> kPageBits;
     const int32_t offset = index & ((1 << kPageBits) - 1);
     const auto page_ptr = pointer::offset(cache, page * kPageBytes);
     const auto value_ptr = pointer::offset(page_ptr, offset * 576);
-    const auto scale_ptr = pointer::offset(page_ptr, 576 << kPageBits, offset * 8);
-    static_cast<fp8x2_e4m3_t*>(value_ptr)[tid] = result;
-    static_cast<uint8_t*>(scale_ptr)[wid] = scale_ue8m0;
+    if constexpr (kStoreInt8) {
+      // per-64-group fp32 scale, stored in the page-wide 32B/token scale section
+      const auto scale = fmaxf(1e-4f, abs_max) / 127.0f;
+      const auto result = pack_int8_round(x / scale, y / scale);
+      const auto scale_ptr = pointer::offset(page_ptr, 576 << kPageBits, offset * 32);
+      static_cast<char2*>(value_ptr)[tid] = result;
+      if (tid % 32 == 0) static_cast<float*>(scale_ptr)[wid] = scale;
+    } else {
+      const auto scale_raw = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+      const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
+      const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
+      const auto result = pack_fp8(x * inv_scale, y * inv_scale);
+      const auto scale_ptr = pointer::offset(page_ptr, 576 << kPageBits, offset * 8);
+      static_cast<fp8x2_e4m3_t*>(value_ptr)[tid] = result;
+      static_cast<uint8_t*>(scale_ptr)[wid] = scale_ue8m0;
+    }
   } else {
     const auto result = cast<bf16x2_t>(elems);
     const int32_t page = index >> kPageBits;
@@ -154,7 +174,10 @@ __global__ void fused_store_indexer_cache(const  FusedStoreCacheParam param) {
 template <typename Float, typename IndicesT, typename StoreT, uint32_t kPageSize, bool kUsePDL>
 struct FusedStoreCacheFlashMLAKernel {
   static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
-  static constexpr int64_t kPageBytes = host::div_ceil(584 * kPageSize, 576) * 576;
+  static constexpr bool kStoreInt8 = std::is_same_v<StoreT, int8_t>;
+  static constexpr int64_t kPageBytes = kStoreInt8
+      ? host::div_ceil(608 * kPageSize, 576) * 576
+      : host::div_ceil(584 * kPageSize, 576) * 576;
   static constexpr auto kernel = fused_store_flashmla_cache<Float, IndicesT, StoreT, kLogSize, kUsePDL>;
 
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
@@ -172,7 +195,7 @@ struct FusedStoreCacheFlashMLAKernel {
         .verify(input);
     TensorMatcher({-1, -1})  // cache
         .with_strides({kPageBytes, 1})
-        .with_dtype<uint8_t>()
+        .with_dtype<StoreT>()
         .with_device(device_)
         .verify(cache);
     TensorMatcher({N})  // indices
