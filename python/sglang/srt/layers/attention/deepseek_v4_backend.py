@@ -2137,7 +2137,7 @@ class DeepseekV4AttnBackend(
                     )
 
             use_triton_decode = (
-                self.token_to_kv_pool.dtype is torch.int8
+                self.token_to_kv_pool.dtype is torch.int8 and envs.SGLANG_DSV4_TRITON_FLASHMLA_KV.get()
                 or (
                     envs.SGLANG_HACK_FLASHMLA_BACKEND.get() == "triton"
                     and self.token_to_kv_pool.dtype
@@ -2194,7 +2194,7 @@ class DeepseekV4AttnBackend(
                     cache_seqlens=None,
                     tile_scheduler_metadata=flashmla_metadata,
                     softmax_scale=self.softmax_scale,
-                    is_fp8_kvcache=True if self.token_to_kv_pool.dtype in (torch.float8_e5m2, torch.float8_e4m3fn) else False, 
+                    is_fp8_kvcache=True if self.token_to_kv_pool.dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.int8) else False, 
                     indices=swa_page_indices,
                     topk_length=swa_topk_lengths,
                     attn_sink=attn_sink,
