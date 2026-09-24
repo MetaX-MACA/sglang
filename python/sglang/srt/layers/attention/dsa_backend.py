@@ -2191,45 +2191,11 @@ class DeepseekSparseAttnBackend(
         page_table_1,
         kv_cache_is_fp8: bool,
     ) -> torch.Tensor:
-        # Correctness-first replacement for third-party FlashMLA. It reads both
-        # FP8 and INT8 656-byte rows directly and keeps the vendor ABI untouched.
-        use_functional_triton = self.dsa_kv_cache_is_quantized and get_bool_env_var(
-            "SGLANG_DSA_TRITON_FLASHMLA_KV", default="true"
-        )
-        if use_functional_triton:
-            from sglang.srt.layers.attention.dsa.triton_flashmla_kv import (
-                flash_mla_with_kvcache_triton,
-            )
-
-            q_input = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
-            paged_cache = kv_cache.view(
-                -1, self.real_page_size, 1, kv_cache.shape[-1]
-            )
-            assert self.real_page_size == 64, "only page size 64 is supported"
-            indices = page_table_1.unsqueeze(1)
-            assert indices.shape[-1] == self.dsa_index_topk
-            o, _ = flash_mla_with_kvcache_triton(
-                q=q_input,
-                k_cache=paged_cache,
-                cache_seqlens=metadata.dsa_cache_seqlens_int32,
-                head_dim_v=v_head_dim,
-                softmax_scale=sm_scale,
-                indices=indices,
-                block_table=None,
-                is_fp8_kvcache=self.dsa_kv_cache_store_fp8,
-            )
-            return o
-
-        if self.dsa_kv_cache_store_int8:
-            raise RuntimeError(
-                "INT8 DSA KV cache requires SGLANG_DSA_TRITON_FLASHMLA_KV=1"
-            )
-
-        from flash_mla import flash_mla_with_kvcache
-
         cache_seqlens = metadata.dsa_cache_seqlens_int32
-        
-        if metadata.flashmla_sched_metadata.tile_scheduler_metadata is None or not envs.MX_ENABLE_FLASH_MLA_METADATA_CACHE.get():
+        if (
+            metadata.flashmla_sched_metadata.tile_scheduler_metadata is None
+            or not envs.MX_ENABLE_FLASH_MLA_METADATA_CACHE.get()
+        ):
             sched_meta = _create_flashmla_metadata()
         else:
             sched_meta = metadata.flashmla_sched_metadata
@@ -2254,52 +2220,45 @@ class DeepseekSparseAttnBackend(
 
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, kv_cache.shape[-1])
         assert self.real_page_size == 64, "only page size 64 is supported"
-
-        # if not self.dsa_kv_cache_store_fp8:
-        #     # inefficiently quantize the whole cache
-        #     kv_cache = quantize_k_cache(kv_cache)
-
         indices = page_table_1.unsqueeze(1)
-        assert (
-            indices.shape[-1] == self.dsa_index_topk
-        )  # requirement of FlashMLA decode kernel
+        assert indices.shape[-1] == self.dsa_index_topk
+        block_table = torch.empty(
+            (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
+        )
 
         flashmla_opt = get_bool_env_var("MX_ENABLE_FLASH_MLA_OPT", default="true")
-
+        flashmla_kwargs = {
+            "q": q_input,
+            "k_cache": kv_cache,
+            "cache_seqlens": cache_seqlens,
+            "head_dim_v": v_head_dim,
+            "tile_scheduler_metadata": sched_meta,
+            "num_splits": None,
+            "softmax_scale": sm_scale,
+            "indices": indices,
+            "block_table": block_table,
+            "is_fp8_kvcache": kv_cache_is_fp8,
+        }
         if flashmla_opt:
-            decode_mask = (indices != -1).all(dim=-1, keepdim=True)
-            o, _ = flash_mla_with_kvcache(
-                q=q_input,
-                k_cache=kv_cache,
-                cache_seqlens=cache_seqlens,
-                head_dim_v=v_head_dim,
-                tile_scheduler_metadata=sched_meta,
-                num_splits=None,
-                softmax_scale=sm_scale,
-                indices=indices,
-                indices_all_valid_per_q=decode_mask,
-                # doc says it is not used, but if pass in None then error
-                block_table=torch.empty(
-                    (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
-                ),
-                is_fp8_kvcache=kv_cache_is_fp8,
+            flashmla_kwargs["indices_all_valid_per_q"] = (indices != -1).all(
+                dim=-1, keepdim=True
             )
+
+        # Correctness-first replacement for third-party FlashMLA. It reads both
+        # FP8 and INT8 656-byte rows directly, but receives the exact vendor-call
+        # kwargs above so the saved case can be replayed against the library.
+        use_functional_triton = self.dsa_kv_cache_is_quantized and envs.SGLANG_DSA_TRITON_FLASHMLA_KV.get()
+        if use_functional_triton:
+            from sglang.srt.layers.attention.dsa.triton_flashmla_kv import (
+                flash_mla_with_kvcache_triton,
+            )
+            o, softmax_lse = flash_mla_with_kvcache_triton(**flashmla_kwargs)
         else:
-            o, _ = flash_mla_with_kvcache(
-                q=q_input,
-                k_cache=kv_cache,
-                cache_seqlens=cache_seqlens,
-                head_dim_v=v_head_dim,
-                tile_scheduler_metadata=sched_meta,
-                num_splits=None,
-                softmax_scale=sm_scale,
-                indices=indices,
-                # doc says it is not used, but if pass in None then error
-                block_table=torch.empty(
-                    (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
-                ),
-                is_fp8_kvcache=kv_cache_is_fp8,
-            )
+            if self.dsa_kv_cache_store_int8:
+                flashmla_kwargs["is_fp8_kvcache"] = True
+            from flash_mla import flash_mla_with_kvcache
+
+            o, _ = flash_mla_with_kvcache(**flashmla_kwargs)
         
         if metadata.flashmla_sched_metadata.tile_scheduler_metadata is None:
             metadata.flashmla_sched_metadata.tile_scheduler_metadata = sched_meta.tile_scheduler_metadata
