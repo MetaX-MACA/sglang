@@ -152,8 +152,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
 
-        self.block_size_q = 1
-        self.block_size_k = sparse_cfg["sparse_block_size"]
+        self.block_size_q = 2
+        self.block_size_k = 32
         if "sparse_init_block" in sparse_cfg:
             self.init_blocks = sparse_cfg["sparse_init_block"]
         else:
