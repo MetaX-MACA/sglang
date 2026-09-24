@@ -304,6 +304,8 @@ class Envs:
     SGLANG_DSPARK_KERNEL_FINALIZE_ACCEPT = EnvStr("triton")
     SGLANG_DSPARK_KERNEL_SAMPLE_STEP_TOKENS = EnvStr("triton")
     SGLANG_DSPARK_KERNEL_BUILD_STEP_LOCAL = EnvStr("triton")
+    # whether dspark share embed and lmhead with target model
+    SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
