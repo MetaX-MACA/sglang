@@ -3,8 +3,16 @@ from typing import Optional, Tuple
 
 import torch
 
+def is_maca() -> bool:
+    return "metax" in torch.__version__
+
+_is_maca = is_maca()
+
 try:
-    from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
+    if _is_maca:
+        import flash_mla as flash_mla_community
+    else:
+        from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
 except Exception as _e:
     _flashmla_import_error = _e
 else:
@@ -61,6 +69,21 @@ def get_mla_metadata(
     """
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error
+
+    if _is_maca:
+        if is_fp8_kvcache and topk is None:
+            return flash_mla_community.get_mla_metadata_dense_fp8(
+                cache_seqlens,
+                num_q_tokens_per_head_k,
+                num_heads_k,
+                )
+        else:
+            return flash_mla_community.get_mla_metadata(
+            cache_seqlens,
+            num_q_tokens_per_head_k,
+            num_heads_k,
+            is_fp8_kvcache=is_fp8_kvcache,
+        )
 
     if cache_seqlens is None:
         return FlashMLASchedMeta(), None
@@ -127,76 +150,111 @@ def flash_mla_with_kvcache(
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error
 
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-    if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
-        return _flash_mla_with_kvcache_sched_meta(
-            q=q,
-            k_cache=k_cache,
-            block_table=block_table,
-            cache_seqlens=cache_seqlens,
-            head_dim_v=head_dim_v,
-            sched_meta=tile_scheduler_metadata,
-            num_splits=num_splits,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            is_fp8_kvcache=is_fp8_kvcache,
-            indices=indices,
-            attn_sink=attn_sink,
-            extra_k_cache=extra_k_cache,
-            extra_indices_in_kvcache=extra_indices_in_kvcache,
-            topk_length=topk_length,
-            extra_topk_length=extra_topk_length,
-        )
-
-    assert num_splits is not None
-    assert block_table is not None
-    assert cache_seqlens is not None
-    assert attn_sink is None
-    assert extra_k_cache is None
-    assert extra_indices_in_kvcache is None
-    assert topk_length is None
-    assert extra_topk_length is None
-    if indices is not None:
-        assert causal == False, "causal must be `false` if sparse attention is enabled."
-    assert (descale_q is None) == (
-        descale_k is None
-    ), "descale_q and descale_k should be both None or both not None"
-
-    if indices is None and q.element_size() == 1:
-        out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla_fp8.default(
-            q,
-            k_cache,
-            head_dim_v,
-            cache_seqlens,
-            block_table,
-            softmax_scale,
-            causal,
-            tile_scheduler_metadata,
-            num_splits,
-            descale_q,
-            descale_k,
-        )
+    if _is_maca:
+        if indices is None and q.element_size() == 1:
+            return flash_mla_community.flash_mla_with_kvcache_fp8(
+                q=q,
+                k_cache=k_cache,
+                block_table=block_table,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=head_dim_v,
+                tile_scheduler_metadata=tile_scheduler_metadata,
+                num_splits=num_splits,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                descale_q=descale_q,
+                descale_k=descale_k,
+            )
+        else:
+            return flash_mla_community.flash_mla_with_kvcache(
+                q=q,
+                k_cache=k_cache,
+                block_table=block_table,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=head_dim_v,
+                tile_scheduler_metadata=tile_scheduler_metadata,
+                num_splits=num_splits,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                is_fp8_kvcache=is_fp8_kvcache,
+                indices=indices,
+                attn_sink=attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices_in_kvcache=extra_indices_in_kvcache,
+                topk_length=topk_length,
+                extra_topk_length=extra_topk_length,
+            )
     else:
-        out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla.default(
-            q,
-            k_cache,
-            head_dim_v,
-            cache_seqlens,
-            block_table,
-            softmax_scale,
-            causal,
-            tile_scheduler_metadata,
-            num_splits,
-            is_fp8_kvcache,
-            indices,
-            attn_sink,
-            extra_k_cache,
-            extra_indices_in_kvcache,
-            topk_length,
-            extra_topk_length,
-        )
-    return out, softmax_lse
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
+            return _flash_mla_with_kvcache_sched_meta(
+                q=q,
+                k_cache=k_cache,
+                block_table=block_table,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=head_dim_v,
+                sched_meta=tile_scheduler_metadata,
+                num_splits=num_splits,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                is_fp8_kvcache=is_fp8_kvcache,
+                indices=indices,
+                attn_sink=attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices_in_kvcache=extra_indices_in_kvcache,
+                topk_length=topk_length,
+                extra_topk_length=extra_topk_length,
+            )
+
+        assert num_splits is not None
+        assert block_table is not None
+        assert cache_seqlens is not None
+        assert attn_sink is None
+        assert extra_k_cache is None
+        assert extra_indices_in_kvcache is None
+        assert topk_length is None
+        assert extra_topk_length is None
+        if indices is not None:
+            assert causal == False, "causal must be `false` if sparse attention is enabled."
+        assert (descale_q is None) == (
+            descale_k is None
+        ), "descale_q and descale_k should be both None or both not None"
+
+        if indices is None and q.element_size() == 1:
+            out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla_fp8.default(
+                q,
+                k_cache,
+                head_dim_v,
+                cache_seqlens,
+                block_table,
+                softmax_scale,
+                causal,
+                tile_scheduler_metadata,
+                num_splits,
+                descale_q,
+                descale_k,
+            )
+        else:
+            out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla.default(
+                q,
+                k_cache,
+                head_dim_v,
+                cache_seqlens,
+                block_table,
+                softmax_scale,
+                causal,
+                tile_scheduler_metadata,
+                num_splits,
+                is_fp8_kvcache,
+                indices,
+                attn_sink,
+                extra_k_cache,
+                extra_indices_in_kvcache,
+                topk_length,
+                extra_topk_length,
+            )
+        return out, softmax_lse
 
 
 def _flash_mla_with_kvcache_sched_meta(
