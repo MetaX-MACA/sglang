@@ -1217,6 +1217,13 @@ class HiSparseCoordinator:
         miss plan into self._miss_{src,dst,count} for the skip layers to replay.
         """
         num_reqs = req_pool_indices.size(0)
+
+        # Hisparse buffers are sized per PP stage (local c4 layer count); the
+        # incoming layer_id is the global layer id (0..num_layers-1). Map it to
+        # this stage's local slice, otherwise PP1+ overflows (IndexError: size=19).
+        start_layer = self.mem_pool_device.start_layer
+        local_layer = layer_id - start_layer
+
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
 
         swap_in_fn = (
@@ -1235,15 +1242,15 @@ class HiSparseCoordinator:
         )
         swap_in_fn(
             top_k_tokens=top_k_result,
-            device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+            device_buffer_tokens=self.req_device_buffer_tokens[local_layer],
             host_cache_locs=self.req_to_host_pool,
-            device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
-            host_cache=self.mem_pool_host.kv_buffer[layer_id],
-            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            device_buffer_locs=self.req_device_buffer_token_locs[local_layer],
+            host_cache=self.mem_pool_host.kv_buffer[local_layer],
+            device_buffer=self.mem_pool_device.kv_buffer[local_layer],
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
             seq_lens=compressed_seq_lens,
-            lru_slots=self.lru_slots[layer_id],
+            lru_slots=self.lru_slots[local_layer],
             item_size_bytes=self.item_size_bytes,
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
