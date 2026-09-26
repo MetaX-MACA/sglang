@@ -1982,6 +1982,8 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
+        page_table_1 = self._align_page_table_to_q(page_table_1, q_nope.shape[0])
+
         if self.dsa_decode_impl == "flashmla_sparse":
             if (
                 self.dsa_kv_cache_store_int8
@@ -2669,6 +2671,38 @@ class DeepseekSparseAttnBackend(
             device=topk_indices.device,
         )
         return torch.cat([topk_indices, padding], dim=0)
+
+    def _align_page_table_to_q(
+        self, page_table_1: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        """Force the decode top-k page table to exactly ``num_tokens`` rows.
+
+        The HiSparse ``swap_in_selected_pages`` path sizes its output to
+        ``req_pool_indices.size(0)``, which under a CP/padded decode batch can
+        diverge from the query row count ``q``.  The downstream sparse kernels
+        (flash_mla_sparse / flashmla_kv / triton) all assert
+        ``indices.shape == (seqlen_q, num_heads_kv, topk)``, so we normalize the
+        row count here.  ``-1`` filler rows are later masked out via
+        ``indices_all_valid_per_q``.
+        """
+        current_tokens = page_table_1.shape[0]
+        if current_tokens == num_tokens:
+            return page_table_1
+        if current_tokens < num_tokens:
+            padding = torch.full(
+                (num_tokens - current_tokens,) + page_table_1.shape[1:],
+                -1,
+                dtype=page_table_1.dtype,
+                device=page_table_1.device,
+            )
+            return torch.cat([page_table_1, padding], dim=0)
+        logger.warning(
+            "DSA decode page_table_1 rows (%d) > q rows (%d); trimming tail. "
+            "Check HiSparse/CP batch alignment.",
+            current_tokens,
+            num_tokens,
+        )
+        return page_table_1[:num_tokens]
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
