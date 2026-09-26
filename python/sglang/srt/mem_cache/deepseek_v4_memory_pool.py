@@ -1098,7 +1098,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         for the per-ratio c4/c128 pools); the default CUDA pool ignores it.
         Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the NPU bf16
         PA_ND variant, which needs ``global_page_size`` for its kernel view."""
+
         del global_page_size  # CUDA pools key only off their own page_size
+        # Forward the PP stage absolute layer range so per-layer lookups can map a
+        # global layer_id to this stage's local slice via ``layer_id - start_layer``
+        # (the c4 hisparse pool + coordinators rely on it; without it PP1+ OOBs).
+        start_layer = self._stage_start
+        end_layer = self._stage_end - 1
         return cls(
             size,
             page_size,
@@ -1108,6 +1114,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            start_layer if start_layer is not None else None,
+            end_layer if end_layer is not None else None,
         )
 
     def _make_indexer_pool(
@@ -1123,6 +1131,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """Build the c4 lightning-indexer K pool (packed CUDA layout).
         Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the
         dedicated-buffer NPU variant (int8 K + fp16 scale)."""
+        start_layer = self._stage_start
+        end_layer = self._stage_end - 1
         return DeepSeekV4IndexerPool(
             size,
             page_size,
@@ -1131,6 +1141,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            start_layer if start_layer is not None else None,
+            end_layer if end_layer is not None else None,
         )
 
     def _state_pool_size(self, ratio: int) -> int:
