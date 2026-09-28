@@ -2334,16 +2334,8 @@ class DeepseekSparseAttnBackend(
             effective_n_per_batch=effective_n_per_batch,
         )
 
-        if self.dsa_decode_impl == "flashmla_kv":
-            flashmla_metadata = metadata.flashmla_metadata.slice(
-                slice(0, seqlens_expanded_size + 1)
-            )
-            flashmla_metadata.copy_(
-                self._compute_flashmla_metadata(
-                    cache_seqlens=dsa_cache_seqlens,
-                    seq_len_q=1,
-                )
-            )
+        # MACA FlashMLA obtains scheduler metadata in _forward_flashmla_kv;
+        # replay only updates the DSA buffers consumed by that execution path.
 
         self.forward_metadata = metadata
 
@@ -2720,12 +2712,6 @@ class DeepseekSparseAttnBackend(
                 metadata.real_page_table[:rows, :cols].copy_(
                     precomputed.real_page_table
                 )
-
-            # Copy FlashMLA metadata in fallback path
-            if precomputed.flashmla_metadata is not None:
-                size = precomputed.seqlens_expanded_size
-                flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
-                flashmla_metadata.copy_(precomputed.flashmla_metadata)
 
     @staticmethod
     def _sibling_replay_metadata_compatible(dst: DSAMetadata, src: DSAMetadata) -> bool:

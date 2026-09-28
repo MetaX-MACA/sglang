@@ -51,27 +51,33 @@ from mcoplib.custom_ops import (
 )
 
 # Register mcoplib op as torch.library custom op for torch.compile / PCG.
-# Cannot use register_custom_op_from_extern because infer_schema does not
-# support Tuple return types. Register manually via Library.define with
-# hand-written schema to bypass infer_schema.
+# Packed INT8 values/scales are bytes, not BF16 numbers: expose bytes to AOT
+# so arbitrary payload bit patterns are not compared as floating-point NaNs.
+# Declare the residual mutation explicitly; the custom op returns only fresh
+# tensors so AOT functionalization can handle the in-place residual update.
 _mocop_op_name = "fused_add_rms_norm_dynamic_per_token_quant_padding_output"
 if not hasattr(torch.ops.sglang, _mocop_op_name):
     _sglib = torch.library.Library("sglang", "FRAGMENT")
     _sglib.define(
         f"{_mocop_op_name}("
-        "Tensor input, Tensor? residual, Tensor weight, int pad_size, float epsilon"
-        ") -> (Tensor, Tensor?, Tensor, Tensor, Tensor)"
+        "Tensor input, Tensor(a!)? residual, Tensor weight, int pad_size, float epsilon"
+        ") -> (Tensor, Tensor, Tensor, Tensor)"
     )
 
     def _mocop_cuda_impl(input, residual, weight, pad_size, epsilon):
-        return _mocop_fused_add_rms_norm_quant_pad(
-            input, residual, weight, pad_size, epsilon,
+        output, _, output_rms, output_quant_int8, scales = (
+            _mocop_fused_add_rms_norm_quant_pad(input, residual, weight, pad_size, epsilon)
         )
+        # MCOP writes INT8 values plus one FP32 scale per row. Initialize
+        # alignment padding as well: AOT functionalization compares complete
+        # outputs, and allocator contents are not part of the op's semantics.
+        output.view(torch.uint8)[..., input.shape[-1] + 4 :].zero_()
+        return output.view(torch.uint8), output_rms, output_quant_int8, scales
 
     def _mocop_fake_impl(input, residual, weight, pad_size, epsilon):
         shape = list(input.shape)
-        shape[-1] = pad_size
-        output = torch.empty(shape, dtype=torch.bfloat16, device=input.device)
+        shape[-1] = pad_size * 2
+        output = torch.empty(shape, dtype=torch.uint8, device=input.device)
         output_rms = torch.empty_like(input)
         output_quant_int8 = torch.empty_like(input, dtype=torch.int8)
         scales = torch.empty(
@@ -79,15 +85,24 @@ if not hasattr(torch.ops.sglang, _mocop_op_name):
             device=input.device,
             dtype=torch.float32,
         )
-        residual_out = residual if residual is not None else None
-        return output, residual_out, output_rms, output_quant_int8, scales
+        return output, output_rms, output_quant_int8, scales
 
     _sglib.impl(_mocop_op_name, _mocop_cuda_impl, "CUDA")
     _sglib._register_fake(_mocop_op_name, _mocop_fake_impl)
 
-fused_add_rms_norm_dynamic_per_token_quant_padding_output = (
-    torch.ops.sglang.fused_add_rms_norm_dynamic_per_token_quant_padding_output
-)
+
+def fused_add_rms_norm_dynamic_per_token_quant_padding_output(
+    input, residual, weight, pad_size, epsilon
+):
+    # Keep the alias outside the custom op so functionalization can track the
+    # residual mutation without an unsupported aliased custom-op output.
+    output, output_rms, output_quant_int8, scales = (
+        torch.ops.sglang.fused_add_rms_norm_dynamic_per_token_quant_padding_output(
+            input, residual, weight, pad_size, epsilon
+        )
+    )
+    return output.view(torch.bfloat16), residual, output_rms, output_quant_int8, scales
+
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()

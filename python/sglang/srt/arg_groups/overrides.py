@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import inspect
 import json
 import logging
 import math
@@ -69,14 +70,21 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
     get_context,
     get_platform,
 )
 from sglang.srt.utils.common import (
+    get_device_name,
+    get_nvidia_driver_version,
     get_quantization_config,
+    is_cpu,
     is_gfx95_supported,
+    is_mnnvl_fabric_device,
+    is_mps,
+    is_triton_kernels_available,
     xpu_has_xmx_support,
 )
 
@@ -570,7 +578,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["dcp_comm_backend"] = dcp_comm_backend
         return overrides
 
-    if not (get_platform().is_sm100_supported and get_device_sm() in (100, 103)):
+    if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103)):
         return {}
     backends_unset = is_attention_backend_not_set(cfg)
     if cfg.speculative_algorithm != "DSPARK":
@@ -644,7 +652,7 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if cfg.moe_runner_backend != "auto":
         return {}
-    if not (get_platform().is_sm100_supported and get_device_sm() in (100, 103, 107)):
+    if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103, 107)):
         return {}
     if not _is_mxfp4_pack_quantized(hf_config):
         return {}
@@ -741,7 +749,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 logger.warning("Setting page size to 64 for DeepSeek DSA.")
     else:
         # DeepSeek V3/R1/V3.1
-        if get_platform().is_sm100_supported:
+        if get_platform().is_sm100:
             if (
                 cfg.attention_backend is None
                 and cfg.prefill_attention_backend is None
@@ -796,7 +804,7 @@ def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
     # On Blackwell "auto" falls through to the triton fused-MoE runner, ~12%
     # slower at bs=1 decode. FP4 checkpoints use flashinfer_mxfp4 instead.
     if (
-        get_platform().is_sm100_supported
+        get_platform().is_sm100
         and cfg.moe_runner_backend == "auto"
         and get_quantization_config(hf_config) == "fp8"
     ):
@@ -813,9 +821,9 @@ def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
         "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
     )
     if (
-        get_platform().is_sm100_supported
+        get_platform().is_sm100
         and cfg.moe_runner_backend == "auto"
-        and server_args.get_model_config().quantization == "modelopt_fp4"
+        and model_config_of(server_args).quantization == "modelopt_fp4"
     ):
         overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
         logger.info(
@@ -864,7 +872,7 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         # accelerate the large prefill all-reduce.
         if not aiter_fusion_resolved and not envs.SGLANG_M3_ALLOW_CUSTOM_AR.get():
             overrides["disable_custom_all_reduce"] = True
-    elif get_platform().is_sm100_supported:
+    elif get_platform().is_sm100:
         if is_attention_backend_not_set(cfg):
             if (
                 cfg.kv_cache_dtype == "fp8_e4m3"
@@ -895,7 +903,7 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             f"{overrides.get('attention_backend', cfg.attention_backend)}, page_size={page_resolved}, "
             f"moe_runner_backend={overrides.get('moe_runner_backend', cfg.moe_runner_backend)}."
         )
-    elif get_platform().is_sm90_supported:
+    elif get_platform().is_sm90:
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "fa3"
         page_resolved = cfg.page_size
@@ -928,7 +936,7 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
     elif (
         cfg.kv_cache_dtype == "fp8_e4m3"
         and overrides.get("attention_backend", cfg.attention_backend) == "trtllm_mha"
-        and get_platform().is_sm100_supported
+        and get_platform().is_sm100
     ):
         if envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get():
             logger.info(
@@ -989,11 +997,11 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
     # Set attention backend for GPT-OSS
     if is_attention_backend_not_set(cfg):
-        if get_platform().is_sm100_supported:
+        if get_platform().is_sm100:
             overrides["attention_backend"] = "trtllm_mha"
-        elif get_platform().is_sm90_supported:
+        elif get_platform().is_sm90:
             overrides["attention_backend"] = "fa3"
-        elif get_platform().is_cpu and get_platform().cpu_has_amx_support:
+        elif is_cpu() and get_platform().has_amx:
             overrides["attention_backend"] = "intel_amx"
         elif get_platform().is_xpu:
             overrides["attention_backend"] = "intel_xpu"
@@ -1027,12 +1035,12 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["dtype"] = "bfloat16"
     if cfg.moe_runner_backend == "auto":
 
-        if get_platform().is_sm100_supported and is_mxfp4_quant_format:
+        if get_platform().is_sm100 and is_mxfp4_quant_format:
             overrides["moe_runner_backend"] = "flashinfer_mxfp4"
             logger.warning(
                 "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
             )
-        elif is_sm120_supported() and is_mxfp4_quant_format:
+        elif get_platform().is_sm120 and is_mxfp4_quant_format:
             overrides["moe_runner_backend"] = "flashinfer_mxfp4"
             logger.warning(
                 "Detected SM120 and MXFP4 quantization format for GPT-OSS model, "
@@ -1057,7 +1065,7 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             logger.warning(
                 "Detected ROCm with SGLANG_USE_AITER for GPT-OSS bf16 model, using triton MOE kernel."
             )
-        elif is_musa() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
+        elif get_platform().is_musa and envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
             overrides["moe_runner_backend"] = "deep_gemm"
             logger.warning(
                 "Detected MUSA with SGLANG_DEEPEP_BF16_DISPATCH for bf16 model, using deep_gemm kernel."
@@ -1066,11 +1074,11 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             cfg.ep_size == 1
             and is_triton_kernels_available()
             and cfg.quantization is None
-            and not (get_platform().is_cpu and get_platform().cpu_has_amx_support)
+            and not (is_cpu() and get_platform().has_amx)
         ):
             # The triton_kernels package segfaults on Blackwell (B200)
             # with NVIDIA driver >= 595. Fall back to triton backend.
-            if is_blackwell_supported() and get_nvidia_driver_version() >= (595,):
+            if get_platform().is_blackwell and get_nvidia_driver_version() >= (595,):
                 overrides["moe_runner_backend"] = "triton"
                 logger.warning(
                     "Detected GPT-OSS model on Blackwell with driver >= 595, "
@@ -1093,9 +1101,9 @@ def _llama4_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
     # Auto-select attention backend for Llama4 if not specified
     if cfg.attention_backend is None:
-        if get_platform().is_sm100_supported:
+        if get_platform().is_sm100:
             backend, platform = "trtllm_mha", "sm100"
-        elif get_platform().is_sm90_supported:
+        elif get_platform().is_sm90:
             backend, platform = "fa3", "sm90"
         elif get_platform().is_hip:
             backend, platform = "aiter", "hip"
@@ -1107,7 +1115,7 @@ def _llama4_overrides(server_args: Any, hf_config: Any) -> dict:
             f"Use {backend} as attention backend on {platform} for Llama4 model"
         )
         overrides["attention_backend"] = backend
-    if get_platform().is_sm100_supported and cfg.moe_runner_backend == "auto":
+    if get_platform().is_sm100 and cfg.moe_runner_backend == "auto":
         if cfg.quantization in {"fp8", "modelopt_fp8"}:
             overrides["moe_runner_backend"] = "flashinfer_trtllm"
             logger.info(
@@ -1124,7 +1132,7 @@ def _llama4_overrides(server_args: Any, hf_config: Any) -> dict:
 def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
-    default_attention_backend = "trtllm_mha" if get_platform().is_sm100_supported else "triton"
+    default_attention_backend = "trtllm_mha" if get_platform().is_sm100 else "triton"
     if is_attention_backend_not_set(cfg):
         logger.info(
             f"Use {default_attention_backend} as default attention backend for Gemma4"
@@ -1135,8 +1143,8 @@ def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
     # choose an unsupported backend later.
     elif cfg.attention_backend is None:
         overrides["attention_backend"] = default_attention_backend
-    if get_platform().is_sm100_supported and cfg.moe_runner_backend == "auto":
-        if server_args.get_model_config().quantization == "modelopt_fp4":
+    if get_platform().is_sm100 and cfg.moe_runner_backend == "auto":
+        if model_config_of(server_args).quantization == "modelopt_fp4":
             overrides["quantization"] = "modelopt_fp4"
             overrides["moe_runner_backend"] = "flashinfer_trtllm"
             logger.info(
@@ -1180,7 +1188,7 @@ def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["disable_radix_cache"] = True
     if envs.SGLANG_MINICPM_FORCE_DENSE.get():
         dense_backends = {
-            "minicpm_flashattn": ("fa4" if is_blackwell_supported() else "fa3"),
+            "minicpm_flashattn": ("fa4" if get_platform().is_blackwell else "fa3"),
             "minicpm_flashinfer": "flashinfer",
         }
         # Literal keys keep the written-field set statically derivable; a loop
@@ -1210,7 +1218,7 @@ def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
         if cfg.is_attention_backend_not_set():
             overrides["attention_backend"] = (
                 "minicpm_flashinfer"
-                if is_blackwell_supported()
+                if get_platform().is_blackwell
                 else "minicpm_flashattn"
             )
     return overrides
@@ -1219,7 +1227,7 @@ def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
 @_register_for("MiniCPMV4_6ForConditionalGeneration")
 def _minicpm_v4_6_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    if get_platform().is_sm100_supported and cfg.attention_backend is None:
+    if get_platform().is_sm100 and cfg.attention_backend is None:
         return {"attention_backend": "triton"}
     return {}
 
@@ -1229,7 +1237,7 @@ def _minicpm_v4_6_overrides(server_args: Any, hf_config: Any) -> dict:
 )
 def _falcon_h1_jet_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    if get_platform().is_sm100_supported and cfg.attention_backend is None:
+    if get_platform().is_sm100 and cfg.attention_backend is None:
         return {"attention_backend": "triton"}
     return {}
 
@@ -1240,7 +1248,7 @@ def _granite_moe_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     has_mamba = any(
         layer_type == "mamba" for layer_type in getattr(hf_config, "layer_types", [])
     )
-    if has_mamba and get_platform().is_sm100_supported and cfg.attention_backend is None:
+    if has_mamba and get_platform().is_sm100 and cfg.attention_backend is None:
         return {"attention_backend": "flashinfer"}
     return {}
 
@@ -1248,7 +1256,7 @@ def _granite_moe_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
 @_register_for("Lfm2ForCausalLM", "Lfm2MoeForCausalLM")
 def _lfm2_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    if get_platform().is_sm100_supported and cfg.attention_backend is None:
+    if get_platform().is_sm100 and cfg.attention_backend is None:
         return {"attention_backend": "flashinfer"}
     return {}
 
@@ -1285,7 +1293,7 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
 
     if cfg.moe_runner_backend == "auto":
-        model_config = server_args.get_model_config()
+        model_config = model_config_of(server_args)
         # nvidia/DeepSeek-V4-Pro-NVFP4 uses the routed TRT-LLM runner.
         if model_config.nvfp4_moe_meta is not None:
             overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
@@ -1299,7 +1307,11 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
             and cfg.moe_a2a_backend == "none"
             and not envs.SGLANG_DSV4_FP4_DEQUANT.get()
             and model_config.is_fp4_experts
-            and (get_platform().is_sm90_supported or get_platform().is_sm100_supported or is_sm120_supported())
+            and (
+                get_platform().is_sm90
+                or get_platform().is_sm100
+                or get_platform().is_sm120
+            )
         ):
             overrides["moe_runner_backend"] = "flashinfer_mxfp4"
             logger.info(
@@ -1350,7 +1362,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
     # --attention-backend / --prefill/decode-attention-backend still wins.
     if is_attention_backend_not_set(cfg):
-        inkling_attn_backend = "fa4" if get_platform().is_sm100_supported else "triton"
+        inkling_attn_backend = "fa4" if get_platform().is_sm100 else "triton"
         overrides["attention_backend"] = inkling_attn_backend
         logger.info(
             f"Use {inkling_attn_backend} as the attention backend for Inkling "
@@ -1367,7 +1379,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     cache handling and the triton-backend assert stay in the arch branch)."""
     cfg = resolving_view(server_args)
     model_arch = hf_config.architectures[0]
-    model_config = server_args.get_model_config()
+    model_config = model_config_of(server_args)
     overrides: Dict[str, Any] = {}
 
     is_modelopt = model_config.quantization in [
@@ -1416,7 +1428,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     elif (is_modelopt or model_config.quantization is None) and (
         cfg.moe_runner_backend == "auto"
     ):
-        if get_platform().is_sm100_supported and cfg.moe_a2a_backend == "none":
+        if get_platform().is_sm100 and cfg.moe_a2a_backend == "none":
             overrides["moe_runner_backend"] = "flashinfer_trtllm"
             logger.info(
                 f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
@@ -1426,8 +1438,8 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                 model_config.quantization in ("modelopt_fp4", "modelopt_mixed")
                 or quantization == "modelopt_fp4"
             )
-            and is_cuda()
-            and (8, 0) <= get_device_capability() < (10, 0)
+            and get_platform().is_cuda
+            and (8, 0) <= get_platform().device_capability < (10, 0)
         ):
             overrides["moe_runner_backend"] = "marlin"
             logger.info(
@@ -1437,10 +1449,10 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         else:
             overrides["moe_runner_backend"] = "flashinfer_cutlass"
 
-    if is_blackwell_supported() and cfg.is_attention_backend_not_set():
+    if get_platform().is_blackwell and cfg.is_attention_backend_not_set():
         if cfg.speculative_algorithm is not None:
             speculative_algorithm = cfg.speculative_algorithm.upper()
-            if get_platform().is_sm100_supported and cfg.speculative_eagle_topk in (
+            if get_platform().is_sm100 and cfg.speculative_eagle_topk in (
                 None,
                 1,
             ):
@@ -1461,7 +1473,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                     and speculative_algorithm in ("EAGLE", "NEXTN", "DFLASH", "DSPARK")
                 ):
                     overrides["speculative_draft_attention_backend"] = "flashinfer"
-        elif get_platform().is_sm100_supported:
+        elif get_platform().is_sm100:
             overrides["attention_backend"] = "trtllm_mha"
     return overrides
 
@@ -1475,7 +1487,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
 )
 def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    if not get_platform().is_sm100_supported or cfg.attention_backend is not None:
+    if not get_platform().is_sm100 or cfg.attention_backend is not None:
         return {}
     sm100_default_attn_backend = "triton"
     # trtllm_mha requires speculative_eagle_topk == 1 and page_size > 1.
@@ -1485,7 +1497,7 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     # and spec decoding are disabled.
     default_attn_backend = server_args._get_default_attn_backend(
         use_mla_backend=server_args.use_mla_backend(),
-        model_config=server_args.get_model_config(),
+        model_config=model_config_of(server_args),
     )
     # The mamba radix-cache pass runs before this dispatch: read the
     # declared strategy through the view (the legacy branch observed the
@@ -1534,7 +1546,7 @@ def _qwen3vl_overrides(server_args: Any, hf_config: Any) -> dict:
 def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
-    if get_platform().is_sm100_supported:
+    if get_platform().is_sm100:
         quant_method = get_quantization_config(hf_config)
         quantization = cfg.quantization
         if (
@@ -1561,7 +1573,7 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
 def _glm4_moe_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
-    if get_platform().is_sm100_supported:
+    if get_platform().is_sm100:
         quantization_config = getattr(hf_config, "quantization_config", None)
         quant_method = (
             quantization_config.get("quant_method")
@@ -1602,9 +1614,9 @@ def _olmo2_overrides(server_args: Any, hf_config: Any) -> dict:
     )
     overrides["disable_hybrid_swa_memory"] = True
     if cfg.attention_backend is None:
-        if is_cuda() and get_platform().is_sm100_supported:
+        if get_platform().is_cuda and get_platform().is_sm100:
             overrides["attention_backend"] = "trtllm_mha"
-        elif is_cuda() and get_device_sm() >= 80:
+        elif get_platform().is_cuda and get_platform().device_sm >= 80:
             overrides["attention_backend"] = "fa3"
         else:
             overrides["attention_backend"] = "triton"
@@ -1813,7 +1825,7 @@ def _dsa_index_cache_dtype_default(view: Any) -> dict:
     """Set dsa index cache by default according to model quantization method."""
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
-    hf_config = view.get_model_config().hf_config
+    hf_config = model_config_of(view).hf_config
     if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
     if not is_deepseek_dsa(hf_config):

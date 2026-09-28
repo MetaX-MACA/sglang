@@ -55,6 +55,7 @@ from sglang.srt.arg_groups.argparse_actions import (
 from sglang.srt.arg_groups.overrides import (
     mamba_extra_buffer_lazy_of,
     mamba_extra_buffer_of,
+    model_config_of,
     remote_instance_transfer_engine_of,
     resolution_projection,
     resolving_view,
@@ -3797,7 +3798,7 @@ class ServerArgs:
             or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
         ):
             return
-        arch = self.get_model_config().hf_config.architectures[0]
+        arch = model_config_of(self).hf_config.architectures[0]
         if arch in ("MuseGlimmerForCausalLM", "MuseGlimmerForConditionalGeneration"):
             self._declare(
                 "_apply_muse_glimmer_prefill_cuda_graph_max_bs_default",
@@ -3934,8 +3935,8 @@ class ServerArgs:
         # this runs first, so piecewise would otherwise silently win.
         if (
             cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
-            and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
-            and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported
+            and model_config_of(self).is_multimodal_piecewise_cuda_graph_supported
+            and not model_config_of(self).is_multimodal_breakable_cuda_graph_supported
             # Keep trtllm_mla on the preferred breakable path, which now serves
             # MLA by falling back to the flashinfer MLA impl for extend.
             and self._resolved_attention_backends()[0] != "trtllm_mla"
@@ -3971,7 +3972,7 @@ class ServerArgs:
         rules = [
             (
                 "model-arch blacklist",
-                lambda: self.get_model_config().is_piecewise_cuda_graph_disabled_model,
+                lambda: model_config_of(self).is_piecewise_cuda_graph_disabled_model,
             ),
             ("DP attention", lambda: self._resolved().enable_dp_attention),
             ("full torch.compile mode", lambda: cfg.enable_torch_compile),
@@ -3994,8 +3995,8 @@ class ServerArgs:
             ("LoRA", lambda: bool(cfg.lora_paths) or cfg.enable_lora),
             (
                 "multimodal model",
-                lambda: self.get_model_config().is_multimodal
-                and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported,
+                lambda: model_config_of(self).is_multimodal
+                and not model_config_of(self).is_multimodal_piecewise_cuda_graph_supported,
             ),
             (
                 "GGUF quantization",
@@ -4053,13 +4054,13 @@ class ServerArgs:
         rules = [
             (
                 "KDA hybrid linear attention",
-                lambda: uses_kda_attention(self.get_model_config().hf_config),
+                lambda: uses_kda_attention(model_config_of(self).hf_config),
             ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
             (
                 "DeepSeek-V4 (heavy capture-pool memory pressure)",
-                lambda: is_deepseek_v4(self.get_model_config().hf_config),
+                lambda: is_deepseek_v4(model_config_of(self).hf_config),
             ),
             # CP all_gather replay size mismatch under BCG.
             (
@@ -4085,8 +4086,8 @@ class ServerArgs:
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
                 "multimodal model",
-                lambda: self.get_model_config().is_multimodal
-                and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+                lambda: model_config_of(self).is_multimodal
+                and not model_config_of(self).is_multimodal_breakable_cuda_graph_supported,
             ),
         ]
         for name, predicate in rules:
@@ -4127,7 +4128,7 @@ class ServerArgs:
             return
         if (
             "DeepseekV3ForCausalLM"
-            not in self.get_model_config().hf_config.architectures
+            not in model_config_of(self).hf_config.architectures
         ):
             return
         prefill_attention_backend, _ = self._resolved_attention_backends()
@@ -4407,7 +4408,7 @@ class ServerArgs:
             # so we adjust the mem_fraction_static accordingly. The VLM encoder
             # only runs on the prefill stage, so PD decode engines do not need
             # this headroom; prefill engines and normal (non-PD) engines do.
-            model_config = self.get_model_config()
+            model_config = model_config_of(self)
             if (
                 model_config.is_multimodal
                 and not cfg.language_only
@@ -4470,7 +4471,7 @@ class ServerArgs:
 
         from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
 
-        hf_config = self.get_model_config().hf_config
+        hf_config = model_config_of(self).hf_config
         if is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config):
             return False
 
@@ -4700,7 +4701,7 @@ class ServerArgs:
             # key them on.
             return
 
-        model_config = self.get_model_config()
+        model_config = model_config_of(self)
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
 
@@ -5379,7 +5380,7 @@ class ServerArgs:
 
     def _handle_attention_backend_compatibility(self):
         cfg = resolving_view(self)
-        model_config = self.get_model_config()
+        model_config = model_config_of(self)
 
         # The attention_backend write clusters of this handler moved to the
         # resolution pipeline (arg_groups/overrides.py), each invoked below at
@@ -6025,7 +6026,7 @@ class ServerArgs:
             from sglang.srt.configs.model_config import is_deepseek_dsa
             from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
 
-            model_config = self.get_model_config()
+            model_config = model_config_of(self)
             hf_config = model_config.hf_config
             model_arch = hf_config.architectures[0]
             if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:
@@ -6304,7 +6305,7 @@ class ServerArgs:
             # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
             assert (
                 view.quantization in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online"]
-                or self.get_model_config().nvfp4_moe_meta is not None
+                or model_config_of(self).nvfp4_moe_meta is not None
             ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', or hybrid NVFP4 models."
             assert view.ep_size in [
                 1,
@@ -6496,7 +6497,7 @@ class ServerArgs:
             )
 
         architectures = (
-            getattr(self.get_model_config().hf_config, "architectures", None) or []
+            getattr(model_config_of(self).hf_config, "architectures", None) or []
         )
 
         architecture = architectures[0] if architectures else None
@@ -6647,7 +6648,7 @@ class ServerArgs:
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
             if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
                 resolved_view(self).quantization == "modelopt_fp4"
-                or self.get_model_config().nvfp4_moe_meta is not None
+                or model_config_of(self).nvfp4_moe_meta is not None
             ):
                 envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
                 logger.warning(
@@ -7549,7 +7550,7 @@ class ServerArgs:
                 "--language-model-only is incompatible with --disaggregation-mode "
                 "prefill/decode"
             )
-        architectures = self.get_model_config().hf_config.architectures
+        architectures = model_config_of(self).hf_config.architectures
         if not any(a in self.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures):
             raise ValueError(
                 f"--language-model-only does not support {architectures}. "
@@ -7590,7 +7591,7 @@ class ServerArgs:
             )
 
         # Validate model type for encoder disaggregation
-        hf_config = self.get_model_config().hf_config
+        hf_config = model_config_of(self).hf_config
         model_arch = hf_config.architectures[0]
         if cfg.encoder_transfer_backend == "auto":
             self._declare(
@@ -7788,7 +7789,7 @@ class ServerArgs:
                     "--encoder-transfer-backend instead."
                 )
             elif (
-                self.get_model_config().is_multimodal
+                model_config_of(self).is_multimodal
                 and is_cuda()
                 and cfg.disaggregation_mode == "null"
             ):
@@ -7806,7 +7807,7 @@ class ServerArgs:
                         supports_cuda_vmm_feature_transport,
                     )
 
-                    if supports_cuda_vmm_feature_transport(self.get_model_config()):
+                    if supports_cuda_vmm_feature_transport(model_config_of(self)):
                         requested_transport = "cuda_vmm"
                         logger.info(
                             "Multimodal feature transport auto-resolved to "
@@ -8094,7 +8095,7 @@ class ServerArgs:
             is_deepseek_model = False
             if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
                 try:
-                    hf_config = self.get_model_config().hf_config
+                    hf_config = model_config_of(self).hf_config
                     model_arch = hf_config.architectures[0]
                     is_deepseek_model = model_arch in [
                         "DeepseekV2ForCausalLM",

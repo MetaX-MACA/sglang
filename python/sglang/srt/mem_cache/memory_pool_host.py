@@ -219,7 +219,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        alloc_func = ALLOC_MEMORY_FUNCS[torch.device(self.gpu_device).type]
+        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [

@@ -39,7 +39,7 @@ import json
 import os
 from setuptools import setup
 
-version = "0.5.18"
+version = "0.5.19"
 maca_ai_version = os.environ.get('MACA_AI_VERSION', '0.0.0.0')
 version += "+maca"+maca_ai_version
 setup(
