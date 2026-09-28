@@ -2120,7 +2120,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_attn_fn,
                     self.hc_attn_scale,
                     self.hc_attn_base,
-                    norm=self.input_layernorm,
                     forward_batch=forward_batch,
                 )
                 if not norm_fused:
@@ -2142,7 +2141,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
-                norm=self.input_layernorm,
                 forward_batch=forward_batch,
             )
             if not norm_fused:
@@ -2411,7 +2409,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
-            norm=self.input_layernorm,
             forward_batch=forward_batch,
         )
         if not norm_fused:
