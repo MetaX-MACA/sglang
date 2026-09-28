@@ -182,6 +182,10 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
+from sglang.srt.models.deepseek_common.online_rotation import (
+    build_rotation,
+    get_online_rotation_module_config,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _get_llama_4_scaling,
@@ -3039,6 +3043,14 @@ class DeepseekV2Model(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
+        rotation_config = get_online_rotation_module_config(
+            config, add_prefix("prenorm_hadamard_rotation", prefix)
+        )
+        if rotation_config is not None and self.pp_group.is_last_rank:
+            self.prenorm_hadamard_rotation = build_rotation(rotation_config)
+        else:
+            self.prenorm_hadamard_rotation = None
+
         self.gemm_output_zero_allocator_size = 0
         if (
             _use_aiter_gfx95
@@ -3286,6 +3298,11 @@ class DeepseekV2Model(nn.Module):
         else:
             if not forward_batch.forward_mode.is_idle():
                 if residual is None:
+                    hidden_states = self.norm(hidden_states)
+                elif self.prenorm_hadamard_rotation is not None:
+                    hidden_states = self.prenorm_hadamard_rotation(
+                        hidden_states + residual,
+                    )
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
