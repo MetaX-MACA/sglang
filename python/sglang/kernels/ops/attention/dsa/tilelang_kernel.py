@@ -333,7 +333,7 @@ def sparse_attention_fwd_kernel_v1(
     else:
         REPLICATE_H = 1
 
-    H_per_block = padded_H if REPLICATE_H == 1 else 64  # 16 
+    H_per_block = padded_H if REPLICATE_H == 1 else head_tile  # 16
 
     @T.prim_func
     def main(

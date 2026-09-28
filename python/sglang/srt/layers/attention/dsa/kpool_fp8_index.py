@@ -2353,7 +2353,6 @@ def kpool_write_tail_and_maybe_compress(
     assert num_draft_tokens > 0
     assert buf.dtype in [torch.uint8, torch.int8]
     assert key.dim() == 2 and key.shape[1] == INDEX_HEAD_DIM
-    assert buf.dtype == key.dtype
     assert score.shape == key.shape
     assert tail_k.dtype == torch.bfloat16 and key.dtype == torch.bfloat16
     assert tail_k.shape == tail_score.shape
