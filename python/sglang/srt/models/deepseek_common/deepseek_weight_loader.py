@@ -410,6 +410,7 @@ class DeepseekV2WeightLoaderMixin:
             nextn_layer_prefix=f"model.layers.{nextn_layer_id}",
             nextn_spec_weight_names=[
                 "shared_head.norm",
+                "prenorm_hadamard_rotation",
                 "eh_proj",
                 "enorm",
                 "hnorm",
