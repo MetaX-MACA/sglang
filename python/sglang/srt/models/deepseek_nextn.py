@@ -54,6 +54,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.deepseek_common.online_rotation import (
+    build_rotation,
+    get_online_rotation_module_config,
+)
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
@@ -164,6 +168,16 @@ class DeepseekModelNextN(nn.Module):
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        nextn_layer_id = config.num_hidden_layers
+        rotation_module_name = add_prefix(
+            "prenorm_hadamard_rotation", f"model.layers.{nextn_layer_id}.shared_head"
+        )
+        rotation_config = get_online_rotation_module_config(config, rotation_module_name)
+        if rotation_config is not None:
+            self.shared_head.prenorm_hadamard_rotation = build_rotation(rotation_config)
+        else:
+            self.shared_head.prenorm_hadamard_rotation = None
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -241,7 +255,12 @@ class DeepseekModelNextN(nn.Module):
                     forward_batch.topk_indices = topk_indices
 
             if not forward_batch.forward_mode.is_idle():
-                if residual is not None:
+                if self.shared_head.prenorm_hadamard_rotation is not None:
+                    hidden_states = self.shared_head.prenorm_hadamard_rotation(
+                        hidden_states + residual if residual is not None else hidden_states,
+                    )
+                    hidden_states = self.shared_head.norm(hidden_states)
+                elif residual is not None:
                     hidden_states, _ = self.shared_head.norm(hidden_states, residual)
                 else:
                     hidden_states = self.shared_head.norm(hidden_states)
