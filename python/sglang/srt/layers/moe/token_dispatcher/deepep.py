@@ -73,7 +73,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.runtime_context import get_resources
-
+SGLANG_DEEPEP_MODE_NORMAL_USE_INT8_QUANT = envs.SGLANG_DEEPEP_MODE_NORMAL_USE_INT8_QUANT.get()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
@@ -633,19 +633,23 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         else:
             hidden_states_scale = None
 
-        if hidden_states.shape[0] > 0:
-            reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
-                hidden_states, topk_ids, fp8_dtype=hidden_states.dtype
-            )
+        if SGLANG_DEEPEP_MODE_NORMAL_USE_INT8_QUANT:
+            if hidden_states.shape[0] > 0:
+                reorder_topk_ids, seg_indptr, hidden_states = self._deepep_permute(
+                    hidden_states, topk_ids, fp8_dtype=hidden_states.dtype
+                )
+            else:
+                reorder_topk_ids = torch.empty(
+                    (0,), device=hidden_states.device, dtype=torch.int64
+                )
+                seg_indptr = torch.zeros(
+                    (self.num_local_experts + 1,),
+                    device=hidden_states.device,
+                    dtype=torch.int64,
+                )
         else:
-            reorder_topk_ids = torch.empty(
-                (0,), device=hidden_states.device, dtype=torch.int64
-            )
-            seg_indptr = torch.zeros(
-                (self.num_local_experts + 1,),
-                device=hidden_states.device,
-                dtype=torch.int64,
-            )
+            reorder_topk_ids = None
+            seg_indptr = None
 
         return DeepEPNormalDispatchOutput(
             hidden_states,
@@ -726,7 +730,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
+        if not SGLANG_DEEPEP_MODE_NORMAL_USE_INT8_QUANT or deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
             # raise NotImplementedError()  # triton runner was supported but it's temporarily disabled

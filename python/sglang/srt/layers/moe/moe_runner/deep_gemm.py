@@ -1576,6 +1576,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
         topk_ids,
         topk_weights,
         num_recv_tokens_per_expert,
+        _,
+        _
     ) = dispatch_output
     assert runner_config.activation in ("silu", "situ")
 
