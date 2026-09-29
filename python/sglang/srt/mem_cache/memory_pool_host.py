@@ -14,6 +14,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.environ import envs
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -195,7 +196,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.item_bytes = item_bytes
         self.num_host_pages = num_host_pages
         self.slot_page_size = slot_page_size
-        self.dtype = torch.uint8
+        kv_dtype = envs.MX_DSV4_HISPARSE_CACHE_DTYPE.get()
+        if kv_dtype == 'bfloat16':
+            self.dtype = torch.bfloat16
+        else:
+            self.dtype = torch.uint8
         self.device = device
         self.pin_memory = pin_memory
         self.allocator = get_allocator_from_storage(allocator_type)
@@ -219,7 +224,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        device_key = torch.device(self.gpu_device).type
+        alloc_func = ALLOC_MEMORY_FUNCS[device_key]
+        # alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [
