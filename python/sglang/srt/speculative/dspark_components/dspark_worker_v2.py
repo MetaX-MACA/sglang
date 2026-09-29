@@ -1,5 +1,5 @@
 import logging
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from typing import Optional
 
@@ -20,6 +20,10 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
+)
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
 )
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -348,10 +352,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextmanager
     def _draft_context(self):
-        if self._draft_dp_context_enabled:
-            return draft_tp_context(get_parallel().attn_tp_group)
-        return nullcontext()
+        with ExitStack() as stack:
+            if self._draft_dp_context_enabled:
+                stack.enter_context(draft_tp_context(get_parallel().attn_tp_group))
+            stack.enter_context(speculative_moe_backend_context())
+            stack.enter_context(speculative_moe_a2a_backend_context())
+            yield
 
     def alloc_memory_pool(
         self,
@@ -606,7 +614,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_idle_decode_step()
             if get_parallel().enable_dp_attention:
                 if self._draft_is_moe:
-                    self._proposer.run_idle_participation(batch)
+                    with self._draft_context():
+                        self._proposer.run_idle_participation(batch)
                 self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                 )
