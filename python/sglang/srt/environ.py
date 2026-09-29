@@ -1005,6 +1005,7 @@ class Envs:
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    SGLANG_DSV4_TRITON_FLASHMLA_KV = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)

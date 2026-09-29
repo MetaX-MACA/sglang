@@ -5,20 +5,28 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.attention.dsv4.kv_cache_layout import (
+    DSV4KVCacheFormat,
+    FP8_SCALE_BYTES_PER_TOKEN,
+    INT8_SCALE_BYTES_PER_TOKEN,
+    NOPE_DIM,
+    NUM_QUANT_GROUPS,
+    QUANT_GROUP_SIZE,
+    ROPE_DIM,
+    VALUE_BYTES_PER_TOKEN,
+    get_kv_cache_format,
+)
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
-# v4 KV cache layout (see dsv4.index_buf_accessor._set_k_and_s_triton_kernel):
-#   per-token: 448 fp8 nope + 64 bf16 rope (= 576 contiguous bytes) +
-#              7 ue8m0 scales padded to 8 bytes.
-#   per-page:  [token 0..P-1 nope+rope (P*576 bytes)] [token 0..P-1 scale (P*8 bytes)]
-#              padded up to a multiple of 576.
-DIM_NOPE = 448
-DIM_ROPE = 64
-TILE_SIZE = 64  # one nope scale tile = 64 fp8 values
-NUM_SCALE_TILES = DIM_NOPE // TILE_SIZE  # 7
-NOPE_ROPE_BYTES = DIM_NOPE + DIM_ROPE * 2  # 576
-PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
+# V4 packed KV cache: a page-wide value section of 576 bytes per token,
+# followed by an 8-byte FP8 or 32-byte INT8 scale record per token.
+DIM_NOPE = NOPE_DIM
+DIM_ROPE = ROPE_DIM
+TILE_SIZE = QUANT_GROUP_SIZE
+NUM_SCALE_TILES = NUM_QUANT_GROUPS
+NOPE_ROPE_BYTES = VALUE_BYTES_PER_TOKEN
+PADDED_SCALE_PER_TOKEN = FP8_SCALE_BYTES_PER_TOKEN
 
 
 def dequantize_k_cache_paged(
@@ -30,7 +38,8 @@ def dequantize_k_cache_paged(
     """Dequantize the DeepSeek v4 paged KV cache for a list of token IDs.
 
     Args:
-        quant_k_cache: (num_pages, bytes_per_page_padded) uint8.
+        quant_k_cache: FP8/uint8 or INT8 view of
+            (num_pages, bytes_per_page_padded).
         page_table_1_flattened: (num_tokens,) int — token IDs into the cache.
         page_size: number of tokens per page.
         out: optional (num_tokens, 1, DIM_NOPE + DIM_ROPE) bf16 destination.
@@ -40,7 +49,10 @@ def dequantize_k_cache_paged(
     Returns:
         (num_tokens, 1, DIM_NOPE + DIM_ROPE) bfloat16.
     """
+    assert quant_k_cache.ndim == 2
     assert quant_k_cache.is_contiguous()
+    cache_format = get_kv_cache_format(quant_k_cache.dtype)
+    assert cache_format in (DSV4KVCacheFormat.FP8, DSV4KVCacheFormat.INT8)
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
 
     # The buffer's dtype is whatever the pool exposes (often bf16); the
@@ -52,8 +64,10 @@ def dequantize_k_cache_paged(
 
     # Three typed views over the same underlying bytes.
     buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
+    buf_int8 = quant_k_cache_u8.view(torch.int8).reshape(-1)
     buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
     buf_uint8 = quant_k_cache_u8.reshape(-1)
+    buf_fp32 = quant_k_cache_u8.view(torch.float32).reshape(-1)
 
     if out is None:
         out = torch.empty(
@@ -68,8 +82,10 @@ def dequantize_k_cache_paged(
     _dequantize_k_cache_paged_kernel[(num_tokens,)](
         out,
         buf_fp8,
+        buf_int8,
         buf_bf16,
         buf_uint8,
+        buf_fp32,
         page_table_1_flattened,
         out.stride(0),
         BYTES_PER_PAGE=bytes_per_page,
@@ -79,8 +95,13 @@ def dequantize_k_cache_paged(
         TILE_SIZE=TILE_SIZE,
         NUM_SCALE_TILES=NUM_SCALE_TILES,
         NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
-        PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
+        SCALE_BYTES_PER_TOKEN=(
+            FP8_SCALE_BYTES_PER_TOKEN
+            if cache_format == DSV4KVCacheFormat.FP8
+            else INT8_SCALE_BYTES_PER_TOKEN
+        ),
         S_OFFSET_BYTES=s_offset_bytes,
+        CACHE_FORMAT=int(cache_format),
     )
     return out
 
@@ -223,8 +244,10 @@ def cast_q_fp8_for_q8kv8_prefill(
 def _dequantize_k_cache_paged_kernel(
     output_ptr,
     buf_fp8_ptr,
+    buf_int8_ptr,
     buf_bf16_ptr,
     buf_uint8_ptr,
+    buf_fp32_ptr,
     page_table_ptr,
     output_stride_0,
     BYTES_PER_PAGE: tl.constexpr,
@@ -234,8 +257,9 @@ def _dequantize_k_cache_paged_kernel(
     TILE_SIZE: tl.constexpr,
     NUM_SCALE_TILES: tl.constexpr,
     NOPE_ROPE_BYTES: tl.constexpr,
-    PADDED_SCALE_PER_TOKEN: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
     S_OFFSET_BYTES: tl.constexpr,
+    CACHE_FORMAT: tl.constexpr,
 ):
     # One program per token: load page_table[token_id] once and emit all
     # NUM_SCALE_TILES nope tiles + rope tail via tl.static_range.
@@ -246,22 +270,25 @@ def _dequantize_k_cache_paged_kernel(
     page_byte_base = page_idx * BYTES_PER_PAGE
     token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
     token_scale_base = (
-        page_byte_base + S_OFFSET_BYTES + in_page * PADDED_SCALE_PER_TOKEN
+        page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES_PER_TOKEN
     )
     out_row_base = token_id * output_stride_0
 
     nope_offs = tl.arange(0, TILE_SIZE)
     for tile_id in tl.static_range(NUM_SCALE_TILES):
         fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
-        fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
-
-        scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
-        scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
+        if CACHE_FORMAT == 1:
+            quant_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
+            scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
+            scale = tl.exp2((scale_u8 - 127).to(tl.float32))
+        else:
+            quant_vals = tl.load(buf_int8_ptr + fp8_off).to(tl.float32)
+            scale = tl.load(buf_fp32_ptr + token_scale_base // 4 + tile_id)
 
         out_off = out_row_base + tile_id * TILE_SIZE + nope_offs
         tl.store(
             output_ptr + out_off,
-            (fp8_vals * scale_pow2).to(output_ptr.dtype.element_ty),
+            (quant_vals * scale).to(output_ptr.dtype.element_ty),
         )
 
     rope_offs = tl.arange(0, DIM_ROPE)
@@ -334,39 +361,52 @@ def dequantize_k_cache_paged_ref(
     below); not on any hot path.
     """
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
+    assert quant_k_cache.ndim == 2
+    cache_format = get_kv_cache_format(quant_k_cache.dtype)
+    assert cache_format in (DSV4KVCacheFormat.FP8, DSV4KVCacheFormat.INT8)
     u8 = quant_k_cache.view(torch.uint8)
     bytes_per_page = u8.shape[-1]
     s_offset_bytes = page_size * NOPE_ROPE_BYTES
 
     flat_u8 = u8.reshape(-1)
     flat_fp8 = u8.view(fp8_dtype).reshape(-1)
+    flat_int8 = u8.view(torch.int8).reshape(-1)
     flat_bf16 = u8.view(torch.bfloat16).reshape(-1)
+    flat_fp32 = u8.view(torch.float32).reshape(-1)
 
     loc = page_table_1_flattened.to(torch.int64)
     page_idx = loc // page_size
     in_page = loc % page_size
     page_byte_base = page_idx * bytes_per_page
     token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
-    token_scale_base = (
-        page_byte_base + s_offset_bytes + in_page * PADDED_SCALE_PER_TOKEN
+    scale_stride = (
+        FP8_SCALE_BYTES_PER_TOKEN
+        if cache_format == DSV4KVCacheFormat.FP8
+        else INT8_SCALE_BYTES_PER_TOKEN
     )
+    token_scale_base = page_byte_base + s_offset_bytes + in_page * scale_stride
 
     device = quant_k_cache.device
     nope_byte = (
         token_data_base[:, None] + torch.arange(DIM_NOPE, device=device)[None, :]
     )
-    nope_fp8 = flat_fp8[nope_byte].to(torch.float32)
-    scale_byte = (
-        token_scale_base[:, None]
-        + torch.arange(NUM_SCALE_TILES, device=device)[None, :]
-    )
-    scale_u8 = flat_u8[scale_byte].to(torch.int32)
-    scale_pow2 = torch.exp2((scale_u8 - 127).to(torch.float32))
-    scale_pow2 = torch.where(
-        scale_pow2 < (2.0**-126), torch.zeros_like(scale_pow2), scale_pow2
-    )
-    scale_full = scale_pow2.repeat_interleave(TILE_SIZE, dim=1)
-    nope = nope_fp8 * scale_full
+    if cache_format == DSV4KVCacheFormat.FP8:
+        nope_quant = flat_fp8[nope_byte].to(torch.float32)
+        scale_byte = token_scale_base[:, None] + torch.arange(
+            NUM_SCALE_TILES, device=device
+        )[None, :]
+        scale_u8 = flat_u8[scale_byte].to(torch.int32)
+        scales = torch.exp2((scale_u8 - 127).to(torch.float32))
+        scales = torch.where(
+            scales < (2.0**-126), torch.zeros_like(scales), scales
+        )
+    else:
+        nope_quant = flat_int8[nope_byte].to(torch.float32)
+        scale_idx = token_scale_base[:, None] // 4 + torch.arange(
+            NUM_SCALE_TILES, device=device
+        )[None, :]
+        scales = flat_fp32[scale_idx]
+    nope = nope_quant * scales.repeat_interleave(TILE_SIZE, dim=1)
 
     rope_bf16_base = (token_data_base + DIM_NOPE) // 2
     rope_idx = rope_bf16_base[:, None] + torch.arange(DIM_ROPE, device=device)[None, :]

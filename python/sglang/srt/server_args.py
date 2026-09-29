@@ -615,7 +615,8 @@ class ServerArgs:
         Arg(
             help=(
                 'Data type for kv cache storage. "auto" will use model data type. '
-                '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
+                '"bf16" or "bfloat16" for BF16 KV cache. "int8" enables an '
+                'INT8 KV cache on supported backends. "fp8_e5m2" and '
                 '"fp8_e4m3" are supported for CUDA 11.8+. "mxfp8" is supported '
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
@@ -627,6 +628,7 @@ class ServerArgs:
                 "fp8_e5m2",
                 "fp8_e4m3",
                 "mxfp8",
+                "int8",
                 "bf16",
                 "bfloat16",
                 "nvfp4",

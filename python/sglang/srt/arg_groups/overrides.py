@@ -1814,6 +1814,7 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
+        "int8",
     ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
@@ -2126,6 +2127,7 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
     assert kv_cache_dtype in [
         "fp8_e4m3",
         "bfloat16",
+        "int8",
     ], f"{kv_cache_dtype} is not supported for {model_arch}"
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}

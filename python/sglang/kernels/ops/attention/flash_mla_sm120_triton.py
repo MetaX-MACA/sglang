@@ -6,14 +6,17 @@ Replaces V1's serial token loop with a tiled vectorized approach:
   3. V accumulation via vectorized weighted sum across BLOCK_T tokens
   4. Online softmax operates on tile-level maxima (fewer rescales)
 
-Three typed views of the same paged buffer handle FP8/uint8/BF16 regions:
+Typed views of the same paged buffer handle FP8/INT8/scale/BF16 regions:
 - float8_e4m3fn view -> nope FP8 values (direct load + dequant)
 - uint8 view -> UE8M0 scale bytes (raw integer -> exp2 conversion)
 - bfloat16 view -> rope BF16 values (direct load)
 
-DSv4 page layout (per token, 576 bytes data + 8 bytes scales):
+DSv4 FP8 page layout (per token, 576 bytes data + 8 bytes scales):
   Data section: [0:448] FP8 nope | [448:576] BF16 rope (64 values = 128 bytes)
   Scale section: [page_size*576 + offset*8 : +7] UE8M0 scales (7 groups of 64)
+
+The INT8 variant keeps the 576-byte data record and uses a 32-byte scale
+record containing 7 FP32 group scales plus 4 bytes of padding.
 
 Target: RTX PRO 6000 (SM120, 188 SMs, 99KB SMEM, ~1.5 TB/s GDDR7, 96MB L2)
 """
@@ -25,16 +28,25 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.dsv4.kv_cache_layout import (
+    DSV4KVCacheFormat,
+    FP8_SCALE_BYTES_PER_TOKEN,
+    INT8_SCALE_BYTES_PER_TOKEN,
+    NOPE_DIM,
+    ROPE_DIM,
+    VALUE_BYTES_PER_TOKEN,
+    get_kv_cache_format,
+)
+
 logger = logging.getLogger(__name__)
 
 LOG2E = tl.constexpr(1.4426950408889634)
 
 # DSv4 KV cache layout constants
-_NOPE_DIM = 448
-_ROPE_DIM = 64
+_NOPE_DIM = NOPE_DIM
+_ROPE_DIM = ROPE_DIM
 _D = _NOPE_DIM + _ROPE_DIM  # 512
-_TOKEN_DATA_STRIDE = 576  # bytes per token in data section
-_SCALE_STRIDE = 8  # bytes per token in scale section
+_TOKEN_DATA_STRIDE = VALUE_BYTES_PER_TOKEN
 
 
 @triton.autotune(
@@ -49,11 +61,13 @@ _SCALE_STRIDE = 8  # bytes per token in scale section
 def _tiled_sparse_decode_kernel(
     # Q: [B, H, D] bf16
     Q_ptr,
+    cache_int8_ptr,
     # Paged KV cache — three typed views of same underlying memory
     cache_fp8_ptr,  # float8_e4m3fn flat (1 byte/elem) — for nope
     cache_uint8_ptr,  # uint8 flat (1 byte/elem) — for scales
     cache_bf16_ptr,  # bfloat16 flat (2 bytes/elem) — for rope
     # Indices: [B, topk] int32
+    cache_fp32_ptr,
     indices_ptr,
     # Valid lengths: [B] int32
     topk_len_ptr,
@@ -65,6 +79,7 @@ def _tiled_sparse_decode_kernel(
     page_size: tl.int32,
     page_bytes: tl.int64,
     scale_section_off: tl.int64,  # page_size * 576
+    scale_stride: tl.int32,
     H: tl.int32,
     topk: tl.int32,
     topk_rounded: tl.int32,  # for autotune key
@@ -80,6 +95,7 @@ def _tiled_sparse_decode_kernel(
     ROPE_DIM: tl.constexpr,  # 64
     NOPE_DIM_RT: tl.int32,  # 448 (runtime, for masking)
     BLOCK_T: tl.constexpr,  # tokens per tile (16 or 32)
+    CACHE_FORMAT: tl.constexpr,
 ):
     """Tiled sparse decode: vectorized gather + QK + softmax + V accumulation.
 
@@ -139,22 +155,21 @@ def _tiled_sparse_decode_kernel(
         # ---- Vectorized NOPE FP8 gather: [BLOCK_T, NOPE_PAD] ----
         nope_addrs = token_data_bases[:, None] + nope_offs[None, :].to(tl.int64)
         nope_2d_mask = idx_valid[:, None] & nope_mask[None, :]
-        kv_nope_fp8 = tl.load(
-            cache_fp8_ptr + nope_addrs,
-            mask=nope_2d_mask,
-            other=0.0,
-        )
-
-        # ---- Vectorized scale gather + dequant: [BLOCK_T, NOPE_PAD] ----
-        scale_bases = page_ids * page_bytes + scale_section_off + page_offs_t * 8
-        scale_addrs = scale_bases[:, None] + group_ids[None, :]
-        scale_raw = tl.load(
-            cache_uint8_ptr + scale_addrs,
-            mask=nope_2d_mask,
-            other=127,
-        )
-        scale_f32 = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
-        kv_nope = tl.where(nope_2d_mask, kv_nope_fp8.to(tl.float32) * scale_f32, 0.0)
+        scale_bases = page_ids * page_bytes + scale_section_off + page_offs_t * scale_stride
+        if CACHE_FORMAT == 1:
+            kv_nope_quant = tl.load(
+                cache_fp8_ptr + nope_addrs, mask=nope_2d_mask, other=0.0
+            ).to(tl.float32)
+            scale_addrs = scale_bases[:, None] + group_ids[None, :]
+            scale_raw = tl.load(cache_uint8_ptr + scale_addrs, mask=nope_2d_mask, other=127)
+            scale_f32 = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
+        else:
+            kv_nope_quant = tl.load(
+                cache_int8_ptr + nope_addrs, mask=nope_2d_mask, other=0
+            ).to(tl.float32)
+            scale_addrs = scale_bases[:, None] // 4 + group_ids[None, :]
+            scale_f32 = tl.load(cache_fp32_ptr + scale_addrs, mask=nope_2d_mask, other=1.0)
+        kv_nope = tl.where(nope_2d_mask, kv_nope_quant * scale_f32, 0.0)
 
         # ---- Vectorized ROPE BF16 gather: [BLOCK_T, ROPE_DIM] ----
         rope_byte_bases = token_data_bases + 448
@@ -214,6 +229,9 @@ def _run_triton_sparse_decode(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the tiled Triton sparse decode kernel on one paged KV cache."""
     B, _, H, D = q.shape
+    cache_format = get_kv_cache_format(k_cache.dtype)
+    if cache_format == DSV4KVCacheFormat.BF16:
+        raise ValueError("Packed Triton decode only accepts FP8 or INT8 cache")
     num_pages = k_cache.shape[0]
     page_size = k_cache.shape[1]
     page_bytes = k_cache.stride(0)  # elements = bytes for float8
@@ -230,7 +248,9 @@ def _run_triton_sparse_decode(
     raw_flat = k_cache.as_strided((total_elems,), (1,))
     raw_uint8 = raw_flat.view(torch.uint8)
     raw_fp8 = raw_uint8.view(torch.float8_e4m3fn)
+    raw_int8 = raw_uint8.view(torch.int8)
     raw_bf16 = raw_uint8.view(torch.bfloat16)
+    raw_fp32 = raw_uint8.view(torch.float32)
 
     # Squeeze Q: [B, H, D]
     q3 = q.squeeze(1)
@@ -246,9 +266,11 @@ def _run_triton_sparse_decode(
     grid = (B, H)
     _tiled_sparse_decode_kernel[grid](
         q3,
+        raw_int8,
         raw_fp8,
         raw_uint8,
         raw_bf16,
+        raw_fp32,
         flat_indices,
         (
             topk_length
@@ -261,6 +283,11 @@ def _run_triton_sparse_decode(
         page_size,
         int(page_bytes),  # page_bytes (int64)
         int(page_size * _TOKEN_DATA_STRIDE),  # scale_section_off (int64)
+        (
+            FP8_SCALE_BYTES_PER_TOKEN
+            if cache_format == DSV4KVCacheFormat.FP8
+            else INT8_SCALE_BYTES_PER_TOKEN
+        ),
         H,
         topk,
         topk_rounded,
@@ -273,6 +300,7 @@ def _run_triton_sparse_decode(
         NOPE_PAD=512,
         ROPE_DIM=_ROPE_DIM,
         NOPE_DIM_RT=_NOPE_DIM,
+        CACHE_FORMAT=int(cache_format),
     )
 
     # Return [B, 1, H, D] and [B, 1, H]
