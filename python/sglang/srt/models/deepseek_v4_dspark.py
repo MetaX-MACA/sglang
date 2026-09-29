@@ -897,6 +897,19 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
         last = self.stages[-1]
+
+        if x.numel() > 0:
+            from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
+
+            return fused_hc_head(
+                x.contiguous(),
+                last.hc_head_fn,
+                last.hc_head_scale,
+                last.hc_head_base,
+                norm_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+            )
+
         return hc_head_torch(
             x,
             last.hc_head_fn,

@@ -128,13 +128,47 @@ def rms_norm_dynamic_per_token_quant_custom(input: torch.Tensor,
                                                    quant_dtype: torch.dtype,
                                                    scale_ub: torch.Tensor = None,
                                                    residual: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] :
-    out = torch.zeros_like(input, dtype=torch.int8)
+    out = torch.zeros_like(input, dtype=quant_dtype)
     out_bf16 = torch.zeros_like(input, dtype=torch.bfloat16)
     scales = torch.empty((input.numel() // input.shape[-1], 1),
                          device=input.device,
                          dtype=torch.float32)
     torch.ops.sgl_kernel.rms_norm_dynamic_per_token_quant_custom.default(out, out_bf16, input, weight, scales, var_epsilon, scale_ub, residual)
     return out, out_bf16, scales
+
+def rms_norm_dynamic_per_group_quant_custom(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    var_epsilon: float,
+    quant_dtype: torch.dtype,
+    group_size: int = 128,
+    residual: torch.Tensor = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    hidden_size = input.shape[-1]
+    tokens = input.numel() // hidden_size
+    quant_input = input.contiguous().reshape(tokens, hidden_size)
+    quant_residual = (
+        residual.reshape(tokens, hidden_size) if residual is not None else None
+    )
+    output = torch.empty_like(quant_input, dtype=quant_dtype)
+    output_bf16 = torch.empty_like(quant_input)
+    scales = torch.empty(
+        (tokens, (hidden_size + group_size - 1) // group_size),
+        device=input.device,
+        dtype=torch.float32,
+    )
+    torch.ops.sgl_kernel.rms_norm_dynamic_per_group_quant.default(
+        output,
+        output_bf16,
+        quant_input,
+        weight,
+        scales,
+        group_size,
+        var_epsilon,
+        None,
+        quant_residual,
+    )
+    return output, output_bf16, scales
 
 def fused_add_rmsnorm(
     input: torch.Tensor,

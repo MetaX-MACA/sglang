@@ -969,6 +969,13 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (
+            isinstance(x, tuple)
+            and len(x) == 3
+            and isinstance(x[0], torch.dtype)
+        ):
+            x = (x[1], x[2])
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,

@@ -247,27 +247,43 @@ def mhc_pre_vllm(
         gemm_out_sqrsum,
         n_splits,
     )
-    # END of TileLang implementation of pre-norm-fn forward matmul
-    _mhc_pre_big_fuse(
-        hidden_size,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-        n_splits=n_splits,
-        mhc_mult=mhc_mult,
-    )(
+
+    from mcoplib.tilelang_mhc_pre import mhc_pre as mhc_pre_opt
+    return mhc_pre_opt(
         gemm_out_mul,
         gemm_out_sqrsum,
         hc_scale,
         hc_base,
         residual_flat,
-        post_mix,
-        comb_mix,
-        layer_input,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
     )
-    post_mix = post_mix.view(*outer_shape, mhc_mult, 1)
-    comb_mix = comb_mix.view(*outer_shape, mhc_mult, mhc_mult)
-    layer_input = layer_input.view(*outer_shape, hidden_size)
-    return post_mix, comb_mix, layer_input
+
+    # # END of TileLang implementation of pre-norm-fn forward matmul
+    # _mhc_pre_big_fuse(
+    #     hidden_size,
+    #     rms_eps,
+    #     hc_pre_eps,
+    #     hc_sinkhorn_eps,
+    #     hc_post_mult_value,
+    #     sinkhorn_repeat,
+    #     n_splits=n_splits,
+    #     mhc_mult=mhc_mult,
+    # )(
+    #     gemm_out_mul,
+    #     gemm_out_sqrsum,
+    #     hc_scale,
+    #     hc_base,
+    #     residual_flat,
+    #     post_mix,
+    #     comb_mix,
+    #     layer_input,
+    # )
+    # post_mix = post_mix.view(*outer_shape, mhc_mult, 1)
+    # comb_mix = comb_mix.view(*outer_shape, mhc_mult, mhc_mult)
+    # layer_input = layer_input.view(*outer_shape, hidden_size)
+    # return post_mix, comb_mix, layer_input
