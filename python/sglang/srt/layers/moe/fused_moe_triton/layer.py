@@ -495,7 +495,7 @@ class FusedMoE(torch.nn.Module):
             with_bias=with_bias,
             moe_intermediate_size=intermediate_size,
         )
-        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.use_fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
         # Dispatchers are not nn.Modules, so they cannot register their own

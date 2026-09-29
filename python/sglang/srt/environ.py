@@ -682,6 +682,13 @@ class Envs:
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
     # ===================================================================
+    # PD disaggregation optimization (Metax)
+    # ===================================================================
+    MX_ENABLE_FUSE_RMSNORM_QUANT = EnvBool(False)
+    MX_ENABLE_FUSE_SILUMUL_QUANT = EnvBool(False)
+    MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE = EnvInt(256)
+
+    # ===================================================================
     # Distributed and model-parallel runtime
     # ===================================================================
     SGLANG_ENABLE_CP_V2 = EnvBool(False)

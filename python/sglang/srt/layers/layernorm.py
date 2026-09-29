@@ -49,6 +49,9 @@ from sglang.srt.utils import (
 from mcoplib.custom_ops import (
     fused_add_rms_norm_dynamic_per_token_quant_padding_output as _mocop_fused_add_rms_norm_quant_pad,
 )
+from sgl_kernel import (
+    rms_norm_dynamic_per_token_quant_custom,
+)
 
 # Register mcoplib op as torch.library custom op for torch.compile / PCG.
 # Packed INT8 values/scales are bytes, not BF16 numbers: expose bytes to AOT
@@ -647,16 +650,32 @@ class RMSNorm(BaseFusedOp):
                 return x, residual
             return x
 
-        if self.fused_quant and self.packed_quant and residual is not None:
-            packed_output, residual, no_quant_output, int8_out, scales = \
-                fused_add_rms_norm_dynamic_per_token_quant_padding_output(
-                    x,
-                    residual,
+        if self.fused_quant: 
+            if self.packed_quant:
+                packed_out, residual, out, quant_out, quant_scale = \
+                    fused_add_rms_norm_dynamic_per_token_quant_padding_output(
+                        x,
+                        residual,
+                        self.weight.data,
+                        self.packed_size,
+                        self.variance_epsilon,
+                    )
+                if residual is not None:
+                    return (packed_out, out, (quant_out, quant_scale)), residual
+                else:
+                    return (packed_out, out, (quant_out, quant_scale))
+            else:
+                quant_out, out, quant_scale = rms_norm_dynamic_per_token_quant_custom(
+                    x.contiguous(),
                     self.weight.data,
-                    self.packed_size,
                     self.variance_epsilon,
+                    quant_dtype=torch.int8,
+                    residual=residual,
                 )
-            return (packed_output, no_quant_output, (int8_out, scales)), residual
+                if residual is not None:
+                    return (quant_out, quant_scale, out), residual
+                else:
+                    return (quant_out, quant_scale, out)
         else:
             if self.variance_size_override is not None:
                 return self.forward_native(x, residual, post_residual_addition)
