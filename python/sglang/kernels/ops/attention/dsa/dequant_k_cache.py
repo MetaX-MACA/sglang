@@ -4,8 +4,20 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.dsa.kv_cache_layout import (
+    DSAKVCacheFormat,
+    HEAD_DIM,
+    NOPE_DIM,
+    NUM_QUANT_GROUPS,
+    PACKED_BYTES_PER_TOKEN,
+    QUANT_GROUP_SIZE,
+    ROPE_DIM,
+    get_kv_cache_format,
+)
+
 
 def dequantize_k_cache(quant_k_cache):
+    """Dequantize a complete FP8 or INT8 DSA packed cache tensor."""
     return _dequantize_k_cache_fast_wrapped(quant_k_cache)
 
 
@@ -62,9 +74,9 @@ def _dequantize_k_cache_fast_wrapped(
         # set block_size = 1
         quant_k_cache = quant_k_cache.unsqueeze(1)
     num_blocks, block_size, _, dim_quant = quant_k_cache.shape
-    assert dv == 512
-    assert dim_quant == 656
-    assert tile_size == 128
+    assert dv == NOPE_DIM
+    assert dim_quant == PACKED_BYTES_PER_TOKEN
+    assert tile_size == QUANT_GROUP_SIZE
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     output = _dequantize_k_cache_fast(quant_k_cache)
@@ -75,14 +87,17 @@ def _dequantize_k_cache_fast_wrapped(
         return output.view(num_blocks, block_size, 1, -1)
 
 
-def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
+def _dequantize_k_cache_fast(
+    quant_k_cache, group_size: int = QUANT_GROUP_SIZE
+):
     num_tokens, dim_quant = quant_k_cache.shape
 
-    assert quant_k_cache.dtype == torch.float8_e4m3fn
-    dim_nope = 512
-    dim_rope = 64
+    cache_format = get_kv_cache_format(quant_k_cache.dtype)
+    assert cache_format in (DSAKVCacheFormat.FP8, DSAKVCacheFormat.INT8)
+    dim_nope = NOPE_DIM
+    dim_rope = ROPE_DIM
     num_tiles = dim_nope // group_size
-    assert dim_quant == 656
+    assert dim_quant == PACKED_BYTES_PER_TOKEN
 
     output = torch.empty(
         (num_tokens, dim_nope + dim_rope),
@@ -170,7 +185,7 @@ def _dequantize_k_cache_fast_kernel(
 def dequantize_k_cache_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
-    group_size: int = 128,
+    group_size: int = QUANT_GROUP_SIZE,
 ) -> torch.Tensor:
     """
     De-quantize the k-cache with paged layout
@@ -181,17 +196,20 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert (
-        dim_quant == 656
-    ), f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
+    assert dim_quant == PACKED_BYTES_PER_TOKEN, (
+        f"dim_quant: {dim_quant} != {PACKED_BYTES_PER_TOKEN} detected in "
+        "dequantize_k_cache_paged"
+    )
+    assert group_size == QUANT_GROUP_SIZE
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)
     # Index bounds validated in dsa_backend.init_forward_metadata
     num_tokens = page_table_1_flattened.shape[0]
-    assert quant_k_cache.dtype == torch.float8_e4m3fn
-    dim_nope = 512
-    dim_rope = 64
+    cache_format = get_kv_cache_format(quant_k_cache.dtype)
+    assert cache_format in (DSAKVCacheFormat.FP8, DSAKVCacheFormat.INT8)
+    dim_nope = NOPE_DIM
+    dim_rope = ROPE_DIM
     num_tiles = dim_nope // group_size  # 512 // 128 = 4
 
     output = torch.empty(
@@ -230,6 +248,53 @@ def dequantize_k_cache_paged(
         DIM_ROPE=dim_rope,
     )
 
+    return output
+
+
+def dequantize_k_cache_paged_ref(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+) -> torch.Tensor:
+    """Pure-Torch gather/dequant reference for FP8 and INT8 packed rows."""
+    cache_format = get_kv_cache_format(quant_k_cache.dtype)
+    if cache_format not in (DSAKVCacheFormat.FP8, DSAKVCacheFormat.INT8):
+        raise ValueError("The packed DSA dequantizer only accepts FP8 or INT8 cache")
+    if quant_k_cache.shape[-1] != PACKED_BYTES_PER_TOKEN:
+        raise ValueError(
+            f"Expected {PACKED_BYTES_PER_TOKEN} bytes per packed row, got "
+            f"{quant_k_cache.shape[-1]}"
+        )
+    if page_table_1_flattened.dtype not in (torch.int32, torch.int64):
+        raise TypeError("page_table_1_flattened must contain int32/int64 token IDs")
+
+    cache_u8 = quant_k_cache.contiguous().view(torch.uint8).reshape(
+        -1, PACKED_BYTES_PER_TOKEN
+    )
+    loc = page_table_1_flattened.reshape(-1).to(torch.int64)
+    rows = cache_u8[loc]
+    if cache_format == DSAKVCacheFormat.FP8:
+        nope_q = rows[:, :NOPE_DIM].contiguous().view(torch.float8_e4m3fn).float()
+    else:
+        nope_q = rows[:, :NOPE_DIM].contiguous().view(torch.int8).float()
+    scales = (
+        rows[:, NOPE_DIM : NOPE_DIM + NUM_QUANT_GROUPS * 4]
+        .contiguous()
+        .view(torch.float32)
+    )
+    rope = rows[:, NOPE_DIM + NUM_QUANT_GROUPS * 4 :].contiguous().view(
+        torch.bfloat16
+    )
+    nope = (
+        nope_q.reshape(-1, NUM_QUANT_GROUPS, QUANT_GROUP_SIZE)
+        * scales.reshape(-1, NUM_QUANT_GROUPS, 1)
+    ).reshape(-1, NOPE_DIM)
+    output = torch.empty(
+        (loc.numel(), 1, HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=quant_k_cache.device,
+    )
+    output[:, 0, :NOPE_DIM] = nope.to(torch.bfloat16)
+    output[:, 0, NOPE_DIM:] = rope.reshape(-1, ROPE_DIM)
     return output
 
 
