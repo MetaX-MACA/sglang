@@ -246,9 +246,8 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         else:
             x_q, x_scale = per_token_quant_int8(x)
             out_dtype=x.dtype
-        # x_q, x_scale = per_token_quant_int8(x)
-        # x_q_2d = x_q.view(-1, x_q.shape[-1])
-        # x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
+        x_q_2d = x_q.view(-1, x_q.shape[-1])
+        x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
         output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
         # output = int8_scaled_mm(
         #     x_q_2d,
@@ -258,7 +257,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         #     out_dtype=x.dtype,
         #     bias=bias,
         # )
-        output = cutlass_scaled_mm(x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=out_dtype, bias=bias)
+        output = cutlass_scaled_mm(x_q_2d, layer.weight, x_scale_2d, layer.weight_scale, out_dtype=out_dtype, bias=bias)
         return output.view(output_shape)
 
 

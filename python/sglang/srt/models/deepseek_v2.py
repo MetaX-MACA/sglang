@@ -313,7 +313,8 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        self.fused_quant = envs.MX_ENABLE_FUSE_SILUMUL_QUANT.get()
+        self.act_fn = SiluAndMul(fused_quant=self.fused_quant)
         self.use_fused_clamp_act_mul = _is_hip
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
@@ -414,7 +415,27 @@ class DeepseekV2MLP(nn.Module):
             )
             return down_output
 
-        if self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
+        if envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get():
+            M, N = gate_up.shape
+            quant_group_size = 128
+            x_quant = torch.empty(
+                (M, N // 2),
+                device=gate_up.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            x_scale = torch.empty(
+                (M, (N // 2) // quant_group_size),
+                device=gate_up.device,
+                dtype=torch.float32,
+            )
+            torch.ops.sgl_kernel.fused_silu_mul_per_group_quant(
+                x_quant,
+                x_scale,
+                gate_up,
+                self.swiglu_limit,
+            )
+            x = (x_quant, x_scale)
+        elif self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
             from aiter.ops.triton.fusions.fused_clamp_act_mul import (
                 fused_clamp_act_mul,
             )
@@ -455,17 +476,20 @@ class DeepseekV2MLP(nn.Module):
 
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
-            if _is_npu:
-                _g, _u = gate_up.chunk(2, dim=-1)
-                _lim = float(self.swiglu_limit)
-                gate_up = torch.cat(
-                    [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
-                )
-                x = self.act_fn(gate_up)
+            if self.fused_quant:
+                x = self.act_fn(gate_up, self.swiglu_limit)
             else:
-                M, N = gate_up.shape
-                x = gate_up.new_empty((M, N // 2))
-                silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+                if _is_npu:
+                    _g, _u = gate_up.chunk(2, dim=-1)
+                    _lim = float(self.swiglu_limit)
+                    gate_up = torch.cat(
+                        [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+                    )
+                    x = self.act_fn(gate_up)
+                else:
+                    M, N = gate_up.shape
+                    x = gate_up.new_empty((M, N // 2))
+                    silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
             x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -623,7 +647,7 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
-        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.use_fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
@@ -1294,7 +1318,7 @@ class DeepseekV2MoE(nn.Module):
             packed_hidden = hidden_states
             if self.use_fused_quant and packed_hidden.shape[0] == 0:
                 packed_hidden = torch.empty(
-                    (0, align_packed_tensor_size(packed_hidden.shape[-1])), 
+                    (0, align_packed_tensor_size(packed_hidden.shape[-1], envs.MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE.get())), 
                     dtype=hidden_states.dtype, 
                     device=hidden_states.device
                 )
@@ -2454,7 +2478,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         #     config.hidden_size, eps=config.rms_norm_eps
         # )
         packed_quant = True if self.is_layer_sparse else False
-        fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
+        fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, fused_quant=fused_quant, packed_quant=packed_quant, packed_size=align_packed_tensor_size(config.hidden_size))

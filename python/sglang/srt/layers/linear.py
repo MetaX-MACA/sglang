@@ -294,7 +294,13 @@ class ReplicatedLinear(LinearBase):
         ), f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
         param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        out_dtype: Optional[torch.dtype] = torch.bfloat16,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if isinstance(x, tuple):
+            x = (out_dtype, x[0], x[1])
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
         output = self.quant_method.apply(self, x, bias)
@@ -490,7 +496,14 @@ class ColumnParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_column_parallel_weight(loaded_weight)
 
-    def forward(self, input_):
+    def forward(
+        self,
+        input_,
+        out_dtype: Optional[torch.dtype]= torch.bfloat16,
+    ):
+        if isinstance(input_, tuple):
+            input_ = (out_dtype, input_[0], input_[1])
+
         bias = self.bias if not self.skip_bias_add else None
 
         # Megatron SP "g": the input is this rank's [M_pad/tp, K] sequence shard;
@@ -1616,7 +1629,10 @@ class RowParallelLinear(LinearBase):
         skip_all_reduce=False,
         forward_batch=None,
         output_tensor=None,
+        out_dtype: Optional[torch.dtype]= torch.bfloat16,
     ):
+        if isinstance(input_, tuple):
+            input_ = (out_dtype, input_[0], input_[1])
         if self.input_is_parallel:
             input_parallel = input_
         else:

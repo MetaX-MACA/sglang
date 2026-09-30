@@ -682,6 +682,16 @@ class Envs:
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
     # ===================================================================
+    # PD disaggregation optimization (Metax)
+    # ===================================================================
+    MX_ENABLE_WARMUP_OUTPUT = EnvBool(False)
+    MX_DSV4_PAGED_MQA_LOGITS_BACKEND = EnvStr("maca_c")
+    MX_ENABLE_FUSE_RMSNORM_QUANT = EnvBool(False)
+    MX_ENABLE_FUSE_SILUMUL_QUANT = EnvBool(False)
+    MX_ENABLE_FUSE_ACT_FP8_QUANT = EnvBool(False)
+    MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE = EnvInt(256)
+
+    # ===================================================================
     # Distributed and model-parallel runtime
     # ===================================================================
     SGLANG_ENABLE_CP_V2 = EnvBool(False)
@@ -998,6 +1008,8 @@ class Envs:
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    SGLANG_DSA_TRITON_FLASHMLA_KV = EnvBool(False)
+    SGLANG_DSV4_TRITON_FLASHMLA_KV = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)

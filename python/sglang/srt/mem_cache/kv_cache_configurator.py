@@ -2471,11 +2471,11 @@ def calculate_mla_kv_cache_dim(
 
     quant_block_size = DSATokenToKVPool.quant_block_size
     rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
-    # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
+    # Calculate override_kv_cache_dim for FP8/INT8 storage in backends that use scaled KV layout
     # (excluding TRTLLM and HIP raw-layout kernels).
     # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
-    # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
-    if kv_cache_dtype == torch.float8_e4m3fn:
+    # Note: RoPE is stored in BF16 for both formats, not quantized.
+    if kv_cache_dtype in (torch.float8_e4m3fn, torch.int8):
         assert (
             kv_lora_rank % quant_block_size == 0
         ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"

@@ -16,6 +16,7 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
     torch.float8_e4m3fnuz: "fp8_e4m3",
     torch.float8_e5m2: "fp8_e5m2",
     torch.bfloat16: "bf16",
+    torch.int8: "int8",
 }
 
 
@@ -59,6 +60,8 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
+    elif server_args_kv_cache_dtype == "int8":
+        kv_cache_dtype = torch.int8
     elif server_args_kv_cache_dtype == "fp4_e2m1":
         raise ValueError(
             "--kv-cache-dtype=fp4_e2m1 is deprecated. "

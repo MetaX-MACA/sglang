@@ -62,6 +62,7 @@ else:
         # gemma_rmsnorm,
         # rmsnorm,
         rms_norm_dynamic_per_token_quant_custom,
+        rms_norm_dynamic_per_group_quant_custom,
         rotary_embedding,
         silu_and_mul,
     )

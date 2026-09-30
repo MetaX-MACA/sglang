@@ -1353,17 +1353,21 @@ def mhc_post(
         residual = strict_contiguous(residual)
         post_layer_mix = strict_contiguous(post_layer_mix)
         comb_res_mix = strict_contiguous(comb_res_mix)
-    out = torch.empty_like(residual)
-    mhc_post_tilelang(
-        comb_res_mix,
-        residual,
-        post_layer_mix.squeeze(-1),
-        x,
-        out,
-        residual.shape[-2],
-        residual.shape[-1],
-    )
-    return out
+
+    from mcoplib.tilelang_mhc_post import mhc_post as mhc_post_opt
+    return mhc_post_opt(x, residual, post_layer_mix, comb_res_mix)
+
+    # out = torch.empty_like(residual)
+    # mhc_post_tilelang(
+    #     comb_res_mix,
+    #     residual,
+    #     post_layer_mix.squeeze(-1),
+    #     x,
+    #     out,
+    #     residual.shape[-2],
+    #     residual.shape[-1],
+    # )
+    # return out
 
 
 @tilelang.jit(

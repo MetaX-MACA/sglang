@@ -40,6 +40,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
+    quantize_k_cache_int8_separate,
     quantize_k_cache_separate,
 )
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
@@ -4291,11 +4292,21 @@ class MLATokenToKVPool(KVCache):
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
+        self.dsa_kv_cache_store_int8 = (
+            use_dsa and dtype == torch.int8 and override_kv_cache_dim is not None
+        )
+        self.dsa_kv_cache_is_quantized = (
+            self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8
+        )
+        # Packed INT8 rows contain INT8 values, FP32 scales and BF16 RoPE.
+        # Allocate byte-addressable storage and expose it as INT8 to readers.
+        if self.dsa_kv_cache_store_int8:
+            self.store_dtype = torch.uint8
         # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.dsa_kv_cache_store_fp8
+            if self.dsa_kv_cache_is_quantized
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -4385,7 +4396,7 @@ class MLATokenToKVPool(KVCache):
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
-        assert not self.dsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_is_quantized
         parallel = get_parallel()
         if parallel.dcp_enabled:
             valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
@@ -4418,6 +4429,16 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope,
                 cache_k_rope,
                 fp8_dtype,
+            )
+        elif self.dsa_kv_cache_store_int8:
+            cache_k_nope_int8, cache_k_rope_bf16 = quantize_k_cache_int8_separate(
+                cache_k_nope, cache_k_rope
+            )
+            set_mla_kv_buffer_triton(
+                dst_buffer,
+                loc,
+                cache_k_nope_int8,
+                cache_k_rope_bf16,
             )
         elif self.dsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
@@ -4490,6 +4511,16 @@ class MLATokenToKVPool(KVCache):
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
         layer_id = layer.layer_id
         kv_buffer = self.get_key_buffer(layer_id)
+        if self.dsa_kv_cache_is_quantized:
+            from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
+                dequantize_k_cache_paged,
+            )
+
+            kv = dequantize_k_cache_paged(kv_buffer, loc.reshape(-1))
+            dst_dtype = dst_dtype or torch.bfloat16
+            kv = kv.to(dst_dtype)
+            return kv[..., : self.kv_lora_rank], kv[..., self.kv_lora_rank :]
+
         dst_dtype = dst_dtype or self.dtype
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),

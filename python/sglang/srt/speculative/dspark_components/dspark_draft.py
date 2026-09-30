@@ -361,6 +361,10 @@ class DraftBlockProposer:
 
         idle_batch.is_dsa = is_deepseek_dsa(batch.model_config.hf_config)
         idle_batch.is_ds_compressed = is_deepseek_v4(batch.model_config.hf_config)
+        idle_batch.num_token_non_padded = torch.zeros(
+            (1,), dtype=torch.int32, device=device
+        )
+        idle_batch.num_token_non_padded_cpu = 0
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)
@@ -433,6 +437,10 @@ class DraftBlockProposer:
             num_token_non_padded=_make_num_token_non_padded(draft_num_tokens, device),
             num_token_non_padded_cpu=draft_num_tokens,
         )
+        draft_forward_batch.num_token_non_padded = torch.tensor(
+            draft_block_ids.numel(), dtype=torch.int32, device=device
+        )
+        draft_forward_batch.num_token_non_padded_cpu = draft_block_ids.numel()
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
         if (

@@ -957,16 +957,33 @@ def _fused_moe_kernel_sequence(
                 swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
 
             if not filter_expert:
-                if swiglu_limit_for_silu_and_mul_clamp is not None:
-                    from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
+                if envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get():
+                    gate_up = intermediate_cache1.view(-1, N)
+                    M, N = gate_up.shape
+                    quant_group_size = 128
+                    groups = (N // 2) // quant_group_size
 
-                    silu_and_mul_clamp(
-                        intermediate_cache1.view(-1, N),
-                        intermediate_cache2,
+                    x_quant = torch.empty((M, N // 2), device=gate_up.device, dtype=torch.float8_e4m3fn)
+                    x_scale = torch.empty((M, groups), device=gate_up.device, dtype=torch.float32)
+
+                    torch.ops.sgl_kernel.fused_silu_mul_per_group_quant(
+                        x_quant,
+                        x_scale,
+                        gate_up,
                         swiglu_limit_for_silu_and_mul_clamp,
                     )
+                    intermediate_cache2 = (x_quant, x_scale)
                 else:
-                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                    if swiglu_limit_for_silu_and_mul_clamp is not None:
+                        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
+
+                        silu_and_mul_clamp(
+                            intermediate_cache1.view(-1, N),
+                            intermediate_cache2,
+                            swiglu_limit_for_silu_and_mul_clamp,
+                        )
+                    else:
+                        silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
                 act_and_mul_triton(
                     intermediate_cache1.view(-1, N),

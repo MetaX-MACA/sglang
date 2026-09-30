@@ -181,6 +181,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
     get_int_env_var,
+    align_packed_tensor_size,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -686,7 +687,13 @@ class MqaAttentionBase(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("wkv", prefix),
             )
-        self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
+        self.fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+        self.q_norm = RMSNorm(
+            self.q_lora_rank,
+            eps=self.eps,
+            fused_quant=self.fused_quant,
+            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
+        )
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -1470,7 +1477,12 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
         else:
             q_lora = self.q_norm(q_lora)
-            q = self._compute_q_b(q_lora, positions, q_out)
+            if isinstance(q_lora, tuple):
+                q_linear = (q_lora[0], q_lora[1])
+                q_lora = q_lora[2]
+            else:
+                q_linear = q_lora
+            q = self._compute_q_b(q_linear, positions, q_out)
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
@@ -1821,9 +1833,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_deepseek_v4=True,
         )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.fused_quant,
+            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.fused_quant,
+            packed_quant=True,
+            packed_size=align_packed_tensor_size(config.hidden_size, envs.MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE.get()),
         )
 
         self.hc_mult = hc_mult = config.hc_mult
@@ -2152,7 +2174,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                     )
                 else:
                     hidden_states = self.input_layernorm(hidden_states)
-                    x_quant = None
+                    if isinstance(hidden_states, tuple):
+                        x_quant = hidden_states[:2]
+                        hidden_states = hidden_states[2]
+                    else:
+                        x_quant = None
             else:
                 x_quant = None
 
@@ -2237,8 +2263,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         *,
-        input_ids: torch.Tensor,
-        input_ids_global: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        input_ids_global: Optional[torch.Tensor],
     ) -> torch.Tensor:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -2323,10 +2349,24 @@ class DeepseekV4DecoderLayer(nn.Module):
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
-            _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
-            hidden_states = _a2a_scatter_chunks[r].contiguous()
-            input_ids = input_ids.tensor_split(s)[r].contiguous()
-            input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
+            if isinstance(hidden_states, tuple):
+                packed_out, out, (quant_out, quant_scale) = hidden_states
+                _a2a_scatter_chunks_packed_out = list(packed_out.tensor_split(s))
+                _a2a_scatter_chunks = list(out.tensor_split(s))
+                _a2a_scatter_chunks_quant_out = list(quant_out.tensor_split(s))
+                _a2a_scatter_chunks_quant_scale = list(quant_scale.tensor_split(s))
+                packed_out = _a2a_scatter_chunks_packed_out[r].contiguous()
+                out = _a2a_scatter_chunks[r].contiguous()
+                quant_out = _a2a_scatter_chunks_quant_out[r].contiguous()
+                quant_scale = _a2a_scatter_chunks_quant_scale[r].contiguous()
+                hidden_states = (packed_out, out, (quant_out, quant_scale))
+            else:
+                _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
+                hidden_states = _a2a_scatter_chunks[r].contiguous()
+            if input_ids is not None:
+                input_ids = input_ids.tensor_split(s)[r].contiguous()
+            if input_ids_global is not None:
+                input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
         # Skip the MoE-internal post-experts all_reduce when we will do the
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
@@ -2745,11 +2785,14 @@ class DeepseekV4Model(nn.Module):
         )
         device_module = torch.get_device_module()
         num_alt_streams = 5 if (_is_cuda or _is_npu) else 2
-        self.alt_streams = (
-            [device_module.Stream() for _ in range(num_alt_streams)]
-            if use_stream_pool
-            else None
-        )
+        if envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get():
+            self.alt_streams = (
+                [device_module.Stream() for _ in range(num_alt_streams)]
+                if use_stream_pool
+                else None
+            )
+        else:
+            self.alt_streams = None
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV4DecoderLayer(

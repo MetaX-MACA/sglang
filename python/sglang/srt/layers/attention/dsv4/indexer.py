@@ -698,11 +698,15 @@ class C4IndexerBackendMixin:
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
 
         positions = core_metadata.positions
+        q_lora_linear = q_lora[0] if isinstance(q_lora, tuple) else q_lora
         num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
         if x.shape[0] != num_queries:
             x = x[:num_queries]
-        if q_lora.shape[0] != num_queries:
-            q_lora = q_lora[:num_queries]
+        if q_lora_linear.shape[0] != num_queries:
+            if isinstance(q_lora, tuple):
+                q_lora = tuple(item[:num_queries] for item in q_lora)
+            else:
+                q_lora = q_lora[:num_queries]
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
 
@@ -833,7 +837,7 @@ class C4IndexerBackendMixin:
                 indexer_metadata.deep_gemm_metadata,
                 indexer_metadata.max_c4_seq_len,
                 False,
-                backend="triton" if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8" else "tilelang",
+                backend=envs.MX_DSV4_PAGED_MQA_LOGITS_BACKEND.get(),
         )
 
         assert indexer_metadata.page_table is core_metadata.page_table

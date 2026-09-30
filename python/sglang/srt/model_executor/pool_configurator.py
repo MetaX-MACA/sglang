@@ -970,6 +970,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             torch.float8_e4m3fnuz,
         ):
             kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        elif self.kv_cache_dtype is torch.int8:
+            # 448 INT8 NOPE + 64 BF16 RoPE + 7 FP32 scales and padding.
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 32
         else:
             assert self.kv_cache_dtype is torch.bfloat16
             kv_bytes = (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2

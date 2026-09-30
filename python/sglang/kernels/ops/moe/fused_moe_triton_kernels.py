@@ -876,7 +876,10 @@ def invoke_fused_moe_kernel(
                 # passed to the kernel below).
                 assert A_scale is not None
             elif _is_cuda:
-                A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+                if isinstance(A, tuple):
+                    A, A_scale = A
+                else:
+                    A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
             else:
                 A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]

@@ -3223,11 +3223,12 @@ def grouped_gemm_triton_kernel(
     tl.store(c_ptr, c_tile, mask=c_mask)
 
 
-def silu_and_mul_masked_fwd(
+def silu_and_mul_masked(
     input: torch.Tensor,
     masked_m: torch.Tensor,
+    swiglu_limit: Optional[float] = None,
 ):
     out_stride = (input.shape[-1]//4 + 257) // 256 * 256
     output = torch.empty((input.shape[0], input.shape[1], out_stride), device=input.device, dtype=input.dtype)
-    mcoplib.op.fused_silu_mul_dq_mask_quant(output, input, masked_m)
+    mcoplib.op.fused_silu_mul_dq_mask_quant(output, input, masked_m, swiglu_limit)
     return output

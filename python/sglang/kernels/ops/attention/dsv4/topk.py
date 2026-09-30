@@ -64,9 +64,12 @@ def topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
     else:
-        module = _jit_topk_v1_module()
-        module.topk_transform(
-            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        # module = _jit_topk_v1_module()
+        # module.topk_transform(
+        #     scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        # )
+        torch.ops.sgl_kernel.topk_transform_v1.default(
+            scores, seq_lens, out_page_indices, page_tables, page_size, out_raw_indices
         )
 
 

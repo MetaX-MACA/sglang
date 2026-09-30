@@ -397,7 +397,7 @@ class DeepEPMoE(FusedMoE):
             #else:
             #    assert False, "forward_deepgemm_contiguous is deprecated"
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
-            output = self.forward_deepgemm_masked_v1(dispatch_output)
+            assert False, "forward_deepgemm_masked is deprecated"
             #if self.use_w4afp8:
             #    output = self.forward_cutlass_w4afp8_masked(dispatch_output)
             #else:
@@ -553,63 +553,7 @@ class DeepEPMoE(FusedMoE):
             )
         return down_output
     
-    def forward_deepgemm_masked_v1(
-        self,
-        dispatch_output: DeepEPLLDispatchOutput,
-    ):
-        hidden_states, _,_,_, masked_m, expected_m = dispatch_output
-        assert self.quant_method is not None
-        assert self.activation == "silu"
 
-        # GroupGemm-0
-        num_groups, m, k = hidden_states.size()
-        n = self.w13_weight.size(1)
-        gateup_output = torch.empty(
-            (num_groups, m, n), device=hidden_states.device, dtype=torch.bfloat16
-        )
-
-        m_grouped_gemm_nt_masked(
-            hidden_states,
-            self.w13_weight,
-            gateup_output,
-            masked_m,
-            expected_m,
-            self.w13_weight_scale,
-            use_triton_kernel = False,
-            unpack_tensor=True
-        )
-        # Act
-        down_input = torch.empty(
-            (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
-                gateup_output.shape[2] // 2,
-            ),
-            device=gateup_output.device,
-            dtype=gateup_output.dtype,
-        )
-
-        # if self.use_fused_quant:
-        #     down_input = silu_and_mul_masked_fwd(gateup_output, masked_m)
-        # else:
-        silu_and_mul_masked_fwd_no_pack(gateup_output, down_input, masked_m)
-
-        # GroupGemm-1
-        n = self.w2_weight.size(1)
-        down_output = torch.empty(
-            (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
-        )
-        m_grouped_gemm_nt_masked(
-            down_input,
-            self.w2_weight,
-            down_output,
-            masked_m,
-            expected_m,
-            self.w2_weight_scale,
-            use_triton_kernel = False,
-            unpack_tensor=False
-        )
-        return down_output
 
     def forward_cutlass_w4afp8(
         self,

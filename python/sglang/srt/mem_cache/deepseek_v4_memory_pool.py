@@ -17,6 +17,14 @@ from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.srt.layers.attention.dsv4.kv_cache_layout import (
+    FP8_BYTES_PER_TOKEN,
+    INT8_BYTES_PER_TOKEN,
+    INT8_SCALE_BYTES_PER_TOKEN,
+    VALUE_BYTES_PER_TOKEN,
+    is_fp8_dtype,
+    packed_page_bytes,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -121,38 +129,27 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
-        if self.dtype in (
-            torch.float8_e5m2,
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-        ):
-            dim_per_token = (
-                self.qk_nope_head_dim
-                + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
-                + self.qk_nope_head_dim // self.quantize_block_size
-                + self.scale_pad
-            )
-        else:
-            dim_per_token = (self.qk_nope_head_dim + self.qk_rope_head_dim)
-
-        return dim_per_token
+        if is_fp8_dtype(self.dtype):
+            return FP8_BYTES_PER_TOKEN
+        if self.dtype is torch.int8:
+            return INT8_BYTES_PER_TOKEN
+        return self.qk_nope_head_dim + self.qk_rope_head_dim
 
     def create_buffer(self, *, num_pages: int):
         bytes_per_token = self.get_bytes_per_token()
         self.kv_cache_total_dim = bytes_per_token
         bytes_per_page_non_padded = self.page_size * bytes_per_token
-        if self.dtype in (
-            torch.float8_e5m2,
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-        ):
-            self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
+        if is_fp8_dtype(self.dtype) or self.dtype is torch.int8:
+            self.bytes_per_page_padded = packed_page_bytes(self.page_size, self.dtype)
 
-            assert bytes_per_token == 448 + 64 * 2 + 8, (
-                "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
-                "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+            expected_bytes = (
+                self.qk_nope_head_dim
+                + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
+                + (8 if is_fp8_dtype(self.dtype) else INT8_SCALE_BYTES_PER_TOKEN)
             )
-            assert self.store_dtype == torch.uint8
+            assert bytes_per_token == expected_bytes
+            assert VALUE_BYTES_PER_TOKEN == 448 + 64 * 2
+            assert self.store_dtype in (torch.uint8, torch.int8)
         else:
             self.bytes_per_page_padded = bytes_per_page_non_padded
 
@@ -188,11 +185,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        if self.dtype in (
-            torch.float8_e5m2,
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-        ):
+        if is_fp8_dtype(self.dtype):
             return fused_store_cache(
                 input=cache_k,
                 cache=self.kv_buffer[layer_id],

@@ -30,6 +30,7 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -396,7 +397,7 @@ class MiMoV2MoE(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
-        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.use_fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
 
         self.config = config
         self.layer_id = layer_id
@@ -878,7 +879,7 @@ class MiMoV2DecoderLayer(nn.Module):
             )
 
         packed_quant = True if self.is_layer_sparse else False
-        fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
+        fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.layernorm_epsilon, fused_quant=fused_quant, packed_quant=packed_quant, packed_size=align_packed_tensor_size(config.hidden_size)

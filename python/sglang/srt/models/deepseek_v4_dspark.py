@@ -248,17 +248,24 @@ class DSparkAttention(MqaAttentionBase):
         attn_backend = get_attn_backend()
         rd = self.rope_head_dim
 
+        # Fused RMSNorm can return a quantized tuple. Keep that tuple as the
+        # input to the quantized linear layers, but use its BF16 tensor for
+        # shape queries and temporary buffer allocation.
+        hidden_states_bf16 = (
+            hidden_states[2] if isinstance(hidden_states, tuple) else hidden_states
+        )
+
         enable_multi_stream = (
             self.alt_streams is not None
             and get_is_capture_mode()
-            and hidden_states.shape[0] <= self._multi_stream_bs_limit
+            and hidden_states_bf16.shape[0] <= self._multi_stream_bs_limit
         )
 
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
         if self.n_local_heads < _PAD_NUM_HEADS:
-            q_padded = hidden_states.new_empty(
-                hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
+            q_padded = hidden_states_bf16.new_empty(
+                hidden_states_bf16.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
             q_out = q_padded[:, : self.n_local_heads, :]
 
@@ -641,8 +648,8 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         return x
 
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
-        shape = x.shape
-        x = x.reshape(-1, self.dim)
+        shape = x[1].shape if isinstance(x, tuple) else x.shape
+        # x = x.reshape(-1, self.dim)
         y = self._run_moe_ffn_dp_sync(
             x, forward_batch, input_ids=None, input_ids_global=None
         )
@@ -890,6 +897,19 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
         last = self.stages[-1]
+
+        if x.numel() > 0:
+            from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
+
+            return fused_hc_head(
+                x.contiguous(),
+                last.hc_head_fn,
+                last.hc_head_scale,
+                last.hc_head_base,
+                norm_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+            )
+
         return hc_head_torch(
             x,
             last.hc_head_fn,

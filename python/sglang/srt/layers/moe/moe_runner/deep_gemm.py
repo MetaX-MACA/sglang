@@ -323,7 +323,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
         self.use_swizzle = get_moe_a2a_backend().is_megamoe()
-        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT")
+        self.use_fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
 
     def run(
         self,
@@ -1155,7 +1155,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         from sglang.kernels.ops.moe.ep_moe_kernels import (
-            silu_and_mul_masked_fwd,
+            silu_and_mul_masked,
         )
         from sglang.kernels.ops.quantization.int8_kernel import (
             per_token_quant_int8,
@@ -1189,7 +1189,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
 
         # Act
-        down_input = silu_and_mul_masked_fwd(gateup_output, masked_m)
+        down_input = silu_and_mul_masked(gateup_output, masked_m, self.swiglu_limit)
         del gateup_output
 
         # GroupGemm-2
