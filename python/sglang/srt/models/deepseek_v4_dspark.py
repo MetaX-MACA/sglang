@@ -906,7 +906,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 last.hc_head_fn,
                 last.hc_head_scale,
                 last.hc_head_base,
-                norm_eps=self.rms_norm_eps,
+                norm_eps=self.norm_eps,
                 hc_eps=self.hc_eps,
             )
 
