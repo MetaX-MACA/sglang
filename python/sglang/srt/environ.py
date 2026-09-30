@@ -684,6 +684,7 @@ class Envs:
     # ===================================================================
     # PD disaggregation optimization (Metax)
     # ===================================================================
+    MX_ENABLE_WARMUP_OUTPUT = EnvBool(False)
     MX_DSV4_PAGED_MQA_LOGITS_BACKEND = EnvStr("maca_c")
     MX_ENABLE_FUSE_RMSNORM_QUANT = EnvBool(False)
     MX_ENABLE_FUSE_SILUMUL_QUANT = EnvBool(False)
