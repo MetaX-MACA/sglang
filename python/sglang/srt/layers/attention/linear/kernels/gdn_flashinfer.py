@@ -22,7 +22,7 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_maca
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
@@ -118,17 +118,18 @@ def _get_flashinfer_gdn_kernels():
                 gated_delta_rule_decode_pretranspose,
                 gated_delta_rule_mtp,
             )
-            from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
-                gated_delta_rule_mtp as gated_delta_rule_mtp_bf16,
-            )
+            # from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+            #     gated_delta_rule_mtp as gated_delta_rule_mtp_bf16,
+            # )
             from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
             _flashinfer_chunk_gated_delta_rule = chunk_gated_delta_rule
             _flashinfer_gated_delta_rule_mtp = gated_delta_rule_mtp
-            _flashinfer_gated_delta_rule_mtp_bf16 = gated_delta_rule_mtp_bf16
+            # _flashinfer_gated_delta_rule_mtp_bf16 = gated_delta_rule_mtp_bf16
+            _flashinfer_gated_delta_rule_mtp_bf16 = None
             _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode_pretranspose
             _flashinfer_gdn_available = (
-                is_cuda() and torch.cuda.get_device_capability()[0] >= 9
+                (is_cuda() and torch.cuda.get_device_capability()[0] >= 9) or (is_maca())
             )
             if _flashinfer_gdn_available:
                 logger.info("FlashInfer GDN kernels loaded successfully")
