@@ -5026,6 +5026,13 @@ class Scheduler(
         }
 
     def abort_request(self, recv_req: AbortReq):
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.ps.pp_size > 1
+            and self._pp_order_or_defer_abort_request(recv_req)
+        ):
+            return
+
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -5057,13 +5064,11 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                bootstrap_pending = req.pending_bootstrap
                 maybe_release_metadata_buffer(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
                 if (
-                    bootstrap_pending
-                    and hasattr(req, "disagg_kv_sender")
+                    hasattr(req, "disagg_kv_sender")
                     and req.disagg_kv_sender is not None
                 ):
                     if hasattr(req.disagg_kv_sender, "abort"):

@@ -2045,6 +2045,10 @@ class AbortReq(BaseReq, kw_only=True):
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
+    # PP0 stamps the newest bootstrap decision that was frozen when this abort
+    # was observed. Downstream stages apply through this sequence first, so an
+    # abort cannot rewrite an earlier bootstrap decision on only one stage.
+    pp_bootstrap_abort_after_sequence: Optional[int] = None
     weight_versions: Optional[WeightVersionSpans] = None
 
     def __post_init__(self):
