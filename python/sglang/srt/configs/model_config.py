@@ -472,6 +472,8 @@ class ModelConfig:
             "routed_experts_quant_method"
         )
         self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
+        # if getattr(self.hf_config, "expert_dtype", None) == "fp4":
+        #     self.is_fp4_experts = True
         if self.is_fp4_experts:
             logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
 
