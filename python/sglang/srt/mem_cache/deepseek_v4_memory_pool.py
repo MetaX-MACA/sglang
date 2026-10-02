@@ -1911,6 +1911,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # swa_kv_pool is None under the request window and unified_kv.
         return self.kv_layout
 
+    def get_swa_key_page_size(self) -> int:
+        if self.request_window is not None:
+            return self.request_window.page_size
+        return self.swa_kv_pool.page_size
+
     def get_swa_key_bytes_per_token(self) -> int:
         """Physical bytes per SWA token (divide by element size for a view)."""
         if self.uniform_fp8:
