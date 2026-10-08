@@ -102,6 +102,7 @@ from sglang.srt.utils import (
     is_xpu,
     make_layers,
 )
+from sglang.srt.utils.common import align_packed_tensor_size
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -565,6 +566,7 @@ class MiniMaxM2MoE(nn.Module):
         )
 
         self.layer_id = layer_id
+        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
 
         if get_moe_a2a_backend().is_deepep():
             self.ep_size = get_parallel().moe_ep_size
@@ -592,6 +594,15 @@ class MiniMaxM2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        if isinstance(hidden_states, tuple):
+            # RMSNorm fused_quant returns two layouts:
+            #   Path A (packed_quant + residual): (packed_out, bf16_out, (int8, scales))  -> bf16 at idx 1
+            #   Path B (else):                    (int8_out, scale, bf16_out)             -> bf16 at idx 2
+            hidden_states = (
+                hidden_states[1]
+                if isinstance(hidden_states[2], tuple)
+                else hidden_states[2]
+            )
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -613,6 +624,23 @@ class MiniMaxM2MoE(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        if isinstance(hidden_states, tuple):
+            packed_hidden = hidden_states[0]
+            # bf16 is at idx 1 (Path A) or idx 2 (Path B); see forward_normal.
+            hidden_states = (
+                hidden_states[1]
+                if isinstance(hidden_states[2], tuple)
+                else hidden_states[2]
+            )
+        else:
+            packed_hidden = hidden_states
+            if self.use_fused_quant and packed_hidden.shape[0] == 0:
+                packed_hidden = torch.empty(
+                    (0, align_packed_tensor_size(hidden_states.shape[-1])),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states.to(torch.float32))
@@ -627,7 +655,7 @@ class MiniMaxM2MoE(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(device=hidden_states.device)
         final_hidden_states = self.experts(
-            hidden_states=hidden_states,
+            hidden_states=packed_hidden,
             topk_output=topk_output,
         )
 
@@ -821,19 +849,30 @@ class MiniMaxM2Attention(nn.Module):
         # QK Normalization layers
         if self.use_qk_norm:
             if self.qk_norm_type == "per_layer":
-                # Use RMSNormTP for proper tensor parallel support
-                # Use total dimensions (before TP sharding) for correct normalization
-                self.q_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_heads * self.head_dim,
-                    num_heads=self.total_num_heads,
-                    eps=config.rms_norm_eps,
-                )
-                self.k_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_kv_heads * self.head_dim,
-                    num_heads=self.total_num_kv_heads,
-                    eps=config.rms_norm_eps,
-                )
-                self.qk_norm_impl = MiniMaxM2QKRMSNorm(self.q_norm, self.k_norm)
+                if is_dp_attention_enabled():
+                    self.q_norm = RMSNorm(
+                        self.total_num_heads * self.head_dim,
+                        eps=config.rms_norm_eps,
+                    )
+                    self.k_norm = RMSNorm(
+                        self.total_num_kv_heads * self.head_dim,
+                        eps=config.rms_norm_eps,
+                    )
+                    self.qk_norm_impl = None
+                else:
+                    # Use RMSNormTP for proper tensor parallel support
+                    # Use total dimensions (before TP sharding) for correct normalization
+                    self.q_norm = MiniMaxM2RMSNormTP(
+                        self.total_num_heads * self.head_dim,
+                        num_heads=self.total_num_heads,
+                        eps=config.rms_norm_eps,
+                    )
+                    self.k_norm = MiniMaxM2RMSNormTP(
+                        self.total_num_kv_heads * self.head_dim,
+                        num_heads=self.total_num_kv_heads,
+                        eps=config.rms_norm_eps,
+                    )
+                    self.qk_norm_impl = MiniMaxM2QKRMSNorm(self.q_norm, self.k_norm)
             else:
                 raise ValueError(f"Unsupported qk_norm_type: {self.qk_norm_type}")
 
@@ -853,6 +892,8 @@ class MiniMaxM2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[2]
         if hidden_states.shape[0] == 0:
             assert (
                 not self.o_proj.reduce_results
@@ -861,7 +902,11 @@ class MiniMaxM2Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
-            q, k = self.qk_norm_impl.forward(q, k)
+            if self.qk_norm_impl is not None:
+                q, k = self.qk_norm_impl.forward(q, k)
+            else:
+                q = self.q_norm(q.contiguous())
+                k = self.k_norm(k.contiguous())
         q, k = self.rotary_emb(positions, q, k)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
@@ -975,11 +1020,21 @@ class MiniMaxM2DecoderLayer(nn.Module):
             prefix=add_prefix("block_sparse_moe", prefix),
         )
 
+        packed_quant = True
+        fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
+        fused_quant_pd = fused_quant or get_bool_env_var(
+            "FUSED_RMSNORM_QUANT_PREFILL", default="false"
+        )
+
         self.input_layernorm = RMSNorm(
-            config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6)
+            config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6),
+            fused_quant=fused_quant_pd,
         )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6)
+            config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6),
+            fused_quant=fused_quant,
+            packed_quant=packed_quant,
+            packed_size=align_packed_tensor_size(config.hidden_size),
         )
 
         is_previous_layer_sparse = True
@@ -1252,12 +1307,17 @@ class MiniMaxM2ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
 
+        self.start_layer = self.model.start_layer
+        self.end_layer = self.model.end_layer
+
+
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                quant_config=None,
+                quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
         else:
             self.lm_head = PPMissingLayer()
