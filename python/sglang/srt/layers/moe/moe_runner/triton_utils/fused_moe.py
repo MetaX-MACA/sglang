@@ -957,7 +957,7 @@ def _fused_moe_kernel_sequence(
                 swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
 
             if not filter_expert:
-                if envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get():
+                if use_fp8_w8a8 and envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get():
                     gate_up = intermediate_cache1.view(-1, N)
                     M, N = gate_up.shape
                     quant_group_size = 128
