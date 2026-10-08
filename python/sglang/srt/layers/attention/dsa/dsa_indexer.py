@@ -1834,11 +1834,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         act_quant = self._get_index_cache_quantizer()
 
+        # Fused RMSNorm/quantization can wrap `x` and `q_lora` independently.
+        # Do not infer the representation of one input from the other: in the
+        # DSA decode path `x` can be a Tensor while `q_lora` is a quantized
+        # tuple, which previously made the `.shape` access below fail.
         if isinstance(x, tuple):
             x = x[-1]
-            q_lora_shape0 = q_lora[0].shape[0]
-        else:
-            q_lora_shape0 = q_lora.shape[0]
+
+        q_lora_meta = q_lora[0] if isinstance(q_lora, tuple) else q_lora
+        q_lora_shape0 = q_lora_meta.shape[0]
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
