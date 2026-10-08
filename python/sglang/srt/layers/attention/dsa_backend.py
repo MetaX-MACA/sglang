@@ -515,8 +515,8 @@ class DeepseekSparseAttnBackend(
         self.ingraph_verify_metadata_dg_out_of_graph = (
             envs.SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA_DG_OUT_OF_GRAPH.get()
         )
-        self.dsa_kv_cache_store_int8 = (
-            model_runner.token_to_kv_pool.dsa_kv_cache_store_int8
+        self.dsa_kv_cache_store_int8 = getattr(
+            model_runner.token_to_kv_pool, "dsa_kv_cache_store_int8", None
         )
         self.dsa_kv_cache_is_quantized = (
             self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8
