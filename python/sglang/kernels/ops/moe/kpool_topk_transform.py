@@ -8,7 +8,7 @@ from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
-
+import os
 SUPPORTED_GROUP_TOPK = (128, 160, 192, 224, 256, 512)
 
 
@@ -55,17 +55,31 @@ def fast_kpool_topk_transform_fused(
 
     out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
     dst_token_indices = score.new_empty((score.shape[0], out_cols), dtype=torch.int32)
-
-    module = _jit_kpool_topk_transform_module(group_topk)
-    module.kpool_topk_transform(
-        score,
-        lengths,
-        dst_token_indices,
-        pool_size,
-        page_table,
-        topk_indices_offset,
-        row_starts,
-        seq_lens,
-        page_table_row_index,
-    )
+    if 'MX_KPOOL_TOPK_TRANSFORM' in os.environ:
+        import torch
+        import mcoplib.sgl_kernel
+        torch.ops.sgl_kernel.kpool_topk_transform.default(
+            score,
+            lengths,
+            dst_token_indices,
+            pool_size,
+            page_table,
+            topk_indices_offset,
+            row_starts,
+            seq_lens,
+            page_table_row_index,
+        )
+    else:
+        module = _jit_kpool_topk_transform_module(group_topk)
+        module.kpool_topk_transform(
+            score,
+            lengths,
+            dst_token_indices,
+            pool_size,
+            page_table,
+            topk_indices_offset,
+            row_starts,
+            seq_lens,
+            page_table_row_index,
+        )
     return dst_token_indices
