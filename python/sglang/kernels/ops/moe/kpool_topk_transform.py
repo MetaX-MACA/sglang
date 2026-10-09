@@ -56,7 +56,6 @@ def fast_kpool_topk_transform_fused(
     out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
     dst_token_indices = score.new_empty((score.shape[0], out_cols), dtype=torch.int32)
     if 'MX_KPOOL_TOPK_TRANSFORM' in os.environ:
-        import torch
         import mcoplib.sgl_kernel
         torch.ops.sgl_kernel.kpool_topk_transform.default(
             score,
