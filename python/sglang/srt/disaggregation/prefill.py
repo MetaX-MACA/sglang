@@ -71,7 +71,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MiniMaxSparseKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import (
     get_disagg,
