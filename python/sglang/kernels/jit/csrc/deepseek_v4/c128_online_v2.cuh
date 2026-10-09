@@ -926,7 +926,7 @@ inline OnlinePrefillPlan plan_online_prefill(
 
 }  // namespace host::compress
 
-[[maybe_unused]] constexpr auto& plan_compress_128_online_decode = host::compress::plan_online_decode;
-[[maybe_unused]] constexpr auto& plan_compress_128_online_prefill = host::compress::plan_online_prefill;
+[[maybe_unused]] inline constexpr auto& plan_compress_128_online_decode = host::compress::plan_online_decode;
+[[maybe_unused]] inline constexpr auto& plan_compress_128_online_prefill = host::compress::plan_online_prefill;
 
 }  // namespace sglang
