@@ -1,4 +1,5 @@
 import functools
+import logging
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -8,6 +9,9 @@ import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_maca
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 tilelang.set_log_level("WARNING")
 
@@ -275,10 +279,11 @@ def sparse_attention_fwd_kernel_v1(
     return_lse=False,
 ):
     # for low smem platform
-    default_smem = torch.cuda.get_device_properties(torch.cuda.current_device()).shared_memory_per_block
-    if (default_smem // 1024) < 160:
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    default_smem = props.shared_memory_per_block
+    if _is_maca or (default_smem // 1024) < 160:
         num_stages //= 2
-    if (default_smem // 1024) < 96:
+    if _is_maca or (default_smem // 1024) < 96:
         block_I //= 2
         threads //= 2
 
@@ -1360,6 +1365,429 @@ def sparse_mla_fwd_decode_partial_fp8(
     return main
 
 
+@tilelang.jit(
+    out_idx=[-2, -1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
+def _sparse_mla_fwd_decode_partial_splitkv(
+    heads,
+    dim,
+    tail_dim,
+    topk,
+    *,
+    kv_group=1,
+    sm_scale=None,
+    is_causal=True,
+    block_I=64,
+    inner_iter=1,
+    num_stages=1,
+    threads=256,
+    heads_per_block=64,
+):
+    """
+    grid: (seq_len * REPLICATE_H, top_k / block_I / inner_iter)
+    Each GPU block processes `inner_iter` consecutive KV tiles and writes one (partial_o, partial_lse) entry.
+    """
+
+    assert is_causal == True, "non-causal is not supported"
+    assert kv_group == 1
+    assert topk % block_I == 0
+    assert topk % (block_I * inner_iter) == 0, (
+        f"topk ({topk}) must be divisible by block_I * inner_iter = "
+        f"{block_I} * {inner_iter}"
+    )
+
+    # log2(e) = 1.44269504
+    if sm_scale is None:
+        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504
+    else:
+        sm_scale = sm_scale * 1.44269504
+
+    batch = 1
+    seq_len = T.dynamic("seq_len")
+    seq_len_kv = T.dynamic("seq_len_kv")
+
+    head_kv = heads // kv_group
+    assert heads_per_block in (16, 32, 64)
+    if head_kv <= heads_per_block:
+        REPLICATE_H = 1
+        H_per_block = max(tilelang.math.next_power_of_2(head_kv), 16)
+    else:
+        assert head_kv % heads_per_block == 0
+        REPLICATE_H = head_kv // heads_per_block
+        H_per_block = heads_per_block
+    N_GROUPS = topk // (block_I * inner_iter)
+    BI = block_I
+    D = dim
+    D_tail = tail_dim
+
+    q_shape = [batch, seq_len, heads, dim + tail_dim]
+    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
+    indices_shape = [batch, seq_len, kv_group, topk]
+    partial_o_shape = [batch, seq_len, N_GROUPS, heads, dim]
+    partial_lse_shape = [batch, seq_len, N_GROUPS, heads]
+    indices_dtype = T.int32
+    dtype = T.bfloat16
+    accum_dtype = T.float32
+
+    _q_in_shared = inner_iter == 1
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor(q_shape, dtype),
+        KV: T.Tensor(kv_shape, dtype),
+        Indices: T.Tensor(indices_shape, indices_dtype),
+        Partial_O: T.Tensor(partial_o_shape, dtype),
+        Partial_Lse: T.Tensor(partial_lse_shape, accum_dtype),
+    ):
+        with T.Kernel(seq_len * REPLICATE_H, N_GROUPS, threads=threads) as (bx, by):
+            if _q_in_shared:
+                Q_buf = T.alloc_shared([H_per_block, D], dtype)
+                if D_tail > 0:
+                    Q_tail_buf = T.alloc_shared([H_per_block, D_tail], dtype)
+            else:
+                Q_buf = T.alloc_fragment([H_per_block, D], dtype)
+                if D_tail > 0:
+                    Q_tail_buf = T.alloc_fragment([H_per_block, D_tail], dtype)
+
+            KV_shared = T.alloc_shared([BI, D], dtype)
+            if D_tail > 0:
+                K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            S_shared = T.alloc_shared([H_per_block, BI], dtype)
+            mask = T.alloc_fragment([BI], T.bool)
+
+            acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
+            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
+            # BI=32 needs shared state here: TileLang cannot infer a single
+            # compatible fragment layout for reduce_sum and recurrent updates.
+            if BI == 32:
+                sumexp = T.alloc_shared([H_per_block], accum_dtype)
+                m_i_prev_shared = T.alloc_shared([H_per_block], accum_dtype)
+                alpha_shared = T.alloc_shared([H_per_block], accum_dtype)
+            else:
+                sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+                m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+                alpha = T.alloc_fragment([H_per_block], accum_dtype)
+            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i = T.alloc_fragment([H_per_block], accum_dtype)
+
+            T.fill(acc_o, 0)
+            T.fill(sumexp, 0)
+            T.fill(m_i, -(2**30))
+
+            b_i, g_i = 0, 0
+            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
+            group_i = by
+            H0 = (bx % REPLICATE_H) * H_per_block
+            H1 = H0 + H_per_block
+
+            T.copy(Q[b_i, s_i, H0:H1, :D], Q_buf)
+            if D_tail > 0:
+                T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_buf)
+
+            for k_i in T.Pipelined(inner_iter, num_stages=num_stages):
+                topk_block_i = group_i * inner_iter + k_i
+
+                for bi_i in T.Parallel(BI):
+                    mask[bi_i] = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i] >= 0
+                for bi_i, d_i in T.Parallel(BI, D):
+                    idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
+                    KV_shared[bi_i, d_i] = KV[
+                        b_i, T.if_then_else(idx >= 0, idx, 0), g_i, d_i
+                    ]
+                if D_tail > 0:
+                    for bi_i, d_i in T.Parallel(BI, D_tail):
+                        idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
+                        K_tail_shared[bi_i, d_i] = KV[
+                            b_i, T.if_then_else(idx >= 0, idx, 0), g_i, D + d_i
+                        ]
+
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.if_then_else(
+                        mask[bi_i], 0, -T.infinity(acc_s.dtype)
+                    )
+
+                T.gemm(
+                    Q_buf,
+                    KV_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                if D_tail > 0:
+                    T.gemm(
+                        Q_tail_buf,
+                        K_tail_shared,
+                        acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
+
+                if BI == 32:
+                    T.copy(m_i, m_i_prev_shared)
+                else:
+                    T.copy(m_i, m_i_prev)
+                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                if BI == 32:
+                    for h_i in T.Parallel(H_per_block):
+                        alpha_shared[h_i] = T.exp2(
+                            (m_i_prev_shared[h_i] - m_i[h_i]) * sm_scale
+                        )
+                else:
+                    for h_i in T.Parallel(H_per_block):
+                        alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.exp2(
+                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                    )
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                if BI == 32:
+                    for h_i in T.Parallel(H_per_block):
+                        sumexp[h_i] = (
+                            sumexp[h_i] * alpha_shared[h_i] + sumexp_i[h_i]
+                        )
+                    for h_i, d_i in T.Parallel(H_per_block, D):
+                        acc_o[h_i, d_i] *= alpha_shared[h_i]
+                else:
+                    for h_i in T.Parallel(H_per_block):
+                        sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                    for h_i, d_i in T.Parallel(H_per_block, D):
+                        acc_o[h_i, d_i] *= alpha[h_i]
+
+                T.copy(acc_s, S_shared)
+                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+
+            # sumexp==0 (all masked), divide by 1 to get 0 and avoid nan
+            for h_i, d_i in T.Parallel(H_per_block, D):
+                acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
+                    sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
+                )
+            # sumexp==0 (all masked), use large negative so combine ignores this split
+            for h_i in T.Parallel(H_per_block):
+                sumexp[h_i] = T.if_then_else(
+                    sumexp[h_i] == 0.0,
+                    -(2**30),
+                    T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
+                )
+
+            T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :])
+            T.copy(sumexp, Partial_Lse[b_i, s_i, group_i, H0:H1])
+
+    return main
+
+
+class _SparseAttentionV1SplitKV:
+    """Callable wrapper for the partial and merge kernels.
+
+    Its call signature is deliberately identical to the v1 TileLang adapter:
+    ``kernel(q, kv, indices, lse) -> output``.  The fourth argument is kept
+    for source compatibility; MTP6 currently does not consume an LSE output.
+    """
+
+    def __init__(self, partial_kernel, combine_kernel):
+        self.partial_kernel = partial_kernel
+        self.combine_kernel = combine_kernel
+
+    def __call__(self, q, kv, indices, lse):
+        del lse
+        partial_o, partial_lse = self.partial_kernel(q, kv, indices)
+        return self.combine_kernel(partial_o, partial_lse)
+
+
+def sparse_attention_fwd_kernel_v1_splitkv(
+    num_heads,
+    dim,
+    tail_dim,
+    topk,
+    *,
+    kv_group=1,
+    sm_scale=None,
+    is_causal=True,
+    block_I=32,
+    num_stages=2,
+    threads=256,
+    heads_per_block=32,
+    split_kv=11,
+    combine_heads_per_block=16,
+    return_lse=False,
+):
+    """Split-KV sparse-attention implementation.
+
+    This is an additional factory; ``sparse_attention_fwd_kernel_v1`` above
+    remains untouched as the reference/fallback path.  The tested production
+    configuration is 64 heads, dim=512, tail_dim=0, topk=2112, kv_group=1.
+    Split-KV makes more partial CTAs, then merges them with a global online
+    softmax, preserving the v1 output semantics.
+    """
+
+    assert tail_dim == 0, "split-KV currently requires tail_dim=0"
+    assert kv_group == 1, "split-KV currently requires kv_group=1"
+    assert is_causal is True, "non-causal attention is unsupported"
+    assert return_lse is False, "split-KV does not return LSE"
+    assert num_heads % heads_per_block == 0
+    assert num_heads % combine_heads_per_block == 0
+    assert topk % block_I == 0
+    tile_count = topk // block_I
+    assert tile_count % split_kv == 0, (
+        f"topk/block_I ({tile_count}) must be divisible by split_kv ({split_kv})"
+    )
+
+    partial_kernel = _sparse_mla_fwd_decode_partial_splitkv(
+        num_heads,
+        dim,
+        tail_dim,
+        topk,
+        kv_group=kv_group,
+        sm_scale=sm_scale,
+        is_causal=is_causal,
+        block_I=block_I,
+        inner_iter=tile_count // split_kv,
+        num_stages=num_stages,
+        threads=threads,
+        heads_per_block=heads_per_block,
+    )
+    combine_kernel = sparse_mla_fwd_decode_combine(
+        num_heads,
+        dim,
+        split_kv * block_I,
+        head_per_block=combine_heads_per_block,
+        block_I=block_I,
+        threads=threads,
+    )
+    return _SparseAttentionV1SplitKV(partial_kernel, combine_kernel)
+
+
+_SPLITKV_STAGE2_SHARED_MEMORY_BYTES = 72 * 1024
+
+
+def _select_splitkv_num_stages():
+    """Select a schedule that fits the current device's per-block shared memory."""
+
+    try:
+        device = torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(device)
+        shared_memory_limit = int(properties.shared_memory_per_block)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        # Prefer the smaller schedule when the runtime cannot report a limit.
+        shared_memory_limit = 0
+    num_stages = (
+        2 if shared_memory_limit >= _SPLITKV_STAGE2_SHARED_MEMORY_BYTES else 1
+    )
+    return num_stages, shared_memory_limit
+
+
+@functools.cache
+def _log_splitkv_schedule(mode, num_stages, shared_memory_limit):
+    logger.info(
+        "TileLang sparse attention dispatch: mode=%s, num_stages=%d, "
+        "shared_memory_per_block=%d bytes",
+        mode,
+        num_stages,
+        shared_memory_limit,
+    )
+
+
+def sparse_attention_fwd_kernel_v1_splitkv_decode(
+    num_heads,
+    dim,
+    tail_dim,
+    topk,
+    *,
+    kv_group=1,
+    sm_scale=None,
+    is_causal=True,
+    return_lse=False,
+):
+    """Decode-tuned Split-KV factory for the validated H64/D512/TopK2112 path."""
+
+    num_stages, shared_memory_limit = _select_splitkv_num_stages()
+    _log_splitkv_schedule("decode", num_stages, shared_memory_limit)
+    kernel = sparse_attention_fwd_kernel_v1_splitkv(
+        num_heads,
+        dim,
+        tail_dim,
+        topk,
+        kv_group=kv_group,
+        sm_scale=sm_scale,
+        is_causal=is_causal,
+        block_I=32,
+        num_stages=num_stages,
+        threads=256,
+        heads_per_block=32,
+        split_kv=11,
+        combine_heads_per_block=16,
+        return_lse=return_lse,
+    )
+    kernel.selected_num_stages = num_stages
+    kernel.device_shared_memory_per_block = shared_memory_limit
+    return kernel
+
+
+def sparse_attention_fwd_kernel_v1_splitkv_prefill(
+    num_heads,
+    dim,
+    tail_dim,
+    topk,
+    *,
+    kv_group=1,
+    sm_scale=None,
+    is_causal=True,
+    return_lse=False,
+):
+    """Prefill-tuned Split-KV factory for the validated H64/D512/TopK2112 path."""
+
+    num_stages, shared_memory_limit = _select_splitkv_num_stages()
+    _log_splitkv_schedule("prefill", num_stages, shared_memory_limit)
+    kernel = sparse_attention_fwd_kernel_v1_splitkv(
+        num_heads,
+        dim,
+        tail_dim,
+        topk,
+        kv_group=kv_group,
+        sm_scale=sm_scale,
+        is_causal=is_causal,
+        block_I=32,
+        num_stages=num_stages,
+        threads=256,
+        heads_per_block=32,
+        split_kv=2,
+        combine_heads_per_block=16,
+        return_lse=return_lse,
+    )
+    kernel.selected_num_stages = num_stages
+    kernel.device_shared_memory_per_block = shared_memory_limit
+    return kernel
+
+
+def _select_splitkv_factory(q, kv, indices, d_v, return_lse):
+    if not envs.MX_ENABLE_TILELANG_SPLITKV.get():
+        return None
+    if not (
+        _is_maca
+        and not return_lse
+        and q.dtype == torch.bfloat16
+        and kv.dtype == torch.bfloat16
+        and indices.dtype == torch.int32
+        and q.shape[0] > 0
+        and q.shape[1:] == (64, 512)
+        and d_v == 512
+        and kv.shape[1:] == (1, 512)
+        and indices.shape[1:] == (1, 2112)
+        and q.is_contiguous()
+        and kv.is_contiguous()
+        and indices.is_contiguous()
+    ):
+        return None
+    return (
+        sparse_attention_fwd_kernel_v1_splitkv_decode
+        if q.shape[0] <= 128
+        else sparse_attention_fwd_kernel_v1_splitkv_prefill
+    )
+
+
 def tilelang_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -1428,11 +1856,13 @@ def tilelang_sparse_fwd(
         )
         out = kernel_combine(partial_o_batched, partial_lse_batched)
     else:
-        kernel_factory = (
-            sparse_attention_fwd_kernel_v1
-            if tail_dim == 0
-            else sparse_attention_fwd_kernel_v2
-        )
+        kernel_factory = _select_splitkv_factory(q, kv, indices, d_v, return_lse)
+        if kernel_factory is None:
+            kernel_factory = (
+                sparse_attention_fwd_kernel_v1
+                if tail_dim == 0
+                else sparse_attention_fwd_kernel_v2
+            )
         kernel = kernel_factory(
             num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, return_lse=return_lse
         )

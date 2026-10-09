@@ -65,6 +65,8 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -121,7 +123,13 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_forward, get_mm, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_lora,
+    get_mm,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -140,6 +148,36 @@ if _use_aiter_gfx95:
 
 logger = logging.getLogger(__name__)
 _GLM_AITER_FUSED_MHC_LOGGED = False
+
+
+_KDA_PROJ_NAMES = ("qkv_proj", "b_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj")
+
+
+def _kda_projs_unquantized(quant_config, prefix: str) -> bool:
+    if quant_config is None:
+        return True
+    names = [f"{prefix}.{n}" for n in _KDA_PROJ_NAMES]
+    fused = quant_config.packed_modules_mapping
+    if type(quant_config) is Fp8Config:
+        return all(
+            is_layer_skipped(n, quant_config.ignored_layers, fused_mapping=fused)
+            for n in names
+        )
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+    from sglang.srt.layers.quantization.compressed_tensors.utils import (
+        should_ignore_layer,
+    )
+    if isinstance(quant_config, CompressedTensorsConfig):
+        # 设置了 linear_fp8_config 时，所有 Linear 都会被强制走 FP8，ignore 不起作用
+        if getattr(quant_config, "linear_fp8_config", None) is not None:
+            return False
+        return all(
+            should_ignore_layer(n, ignore=quant_config.ignore, fused_mapping=fused)
+            for n in names
+        )
+    return False
 
 
 @torch.compile
@@ -370,7 +408,14 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        # Both fused projections shard on attention TP, including under DP
+        # attention where the attention and global TP groups differ.
+        # LoRA wraps the original projections, not these fused module types.
+        self.do_fuse_qkvbfg = (
+            envs.MX_ENABLE_KDA_PROJECTION_FUSION.get()
+            and not (get_lora().enable_lora or get_lora().lora_paths)
+            and _kda_projs_unquantized(quant_config, prefix)
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -384,8 +429,11 @@ class Glm5NextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=quant_config,
+                # Eligibility is resolved using the original projection names.
+                quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
             self.split_sizes = [
                 3 * projection_size // head_shard_size,
@@ -398,7 +446,12 @@ class Glm5NextLinearAttention(nn.Module):
                 or torch.get_default_dtype()
             )
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2, self.head_dim, projection_size, dtype=fused_dtype
+                2,
+                self.head_dim,
+                projection_size,
+                dtype=fused_dtype,
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
         else:
             self.qkv_proj = QKVParallelLinear(

@@ -693,6 +693,27 @@ class Envs:
     MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL = EnvBool(False)
     MX_ENABLE_FUSE_SILUMUL_QUANT = EnvBool(False)
     MX_ENABLE_FUSE_ACT_FP8_QUANT = EnvBool(False)
+    # Guarded TileLang Split-KV sparse-attention kernels (MACA, BF16,
+    # H64/D512/TopK2112, no-LSE path only); falls back to the original
+    # v1/v2 kernels when off or shapes are unsupported.
+    MX_ENABLE_TILELANG_SPLITKV = EnvBool(False)
+    # GLM5.3 KDA: fuse qkv/b and f/g projections into batched linears.
+    # Decode in PD disaggregation can trigger a kernel trap with this on;
+    # opt in explicitly for prefill only (fallback: separate projections).
+    MX_ENABLE_KDA_PROJECTION_FUSION = EnvBool(False)
+    # GLM5.3 KDA: reuse CPU-side extend_seq_lens to derive the logical token
+    # count and skip a GPU scalar read; guarded to plain target-EXTEND without
+    # mamba tracking. Opt-in: combining with projection fusion regressed with
+    # Triton MoE.
+    MX_ENABLE_KDA_CPU_TOKENS = EnvBool(False)
+    # GLM5.3 KDA (MACA): use mcoplib fused_sigmoid_gating_delta_rule_update
+    # (recurrent/verify) and chunk_gated_delta_rule_fwd_h (chunk-H) kernels.
+    # Off falls back to the native sglang Triton kernels; requires a recent
+    # mcoplib build.
+    MX_USE_MCOPLIB_KDA = EnvBool(False)
+    # DSA sparse attention via mcoplib's tilelang_sparse_fwd instead of the
+    # in-tree tilelang kernels (MACA).
+    MX_ENABLE_MCOPLIB_TILELANG_DSA = EnvBool(False)
     MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE = EnvInt(256)
 
     # ===================================================================

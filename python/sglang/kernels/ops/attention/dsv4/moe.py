@@ -6,14 +6,18 @@ from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     is_hip_runtime,
+    is_maca_runtime,
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import get_bool_env_var, is_xpu
 
 from .utils import make_name
 
 _is_xpu = is_xpu()
+_use_mcoplib_silu_mul_quant_varlen = get_bool_env_var(
+    "MX_USE_MCOPLIB_SILU_MUL_QUANT_VARLEN", "false"
+)
 
 
 @cache_once
@@ -199,6 +203,34 @@ def silu_and_mul_masked_post_quant(
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
 ) -> None:
+    if _use_mcoplib_silu_mul_quant_varlen and is_maca_runtime():
+        if quant_group_size != 128:
+            raise ValueError("mcoplib silu_mul_quant_varlen requires group size 128")
+        import mcoplib.sgl_kernel  # noqa: F401 - registers torch.ops.sgl_kernel
+
+        # Call-local scratch also uses PyTorch's graph pool during capture.
+        workspace = torch.empty(
+            2 + 2 * input.shape[1] * topk,
+            dtype=torch.int32,
+            device=input.device,
+        )
+        sm_count = torch.cuda.get_device_properties(input.device).multi_processor_count
+        torch.ops.sgl_kernel.silu_mul_quant_varlen(
+            input,
+            output,
+            output_scale,
+            masked_m,
+            topk=topk,
+            scale_ue8m0=scale_ue8m0,
+            transposed=transposed,
+            swizzle=swizzle,
+            swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else None,
+            enable_pdl=False,
+            workspace=workspace,
+            persistent_grid=max(1, sm_count * 4),
+        )
+        return
+
     apply_swiglu_limit = swiglu_limit is not None
     module = _jit_silu_mul_quant_varlen_module(
         quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
