@@ -1250,6 +1250,7 @@ class Envs:
     MX_DISABLE_INDEXER_ALT_STREAM = EnvBool(False)
     MX_ENABLE_FLASH_MLA_METADATA_CACHE = EnvBool(False)
     MX_ENABLE_DSA_INDEXER_GEMM_BF16 = EnvBool(False)
+    MX_USE_INDEXER_LOGITS_OPT = EnvBool(True)
 
     # ===================================================================
     # GLM5.3FLASH

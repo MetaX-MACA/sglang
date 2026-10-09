@@ -57,6 +57,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
+    is_maca,
     is_npu,
     is_xpu,
 )
@@ -157,6 +158,12 @@ FLOAT8_TYPES = {
 }
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+# MetaX: route fp8 (paged) MQA logits kernels to the maca_c backend.
+_INDEXER_LOGITS_KWARGS = (
+    {"backend": "maca_c" if envs.MX_USE_INDEXER_LOGITS_OPT.get() else "triton"}
+    if is_maca()
+    else {}
+)
 
 
 if _is_cuda or _is_hip:
@@ -1067,6 +1074,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 B=B,
                 next_n=next_n,
                 **kernel_kwargs,
+                **(_INDEXER_LOGITS_KWARGS if self.fp8_cache else {}),
             )
         else:
             # DeepGEMM's paged kernels require q=[batch, next_n, heads, dim].
@@ -1088,6 +1096,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 max_seq_len,
                 q_offset=q_offset,
                 **kernel_kwargs,
+                **(_INDEXER_LOGITS_KWARGS if self.fp8_cache else {}),
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
@@ -1328,6 +1337,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                             ks,
                             ke,
                             clean_logits=False,
+                            **_INDEXER_LOGITS_KWARGS,
                         )
 
                     elif self.int8_cache:
@@ -1411,6 +1421,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                             ks[start:end],
                             ke[start:end],
                             clean_logits=False,
+                            **_INDEXER_LOGITS_KWARGS,
                         )
                     elif self.int8_cache:
                         assert q_fp8.dtype is torch.int8
@@ -1656,6 +1667,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         ks,
                         ke,
                         clean_logits=False,
+                        **_INDEXER_LOGITS_KWARGS,
                     )
                 elif self.int8_cache:
                     logits = deep_gemm.int8_mqa_logits(
@@ -1721,6 +1733,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         ks,
                         ke,
                         clean_logits=False,
+                        **_INDEXER_LOGITS_KWARGS,
                     )
                 elif self.int8_cache:
                     logits = deep_gemm.int8_mqa_logits(
