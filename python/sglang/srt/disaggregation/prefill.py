@@ -80,6 +80,9 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from sglang.srt.utils import get_bool_env_var
+
+ENABLE_KV_LAYOUT_FIX = get_bool_env_var("MX_SGLANG_ENABLE_KV_LAYOUT_FIX", "false")
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -205,6 +208,7 @@ class PrefillBootstrapQueue:
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
+        kv_args.is_hisparse = self.scheduler.enable_hisparse
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
@@ -235,6 +239,7 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        kv_args.target_kv_data_ptr_count = len(kv_data_ptrs)
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
             if layer_shard_enabled
@@ -249,10 +254,22 @@ class PrefillBootstrapQueue:
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 draft_kv_pool.get_contiguous_buf_infos()
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
-            num_draft_entries = len(draft_kv_data_ptrs)
+            if not self.is_mla_backend:
+                # Always keep [All K] + [All V] layout when a draft pool exists, so the
+                # V-pointer offset (dst_num_total_layers + start_layer) in
+                # get_mha_kv_ptrs_with_pp is correct for both PP and MTP. (Previously gated
+                # behind ENABLE_KV_LAYOUT_FIX, which left the default [K_main,V_main,K_draft,
+                # V_draft] layout that breaks V transfer when MTP is on.)
+                half_t = len(kv_data_ptrs) // 2
+                half_d = len(draft_kv_data_ptrs) // 2
+                kv_data_ptrs = kv_data_ptrs[:half_t] + draft_kv_data_ptrs[:half_d] + kv_data_ptrs[half_t:] + draft_kv_data_ptrs[half_d:]
+                kv_data_lens = kv_data_lens[:half_t] + draft_kv_data_lens[:half_d] + kv_data_lens[half_t:] + draft_kv_data_lens[half_d:]
+                kv_item_lens = kv_item_lens[:half_t] + draft_kv_item_lens[:half_d] + kv_item_lens[half_t:] + draft_kv_item_lens[half_d:]
+            else:
+                kv_data_ptrs += draft_kv_data_ptrs
+                kv_data_lens += draft_kv_data_lens
+                kv_item_lens += draft_kv_item_lens
+                num_draft_entries = len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
@@ -447,8 +464,24 @@ class PrefillBootstrapQueue:
                     self.scheduler.attn_tp_cpu_group,
                 )
                 for i, local_poll in zip(uncovered, local_polls):
+                    req = self.queue[i]
                     if local_poll == KVPoll.Failed:
-                        polls[i] = KVPoll.Failed
+                        if isinstance(req.finished_reason, FINISH_ABORT):
+                            continue
+                        self.scheduler._pp_record_pending_bootstrap_failure(
+                            req,
+                            "KV transfer failed before bootstrap consensus.",
+                        )
+                    elif local_poll in (
+                        KVPoll.Bootstrapping,
+                        KVPoll.WaitingForInput,
+                    ):
+                        continue
+                    else:
+                        raise RuntimeError(
+                            f"Unexpected local KV poll state {local_poll} for "
+                            f"bootstrap request {req.rid}"
+                        )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for req in self.queue],
@@ -481,6 +514,12 @@ class PrefillBootstrapQueue:
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
                 elif not self.finalize_bootstrap(req):
+                    if pp_good_rids is not None:
+                        raise RuntimeError(
+                            f"PP consensus admitted {req.rid} but finalize_bootstrap "
+                            "failed locally; metadata buffer must be reserved at "
+                            "report time"
+                        )
                     continue
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)

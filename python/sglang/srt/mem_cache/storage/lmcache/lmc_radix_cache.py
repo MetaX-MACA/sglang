@@ -15,6 +15,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    KVCache,
+    MLATokenToKVPool,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.runtime_context import get_memory, get_spec
 from sglang.srt.utils import create_device_stream, device_stream_context
@@ -83,6 +88,36 @@ class LayerTransferCounter:
             self.lmc_connector.load_kv_layerwise(layer_id)
 
 
+def _select_register_pools(
+    kvcache: KVCache,
+) -> Tuple[list[torch.Tensor], list[torch.Tensor], Optional[list[torch.Tensor]]]:
+    """Return the (k_pool, v_pool, indexer_pool) buffers to register with LMCache MP.
+
+    MHA exposes two physical buffers per layer (``k_buffer`` / ``v_buffer``).
+    MLA fuses K and V into one latent buffer per layer (``kv_buffer``; V is a
+    slice of it), so it registers those as the K pool with an empty V pool --
+    the LMCache daemon detects the fused single-buffer layout and copies it
+    whole. DSA pools (``DSATokenToKVPool``, a subclass of MLA) additionally
+    expose one per-layer indexer k-cache (``index_k_with_scale_buffer``, 2-D
+    uint8 in the fp8 layout), registered after the latent layers as a second
+    engine group that shares the latent layers' block-id space.
+
+    Args:
+        kvcache: The engine KV pool for the running model.
+
+    Returns:
+        ``(k_pool, v_pool, indexer_pool)``; ``v_pool`` is empty for fused
+        MLA, and ``indexer_pool`` is ``None`` for non-DSA models.
+    """
+    # DSA checked first (it subclasses MLA); its indexer cache is registered
+    # as a separate layer group alongside the latent buffers.
+    if isinstance(kvcache, DSATokenToKVPool):
+        return kvcache.kv_buffer, [], list(kvcache.index_k_with_scale_buffer)
+    if isinstance(kvcache, MLATokenToKVPool):
+        return kvcache.kv_buffer, [], None
+    return kvcache.k_buffer, kvcache.v_buffer, None
+
+
 class LMCRadixCache(RadixCache):
     """RadixCache + LMCache IO.
 
@@ -112,23 +147,13 @@ class LMCRadixCache(RadixCache):
         cli_lmc_cfg = get_memory().lmcache_config_file or ""
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        k_pool, v_pool, indexer_pool = _select_register_pools(kvcache)
         connector_kwargs = dict(
             sgl_config=model_config,
             tp_size=tp_size,
             rank=rank,
-            # NOTE: The original implementation accessed private buffers via
-            # `_kvcache.k_buffer` / `.v_buffer`. We prefer public accessors when
-            # available; fall back to private fields if needed.
-            k_pool=getattr(
-                kvcache,
-                "k_buffer",
-                getattr(self.token_to_kv_pool_allocator._kvcache, "k_buffer"),
-            ),
-            v_pool=getattr(
-                kvcache,
-                "v_buffer",
-                getattr(self.token_to_kv_pool_allocator._kvcache, "v_buffer"),
-            ),
+            k_pool=k_pool,
+            v_pool=v_pool,
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
 
@@ -139,6 +164,13 @@ class LMCRadixCache(RadixCache):
         # layerwise) because the MP connector shares the KV cache via CUDA IPC
         # (``Tensor._share_cuda_``), which is unavailable on XPU.
         self._mode = LMCacheMode.IP if self.device.type == "xpu" else LMCacheMode.MP
+        if indexer_pool is not None and self._mode is LMCacheMode.IP:
+            raise ValueError(
+                "LMCache IP (layerwise) mode does not support DSA pools: the "
+                "per-layer transfer hook only moves the MLA latent buffer, so "
+                "the indexer k-cache would not be stored or restored. Use MP "
+                "mode for DSA models."
+            )
         if self._mode is LMCacheMode.MP:
             if not cli_lmc_cfg:
                 raise ValueError(
@@ -150,6 +182,7 @@ class LMCRadixCache(RadixCache):
                 page_size=params.page_size,
                 host=lm_cfg.mp_host,
                 port=lm_cfg.mp_port,
+                indexer_pool=indexer_pool,
                 **connector_kwargs,
             )
         elif self._mode is LMCacheMode.IP:

@@ -160,6 +160,9 @@ class DeepseekModelNextN(nn.Module):
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
+        
+        if 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
+            self.alt_stream = None
 
         layer_name = "decoder"
         if _is_npu and (
@@ -391,8 +394,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         if not is_cp_v2_active(forward_batch):
             if self.dsa_enable_prefill_cp:
+                cur_cp_seq_len = len(input_ids) // (self.cp_size * 2)
                 if can_dsa_cp_split(
-                    len(input_ids), self.cp_size, self.use_dsa, forward_batch
+                    cur_cp_seq_len, self.cp_size, self.use_dsa, forward_batch
                 ):
                     forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                         len(input_ids),

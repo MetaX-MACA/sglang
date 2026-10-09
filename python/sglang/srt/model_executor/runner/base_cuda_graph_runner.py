@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     get_cuda_graph_batch_size_alignment,
     get_cuda_graph_max_batch_size,
 )
+from sglang.srt.utils import (require_gathered_buffer, get_device_memory_capacity, enable_specific_device_opt)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
@@ -75,6 +76,7 @@ def get_batch_sizes_to_capture(
     padding instead of the default CUDA-graph padding mode.
     """
 
+    server_args = model_runner.server_args
     capture_bs = list(get_exec().graph.cuda_graph_config.decode.bs)
     num_max_requests = model_runner.req_to_token_pool.size
 
@@ -93,11 +95,7 @@ def get_batch_sizes_to_capture(
         capture_bs += [num_max_requests]
 
     sum_len_bs = []
-    if (
-        get_spec().speculative_algorithm is None
-        and get_moe_a2a_backend().is_none()
-        and get_parallel().attn_cp_size <= 1
-    ):
+    if not server_args.enable_two_batch_overlap and (get_spec().speculative_algorithm is None or enable_specific_device_opt()) and get_moe_a2a_backend().is_none() and get_parallel().attn_cp_size <= 1:
         sum_len_bs = [bs for bs in capture_bs if bs < 10 and bs % mul_base != 0]
 
     # Model input token count = bs * alignment_width; must be a multiple of attn_tp_size.

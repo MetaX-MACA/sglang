@@ -144,6 +144,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.cuda.synchronize()
             except Exception:
                 pass
+        self.seen_max_num_extend_tokens_next_power_of_2 = 1
         self.clear()
 
     def alloc(self, need_size: int):
@@ -184,6 +185,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size
             )
 
+        self.seen_max_num_extend_tokens_next_power_of_2 = max(
+            self.seen_max_num_extend_tokens_next_power_of_2,
+            next_power_of_2(extend_num_tokens),
+        )
+
         bs = len(prefix_lens)
         if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
             self.free_pages
@@ -202,6 +208,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             out_indices,
             next_power_of_2(bs),
             self.page_size,
+            self.seen_max_num_extend_tokens_next_power_of_2,
+            PART2_CHUNK_TOKENS=self.page_size,
         )
 
         if self.debug_mode:

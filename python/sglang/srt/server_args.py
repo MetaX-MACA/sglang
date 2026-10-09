@@ -1003,6 +1003,9 @@ class ServerArgs:
             help="The load balancing strategy for data parallelism.",
             choices=[
                 "auto",
+                "decode_round_robin",
+                "shortest_queue",
+                "minimum_tokens",
                 "round_robin",
                 "follow_bootstrap_room",
                 "total_requests",

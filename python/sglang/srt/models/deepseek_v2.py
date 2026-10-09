@@ -54,6 +54,7 @@ from sglang.srt.distributed import (
     divide,
     get_pp_group,
     tensor_model_parallel_all_reduce,
+    get_tensor_model_parallel_rank,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -208,12 +209,16 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.eplb.mock_balance_tensor import EP_BALANCED_TENSOR, AFD_BALANCED_TENSOR
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
     get_bool_env_var,
+    get_int_env_var,
     is_non_idle_and_non_empty,
     make_layers,
     use_intel_amx_backend,
@@ -899,6 +904,15 @@ class DeepseekV2MoE(nn.Module):
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
+        self.balance_tensor = None
+        work_rank = get_tensor_model_parallel_rank()
+        if 'ENABLE_EP_MOCK_BALANCE' in os.environ:
+            self.balance_tensor = EP_BALANCED_TENSOR[work_rank].to(torch.cuda.current_device())
+        self.use_single_stream_dispatch_overlap = False
+        if 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
+            self.use_single_stream_dispatch_overlap = True
+            self.alt_stream = None
+        self.sbo_tokens_threshold = get_int_env_var("SBO_TOKENS_THRESHOLD", 32)
 
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
@@ -1301,7 +1315,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
-        sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
+        sbo_enabled_flag = self._fuse_shared_experts_inside_sbo
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
         )
@@ -1323,15 +1337,18 @@ class DeepseekV2MoE(nn.Module):
                     device=hidden_states.device
                 )
 
+        num_tokens = hidden_states.shape[0]
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
+            if not sbo_enabled_flag and not self.use_single_stream_dispatch_overlap and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
+                    self.alt_stream = None
                     if sglang_enable_shared_experts_multi_stream:
                         self.alt_stream.wait_stream(torch.cuda.current_stream())
                         with torch.cuda.stream(self.alt_stream):
-                            shared_output = self._forward_shared_experts(hidden_states)
+                            shared_output = self._forward_shared_experts(tensor_scale_tuple if self.use_fused_quant and tensor_scale_tuple is not None
+                            else hidden_states)
                             shared_output.record_stream(self.alt_stream)
                             shared_event = self.alt_stream.record_event()
                     if is_in_breakable_cuda_graph():
@@ -1367,13 +1384,25 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
             )
-
-        if sbo_overlap_dispatch_flag:
+            if is_deepep_class_backend() and self.num_fused_shared_experts > 0:
+                n = self.num_fused_shared_experts
+                topk_output = topk_output._replace(
+                    topk_ids=topk_output.topk_ids.new_empty(
+                        (0, topk_output.topk_ids.shape[-1] + n)
+                    ),
+                    topk_weights=topk_output.topk_weights.new_empty(
+                        (0, topk_output.topk_weights.shape[-1] + n)
+                    ),
+                )
+        if self.balance_tensor is not None:
+            topk_output.topk_ids[:,0:8] = self.balance_tensor[:topk_output.topk_ids.shape[0]]
+        if sbo_overlap_dispatch_flag or self.use_single_stream_dispatch_overlap:
             shared_output = None
 
             def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
                 nonlocal shared_output
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(tensor_scale_tuple if self.use_fused_quant and tensor_scale_tuple is not None
+                        else hidden_states)
                 for handle in deepep_dispatch_hook_handle:
                     handle.remove()
 
@@ -1406,12 +1435,14 @@ class DeepseekV2MoE(nn.Module):
                     _deepep_dispatch_hook
                 )
             )
-            post_dispatch_hook_handle = (
-                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
-            )
-            post_combine_hook_handle = (
-                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
-            )
+            if sbo_overlap_dispatch_flag and not self.is_nextn:
+                post_dispatch_hook_handle = (
+                    self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+                )
+                
+                post_combine_hook_handle = (
+                    self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+                )
 
         elif sbo_overlap_combine_flag:
             shared_output = None
@@ -1676,24 +1707,38 @@ class DeepseekV2MoE(nn.Module):
         return q, s
 
     def op_gate(self, state):
-        if state.hidden_states_mlp_input.shape[0] > 0:
+        hidden_states = state.hidden_states_mlp_input
+        if isinstance(state.hidden_states_mlp_input,tuple):
+            hidden_states = state.hidden_states_mlp_input[1]
+        if is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, hidden_states
+        ):
             # router_logits: (num_tokens, n_experts)
-            state.router_logits = self.gate(state.hidden_states_mlp_input)
+            state.router_logits = self.gate(hidden_states)
         else:
             state.router_logits = None
 
     def op_shared_experts(self, state):
         hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
+        hidden_states = hidden_states_mlp_input
+        if isinstance(hidden_states_mlp_input,tuple):
+            hidden_states = hidden_states_mlp_input[1]
         if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, hidden_states_mlp_input
+            state.forward_batch.forward_mode, hidden_states
         ):
-            state.shared_output = self.shared_experts(hidden_states_mlp_input)
+            if isinstance(hidden_states_mlp_input,tuple):
+                state.shared_output = self.shared_experts(hidden_states_mlp_input[2])
+            else:
+                state.shared_output = self.shared_experts(hidden_states_mlp_input)
         else:
             state.shared_output = None
 
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
+        if isinstance(state.hidden_states_mlp_input,tuple):
+            hidden_states = state.hidden_states_mlp_input[1]
+        else:
+            hidden_states = state.hidden_states_mlp_input
 
         # Hash MoE layers (e.g. DeepSeek-V4) route on input_ids; forward_deepep
         # passes them as a topk kwarg. The per-ubatch forward_batch.input_ids is
@@ -1861,7 +1906,12 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_a_layernorm = RMSNorm(
+                self.q_lora_rank,
+                eps=config.rms_norm_eps,
+                fused_quant=get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
+                or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL", default="false"),
+            )
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
@@ -2057,6 +2107,7 @@ class DeepseekV2AttentionMLA(
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
+        self.topk_indices = None
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
@@ -2481,8 +2532,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, fused_quant=fused_quant, packed_quant=packed_quant, packed_size=align_packed_tensor_size(config.hidden_size))
-
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=fused_quant,
+            packed_quant=packed_quant,
+            packed_size=align_packed_tensor_size(config.hidden_size),
+        )
+        
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
         if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
@@ -2755,6 +2811,9 @@ class DeepseekV2Model(nn.Module):
             )
             else None
         )
+
+        if 'USE_SINGLE_STREAM_DISPATCH_OVERLAP' in os.environ:
+            self.alt_stream = None
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -3244,11 +3303,13 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                         forward_batch.seq_lens_cpu.tolist(),
                         extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                     )
+        execute_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(execute_stream):
+            with get_attn_tp_context().maybe_input_scattered(forward_batch):
+                hidden_states = self.model(
+                    input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+                )
 
-        with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden_states = self.model(
-                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
-            )
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states

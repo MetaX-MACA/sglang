@@ -933,6 +933,7 @@ class Envs:
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
+    SGLANG_DEEPEP_MODE_NORMAL_USE_INT8_QUANT = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
 
@@ -1174,6 +1175,20 @@ class Envs:
     SGLANG_MINICPM_FUSE_TOPK = EnvBool(False)
     SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
     SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
+
+
+    # Metax
+    SGLANG_DSA_DISABLE_FUSED_KERNEL = EnvBool(False)
+
+    # Backend for INT8 paged MQA logits on MetaX.
+    # Supported values: "maca_c", "tilelang", "triton".
+    MX_ENABLE_TILELANG_INT8_MQA_LOGITS = EnvStr("triton")
+    # Enable fused RMSNorm quantization through the MetaX environment namespace.
+    # When enabled, this sets the legacy FUSED_RMSNORM_QUANT switch globally.
+    MX_ENABLE_FUSE_RMSNORM_QUANT = EnvBool(False)
+    MX_FUSED_MLA_ABSORB_ROPE = EnvBool(False)
+    MX_ENABLE_FLASH_MLA_METADATA_CACHE = EnvBool(False)
+    MX_ENABLE_DSA_INDEXER_GEMM_BF16 = EnvBool(False)
 
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend

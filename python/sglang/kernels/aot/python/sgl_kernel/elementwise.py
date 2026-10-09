@@ -490,3 +490,36 @@ def concat_mla_absorb_q(
     )
     torch.ops.sgl_kernel.concat_mla_absorb_q(a, b, out)
     return out
+
+def fused_mla_absorb_rotary_emb(
+    q: torch.Tensor,
+    w_kc: torch.Tensor,
+    latent_cache: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    norm_weight: torch.Tensor,
+    q_input: torch.Tensor,
+    k_input: torch.Tensor,
+    v_input: torch.Tensor,
+    q_len: int = None,
+    num_local_heads: int = None,
+    kv_lora_rank: int = None,
+    qk_rope_head_dim: int = None,
+    qk_nope_head_dim: int = None,
+) -> int :
+    return torch.ops.sgl_kernel.fused_mla_absorb_rotary_emb.default(
+        q, 
+        w_kc,
+        latent_cache,
+        cos_sin_cache,
+        positions,
+        norm_weight,
+        q_input,
+        k_input,
+        v_input,
+        q_len,
+        num_local_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        qk_nope_head_dim,
+    )

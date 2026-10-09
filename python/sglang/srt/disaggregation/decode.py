@@ -101,7 +101,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
 )
-from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
+from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu, get_bool_env_var
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+ENABLE_KV_LAYOUT_FIX = get_bool_env_var("MX_SGLANG_ENABLE_KV_LAYOUT_FIX", "false")
 
 
 def _bootstrap_addr(req: Req) -> str:
@@ -506,6 +507,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
+        kv_args.is_hisparse = self.scheduler.enable_hisparse
 
         attn_tp_size = get_parallel().attn_tp_size
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
@@ -539,6 +541,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_lens += device_kv_data_lens[c4_layer_num:]
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
+        kv_args.target_kv_data_ptr_count = len(kv_data_ptrs)
         num_draft_entries = 0
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
@@ -546,11 +549,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
-            kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
-            num_draft_entries = len(draft_kv_data_ptrs)
+
+            if not self.is_mla_backend and ENABLE_KV_LAYOUT_FIX:
+                # Interleave target and draft K/V pointers to maintain [All K] + [All V] layout
+                half_t = len(kv_data_ptrs) // 2
+                half_d = len(draft_kv_data_ptrs) // 2
+                kv_data_ptrs = kv_data_ptrs[:half_t] + draft_kv_data_ptrs[:half_d] + kv_data_ptrs[half_t:] + draft_kv_data_ptrs[half_d:]
+                kv_data_lens = kv_data_lens[:half_t] + draft_kv_data_lens[:half_d] + kv_data_lens[half_t:] + draft_kv_data_lens[half_d:]
+                kv_item_lens = kv_item_lens[:half_t] + draft_kv_item_lens[:half_d] + kv_item_lens[half_t:] + draft_kv_item_lens[half_d:]
+            else:
+                kv_data_ptrs += draft_kv_data_ptrs
+                kv_data_lens += draft_kv_data_lens
+                kv_item_lens += draft_kv_item_lens
+                kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
+                num_draft_entries = len(draft_kv_data_ptrs)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
@@ -1198,7 +1210,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.
         # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
-        # only transfer_queue reqs are pending device buffer allocation.
+        # Count both pending bootstrap and transfer requests without buffers.
         hisparse_req_budget = float("inf")
         if self.scheduler.enable_hisparse:
             hisparse_avail = (
@@ -1207,7 +1219,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             hisparse_req_budget = max(
                 0,
                 hisparse_avail // self.scheduler.hisparse_coordinator.padded_buffer_size
-                - len(self.transfer_queue.queue),
+                - self._hisparse_pending_device_requests(),
             )
 
         # Then, preallocate the remaining requests if possible
@@ -1404,7 +1416,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 kv_transfer_page_size = getattr(
                     self.token_to_kv_pool_allocator,
                     "hisparse_page_size",
-                    page_size,
+                    1,
                 )
                 kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
             else:
@@ -1551,6 +1563,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             metadata_kwargs = {"decode_prefix_len": total_prefix_len}
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
+            elif (
+                self.scheduler.enable_hisparse
+                and self.draft_token_to_kv_pool is not None
+                and not isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                and not _is_fake_transfer(decode_req.req)
+            ):
+                # Target KV lands in token-addressed host slots. The resident
+                # draft pool instead uses the shared logical token IDs.
+                metadata_kwargs["device_kv_indices"] = (
+                    self.req_to_token_pool.req_to_token[
+                        decode_req.req.kv.req_pool_idx, prefix_len:origin_input_len
+                    ]
+                    .cpu()
+                    .numpy()
+                    .astype(np.int32)
+                )
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1588,6 +1616,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ]
 
         return preallocated_reqs, failed_reqs
+
+    def _hisparse_pending_device_requests(self) -> int:
+        coordinator = self.scheduler.hisparse_coordinator
+        pending_slots = set()
+        for entry in (*self.transfer_queue.queue, *self.pending_reqs):
+            req = entry.req
+            slot = req.kv.req_pool_idx
+            if (
+                slot is not None
+                and req.kv.kv_allocated_len > 0
+                and coordinator.req_device_buffer_size[slot] == 0
+            ):
+                pending_slots.add(slot)
+        return len(pending_slots)
 
     @property
     def has_published_destinations(self) -> bool:

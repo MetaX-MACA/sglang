@@ -154,19 +154,25 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    is_hisparse: bool = False
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        # Current peers append per-entry KV strides at slot 19 and the HiSparse
+        # capability at slot 20. Accept the short-lived v0.5.19 wire layout,
+        # where the capability occupied slot 19, during rolling upgrades.
+        legacy_hisparse_slot = len(msg) == 20 and msg[19] in (b"0", b"1")
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             mooncake_session_id=msg[3].decode("ascii"),
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4]) // 8}Q", msg[4])),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
             dst_state_data_ptrs=unpack_int_lists(msg[6], "Q"),
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
@@ -200,6 +206,16 @@ class KVArgsRegisterInfo:
             ),
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
+            ),
+            dst_kv_item_lens=(
+                list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
+                if len(msg) > 19 and msg[19] and not legacy_hisparse_slot
+                else []
+            ),
+            is_hisparse=(
+                msg[20] == b"1"
+                if len(msg) > 20
+                else legacy_hisparse_slot and msg[19] == b"1"
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
@@ -903,6 +919,100 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+        )
+
+    def _should_send_kvcache_hisparse(self, target: KVArgsRegisterInfo) -> bool:
+        # DSv4 uses compressed host pages and its own device-page channel.
+        return (
+            bool(target.is_hisparse)
+            and getattr(self.kv_args, "mla_compression_ratios", None) is None
+        )
+
+    def send_kvcache_hisparse(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        page_index_slice: slice,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        dst_draft_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
+    ):
+        """Send paged DSA KV to host tokens and optional resident draft tokens."""
+        page_size = self.kv_args.page_size
+        src_count = len(self.kv_args.kv_data_ptrs)
+        target_count = self.kv_args.target_kv_data_ptr_count
+        if target_count is None:
+            target_count = src_count
+        if not 0 < target_count <= src_count or len(dst_kv_ptrs) not in (
+            target_count,
+            src_count,
+        ):
+            raise ValueError("HiSparse PD target/draft KV pointer groups do not match.")
+        has_draft = len(dst_kv_ptrs) > target_count
+        if has_draft:
+            # Prefill and decode must agree on the draft KV configuration.
+            if dst_draft_kv_indices is None or len(dst_draft_kv_indices) != len(
+                dst_kv_indices
+            ):
+                raise ValueError(
+                    "HiSparse PD draft KV requires one logical destination per host token."
+                )
+        elif dst_draft_kv_indices is not None:
+            raise ValueError(
+                "HiSparse PD received draft destinations without draft KV buffers."
+            )
+
+        ptr_count = len(dst_kv_ptrs)
+        page_item_lens = self.kv_args.kv_item_lens[:ptr_count]
+        if (
+            page_size <= 0
+            or len(page_item_lens) != ptr_count
+            or any(n <= 0 or n % page_size for n in page_item_lens)
+        ):
+            raise ValueError(
+                "HiSparse PD KV page strides must contain whole token rows."
+            )
+        start = page_index_slice.start or 0
+        stop = page_index_slice.stop
+        if stop is None:
+            stop = start + len(prefill_kv_indices)
+        if (
+            start < 0
+            or stop - start != len(prefill_kv_indices)
+            or page_index_slice.step not in (None, 1)
+        ):
+            raise ValueError(
+                "HiSparse PD chunk must describe the supplied contiguous page range."
+            )
+        token_start = start * page_size
+        token_stop = min(stop * page_size, len(dst_kv_indices))
+        if token_start > token_stop:
+            raise ValueError(
+                "HiSparse PD chunk starts beyond its destination token table."
+            )
+        dst_tokens = dst_kv_indices[token_start:token_stop]
+        src_tokens = (
+            prefill_kv_indices[:, None] * page_size
+            + np.arange(page_size, dtype=np.int32)[None, :]
+        ).reshape(-1)[: len(dst_tokens)]
+        return self._send_kvcache_generic(
+            mooncake_session_id=mooncake_session_id,
+            src_data_ptrs=self.kv_args.kv_data_ptrs[:ptr_count],
+            dst_data_ptrs=dst_kv_ptrs,
+            item_lens=[n // page_size for n in page_item_lens],
+            prefill_data_indices=src_tokens,
+            dst_data_indices=dst_tokens,
+            executor=executor,
+            src_layer_ids=(self.kv_args.kv_layer_ids or [])[:ptr_count],
+            dst_layer_ids=dst_layer_ids,
+            dst_device_data_indices=(
+                dst_draft_kv_indices[token_start:token_stop] if has_draft else None
+            ),
+            dst_device_data_ptrs=(
+                set(dst_kv_ptrs[target_count:]) if has_draft else None
+            ),
         )
 
     def send_kvcache_dcp(
@@ -1798,6 +1908,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
+                        is_hisparse_transfer = (
+                            not is_dcp_transfer
+                            and self._should_send_kvcache_hisparse(
+                                target_rank_registration_info
+                            )
+                        )
                         chunked_dst_device_kv_indice = None
                         if is_dcp_transfer:
                             if req.dst_device_kv_indices is not None:
@@ -1805,6 +1921,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     "HiSparse destination device indices are not "
                                     "supported by PD DCP relayout"
                                 )
+                            chunked_dst_kv_indice = req.dst_kv_indices
+                        elif is_hisparse_transfer:
+                            # The sender expands the page slice to token
+                            # offsets, so it needs the complete host table.
                             chunked_dst_kv_indice = req.dst_kv_indices
                         else:
                             chunked_dst_kv_indice = req.dst_kv_indices[
@@ -1870,6 +1990,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
                                 pack_buffer=pack_buffer,
+                            )
+                        elif is_hisparse_transfer:
+                            ret = self.send_kvcache_hisparse(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                kv_chunk.index_slice,
+                                executor,
+                                dst_draft_kv_indices=req.dst_device_kv_indices,
+                                dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
                             )
                         elif (
                             self.is_mla_backend
@@ -2592,6 +2723,11 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_size,
                             dst_dcp_rank,
                             packed_staging_slot_layer_ids,
+                            struct.pack(
+                                f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
+                                *self.kv_mgr.kv_args.kv_item_lens,
+                            ),
+                            b"1" if self.kv_mgr.kv_args.is_hisparse else b"0",
                         ]
                     )
             except zmq.ZMQError:

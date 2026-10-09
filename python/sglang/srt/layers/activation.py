@@ -46,7 +46,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 from sglang.utils import resolve_obj_by_qualname
-
+from sglang.srt.server_args import get_global_server_args
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_npu = is_npu()
@@ -104,6 +104,7 @@ if _is_cuda:
     def gelu_tanh_and_mul(input: torch.Tensor, out=None) -> torch.Tensor:
         return _act_and_mul(_jit_gelu_tanh_and_mul, _sgl_gelu_tanh_and_mul, input, out)
 
+    from sgl_kernel import fused_silu_mul_dq_quant
 elif _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:

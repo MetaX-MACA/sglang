@@ -117,6 +117,8 @@ logger = logging.getLogger(__name__)
 # concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
+from sglang.srt.utils import is_cuda, is_hip, is_sm100_supported, get_bool_env_var
+from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
 if is_cuda():
     import deep_gemm
@@ -234,6 +236,9 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
         seqlens_32 = seqlens_32.reshape(-1)
     return seqlens_32.contiguous().view(-1, 1)
 
+def _create_flashmla_metadata():
+    import flash_mla
+    return flash_mla.get_mla_metadata()[0]
 
 _PLAN_TOPK_V2 = None
 
@@ -318,6 +323,7 @@ class DSAMetadata:
     dsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
     dsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
 
+    flashmla_sched_metadata: Optional[FlashMLASchedMeta] = None
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
     # Precomputed once per forward batch and reused across layers.
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
@@ -509,8 +515,8 @@ class DeepseekSparseAttnBackend(
         self.ingraph_verify_metadata_dg_out_of_graph = (
             envs.SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA_DG_OUT_OF_GRAPH.get()
         )
-        self.dsa_kv_cache_store_int8 = (
-            model_runner.token_to_kv_pool.dsa_kv_cache_store_int8
+        self.dsa_kv_cache_store_int8 = getattr(
+            model_runner.token_to_kv_pool, "dsa_kv_cache_store_int8", None
         )
         self.dsa_kv_cache_is_quantized = (
             self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8
@@ -1694,6 +1700,7 @@ class DeepseekSparseAttnBackend(
             seq_lens_sum=forward_batch.seq_lens_sum,
             page_table_1=page_table,
             page_table_1_flattened=page_table_1_flattened,
+            flashmla_sched_metadata=_create_flashmla_metadata(),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
@@ -1721,6 +1728,61 @@ class DeepseekSparseAttnBackend(
             kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
+
+        self.init_forward_metadata_in_graph(forward_batch)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        coordinator = self.hisparse_coordinator
+        if (
+            coordinator is not None
+            and coordinator.speculative_verify_enabled
+            and forward_batch.forward_mode.is_target_verify()
+            and forward_batch.batch_size > 0
+        ):
+            # DSA has compression ratio 1. Bind the live logical verify window
+            # before any target KV store, including stores captured in a graph.
+            num_tokens = forward_batch.batch_size * coordinator.spec_layout.verify_width
+            coordinator.prepare_speculative_verify(
+                req_pool_indices=forward_batch.req_pool_indices,
+                prefix_lens=forward_batch.seq_lens,
+                compressed_out_locs=forward_batch.out_cache_loc[:num_tokens],
+            )
+
+    def _swap_in_hisparse_verify_pages(
+        self,
+        forward_batch: ForwardBatch,
+        topk_indices: torch.Tensor,
+        layer_id: int,
+        output_num_tokens: int,
+    ) -> torch.Tensor:
+        coordinator = self.hisparse_coordinator
+        layout = coordinator.spec_layout
+        num_rows = forward_batch.batch_size * layout.verify_width
+        if (
+            topk_indices is None
+            or topk_indices.ndim != 2
+            or topk_indices.shape[0] < num_rows
+            or topk_indices.shape[1] != layout.top_k
+            or output_num_tokens < num_rows
+        ):
+            raise ValueError(
+                "HiSparse DSA verify requires B * W position-space top-k rows."
+            )
+        # TP/DP may add query rows beyond B * W. They are not another
+        # speculative request and must never enter the swap kernel.
+        page_table = coordinator.swap_in_speculative_pages(
+            req_pool_indices=forward_batch.req_pool_indices,
+            compressed_seq_lens=self.forward_metadata.dsa_seqlens_expanded[:num_rows],
+            top_k_result=topk_indices[:num_rows].contiguous(),
+            layer_id=layer_id,
+        )
+        return self._pad_topk_indices(page_table, output_num_tokens)
+
+    def _is_empty_idle(self, forward_batch: ForwardBatch) -> bool:
+        real_bs = getattr(forward_batch, "_original_batch_size", None)
+        if real_bs is None:
+            real_bs = forward_batch.batch_size
+        return forward_batch.forward_mode.is_idle() and real_bs == 0
 
     def _cal_indexer_k_start_end(
         self,
@@ -2008,6 +2070,7 @@ class DeepseekSparseAttnBackend(
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             page_table_1=page_table_1,
+            flashmla_sched_metadata=_create_flashmla_metadata(),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             dsa_cache_seqlens_int32=dsa_cache_seqlens_int32,
@@ -2890,6 +2953,13 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
+        if metadata is None:
+            if not self._is_empty_idle(forward_batch):
+                raise RuntimeError(
+                    "DSA forward metadata is missing for a nonempty batch."
+                )
+            return q.new_zeros((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
+
         dsa_impl = (
             self.dsa_decode_impl
             if (
@@ -2982,7 +3052,16 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
 
-        if self.use_fused_topk:
+        hisparse_verify = (
+            self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.speculative_verify_enabled
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        if hisparse_verify:
+            page_table_1 = self._swap_in_hisparse_verify_pages(
+                forward_batch, topk_indices, layer.layer_id, q_nope.shape[0]
+            )
+        elif self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -3018,7 +3097,7 @@ class DeepseekSparseAttnBackend(
                 )
 
         # todo hisparse: to cover more backends
-        if self.hisparse_coordinator is not None:
+        if self.hisparse_coordinator is not None and not hisparse_verify:
             # flash_mla_sparse_fwd / tilelang require int32 page indices.
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1
@@ -3880,7 +3959,11 @@ class DeepseekSparseAttnBackend(
         from flash_mla import get_mla_metadata
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32
-        sched_meta, _ = get_mla_metadata()
+        
+        if metadata.flashmla_sched_metadata.tile_scheduler_metadata is None or not envs.MX_ENABLE_FLASH_MLA_METADATA_CACHE.get():
+            sched_meta = _create_flashmla_metadata()
+        else:
+            sched_meta = metadata.flashmla_sched_metadata
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
@@ -3950,6 +4033,13 @@ class DeepseekSparseAttnBackend(
 
             o, _ = flash_mla_with_kvcache(**flashmla_kwargs)
 
+        
+        if metadata.flashmla_sched_metadata.tile_scheduler_metadata is None:
+            metadata.flashmla_sched_metadata.tile_scheduler_metadata = sched_meta.tile_scheduler_metadata
+            metadata.flashmla_sched_metadata.num_splits = sched_meta.num_splits
+            metadata.flashmla_sched_metadata.config = sched_meta.config
+            metadata.flashmla_sched_metadata.have_initialized = sched_meta.have_initialized
+            
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
 
@@ -4550,24 +4640,28 @@ class DeepseekSparseAttnBackend(
         else:
             topk_transform_method = TopkTransformMethod.PAGED
         return topk_transform_method
-
+    
+    def on_after_cuda_graph_warmup(self):
+        metadata = self.forward_metadata
+        metadata.flashmla_sched_metadata.tile_scheduler_metadata = None
+        
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> Optional[DSAIndexerMetadata]:
         metadata = self.forward_metadata
         if metadata is None:
-            # Unpadded DP-attention idle ranks deliberately clear stale
-            # metadata in EagerRunner._execute_idle. Returning None uses the
-            # indexer's existing no-work path for this empty companion rank.
-            if forward_batch.forward_mode.is_idle():
-                return None
-            raise RuntimeError(
-                "DSA forward metadata is missing for a non-idle indexer forward"
-            )
+            if not self._is_empty_idle(forward_batch):
+                raise RuntimeError(
+                    "DSA indexer metadata is missing for a nonempty batch."
+                )
+            return None
 
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
         )
         return DSAIndexerMetadata(
             attn_metadata=metadata,
@@ -4623,6 +4717,8 @@ class DeepseekSparseAttnMultiStepBackend:
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
+
+        
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,

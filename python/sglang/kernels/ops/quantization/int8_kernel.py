@@ -9,7 +9,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.srt.utils import get_device_name, is_cuda, is_hip
+from sglang.srt.utils import get_device_name, is_cuda, is_hip, get_bool_env_var
+import mctlassEx
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -18,6 +19,9 @@ if _is_cuda:
 
 logger = logging.getLogger(__name__)
 
+_USE_SGL_KERNEL_QUANT = get_bool_env_var("USE_SGL_KERNEL_QUANT", "True")
+if _USE_SGL_KERNEL_QUANT:
+    from sgl_kernel import scaled_int8_quant
 
 @triton.jit
 def _per_token_quant_int8(
@@ -115,6 +119,10 @@ def _get_per_token_quant_rows_per_program(n_rows: int, n_cols: int) -> int:
 
 
 def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
+    if  _USE_SGL_KERNEL_QUANT:
+        x, scale, _ = scaled_int8_quant(x)
+        return x, scale
+
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
     x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
@@ -533,3 +541,43 @@ def w8a8_block_int8_matmul(
     )
 
     return C
+
+def ctlass_scaled_bmm(attn_output: torch.Tensor, B: torch.Tensor, scale_b: torch.Tensor):
+
+    # NOTE: # Compatible with C500 & C600
+
+    attn_output_quant_val, attn_output_quant_scale, _ = scaled_int8_quant(attn_output.transpose(0, 1).contiguous())
+    batch = attn_output_quant_val.shape[0]
+    m = attn_output_quant_val.shape[1]
+    n = B.shape[2]
+    attn_bmm_output = torch.empty((batch,m, n), dtype=attn_output.dtype, device=attn_output_quant_val.device)
+    attn_output_quant_scale=attn_output_quant_scale.reshape(batch,m,-1)
+    
+    if _USE_CTLASS_SCALED_MM:
+        gemm = ScaledGEMM()
+        gemm(
+            [m, n, attn_output_quant_val.shape[2]],
+            attn_output_quant_val,
+            B,
+            attn_bmm_output,
+            attn_output_quant_scale,
+            scale_b,
+            None,
+        )
+    else:
+        stream_ptr = torch.cuda.current_stream().cuda_stream
+        mctlass_op = mctlassEx.mctlassExHandleWrapper()
+
+        mctlass_op.mctlass_w8a8_scaled_mm_azp(
+            attn_output_quant_val, 
+            B, 
+            attn_bmm_output, 
+            attn_output_quant_scale, 
+            scale_b, 
+            None, 
+            None, 
+            None, 
+            stream_ptr
+        )
+
+    return attn_bmm_output

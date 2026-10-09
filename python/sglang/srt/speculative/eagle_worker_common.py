@@ -598,6 +598,19 @@ def run_eagle_verify(
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
     new_seq_lens = batch.seq_lens + accept_lens
+    coordinator = batch.hisparse_coordinator
+    if (
+        coordinator is not None
+        and coordinator.speculative_verify_enabled
+        and not batch.forward_mode.is_idle()
+    ):
+        # topk=1 accepts a contiguous prefix, including the verify root.
+        # Snapshot the pre-verify length before publishing new_seq_lens.
+        coordinator.finalize_speculative_verify(
+            req_pool_indices=batch.req_pool_indices,
+            prefix_lens=batch.seq_lens,
+            commit_lens=accept_lens,
+        )
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",

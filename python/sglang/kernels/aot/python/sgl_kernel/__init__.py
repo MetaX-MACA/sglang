@@ -65,6 +65,7 @@ else:
         rms_norm_dynamic_per_group_quant_custom,
         rotary_embedding,
         silu_and_mul,
+        fused_mla_absorb_rotary_emb,
     )
     from sgl_kernel.expert_specialization import (
         es_fp8_blockwise_scaled_grouped_mm,
@@ -125,7 +126,8 @@ else:
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
         scaled_int8_quant,
-        mx_awq_dequantize,   
+        mx_awq_dequantize,
+        fused_silu_mul_dq_quant,   
     )
     from sgl_kernel.sampling import (
         top_k_renorm_prob,

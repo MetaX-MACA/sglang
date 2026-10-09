@@ -132,6 +132,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_disable_fused_kerenl = get_bool_env_var("SGLANG_DSA_DISABLE_FUSED_KERNEL")
 _is_musa = is_musa()
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
