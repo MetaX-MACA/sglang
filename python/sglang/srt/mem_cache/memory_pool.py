@@ -3844,6 +3844,10 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "dsa_kv_cache_store_fp8", False)
 
     @property
+    def dsa_kv_cache_store_int8(self) -> bool:
+        return getattr(self.full_kv_pool, "dsa_kv_cache_store_int8", False)
+
+    @property
     def kv_cache_dim(self):
         return getattr(self.full_kv_pool, "kv_cache_dim", None)
 

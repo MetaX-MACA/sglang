@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     resolve_dcp_dst_entry_indices,
+    resolve_linear_state_shards,
     should_send_aux_metadata,
     slice_dsa_tail_dst_ptrs_for_pp,
 )
@@ -1364,14 +1365,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         skip_kv = False
         skip_state = False
 
-        # Must be checked before the non-hybrid early return below, or every CP
-        # rank re-sends the same state and we transfer it cp_size times over.
-        # Prefill CP all-gathers before writing the pool, so every CP rank holds
-        # the full state regardless of whether the pool is hybrid. We assume no
-        # structure about the state rows, so we don't split them across CP ranks
-        # -- just let rank 0 send the whole thing (unless layer split already
-        # shards it per rank).
-        if self._should_skip_cp_replicated_state_transfer():
+        # Hybrid MLA's KDA state is head-sharded over CP; deduplicate its
+        # replicated components individually in maybe_send_extra.
+        if (
+            self._should_skip_cp_replicated_state_transfer()
+            and not self.is_hybrid_mla_backend
+        ):
             skip_state = True
 
         if not self.is_hybrid_mla_backend:
@@ -1414,6 +1413,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
         for i, st in enumerate(state_types):
+            if (
+                self.is_hybrid_mla_backend
+                and st != StateType.MAMBA
+                and self._should_skip_cp_replicated_state_transfer()
+            ):
+                continue
             indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
@@ -1480,9 +1485,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         "prefill and decode must both enable it and use equal "
                         "attention TP sizes."
                     )
+                src_shard_size = self.attn_tp_size
+                src_shard_rank = self.kv_args.engine_rank % self.attn_tp_size
+                if target_rank_registration_info is not None:
+                    shard_mapping = resolve_linear_state_shards(
+                        prefill_attn_tp_size=self.attn_tp_size,
+                        prefill_attn_tp_rank=src_shard_rank,
+                        prefill_attn_cp_size=(
+                            self.attn_cp_size if self.is_hybrid_mla_backend else 1
+                        ),
+                        prefill_attn_cp_rank=self.attn_cp_rank,
+                        decode_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                        decode_tp_rank=target_rank_registration_info.dst_tp_rank,
+                    )
+                    if shard_mapping is None:
+                        continue
+                    src_shard_size, src_shard_rank, _, _ = shard_mapping
                 if (
                     target_rank_registration_info is not None
-                    and self.attn_tp_size
+                    and src_shard_size
                     != target_rank_registration_info.dst_attn_tp_size
                 ):
                     rc = (
@@ -1502,6 +1523,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             src_slice_outer_counts,
                             src_state_layer_ids,
                             dst_state_layer_ids,
+                            src_shard_size=src_shard_size,
+                            src_shard_rank=src_shard_rank,
                         )
                         or rc
                     )
@@ -1717,6 +1740,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         src_state_slice_outer_counts: list[int] = None,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        *,
+        src_shard_size: Optional[int] = None,
+        src_shard_rank: Optional[int] = None,
     ):
         """Transfer Mamba states with TP slice support.
 
@@ -1751,7 +1777,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_layer_ids,
             )
 
-        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        if src_shard_size is None:
+            src_shard_size = self.attn_tp_size
+        local_tp_rank_in_group = (
+            self.kv_args.engine_rank % self.attn_tp_size
+            if src_shard_rank is None
+            else src_shard_rank
+        )
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
 
         transfer_blocks = []
@@ -1790,7 +1822,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 src_dim=src_dim,
                 dst_dim=dst_dim,
                 outer_count=outer_count,
-                src_attn_tp_size=self.attn_tp_size,
+                src_attn_tp_size=src_shard_size,
                 dst_attn_tp_size=dst_attn_tp_size,
                 dst_tp_rank_in_group=dst_tp_rank_in_group,
                 local_tp_rank_in_group=local_tp_rank_in_group,

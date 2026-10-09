@@ -1315,6 +1315,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
+        shared_event = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -1343,7 +1344,6 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and not self.use_single_stream_dispatch_overlap and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
-                    self.alt_stream = None
                     if sglang_enable_shared_experts_multi_stream:
                         self.alt_stream.wait_stream(torch.cuda.current_stream())
                         with torch.cuda.stream(self.alt_stream):
@@ -1357,7 +1357,8 @@ class DeepseekV2MoE(nn.Module):
                         # the shared experts overlap nothing. The alt stream
                         # is kept for record_stream: without that marking the
                         # allocator recycles shared_output across the break.
-                        torch.cuda.current_stream().wait_event(shared_event)
+                        if shared_event is not None:
+                            torch.cuda.current_stream().wait_event(shared_event)
                     else:
                         shared_output = self._forward_shared_experts(hidden_states)
                 else:
@@ -1557,6 +1558,7 @@ class DeepseekV2MoE(nn.Module):
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
+            and shared_event is not None
             and not is_in_breakable_cuda_graph()
             and sglang_enable_shared_experts_multi_stream
         ):

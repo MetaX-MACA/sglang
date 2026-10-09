@@ -39,6 +39,7 @@ from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+    from sglang.srt.models.utils import WeightsMapper
 
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -121,6 +122,20 @@ class W8A8Int8Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> W8A8Int8Config:
         return cls(config)
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper") -> None:
+        """Map checkpoint module names used by the W8A8 ignore list.
+
+        Multimodal checkpoints such as GLM5 store text modules under
+        ``model.language_model.*``, while the runtime model exposes them under
+        ``model.*``.  The model loader invokes this hook before constructing
+        layers, so the mapped names must match the prefixes passed to
+        ``get_quant_method``; otherwise BF16-only modules are accidentally
+        instantiated with W8A8 quantization methods.
+        """
+        self.ignore = list(
+            dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignore))
+        )
 
     def get_quant_method(
         self,

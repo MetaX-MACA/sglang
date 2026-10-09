@@ -1315,7 +1315,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
         if not self.encoder_only:
             self.determine_num_fused_shared_experts()
             self.model = Glm5NextModel(
-                text_config, quant_config, prefix=add_prefix("language_model", "model")
+                text_config,
+                quant_config,
+                # Quantization config names have already been converted by
+                # hf_to_sglang_mapper from ``model.language_model.*`` to the
+                # runtime parameter namespace ``model.*``.
+                prefix=add_prefix("model", prefix),
             )
             if self.pp_group.is_last_rank:
                 if self.pp_group.world_size == 1 and text_config.tie_word_embeddings:
@@ -1372,7 +1377,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             self.visual = Glm5NextVisionModel(
                 config.vision_config,
                 quant_config=quant_config,
-                prefix=add_prefix("visual", "model"),
+                # Keep this aligned with hf_to_sglang_mapper, which maps
+                # ``model.visual.*`` checkpoint names to ``visual.*``.
+                prefix=add_prefix("visual", prefix),
                 use_data_parallel=self.use_data_parallel,
             )
         self.is_mrope_enabled = not self.encoder_only and "mrope_section" in (
