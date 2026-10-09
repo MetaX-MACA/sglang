@@ -134,6 +134,30 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _disable_fused_kerenl = get_bool_env_var("SGLANG_DSA_DISABLE_FUSED_KERNEL")
 _is_musa = is_musa()
+_use_mcoplib_grouped_topk = get_bool_env_var("MX_USE_MCOPLIB_GROUPED_TOPK")
+_mcoplib_grouped_topk_op = None
+
+if _use_mcoplib_grouped_topk:
+    try:
+        import mcoplib._moe_C  # Registers the native router with torch.ops.
+
+        _mcoplib_grouped_topk_op = torch.ops._moe_C.grouped_topk
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "MX_USE_MCOPLIB_GROUPED_TOPK requires mcoplib._moe_C.grouped_topk"
+        ) from exc
+
+    from sglang.srt.utils.patch_torch import register_fake_if_exists
+
+    @register_fake_if_exists("_moe_C::grouped_topk")
+    def _mcoplib_grouped_topk_fake(
+        scores, num_expert_group, topk_group, topk, renormalize,
+        routed_scaling_factor, bias, scoring_func,
+    ):
+        return (
+            scores.new_empty((scores.shape[0], topk), dtype=torch.float32),
+            scores.new_empty((scores.shape[0], topk), dtype=torch.int32),
+        )
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
@@ -1897,6 +1921,23 @@ def biased_grouped_topk_gpu(
             and num_experts <= 512
             and topk <= 32
         ):
+            if _use_mcoplib_grouped_topk and topk <= 8 and num_tokens > 0:
+                scaling = (
+                    routed_scaling_factor
+                    if apply_routed_scaling_factor_on_output
+                    and routed_scaling_factor is not None
+                    else 1.0
+                )
+                return _mcoplib_grouped_topk_op(
+                    gating_output.to(torch.float32).contiguous(),
+                    num_expert_group,
+                    topk_group,
+                    topk,
+                    renormalize,
+                    scaling,
+                    correction_bias.to(torch.float32).contiguous(),
+                    1,
+                )
             # Ungrouped sigmoid (num_expert_group == 1): use the unified Triton
             # router, which subsumes the jit grouped_topk.cuh kernel here.
             from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate as jit_gate

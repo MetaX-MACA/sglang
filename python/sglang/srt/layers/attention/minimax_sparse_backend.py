@@ -337,7 +337,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._extend_meta = None
             self._extend_meta_key = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if extend_lens is not None:
+        if extend_lens is not None and len(extend_lens) > 0:
             self._max_seqlen_q = int(max(extend_lens))
         else:
             self._max_seqlen_q = 1
@@ -348,8 +348,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
             self._max_seqlen_k = self.max_context_len
-        else:
+        elif forward_batch.seq_lens_cpu.numel() > 0:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+        else:
+            self._max_seqlen_k = 1
 
         # Build plan + page table eager (outside capture) so captured forward_decode
         # runs only device-side ops; host-side code can't be captured.

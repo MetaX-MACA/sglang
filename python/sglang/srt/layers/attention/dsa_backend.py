@@ -890,6 +890,7 @@ class DeepseekSparseAttnBackend(
             topk_indices is None
             or self.dsa_index_kpool <= 1
             or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or (phase == "prefill" and dsa_impl == "flashmla_sparse")
         ):
             return
         raise NotImplementedError(
@@ -2977,7 +2978,8 @@ class DeepseekSparseAttnBackend(
             )
             else "prefill"
         )
-        dsa_impl = self._resolve_kpool_tail_backend(topk_indices, dsa_impl)
+        if not (phase == "prefill" and dsa_impl == "flashmla_sparse"):
+            dsa_impl = self._resolve_kpool_tail_backend(topk_indices, dsa_impl)
         self._check_kpool_tail_backend(topk_indices, dsa_impl, phase)
 
         if dsa_impl == "trtllm" and not self.use_mha:
@@ -3564,6 +3566,15 @@ class DeepseekSparseAttnBackend(
         else:
             q_input = q_all
 
+        if self.dsa_index_kpool > 1:
+            # FlashMLA sparse prefill requires physical top-k width aligned to 128.
+            # Keep metadata.dsa_cache_seqlens_int32 as the per-row valid length so
+            # kpool tail entries remain visible to the kernel.
+            padding = (-page_table_1.shape[-1]) % 128
+            if padding:
+                page_table_1 = torch.cat((page_table_1, page_table_1.new_full(
+                    (page_table_1.shape[0], padding), -1)), dim=-1)
+
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
@@ -4123,7 +4134,14 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
         return_lse: bool = False,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
+        if envs.MX_ENABLE_MCOPLIB_TILELANG_DSA.get():
+            from mcoplib.tilelang_sparse_attention import (
+                tilelang_sparse_fwd as ops,
+            )
+        else:
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+                tilelang_sparse_fwd as ops,
+            )
 
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
         # index_topk columns. TileLang processes indices in 64-column blocks,
@@ -4139,7 +4157,7 @@ class DeepseekSparseAttnBackend(
             )
 
         if return_lse:
-            out, lse = tilelang_sparse_fwd(
+            out, lse = ops(
                 q=q_all,
                 kv=kv_cache,
                 indices=page_table_1.unsqueeze(1),
@@ -4149,7 +4167,7 @@ class DeepseekSparseAttnBackend(
             )
             # [1, tokens, H] -> [tokens, H], the [B, H] dcp_pack_a2a_send expects.
             return out, lse.squeeze(0)
-        return tilelang_sparse_fwd(
+        return ops(
             q=q_all,
             kv=kv_cache,
             indices=page_table_1.unsqueeze(1),

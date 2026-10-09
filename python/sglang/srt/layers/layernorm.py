@@ -663,37 +663,82 @@ class RMSNorm(BaseFusedOp):
                 if not residual.is_contiguous():
                     residual = residual.contiguous()
             original_shape = x.shape
-            fp8_out, bf16_out, scales = rms_norm_dynamic_per_group_quant_custom(
-                x,
-                self.weight.data,
-                self.variance_epsilon,
-                torch.float8_e4m3fn,
-                128,
-                residual=residual,
-            )
+            if envs.MX_TRANS_FP8_SCALE_LAYOUT.get():
+                quant_group_size = 128
+                hidden_size = x.shape[-1]
+                tokens = x.numel() // hidden_size
+                groups = (hidden_size + quant_group_size - 1) // quant_group_size
+                quant_input = x.contiguous().reshape(tokens, hidden_size)
+                quant_residual = (
+                    residual.reshape(tokens, hidden_size)
+                    if residual is not None
+                    else None
+                )
+                bf16_out = torch.empty_like(quant_input)
+                fp8_out = torch.empty_like(quant_input, dtype=torch.float8_e4m3fn)
+                # Column-major scales: allocate (groups, tokens) storage and
+                # pass the transposed view; the trailing True asks the op to
+                # write scales in that layout, so a later scale.T.contiguous()
+                # becomes a no-op.  Requires an sgl_kernel build that accepts
+                # the column-major flag.
+                scales = torch.empty(
+                    (groups, tokens), device=x.device, dtype=torch.float32
+                ).transpose(-1, -2)
+                torch.ops.sgl_kernel.rms_norm_dynamic_per_group_quant(
+                    fp8_out,
+                    bf16_out,
+                    quant_input,
+                    self.weight.data,
+                    scales,
+                    quant_group_size,
+                    self.variance_epsilon,
+                    None,
+                    quant_residual,
+                    True,
+                )
+                fp8_out = fp8_out.reshape(original_shape)
+                bf16_out = bf16_out.reshape(original_shape)
+            else:
+                fp8_out, bf16_out, scales = rms_norm_dynamic_per_group_quant_custom(
+                    x,
+                    self.weight.data,
+                    self.variance_epsilon,
+                    torch.float8_e4m3fn,
+                    128,
+                    residual=residual,
+                )
+                fp8_out = fp8_out.reshape(original_shape)
+                bf16_out = bf16_out.reshape(original_shape)
             quant_tuple = (
-                fp8_out.reshape(original_shape),
+                fp8_out,
                 scales,
-                bf16_out.reshape(original_shape),
+                bf16_out,
             )
             if residual is not None:
                 return quant_tuple, residual
             return quant_tuple
 
-        if self.fused_quant: 
+        if self.fused_quant:
             if self.packed_quant:
-                packed_out, residual, out, quant_out, quant_scale = \
+                # The mHC path invokes post-attention RMSNorm without carrying
+                # a separate residual tensor.  The packed kernel is an add +
+                # RMSNorm kernel, so use a zero residual in that case to retain
+                # the exact RMSNorm(x) semantics while still producing the
+                # packed DeepEP/DeepGEMM input.
+                has_residual = residual is not None
+                kernel_residual = residual if has_residual else torch.zeros_like(x)
+                packed_out, kernel_residual, out, quant_out, quant_scale = \
                     fused_add_rms_norm_dynamic_per_token_quant_padding_output(
                         x,
-                        residual,
+                        kernel_residual,
                         self.weight.data,
                         self.packed_size,
                         self.variance_epsilon,
                     )
-                if residual is not None:
-                    return (packed_out, out, (quant_out, quant_scale)), residual
-                else:
-                    return (packed_out, out, (quant_out, quant_scale))
+                packed_result = (packed_out, out, (quant_out, quant_scale))
+                if has_residual:
+                    return packed_result, kernel_residual
+                return packed_result
             else:
                 quant_out, out, quant_scale = rms_norm_dynamic_per_token_quant_custom(
                     x.contiguous(),
@@ -1277,10 +1322,16 @@ class GemmaRMSNorm(BaseFusedOp):
         self,
         hidden_size: int,
         eps: float = 1e-6,
+        fused_quant: bool = False,
+        packed_quant: bool = False,
+        packed_size: int = 3840,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        self.fused_quant = fused_quant
+        self.packed_quant = packed_quant
+        self.packed_size = packed_size
         self.register_buffer(
             "gemma_weight", torch.ones_like(self.weight), persistent=False
         )
@@ -1343,6 +1394,53 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.fused_quant:
+            assert x.shape[0] > 0
+            if post_residual_addition is not None and residual is not None:
+                residual = residual + post_residual_addition
+
+            needs_reshape = x.dim() != 2 and residual is None
+            if needs_reshape:
+                original_shape = x.shape
+                x = x.contiguous().reshape(-1, original_shape[-1])
+
+            if not x.is_contiguous():
+                x = x.contiguous()
+            if residual is not None and not residual.is_contiguous():
+                residual = residual.contiguous()
+
+            ori_res_is_none = residual is None
+
+            if self.packed_quant:
+                if ori_res_is_none:
+                    residual = torch.empty(0, dtype=x.dtype, device=x.device)
+                # gemma_weight = weight + 1; mcoplib kernel does NOT add 1 internally
+                packed_out, residual, out, quant_out, quant_scale = \
+                    fused_add_rms_norm_dynamic_per_token_quant_padding_output(
+                        x,
+                        residual,
+                        self.gemma_weight,
+                        self.packed_size,
+                        self.variance_epsilon,
+                    )
+                if not ori_res_is_none:
+                    return (packed_out, out, (quant_out, quant_scale)), residual
+                return (packed_out, out, (quant_out, quant_scale))
+            else:
+                # sgl_kernel dispatches has_residual=true template when residual
+                # is a tensor (even empty). Must pass None (not torch.empty(0))
+                # to avoid ATU fault on MACA.
+                quant_out, out, quant_scale = rms_norm_dynamic_per_token_quant_custom(
+                    x,
+                    self.gemma_weight,
+                    self.variance_epsilon,
+                    quant_dtype=torch.int8,
+                    residual=residual,
+                )
+                if not ori_res_is_none:
+                    return (quant_out, quant_scale, out), residual
+                return (quant_out, quant_scale, out)
+
         return self._forward_impl(x, residual, post_residual_addition)
 
     def forward_hip(

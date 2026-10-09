@@ -5,7 +5,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_maca, is_npu, is_xpu
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
@@ -14,10 +14,19 @@ if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
         fused_recurrent_linear_replayssm_decode,
     )
-    from sglang.kernels.ops.attention.fla.kda import chunk_kda
-    from mcoplib.triton_fused_sigmoid_gating_delta_rule_update import (
+    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
+    from sglang.kernels.ops.attention.fla.kda import chunk_kda
+
+    from sglang.srt.environ import envs
+
+    # mcoplib re-exports the same entry point; the shadowing import below
+    # switches decode/verify to the mcoplib kernel when enabled.
+    if is_maca() and envs.MX_USE_MCOPLIB_KDA.get():
+        from mcoplib.triton_fused_sigmoid_gating_delta_rule_update import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
 
 
 class TritonKDAKernel(LinearAttnKernelBase):

@@ -65,6 +65,8 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -121,12 +123,19 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_forward, get_mm, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_lora,
+    get_mm,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    align_packed_tensor_size,
     log_info_on_rank0,
     make_layers,
     set_weight_attrs,
@@ -139,6 +148,36 @@ if _use_aiter_gfx95:
 
 logger = logging.getLogger(__name__)
 _GLM_AITER_FUSED_MHC_LOGGED = False
+
+
+_KDA_PROJ_NAMES = ("qkv_proj", "b_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj")
+
+
+def _kda_projs_unquantized(quant_config, prefix: str) -> bool:
+    if quant_config is None:
+        return True
+    names = [f"{prefix}.{n}" for n in _KDA_PROJ_NAMES]
+    fused = quant_config.packed_modules_mapping
+    if type(quant_config) is Fp8Config:
+        return all(
+            is_layer_skipped(n, quant_config.ignored_layers, fused_mapping=fused)
+            for n in names
+        )
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+    from sglang.srt.layers.quantization.compressed_tensors.utils import (
+        should_ignore_layer,
+    )
+    if isinstance(quant_config, CompressedTensorsConfig):
+        # 设置了 linear_fp8_config 时，所有 Linear 都会被强制走 FP8，ignore 不起作用
+        if getattr(quant_config, "linear_fp8_config", None) is not None:
+            return False
+        return all(
+            should_ignore_layer(n, ignore=quant_config.ignore, fused_mapping=fused)
+            for n in names
+        )
+    return False
 
 
 @torch.compile
@@ -369,7 +408,14 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        # Both fused projections shard on attention TP, including under DP
+        # attention where the attention and global TP groups differ.
+        # LoRA wraps the original projections, not these fused module types.
+        self.do_fuse_qkvbfg = (
+            envs.MX_ENABLE_KDA_PROJECTION_FUSION.get()
+            and not (get_lora().enable_lora or get_lora().lora_paths)
+            and _kda_projs_unquantized(quant_config, prefix)
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -383,8 +429,11 @@ class Glm5NextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=quant_config,
+                # Eligibility is resolved using the original projection names.
+                quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
             self.split_sizes = [
                 3 * projection_size // head_shard_size,
@@ -397,7 +446,12 @@ class Glm5NextLinearAttention(nn.Module):
                 or torch.get_default_dtype()
             )
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2, self.head_dim, projection_size, dtype=fused_dtype
+                2,
+                self.head_dim,
+                projection_size,
+                dtype=fused_dtype,
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
         else:
             self.qkv_proj = QKVParallelLinear(
@@ -714,9 +768,25 @@ class Glm5NextDecoderLayer(nn.Module):
                 swiglu_limit=config.swiglu_limit,
             )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        packed_quant = self.is_layer_sparse
+        fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+        fused_quant_pd = fused_quant or envs.MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL.get()
+        # MetaX mHC executes input RMSNorm outside the mHC kernel and its
+        # attention-side communication path expects a plain Tensor.  The
+        # fused-quant RMSNorm returns a tuple, so keep input RMSNorm unfused
+        # for mHC until the mHC kernels can produce/propagate quant metadata.
+        input_fused_quant = fused_quant_pd and not self.config.mhc
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=input_fused_quant,
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=fused_quant,
+            packed_quant=packed_quant,
+            packed_size=align_packed_tensor_size(config.hidden_size),
         )
 
         if self.config.mhc:
@@ -1315,7 +1385,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
         if not self.encoder_only:
             self.determine_num_fused_shared_experts()
             self.model = Glm5NextModel(
-                text_config, quant_config, prefix=add_prefix("language_model", "model")
+                text_config,
+                quant_config,
+                # Quantization config names have already been converted by
+                # hf_to_sglang_mapper from ``model.language_model.*`` to the
+                # runtime parameter namespace ``model.*``.
+                prefix=add_prefix("model", prefix),
             )
             if self.pp_group.is_last_rank:
                 if self.pp_group.world_size == 1 and text_config.tie_word_embeddings:
@@ -1372,7 +1447,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             self.visual = Glm5NextVisionModel(
                 config.vision_config,
                 quant_config=quant_config,
-                prefix=add_prefix("visual", "model"),
+                # Keep this aligned with hf_to_sglang_mapper, which maps
+                # ``model.visual.*`` checkpoint names to ``visual.*``.
+                prefix=add_prefix("visual", prefix),
                 use_data_parallel=self.use_data_parallel,
             )
         self.is_mrope_enabled = not self.encoder_only and "mrope_section" in (

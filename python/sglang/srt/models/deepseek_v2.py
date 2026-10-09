@@ -128,6 +128,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
     emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale,
+    to_column_major_scale_layout,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
@@ -219,6 +220,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     get_int_env_var,
+    is_maca,
     is_non_idle_and_non_empty,
     make_layers,
     use_intel_amx_backend,
@@ -323,6 +325,49 @@ class DeepseekV2MLP(nn.Module):
         self.use_fused_clamp_act_mul = _is_hip
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
+        self._use_mcoplib_silu_fp8 = False
+        if is_maca() and envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get():
+            import mcoplib.sgl_kernel  # noqa: F401: registers torch.ops.sgl_kernel
+            self._use_mcoplib_silu_fp8 = True
+
+    def _can_use_mcoplib_silu_fp8(self, gate_up: torch.Tensor) -> bool:
+        if not self._use_mcoplib_silu_fp8 or torch.compiler.is_compiling():
+            return False
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+        from sglang.srt.layers.quantization.fp8_utils import (
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
+        )
+        from sglang.srt.runtime_context import get_lora
+        if is_batch_invariant_mode_enabled():
+            return False
+        qm = self.down_proj.quant_method
+        weight = getattr(self.down_proj, "weight", None)
+        scale = getattr(self.down_proj, "weight_scale_inv", None)
+        return (
+            not (get_lora().enable_lora or get_lora().lora_paths)
+            and gate_up.ndim == 2
+            and gate_up.is_cuda
+            and gate_up.dtype == torch.bfloat16
+            and gate_up.is_contiguous()
+            and gate_up.shape[0] > 0
+            and gate_up.shape[1] % 256 == 0
+            and isinstance(qm, Fp8LinearMethod)
+            and qm.block_quant
+            and not qm.use_mxfp8
+            and not qm.use_marlin
+            and qm.weight_block_size == [128, 128]
+            and qm.w8a8_block_fp8_linear
+            is deepgemm_w8a8_block_fp8_linear_with_fallback
+            and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and weight is not None
+            and weight.dtype == torch.float8_e4m3fn
+            and weight.ndim == 2
+            and weight.shape[0] % 64 == 0
+            and weight.shape[1] == gate_up.shape[1] // 2
+            and scale is not None
+            and scale.dtype == torch.float32
+        )
 
     def forward(
         self,
@@ -410,6 +455,12 @@ class DeepseekV2MLP(nn.Module):
                 transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 swiglu_limit=float(self.swiglu_limit),
             )
+            if (
+                envs.MX_TRANS_FP8_SCALE_LAYOUT.get()
+                and down_input_scale.dtype == torch.float32
+            ):
+                # The target JIT writes row-major FP32; its transposed mode is UE8M0-only.
+                down_input_scale = to_column_major_scale_layout(down_input_scale)
             down_output = gate_up.new_empty(
                 (M, self.down_proj.output_size), dtype=torch.bfloat16
             )
@@ -478,6 +529,24 @@ class DeepseekV2MLP(nn.Module):
                     swiglu_limit=self.swiglu_limit,
                     activation="silu",
                 )
+
+        elif self._can_use_mcoplib_silu_fp8(gate_up):
+            M, N = gate_up.shape
+            groups = N // 256
+            trans_scale = envs.MX_TRANS_FP8_SCALE_LAYOUT.get()
+            x_quant = torch.empty(
+                (M, N // 2), device=gate_up.device, dtype=torch.float8_e4m3fn
+            )
+            scale_shape = (groups, M) if trans_scale else (M, groups)
+            x_scale = torch.empty(
+                scale_shape, device=gate_up.device, dtype=torch.float32
+            )
+            if trans_scale:
+                x_scale = x_scale.t()
+            torch.ops.sgl_kernel.fused_silu_mul_per_group_quant(
+                x_quant, x_scale, gate_up, self.swiglu_limit, trans_scale
+            )
+            x = (x_quant, x_scale)
 
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
@@ -1315,6 +1384,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
+        shared_event = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -1343,7 +1413,6 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and not self.use_single_stream_dispatch_overlap and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
-                    self.alt_stream = None
                     if sglang_enable_shared_experts_multi_stream:
                         self.alt_stream.wait_stream(torch.cuda.current_stream())
                         with torch.cuda.stream(self.alt_stream):
@@ -1357,7 +1426,8 @@ class DeepseekV2MoE(nn.Module):
                         # the shared experts overlap nothing. The alt stream
                         # is kept for record_stream: without that marking the
                         # allocator recycles shared_output across the break.
-                        torch.cuda.current_stream().wait_event(shared_event)
+                        if shared_event is not None:
+                            torch.cuda.current_stream().wait_event(shared_event)
                     else:
                         shared_output = self._forward_shared_experts(hidden_states)
                 else:
@@ -1557,6 +1627,7 @@ class DeepseekV2MoE(nn.Module):
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
+            and shared_event is not None
             and not is_in_breakable_cuda_graph()
             and sglang_enable_shared_experts_multi_stream
         ):
@@ -1911,6 +1982,7 @@ class DeepseekV2AttentionMLA(
                 eps=config.rms_norm_eps,
                 fused_quant=get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
                 or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL", default="false"),
+                return_quant_tuple=True,
             )
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
@@ -2530,7 +2602,17 @@ class DeepseekV2DecoderLayer(nn.Module):
         # )
         packed_quant = True if self.is_layer_sparse else False
         fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Keep the RMSNorm/quantization contract aligned with glm5_next:
+        # attention input can use the prefill-specific fused quant path, while
+        # sparse MLP input additionally carries the padded/packed tensor needed
+        # by the DeepEP/DeepGEMM MoE path.
+        fused_quant_pd = fused_quant or envs.MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL.get()
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=fused_quant_pd,
+            return_quant_tuple=True,
+        )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,

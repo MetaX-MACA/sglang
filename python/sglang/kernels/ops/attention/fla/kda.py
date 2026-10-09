@@ -36,6 +36,15 @@ if is_intel:
         chunk_gated_delta_rule_fwd_h,
     )
 
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_maca
+
+_USE_MCOPLIB_KDA_CHUNK_H = is_maca() and envs.MX_USE_MCOPLIB_KDA.get()
+if _USE_MCOPLIB_KDA_CHUNK_H:
+    from mcoplib.triton_sglang_chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_h as mcoplib_chunk_gated_delta_rule_fwd_h,
+    )
+
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -1159,17 +1168,42 @@ def chunk_kda_fwd(
         fuse_recompute=_small_grid,
     )
 
-    h, v_new = chunk_gated_delta_rule_fwd_h(
-        k=kg,
-        w=w,
-        u=u,
-        gk=g,
-        initial_state=initial_state,
-        initial_state_indices=initial_state_indices,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        use_exp2=True,
+    use_mcoplib_chunk_h = (
+        _USE_MCOPLIB_KDA_CHUNK_H
+        and initial_state is not None
+        and initial_state_indices is not None
+        and initial_state.is_contiguous()
+        and initial_state_indices.is_contiguous()
+        and kg.is_contiguous()
+        and w.is_contiguous()
+        and u.is_contiguous()
+        and g.is_contiguous()
     )
+    if use_mcoplib_chunk_h:
+        # The mcoplib API consumes natural-log gates; KDA keeps g in log2 space.
+        h, v_new = mcoplib_chunk_gated_delta_rule_fwd_h(
+            k=kg,
+            w=w,
+            u=u,
+            gk=g / RCP_LN2,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            save_new_value=True,
+        )
+    else:
+        h, v_new = chunk_gated_delta_rule_fwd_h(
+            k=kg,
+            w=w,
+            u=u,
+            gk=g,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            use_exp2=True,
+        )
     del w, u, kg
 
     o = chunk_gla_fwd_o_gk(

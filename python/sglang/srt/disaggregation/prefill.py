@@ -236,6 +236,11 @@ class PrefillBootstrapQueue:
             )
         )
         kv_args.mla_compression_ratios = None
+        kv_args.minimax_k_only_sparse_layer_ids = (
+            self.token_to_kv_pool.all_k_only_sparse_layer_ids
+            if isinstance(self.token_to_kv_pool, MiniMaxSparseKVPool)
+            else None
+        )
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -1286,7 +1291,7 @@ class SchedulerDisaggregationPrefillMixin:
             def _dsa_tail_payload():
                 return get_dsa_tail_state_indices(
                     self.token_to_kv_pool_allocator.get_kvcache(),
-                    req.req_pool_idx,
+                    req.kv.req_pool_idx,
                     seq_len,
                 )
 

@@ -25,9 +25,21 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
         text_config = getattr(config, "text_config", config)
+        nextn_layer_id = text_config.num_hidden_layers
         return WeightsMapper(
             orig_to_new_substr={
-                f"model.layers.{text_config.num_hidden_layers}": "model.decoder",
+                # WeightsMapper performs substring replacement.  Without this
+                # longer identity rule, ``model.layers.<id>`` also matches the
+                # tail of ``model.language_model.layers.<id>`` and rewrites a
+                # valid GLM5 compressed-tensors ignore entry to
+                # ``model.language_model.decoder.*``.  The GLM5 draft module is
+                # constructed under the original language-model namespace.
+                f"model.language_model.layers.{nextn_layer_id}": (
+                    f"model.language_model.layers.{nextn_layer_id}"
+                ),
+                # Keep supporting text-only checkpoints whose NextN layer is
+                # exposed by the generic DeepSeek draft as model.decoder.
+                f"model.layers.{nextn_layer_id}": "model.decoder",
             },
         )
 

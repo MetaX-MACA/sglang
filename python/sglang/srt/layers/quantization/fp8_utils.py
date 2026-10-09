@@ -1633,6 +1633,27 @@ def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
     return sf
 
 
+def to_column_major_scale_layout(scale: torch.Tensor) -> torch.Tensor:
+    """Return a scale tensor with the same shape but column-major physical order.
+
+    For a 2D scale with logical shape (N, K), the returned tensor keeps logical
+    shape (N, K) while allocating physical storage as (K, N).  This lets a later
+    `scale.T.contiguous()` become a no-op because `scale.T` is already
+    contiguous.  Batch dimensions before (N, K) are preserved.
+    """
+    if scale.ndim < 2:
+        return scale
+    if scale.transpose(-1, -2).is_contiguous():
+        return scale
+
+    *batch_shape, n, k = scale.shape
+    column_major = torch.empty(
+        (*batch_shape, k, n), device=scale.device, dtype=scale.dtype
+    ).transpose(-1, -2)
+    column_major.copy_(scale)
+    return column_major
+
+
 # Copied from DeepGEMM tests
 def _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(
     x: torch.Tensor,

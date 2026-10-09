@@ -89,6 +89,7 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
+    get_bool_env_var,
     get_device_sm,
     is_cuda,
     is_hip,
@@ -96,6 +97,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.common import align_packed_tensor_size
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
@@ -340,6 +342,7 @@ class MiniMaxM3MoE(nn.Module):
             )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.use_routing_bias = getattr(config, "use_routing_bias", False)
+        self.use_fused_quant = get_bool_env_var("MX_ENABLE_FUSE_RMSNORM_QUANT", default="false")
         if self.use_routing_bias:
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty(config.num_local_experts, dtype=torch.float32)
@@ -436,6 +439,13 @@ class MiniMaxM3MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        if isinstance(hidden_states, tuple):
+            hidden_states = (
+                hidden_states[1]
+                if isinstance(hidden_states[2], tuple)
+                else hidden_states[2]
+            )
+
         if hidden_states.shape[0] > 0:
             if (
                 self.alt_stream is not None
@@ -471,6 +481,19 @@ class MiniMaxM3MoE(nn.Module):
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
+        tensor_scale_tuple = None
+        if isinstance(hidden_states, tuple):
+            packed_hidden = hidden_states[0]
+            tensor_scale_tuple = hidden_states[2]
+            hidden_states = hidden_states[1]
+        else:
+            packed_hidden = hidden_states
+            if self.use_fused_quant and packed_hidden.shape[0] == 0:
+                packed_hidden = torch.empty(
+                    (0, align_packed_tensor_size(packed_hidden.shape[-1])),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
         """DeepEP MoE forward: routed experts via a2a, shared experts replicated."""
         shared_output = None
         enable_npu_dual_stream = _is_npu and (
@@ -500,7 +523,7 @@ class MiniMaxM3MoE(nn.Module):
 
         # DeepEP returns the complete per-token routed result (no TP all-reduce here);
         # shared experts are replicated (tp_size=1), so both add directly.
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        final_hidden_states = self.experts(packed_hidden, topk_output)
 
         if enable_npu_dual_stream:
             wait_share_stream()
@@ -1313,17 +1336,34 @@ class MiniMaxM3DecoderLayer(nn.Module):
             )
 
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
+
+        packed_quant = True if self.is_layer_sparse else False
+        fused_quant = get_bool_env_var("MX_ENABLE_FUSE_RMSNORM_QUANT", default="false")
+        fused_quant_pd = fused_quant or get_bool_env_var(
+            "MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL", default="false"
+        )
+
         if self.use_gemma_norm:
             self.input_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size, eps=config.rms_norm_eps,
             )
             self.post_attention_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size, eps=config.rms_norm_eps,
+                fused_quant=fused_quant,
+                packed_quant=packed_quant,
+                packed_size=align_packed_tensor_size(config.hidden_size),
             )
         else:
-            self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.input_layernorm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+            )
             self.post_attention_layernorm = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                fused_quant=fused_quant,
+                packed_quant=packed_quant,
+                packed_size=align_packed_tensor_size(config.hidden_size),
             )
 
         def _is_layer_sparse(lid):
@@ -1394,7 +1434,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
             forward_batch
         )
 
-        if self.is_layer_sparse or hidden_states.shape[0] != 0:
+        hs = hidden_states[1] if isinstance(hidden_states, tuple) else hidden_states
+        if self.is_layer_sparse or hs.shape[0] != 0:
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch=forward_batch,

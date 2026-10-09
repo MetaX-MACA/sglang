@@ -1190,7 +1190,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
 
         # Act
-        down_input = silu_and_mul_masked(gateup_output, masked_m, self.swiglu_limit)
+        down_input = silu_and_mul_masked(
+            gateup_output, masked_m,
+            gemm1_alpha=getattr(self.config, 'gemm1_alpha', 0.0) or 0.0,
+            swiglu_limit=getattr(self.config, 'gemm1_clamp_limit', None) or getattr(self.config, 'swiglu_limit', None) or 0.0,
+        )
         del gateup_output
 
         # GroupGemm-2
@@ -1784,9 +1788,6 @@ def _varlen_deep_gemm_silu_mul_quant(
     # int32 UE8M0 (no follow-up transform; needs G % 4 == 0 and the
     # num_real_tokens grid bound) when eligible, row-major fp32 otherwise.
     if gemm1_alpha is not None:
-        assert (
-            swiglu_limit is None
-        ), "swiglu_limit and gemm1_alpha are mutually exclusive"
         assert not swizzle, "swizzle is not supported with gemm1_alpha"
         from sglang.kernels.ops.moe.ep_moe_kernels import (
             silu_and_mul_masked_post_quant_fwd,

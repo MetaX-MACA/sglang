@@ -3844,6 +3844,10 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "dsa_kv_cache_store_fp8", False)
 
     @property
+    def dsa_kv_cache_store_int8(self) -> bool:
+        return getattr(self.full_kv_pool, "dsa_kv_cache_store_int8", False)
+
+    @property
     def kv_cache_dim(self):
         return getattr(self.full_kv_pool, "kv_cache_dim", None)
 
@@ -5365,6 +5369,11 @@ class MiniMaxSparseKVPool(KVCache):
         self.sparse_layer_id_mapping: dict[int, int] = {
             gid: i for i, gid in enumerate(local_sparse_layer_ids)
         }
+        self.all_k_only_sparse_layer_ids: List[int] = [
+            lid
+            for lid in sparse_layer_ids
+            if lid in disable_set
+        ]
         # Per-sub-pool local indices.
         self.index_kv_layer_id_mapping: dict[int, int] = {
             gid: i for i, gid in enumerate(local_kv_sparse_layer_ids)
