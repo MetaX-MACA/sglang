@@ -1734,6 +1734,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # CP must go through cp_strategy.run_attention (per-shard
             # masking); the plain-causal fmha_v2 call below would be wrong.
             paged_kv = torch.stack([k_cache, v_cache], dim=1)
+            out = forward_batch._attn_output
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
                 (q, paged_kv),
                 input_layout="Q_PAGED_KV_NHD",
@@ -1747,6 +1748,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
                 block_tables=page_table,
+                out=None if out is None else out.view_as(q),
                 out_dtype=self.q_data_type,
                 mask_mode="causal",
                 window_left=layer.sliding_window_size,
