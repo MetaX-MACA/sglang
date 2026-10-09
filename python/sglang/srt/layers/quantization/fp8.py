@@ -65,6 +65,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_mxfp8_dense_gemm_backend,
+    to_column_major_scale_layout,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -723,6 +724,15 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
+
+        if (
+            self.w8a8_block_fp8_linear is deepgemm_w8a8_block_fp8_linear_with_fallback
+            and layer.weight_scale_inv.dtype == torch.float32
+            and envs.MX_TRANS_FP8_SCALE_LAYOUT.get()
+        ):
+            layer.weight_scale_inv.data = to_column_major_scale_layout(
+                layer.weight_scale_inv.data
+            )
 
         if (
             _use_aiter_bpreshuffle_gfx95
@@ -1785,6 +1795,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         output_dtype=torch.bfloat16,
                         weight_shape=weight.shape[-2:],
                     )
+
+            if (
+                will_use_deepgemm
+                and not self.is_fp4_expert
+                and layer.w13_weight_scale_inv.dtype == torch.float32
+                and envs.MX_TRANS_FP8_SCALE_LAYOUT.get()
+            ):
+                layer.w13_weight_scale_inv.data = to_column_major_scale_layout(
+                    layer.w13_weight_scale_inv.data
+                )
+                layer.w2_weight_scale_inv.data = to_column_major_scale_layout(
+                    layer.w2_weight_scale_inv.data
+                )
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.mxfp8_block_convert import (

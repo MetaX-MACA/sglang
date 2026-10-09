@@ -663,18 +663,56 @@ class RMSNorm(BaseFusedOp):
                 if not residual.is_contiguous():
                     residual = residual.contiguous()
             original_shape = x.shape
-            fp8_out, bf16_out, scales = rms_norm_dynamic_per_group_quant_custom(
-                x,
-                self.weight.data,
-                self.variance_epsilon,
-                torch.float8_e4m3fn,
-                128,
-                residual=residual,
-            )
+            if envs.MX_TRANS_FP8_SCALE_LAYOUT.get():
+                quant_group_size = 128
+                hidden_size = x.shape[-1]
+                tokens = x.numel() // hidden_size
+                groups = (hidden_size + quant_group_size - 1) // quant_group_size
+                quant_input = x.contiguous().reshape(tokens, hidden_size)
+                quant_residual = (
+                    residual.reshape(tokens, hidden_size)
+                    if residual is not None
+                    else None
+                )
+                bf16_out = torch.empty_like(quant_input)
+                fp8_out = torch.empty_like(quant_input, dtype=torch.float8_e4m3fn)
+                # Column-major scales: allocate (groups, tokens) storage and
+                # pass the transposed view; the trailing True asks the op to
+                # write scales in that layout, so a later scale.T.contiguous()
+                # becomes a no-op.  Requires an sgl_kernel build that accepts
+                # the column-major flag.
+                scales = torch.empty(
+                    (groups, tokens), device=x.device, dtype=torch.float32
+                ).transpose(-1, -2)
+                torch.ops.sgl_kernel.rms_norm_dynamic_per_group_quant(
+                    fp8_out,
+                    bf16_out,
+                    quant_input,
+                    self.weight.data,
+                    scales,
+                    quant_group_size,
+                    self.variance_epsilon,
+                    None,
+                    quant_residual,
+                    True,
+                )
+                fp8_out = fp8_out.reshape(original_shape)
+                bf16_out = bf16_out.reshape(original_shape)
+            else:
+                fp8_out, bf16_out, scales = rms_norm_dynamic_per_group_quant_custom(
+                    x,
+                    self.weight.data,
+                    self.variance_epsilon,
+                    torch.float8_e4m3fn,
+                    128,
+                    residual=residual,
+                )
+                fp8_out = fp8_out.reshape(original_shape)
+                bf16_out = bf16_out.reshape(original_shape)
             quant_tuple = (
-                fp8_out.reshape(original_shape),
+                fp8_out,
                 scales,
-                bf16_out.reshape(original_shape),
+                bf16_out,
             )
             if residual is not None:
                 return quant_tuple, residual

@@ -372,7 +372,7 @@ class DeepseekMLAForwardMixin:
             # q_lora needed by indexer
             if self.use_dsa:
                 if q_lora is None:
-                    q_lora = q
+                    q_lora = q[2] if isinstance(q, tuple) and len(q) == 3 else q
 
             # overlap q_b_proj and indexer during decode
             if (
@@ -389,7 +389,7 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj_forward(q)
                 if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
-                        x=hidden_states,
+                        x=hidden_states[2] if isinstance(hidden_states, tuple) and len(hidden_states) == 3 else hidden_states,
                         q_lora=q_lora,
                         positions=positions,
                         forward_batch=forward_batch,
@@ -464,7 +464,7 @@ class DeepseekMLAForwardMixin:
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):
                         topk_indices = self.indexer(
-                            x=hidden_states,
+                            x=hidden_states[2] if isinstance(hidden_states, tuple) and len(hidden_states) == 3 else hidden_states,
                             q_lora=q_lora,
                             positions=positions,
                             forward_batch=forward_batch,

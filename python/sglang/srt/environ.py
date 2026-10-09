@@ -693,6 +693,10 @@ class Envs:
     MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL = EnvBool(False)
     MX_ENABLE_FUSE_SILUMUL_QUANT = EnvBool(False)
     MX_ENABLE_FUSE_ACT_FP8_QUANT = EnvBool(False)
+    # FP8 weight/activation scale layout switched to column-major so a later
+    # scale.T.contiguous() becomes a no-op. Affects all FP8 models when on;
+    # PD decode with this on is known to trap, keep off by default.
+    MX_TRANS_FP8_SCALE_LAYOUT = EnvBool(False)
     # Guarded TileLang Split-KV sparse-attention kernels (MACA, BF16,
     # H64/D512/TopK2112, no-LSE path only); falls back to the original
     # v1/v2 kernels when off or shapes are unsupported.

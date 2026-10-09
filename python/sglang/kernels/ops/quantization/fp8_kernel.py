@@ -25,6 +25,7 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,
@@ -782,12 +783,29 @@ def sglang_per_token_group_quant_fp8(
 
     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
 
+    shape_supported_mcoplib = (
+        x.dim() == 2
+        and group_size == 128
+        and not column_major_scales
+        and not scale_tma_aligned
+        and not scale_ue8m0
+        and not fuse_silu_and_mul
+        and masked_m is None
+    )
+    # Column-major scale layout for the mcoplib cast op (opt-in): allocate
+    # the transposed scale up front and let the op fill it directly.
+    trans_scale_layout = (
+        shape_supported_mcoplib
+        and _mcoplib_per_token_cast_to_fp8 is not None
+        and envs.MX_TRANS_FP8_SCALE_LAYOUT.get()
+    )
+
     x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
         x_shape=out_shape,
         device=x.device,
         group_size=group_size,
-        column_major_scales=column_major_scales,
+        column_major_scales=column_major_scales or trans_scale_layout,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
     )
@@ -797,17 +815,15 @@ def sglang_per_token_group_quant_fp8(
             _mcoplib_per_token_cast_to_fp8 is not None
             or _mcoplib_per_token_group_quant_fp8 is not None
         )
-        and x.dim() == 2
-        and group_size == 128
-        and not column_major_scales
-        and not scale_tma_aligned
-        and not scale_ue8m0
-        and not fuse_silu_and_mul
-        and masked_m is None
+        and shape_supported_mcoplib
     )
     if x.shape[0] > 0:
         if can_use_mcoplib:
-            if _mcoplib_per_token_cast_to_fp8 is not None:
+            if trans_scale_layout:
+                import mcoplib.sgl_kernel  # noqa: F401
+
+                torch.ops.sgl_kernel.per_token_cast_to_fp8.default(x_q, x_s, x, True)
+            elif _mcoplib_per_token_cast_to_fp8 is not None:
                 _mcoplib_per_token_cast_to_fp8(x_q, x_s, x)
             else:
                 _mcoplib_per_token_group_quant_fp8(
