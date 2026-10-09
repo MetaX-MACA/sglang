@@ -2532,7 +2532,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         # )
         packed_quant = True if self.is_layer_sparse else False
         fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Keep the RMSNorm/quantization contract aligned with glm5_next:
+        # attention input can use the prefill-specific fused quant path, while
+        # sparse MLP input additionally carries the padded/packed tensor needed
+        # by the DeepEP/DeepGEMM MoE path.
+        fused_quant_pd = fused_quant or envs.MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL.get()
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=fused_quant_pd,
+        )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,

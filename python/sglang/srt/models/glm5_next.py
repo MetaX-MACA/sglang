@@ -127,6 +127,7 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    align_packed_tensor_size,
     log_info_on_rank0,
     make_layers,
     set_weight_attrs,
@@ -714,9 +715,25 @@ class Glm5NextDecoderLayer(nn.Module):
                 swiglu_limit=config.swiglu_limit,
             )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        packed_quant = self.is_layer_sparse
+        fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+        fused_quant_pd = fused_quant or envs.MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL.get()
+        # MetaX mHC executes input RMSNorm outside the mHC kernel and its
+        # attention-side communication path expects a plain Tensor.  The
+        # fused-quant RMSNorm returns a tuple, so keep input RMSNorm unfused
+        # for mHC until the mHC kernels can produce/propagate quant metadata.
+        input_fused_quant = fused_quant_pd and not self.config.mhc
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=input_fused_quant,
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=fused_quant,
+            packed_quant=packed_quant,
+            packed_size=align_packed_tensor_size(config.hidden_size),
         )
 
         if self.config.mhc:

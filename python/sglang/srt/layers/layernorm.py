@@ -680,20 +680,27 @@ class RMSNorm(BaseFusedOp):
                 return quant_tuple, residual
             return quant_tuple
 
-        if self.fused_quant: 
+        if self.fused_quant:
             if self.packed_quant:
-                packed_out, residual, out, quant_out, quant_scale = \
+                # The mHC path invokes post-attention RMSNorm without carrying
+                # a separate residual tensor.  The packed kernel is an add +
+                # RMSNorm kernel, so use a zero residual in that case to retain
+                # the exact RMSNorm(x) semantics while still producing the
+                # packed DeepEP/DeepGEMM input.
+                has_residual = residual is not None
+                kernel_residual = residual if has_residual else torch.zeros_like(x)
+                packed_out, kernel_residual, out, quant_out, quant_scale = \
                     fused_add_rms_norm_dynamic_per_token_quant_padding_output(
                         x,
-                        residual,
+                        kernel_residual,
                         self.weight.data,
                         self.packed_size,
                         self.variance_epsilon,
                     )
-                if residual is not None:
-                    return (packed_out, out, (quant_out, quant_scale)), residual
-                else:
-                    return (packed_out, out, (quant_out, quant_scale))
+                packed_result = (packed_out, out, (quant_out, quant_scale))
+                if has_residual:
+                    return packed_result, kernel_residual
+                return packed_result
             else:
                 quant_out, out, quant_scale = rms_norm_dynamic_per_token_quant_custom(
                     x.contiguous(),
