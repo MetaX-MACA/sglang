@@ -1067,6 +1067,14 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = None
+    lm_head_tp_size: A[
+        int,
+        Arg(
+            help="The lm head tensor parallelism size.",
+            aliases=["--lm-head-tp-size"],
+        ),
+        NS("parallel"),
+    ] = 1
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -6207,6 +6215,21 @@ class ServerArgs:
         )
 
     def _handle_data_parallelism(self):
+        assert self.lm_head_tp_size >= 1, "lm_head_tp_size must be >= 1"
+        if self.lm_head_tp_size > 1:
+            assert (
+                self.tp_size % self.lm_head_tp_size == 0
+            ), "tp_size must be divisible by lm_head_tp_size"
+            if self.enable_dp_attention:
+                assert (
+                    self.dp_size % self.lm_head_tp_size == 0
+                    or self.lm_head_tp_size % self.dp_size == 0
+                    or self.tp_size == self.dp_size
+                ), (
+                    "lm_head_tp_size with DP attention expects an aligned layout. "
+                    "For EP32/DP32, use tp_size=dp_size and lm_head_tp_size=8."
+                )
+
         # The dp_size==1 resets moved to the resolution pipeline
         # (arg_groups/overrides.py: _data_parallelism_defaults).
         cfg = resolving_view(self)

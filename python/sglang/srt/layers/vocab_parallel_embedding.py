@@ -16,6 +16,7 @@ from sglang.srt.distributed import (
     divide,
     get_tp_group,
     tensor_model_parallel_all_reduce,
+    get_lm_head_tp_group,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -240,6 +241,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         prefix: str = "",
         enable_tp: bool = True,
         use_attn_tp_group: bool = False,
+        use_lm_head_tp_group: bool = False,
         use_presharded_weights: bool = False,
     ):
         super().__init__()
@@ -247,8 +249,16 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
+        self.use_lm_head_tp_group = use_lm_head_tp_group
+        assert not (
+                use_attn_tp_group and use_lm_head_tp_group
+        ), "use_attn_tp_group and use_lm_head_tp_group are mutually exclusive"
+
         if self.enable_tp:
-            if use_attn_tp_group:
+            if use_lm_head_tp_group:
+                tp_rank = get_lm_head_tp_group().rank_in_group
+                self.tp_size = get_lm_head_tp_group().world_size
+            elif use_attn_tp_group:
                 tp_rank = get_parallel().attn_tp_rank
                 self.tp_size = get_parallel().attn_tp_size
             else:
@@ -256,6 +266,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 self.tp_size = get_parallel().tp_size
         else:
             assert use_attn_tp_group is False
+            assert use_lm_head_tp_group is False
             tp_rank = 0
             self.tp_size = 1
 
@@ -573,6 +584,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
             if self.use_attn_tp_group:
                 output_parallel = attn_tp_all_reduce(output_parallel)
+            elif self.use_lm_head_tp_group:
+                output_parallel = get_lm_head_tp_group().all_reduce(
+                    output_parallel
+                )
             else:
                 # Reduce across all the model parallel GPUs.
                 output_parallel = tensor_model_parallel_all_reduce(output_parallel)
@@ -617,6 +632,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         prefix: str = "",
         enable_tp: bool = True,
         use_attn_tp_group: bool = False,
+        use_lm_head_tp_group: bool = False,
         use_presharded_weights: bool = False,
     ):
         super().__init__(
@@ -629,6 +645,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             prefix=prefix,
             enable_tp=enable_tp,
             use_attn_tp_group=use_attn_tp_group,
+            use_lm_head_tp_group=use_lm_head_tp_group,
             use_presharded_weights=use_presharded_weights,
         )
         self.quant_config = quant_config

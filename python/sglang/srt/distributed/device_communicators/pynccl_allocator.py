@@ -31,34 +31,13 @@ after_2_8_0 = torch_release >= (2, 8)
 nccl_allocator_source = """
 
 #include <cuda_runtime.h>
+#include <nccl.h>
 #include <mutex>
 #include <vector>
 #include <unordered_map>
 #include <utility>
 
 extern "C" {
-
-// copy from https://github.com/NVIDIA/nccl/blob/master/src/nccl.h.in
-typedef enum { ncclSuccess                 =  0,
-               ncclUnhandledCudaError      =  1,
-               ncclSystemError             =  2,
-               ncclInternalError           =  3,
-               ncclInvalidArgument         =  4,
-               ncclInvalidUsage            =  5,
-               ncclRemoteError             =  6,
-               ncclInProgress              =  7,
-               ncclNumResults              =  8 } ncclResult_t;
-
-// NCCL symmetric memory window flags
-#define NCCL_WIN_COLL_SYMMETRIC 0x01
-
-typedef struct ncclComm* ncclComm_t;
-typedef struct ncclWindow_vidmem* ncclWindow_t;
-
-ncclResult_t  ncclMemAlloc(void** ptr, size_t size);
-ncclResult_t  ncclMemFree(void *ptr);
-ncclResult_t  ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, ncclWindow_t* win, int winFlags);
-const char*  ncclGetErrorString(ncclResult_t result);
 
 #define NCCLCHECK(cmd) do {                                               \
   ncclResult_t res = cmd;                                                 \

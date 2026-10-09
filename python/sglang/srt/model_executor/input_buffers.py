@@ -12,6 +12,13 @@ from sglang.srt.utils import is_npu
 _PoolKey = Tuple[str, int, torch.dtype, torch.device]
 _forward_input_buffer_pool: Dict[_PoolKey, torch.Tensor] = {}
 
+# Verify preparation may update DP counts on the plan stream while the draft
+# still reads its own counts. Keep these tensors private to each runner even
+# when their shapes match: draft and verify use different token counts.
+_RUNNER_PRIVATE_INPUT_BUFFERS = frozenset(
+    {"global_num_tokens_gpu", "global_num_tokens_for_logprob_gpu"}
+)
+
 
 def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
     """Coalesce a buffer by ``(name, size, dtype, device)`` into the
@@ -31,8 +38,12 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
     identically-named ``input_ids`` / ``positions`` / ``out_cache_loc`` /
     ``mrope_positions``. Cross-runner sharing is safe because those buffers are
     filled immediately before each replay and the forwards that use them are
-    sequential / mutually exclusive.
+    sequential / mutually exclusive. DP token counts are excluded because
+    verify preparation can overlap an in-flight draft forward.
     """
+    if name in _RUNNER_PRIVATE_INPUT_BUFFERS:
+        return new_buffer
+
     key: _PoolKey = (name, new_buffer.numel(), new_buffer.dtype, new_buffer.device)
     canonical = _forward_input_buffer_pool.get(key, None)
     if canonical is None:
