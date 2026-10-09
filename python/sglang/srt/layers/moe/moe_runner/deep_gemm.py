@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
+    is_maca,
     is_musa,
     is_npu,
 )
@@ -71,6 +72,8 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
+if is_maca():
+    import mcoplib._C
 
 if not (_is_npu or _is_hip) and _is_cuda:
     from sglang.kernels.ops.activation.activation import (
@@ -133,7 +136,10 @@ def _estimate_masked_standard_layout_peak_bytes(
     padded_m = (hidden_states.shape[0] // 256 + 1) * 256
     activation_dtype = (
         torch.bfloat16
-        if quant_info.w13_weight.dtype == torch.bfloat16
+        if (
+            quant_info.w13_weight.dtype == torch.bfloat16
+            or (is_maca() and quant_info.is_fp4_experts)
+        )
         else torch.float8_e4m3fn
     )
     hidden_size = hidden_states.shape[1]
@@ -168,6 +174,11 @@ def _should_use_masked_standard_layout(
     quant_info: DeepGemmMoeQuantInfo,
     hidden_states: torch.Tensor,
 ) -> bool:
+    if is_maca() and quant_info.is_fp4_experts:
+        # MACA's MXFP4 kernel consumes BF16 masked inputs. Its contiguous
+        # DeepGEMM API supports FP8 weights and has no FP4 recipe arguments.
+        return True
+
     # Preserve the Oakhaven WideEP escape hatch while adopting upstream's
     # memory-budget-based auto policy. CUDA graph capture remains masked.
     if (
@@ -1267,7 +1278,10 @@ def pre_permute_standard_to_deep_gemm(
     if _should_use_masked_standard_layout(runner_config, quant_info, hidden_states):
         output_dtype = (
             torch.bfloat16
-            if quant_info.w13_weight.dtype == torch.bfloat16
+            if (
+                quant_info.w13_weight.dtype == torch.bfloat16
+                or (is_maca() and quant_info.is_fp4_experts)
+            )
             else torch.float8_e4m3fn
         )
         masked_m, _, src2dst, hidden_states, hidden_states_scale = (

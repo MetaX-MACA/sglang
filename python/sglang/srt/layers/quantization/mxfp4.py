@@ -60,6 +60,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_maca,
     is_triton_kernels_available,
     next_power_of_2,
     round_up,
@@ -709,30 +710,40 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_deep_gemm or self.use_mega_moe:
-            from deep_gemm import transform_sf_into_required_layout
-
             # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
             layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
             layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
-            # Checkpoint scales are uint8 e8m0 (biased exponents). DeepGEMM
-            # SM100 needs them in packed-UE8M0 TMA-aligned MN-major layout.
-            # Round-trip through fp32 is exact (values are powers of two).
-            for scale_name, weight in (
-                ("w13_weight_scale", layer.w13_weight),
-                ("w2_weight_scale", layer.w2_weight),
-            ):
-                scale = getattr(layer, scale_name)
-                num_experts, n, _ = scale.data.shape
-                k = weight.shape[2] * 2
-                scale_f32 = scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
-                scale.data = transform_sf_into_required_layout(
-                    scale_f32,
-                    mn=n,
-                    k=k,
-                    recipe=(1, 32),
-                    num_groups=num_experts,
-                    disable_ue8m0_cast=False,
+            if is_maca():
+                # MACA kernels consume raw UE8M0 bytes in [E, K/32, N]
+                # layout, without NVIDIA's packed/TMA scale transform.
+                layer.w13_weight_scale.data = (
+                    layer.w13_weight_scale.data.transpose(1, 2).contiguous()
                 )
+                layer.w2_weight_scale.data = (
+                    layer.w2_weight_scale.data.transpose(1, 2).contiguous()
+                )
+            else:
+                from deep_gemm import transform_sf_into_required_layout
+
+                # Checkpoint scales are uint8 e8m0 (biased exponents). DeepGEMM
+                # SM100 needs them in packed-UE8M0 TMA-aligned MN-major layout.
+                # Round-trip through fp32 is exact (values are powers of two).
+                for scale_name, weight in (
+                    ("w13_weight_scale", layer.w13_weight),
+                    ("w2_weight_scale", layer.w2_weight),
+                ):
+                    scale = getattr(layer, scale_name)
+                    num_experts, n, _ = scale.data.shape
+                    k = weight.shape[2] * 2
+                    scale_f32 = scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
+                    scale.data = transform_sf_into_required_layout(
+                        scale_f32,
+                        mn=n,
+                        k=k,
+                        recipe=(1, 32),
+                        num_groups=num_experts,
+                        disable_ue8m0_cast=False,
+                    )
             if self.use_mega_moe:
                 # MegaMoE consumes the same transformed sf, plus its own
                 # interleaved/UTCCP weight layout. K3 routes EVERY batch

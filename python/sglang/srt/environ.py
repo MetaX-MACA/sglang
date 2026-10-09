@@ -1177,6 +1177,9 @@ class Envs:
     # standard dispatcher, and the triton MoE runner; falls back silently
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+    # MetaX opt-in: reuse host-side extend token counts in ordinary KDA
+    # prefill to avoid a device scalar read and full-stream synchronization.
+    MX_ENABLE_KDA_CPU_TOKENS = EnvBool(False)
 
     # ===================================================================
     # DeepGEMM Mega MoE

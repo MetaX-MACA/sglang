@@ -15,7 +15,7 @@ import torch
 import triton
 from packaging import version
 
-from sglang.srt.utils.common import torch_release
+from sglang.srt.utils.common import is_maca, torch_release
 
 logger = logging.getLogger(__name__)
 
@@ -281,7 +281,9 @@ use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
 is_tf32_supported = is_nvidia and torch.cuda.get_device_capability(0)[0] >= 8
-is_gather_supported = hasattr(triton.language, "gather")
+# MACA exposes tl.gather, but its indexed shuffle lowers to maca.shfl.sync,
+# which the current MLIR translator cannot handle. Use the direct-load path.
+is_gather_supported = hasattr(triton.language, "gather") and not is_maca()
 
 
 def get_all_max_shared_mem():
