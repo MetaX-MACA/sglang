@@ -102,6 +102,17 @@ def get_batch_sizes_to_capture(
     capture_bs = sum_len_bs + [
         bs for bs in capture_bs if bs * alignment_width % mul_base == 0
     ]
+
+    decode_max_bs = get_exec().graph.cuda_graph_config.decode.max_bs
+    if decode_max_bs:
+        capture_bs = [bs for bs in capture_bs if bs <= decode_max_bs]
+        if not capture_bs:
+            capture_bs = [decode_max_bs]
+        elif max(capture_bs) < decode_max_bs:
+            capture_bs += list(range(max(capture_bs) + 16, decode_max_bs + 1, 16))
+            if max(capture_bs) < decode_max_bs:
+                capture_bs.append(decode_max_bs)
+
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
 
