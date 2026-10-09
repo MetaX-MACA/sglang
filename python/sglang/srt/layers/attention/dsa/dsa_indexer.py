@@ -104,6 +104,9 @@ else:
     pick_dsl_expand = None
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_enable_mqa_chunk_empty_cache = get_bool_env_var(
+    "MX_SGLANG_OPT_MQA_CHUNK", default="false"
+)
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 # Whether the aiter preshuffle paged-MQA path (page_size=64 + Preshuffle=True +
@@ -1157,6 +1160,29 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
         need_chunk = logits_bytes > logits_budget_bytes
+        if need_chunk and _enable_mqa_chunk_empty_cache:
+            # Return unused blocks held by PyTorch's caching allocator to CUDA,
+            # then refresh the cached MQA logits budget before deciding to chunk.
+            # This does not release memory occupied by live tensors.
+            free_mem_before_empty_cache, _ = torch.cuda.mem_get_info(device_index)
+            torch.cuda.empty_cache()
+            free_mem, _ = torch.cuda.mem_get_info(device_index)
+            self._mqa_logits_budget_bytes.pop(device_index, None)
+            logits_budget_bytes = self._get_mqa_logits_budget_bytes(device_index)
+            if _is_hip:
+                logits_budget_bytes = min(
+                    logits_budget_bytes, self._MQA_LOGITS_MAX_BYTES_ROCM
+                )
+            need_chunk = logits_bytes > logits_budget_bytes
+            logger.info(
+                "DSA MQA logits released unused PyTorch CUDA cache: "
+                "free memory %.2f GiB -> %.2f GiB, logits %.2f GiB, "
+                "need_chunk=%s",
+                free_mem_before_empty_cache / (1024**3),
+                free_mem / (1024**3),
+                logits_bytes / (1024**3),
+                need_chunk,
+            )
         return need_chunk, logits_budget_bytes
 
     def _get_topk_ragged(
