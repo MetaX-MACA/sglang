@@ -1934,6 +1934,7 @@ _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
+_LM_HEAD_TP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
@@ -2020,6 +2021,11 @@ def _init_attn_cp_overlap_group(
     )
 
 
+def get_lm_head_tp_group() -> GroupCoordinator:
+    assert _LM_HEAD_TP is not None, "lm head tensor model parallel group is not initialized"
+    return _LM_HEAD_TP
+
+
 def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
     return _DCP
 
@@ -2103,7 +2109,7 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _ATTN_TP, _MOE_EP, _MOE_TP):
+            for group in (_DCP, _ATTN_TP, _LM_HEAD_TP, _MOE_EP, _MOE_TP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2350,6 +2356,7 @@ def initialize_model_parallel(
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
+    lm_head_tensor_parallel_size: int = 1,
     decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
@@ -2375,6 +2382,8 @@ def initialize_model_parallel(
             parallelism.
         moe_data_model_parallel_size: number of GPUs used for moe data
             parallelism.
+        lm_head_tensor_parallel_size: number of GPUs used for LM-head vocab
+            parallelism. It is independent from attention tensor parallelism.
         decode_context_parallel_size: number of GPUs used for decode context
             parallelism, which splits the KV cache across GPUs within each
             tensor-parallel group during decoding. Must be a divisor of
@@ -2606,6 +2615,51 @@ def initialize_model_parallel(
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
+    global _LM_HEAD_TP
+    assert _LM_HEAD_TP is None, "lm head tensor model parallel group is already initialized"
+    if lm_head_tensor_parallel_size <= 1:
+        _LM_HEAD_TP = init_model_parallel_group(
+            [[rank] for rank in range(world_size)],
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            use_message_queue_broadcaster=False,
+            group_name="lm_head_tp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+    elif lm_head_tensor_parallel_size == tensor_model_parallel_size:
+        _LM_HEAD_TP = _TP
+    else:
+        assert (
+                tensor_model_parallel_size % lm_head_tensor_parallel_size == 0
+        ), "tensor_model_parallel_size must be divisible by lm_head_tensor_parallel_size"
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            base = tp_group_idx * tensor_model_parallel_size
+            for lm_head_tp_group_idx in range(
+                    tensor_model_parallel_size // lm_head_tensor_parallel_size
+            ):
+                st = base + lm_head_tp_group_idx * lm_head_tensor_parallel_size
+                en = st + lm_head_tensor_parallel_size
+                group_ranks.append(list(range(st, en)))
+        _LM_HEAD_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_mscclpp_allreduce=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_allreduce=False,
+            use_message_queue_broadcaster=False,
+            group_name="lm_head_tp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
             max_world_size=max_world_size,
@@ -2994,7 +3048,21 @@ def destroy_model_parallel():
         dwdp_mgr.cleanup()
         set_global_dwdp_manager(None)
 
+    global _LM_HEAD_TP
     global _TP
+    global _ATTN_CP
+    global _ATTN_CP_OVERLAP
+    global _ATTN_TP
+    if (
+        _LM_HEAD_TP
+        and _LM_HEAD_TP is not _TP
+        and _LM_HEAD_TP is not _ATTN_TP
+        and _LM_HEAD_TP is not _ATTN_CP
+        and _LM_HEAD_TP is not _ATTN_CP_OVERLAP
+    ):
+        _LM_HEAD_TP.destroy()
+    _LM_HEAD_TP = None
+
     if _TP:
         _TP.destroy()
     _TP = None
@@ -3019,8 +3087,6 @@ def destroy_model_parallel():
         _MOE_TP.destroy()
     _MOE_TP = None
 
-    global _ATTN_CP
-    global _ATTN_CP_OVERLAP
     global _MOE_DP
     # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
     # Only destroy if not aliasing another group.
@@ -3034,7 +3100,6 @@ def destroy_model_parallel():
         _ATTN_CP.destroy()
     _ATTN_CP = None
 
-    global _ATTN_TP
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
