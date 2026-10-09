@@ -23,6 +23,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    get_lm_head_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -538,6 +539,7 @@ def _dp_gather_via_all_reduce(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
+    use_custom_lmhead_tp: bool,
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
@@ -569,10 +571,16 @@ def _dp_gather_via_all_reduce(
         ):
             from sglang.srt.distributed.parallel_state import inplace_all_reduce
 
-            inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
+            if use_custom_lmhead_tp:
+                inplace_all_reduce(global_tokens, group_name=get_lm_head_tp_group().unique_name)
+            else:
+                inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
 
         else:
-            global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+            if use_custom_lmhead_tp:
+                global_tokens[:] = get_lm_head_tp_group().all_reduce(global_tokens)
+            else:
+                global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
 def _dp_gather_via_all_gather(
@@ -580,6 +588,7 @@ def _dp_gather_via_all_gather(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
+    use_custom_lmhead_tp: bool,
 ):
     use_world = world_dp_gather_enabled()
 
@@ -591,7 +600,10 @@ def _dp_gather_via_all_gather(
                 group=torch.distributed.group.WORLD,
             )
         else:
-            get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
+            if use_custom_lmhead_tp:
+                get_lm_head_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
+            else:
+                get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
 
     if not is_partial:
@@ -835,6 +847,7 @@ def _dp_gather(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
+    use_custom_lmhead_tp: bool = False,
 ):
     if (
         is_dp_gatherv_active()
@@ -864,11 +877,11 @@ def _dp_gather(
         and forward_batch.dp_padding_mode.is_max_len()
     ):
         _dp_gather_via_all_gather(
-            global_tokens, local_tokens, forward_batch, is_partial
+            global_tokens, local_tokens, forward_batch, is_partial, use_custom_lmhead_tp
         )
     else:
         _dp_gather_via_all_reduce(
-            global_tokens, local_tokens, forward_batch, is_partial
+            global_tokens, local_tokens, forward_batch, is_partial, use_custom_lmhead_tp
         )
 
 
@@ -884,8 +897,9 @@ def dp_gather_replicate(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
+    use_custom_lmhead_tp: bool = False,
 ):
-    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=False)
+    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=False, use_custom_lmhead_tp=use_custom_lmhead_tp)
 
 
 def dp_scatter(

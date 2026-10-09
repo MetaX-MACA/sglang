@@ -264,6 +264,7 @@ def _init_parallel_groups(
         expert_model_parallel_size=moe_ep_size,
         attention_context_model_parallel_size=attn_cp_size,
         moe_data_model_parallel_size=moe_dp_size,
+        lm_head_tensor_parallel_size=server_args.lm_head_tp_size,
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=get_disagg().enable_pdmux,
         duplicate_attn_cp_group=(
