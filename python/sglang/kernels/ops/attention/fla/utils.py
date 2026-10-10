@@ -283,7 +283,7 @@ use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 is_tf32_supported = is_nvidia and torch.cuda.get_device_capability(0)[0] >= 8
 # MACA exposes tl.gather, but its indexed shuffle lowers to maca.shfl.sync,
 # which the current MLIR translator cannot handle. Use the direct-load path.
-is_gather_supported = hasattr(triton.language, "gather") and not is_maca()
+is_gather_supported = hasattr(triton.language, "gather")
 
 
 def get_all_max_shared_mem():
