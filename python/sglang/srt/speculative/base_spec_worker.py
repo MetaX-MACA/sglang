@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+import msgspec
 import torch
 
 if TYPE_CHECKING:
@@ -17,6 +19,37 @@ if TYPE_CHECKING:
         EagleDraftExtendInput,
         EagleDraftInput,
     )
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+class HiCacheDraftMode(str, Enum):
+    NONE = "none"
+    PACKED = "packed"
+    SIDECAR = "sidecar"
+
+
+class HiCacheDraftPlan(msgspec.Struct, frozen=True, kw_only=True):
+    mode: HiCacheDraftMode = HiCacheDraftMode.NONE
+    device_pools: tuple[Any, ...] = ()
+
+
+def _can_pack_hicache_mtp(
+    spec_algorithm: SpeculativeAlgorithm,
+    draft_runners: tuple[ModelRunner, ...],
+) -> bool:
+    is_nextn_mtp = (
+        spec_algorithm.is_eagle()
+        and not spec_algorithm.is_eagle3()
+        and all(
+            runner.model_config.num_nextn_predict_layers for runner in draft_runners
+        )
+    )
+    is_dspark_dsv4 = (
+        spec_algorithm.is_dspark()
+        and draft_runners[0].model_config.hf_config.architectures[0]
+        == "DeepseekV4ForCausalLMDSpark"
+    )
+    return is_nextn_mtp or is_dspark_dsv4
 
 
 def duplicate_prefix_tail_to_draft_branches(
@@ -275,6 +308,40 @@ class EagleDraftWorkerBase(ABC):
 
 
 class BaseSpecWorker(ABC):
+    _hicache_draft_plan = HiCacheDraftPlan()
+
+    @property
+    def hicache_draft_plan(self) -> HiCacheDraftPlan:
+        return self._hicache_draft_plan
+
+    def _draft_model_runners(self) -> tuple[ModelRunner, ...]:
+        spec_algorithm = self.target_worker.model_runner.spec_algorithm
+        draft_worker = self.draft_worker
+        if (
+            draft_worker is None
+            or spec_algorithm.is_ngram()
+            or spec_algorithm.is_frozen_kv_mtp()
+        ):
+            return ()
+        if spec_algorithm.is_dflash_or_dspark():
+            draft_model_runner = getattr(draft_worker, "model_runner", None)
+            if draft_model_runner is None:
+                draft_model_runner = getattr(self, "draft_model_runner", None)
+            if draft_model_runner is None:
+                return ()
+            return (draft_model_runner,)
+        # EAGLE family: resolve the nested draft runner (the fork has no
+        # .draft_runners tuple; keep the legacy resolution).
+        server_args = self.target_worker.model_runner.server_args
+        if server_args.enable_multi_layer_eagle:
+            return tuple(draft_worker.draft_worker.draft_runner_list)
+        return (draft_worker.draft_worker.draft_runner,)
+
+    @property
+    def primary_draft_kv_pool(self):
+        draft_runners = self._draft_model_runners()
+        return draft_runners[0].token_to_kv_pool if draft_runners else None
+
     @property
     @abstractmethod
     def target_worker(self) -> TpModelWorker:
@@ -298,6 +365,43 @@ class BaseSpecWorker(ABC):
         """Attn backends touched by spec_v2 forward; OR-ed by decide_needs_cpu_seq_lens.
         Default returns target only; subclasses extend with draft backends."""
         return (self.target_worker.model_runner.attn_backend,)
+
+    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        target_model_runner = self.target_worker.model_runner
+        target_model_runner.mtp_draft_device_pools = ()
+        server_args = target_model_runner.server_args
+        spec_algorithm = target_model_runner.spec_algorithm
+        if not server_args.enable_hierarchical_cache:
+            return HiCacheDraftPlan()
+
+        draft_runners = self._draft_model_runners()
+        if not draft_runners:
+            return HiCacheDraftPlan()
+        draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
+        if (
+            "InklingForConditionalGenerationMTP"
+            in draft_runners[0].model_config.hf_config.architectures
+        ):
+            raise NotImplementedError(
+                "HiCache does not support Inkling MTP draft state yet."
+            )
+
+        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+            target_model_runner.mtp_draft_device_pools = draft_pools
+            return HiCacheDraftPlan(
+                mode=HiCacheDraftMode.PACKED,
+                device_pools=draft_pools,
+            )
+
+        return HiCacheDraftPlan(
+            mode=HiCacheDraftMode.SIDECAR,
+            # Preserve the legacy non-packed HiCache behavior: multi-layer
+            # EAGLE registers only the first draft runner as the sidecar.
+            device_pools=draft_pools[:1],
+        )
+
+    def init_hicache_draft_plan(self) -> None:
+        self._hicache_draft_plan = self._build_hicache_draft_plan()
 
     @abstractmethod
     def clear_cache_pool(self):
