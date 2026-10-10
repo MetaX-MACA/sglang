@@ -18,7 +18,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
@@ -665,32 +664,24 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             self.embed_tokens: Optional[nn.Module] = None
             self.lm_head: Optional[nn.Module] = None
         else:
-            self.pp_group = get_pp_group()
-            # embed
-            if self.pp_group.is_first_rank:
-                self.embed_tokens = VocabParallelEmbedding(
+            # The PP tail-only DSPARK draft worker owns both modules. Target
+            # pipeline ownership must not turn either into a missing layer.
+            self.embed_tokens = VocabParallelEmbedding(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                enable_tp=not is_dp_attention_enabled(),
+                prefix=self.separate_emb_name,
+            )
+            if get_pp_group().world_size == 1 and self.config.tie_word_embeddings:
+                self.lm_head = self.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
                     self.config.vocab_size,
                     self.config.hidden_size,
-                    enable_tp=not is_dp_attention_enabled(),
-                    prefix=self.separate_emb_name,
+                    quant_config=self.quant_config,
+                    prefix=self.separate_lmhead_name,
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
                 )
-            else:
-                self.embed_tokens = PPMissingLayer()
-
-            # lm_head
-            if self.pp_group.is_last_rank:
-                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
-                    self.lm_head = self.embed_tokens
-                else:
-                    self.lm_head = ParallelLMHead(
-                        self.config.vocab_size,
-                        self.config.hidden_size,
-                        quant_config=self.quant_config,
-                        prefix=self.separate_lmhead_name,
-                        use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-                    )
-            else:
-                self.lm_head = PPMissingLayer()
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
 

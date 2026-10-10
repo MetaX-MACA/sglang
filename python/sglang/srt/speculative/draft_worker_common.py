@@ -98,6 +98,7 @@ def build_draft_tp_worker(
     nccl_port: int,
     target_model_config: Any,
     algo_label: str,
+    random_seed: Optional[int] = None,
 ) -> DraftWorkerBundle:
     draft_server_args = deepcopy(server_args)
     draft_server_args.skip_tokenizer_init = True
@@ -133,6 +134,7 @@ def build_draft_tp_worker(
         dp_rank=dp_rank,
         nccl_port=nccl_port,
         is_draft_worker=True,
+        random_seed=random_seed,
     )
     set_global_server_args_for_scheduler(saved_server_args)
 
