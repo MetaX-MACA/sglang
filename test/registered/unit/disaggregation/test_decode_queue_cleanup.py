@@ -40,6 +40,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
         queue.queue = [decode_req]
         queue.pending_reqs = []
         queue.retracted_queue = []
