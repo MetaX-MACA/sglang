@@ -31,7 +31,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.mem_cache.memory_pool_host import (
+    HostPoolGroup,
+    MHATokenToKVPoolHost,
+    PoolEntry,
+)
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -287,6 +291,16 @@ class HybridCacheController(BaseHiCacheController):
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
+    def register_host_pool_entry(self, entry: PoolEntry) -> None:
+        """Register a dynamically added (draft sidecar) host pool entry."""
+        if not isinstance(self.mem_pool_host, HostPoolGroup):
+            raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        self.mem_pool_host.add_entry(entry)
+        if not entry.is_primary_index_anchor:
+            self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
+        if self.enable_storage and self.storage_backend is not None:
+            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+
     @staticmethod
     def parse_storage_backend_extra_config(
         storage_backend_extra_config: Optional[str],
@@ -540,9 +554,10 @@ class HybridCacheController(BaseHiCacheController):
         producer_event.start_event.record()
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            target_device_pool = self.mem_pool_host.anchor_entry.device_pool
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
+                    target_device_pool,
                     host_indices,
                     device_indices,
                     i,
@@ -560,6 +575,32 @@ class HybridCacheController(BaseHiCacheController):
                         device_indices,
                         i,
                         self.io_backend,
+                    )
+
+                # HiCache now supports draft caches through two paths:
+                #
+                # - Packed: standard NextN/MTP models (DeepSeek-V3.2, GLM-5.x,
+                #   DeepSeek-V4, MiMo-V2.5) and DeepSeek-V4 DSpark. Draft
+                #   KV/indexer/SWA buffers are appended to the matching target
+                #   host pools as tail layers and share their slot mappings.
+                #   D2H/H2D therefore moves target and draft in the same cache
+                #   operation; the branch below restores the tail layers.
+                #
+                # - Sidecar: standalone EAGLE/EAGLE3, DFlash, and non-DeepSeek-V4
+                #   DSpark. Draft KV/indexer/SWA gets a separate host-pool entry
+                #   sized to its source target pool. Its PoolTransfer follows
+                #   the target KV or SWA indices and is attached to the same
+                #   cache operation.
+
+                if self.has_mtp_draft and i < len(self.mtp_draft_device_pools):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mtp_draft_device_pools[i],
+                        host_indices,
+                        device_indices,
+                        self.layer_num + i,
+                        self.io_backend,
+                        pool_transfers=resolved_pool_transfers,
+                        is_draft=True,
                     )
                 producer_event.complete(i)
             self._record_transfer_indices_on_stream(
@@ -710,16 +751,46 @@ class HybridCacheController(BaseHiCacheController):
         return kv_success
 
     def _page_backup(self, operation):
+        # MLA KV is replicated across TP ranks and should still be written only
+        # by TP0. Rank-sharded sidecars still need every TP rank.
+        backup_transfers = [
+            transfer
+            for transfer in operation.pool_transfers or []
+            if self.should_backup(transfer)
+        ]
+
         # Backup extra pools
-        if operation.pool_transfers:
+        if backup_transfers:
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(operation.pool_transfers)
+            results = self.storage_backend.batch_set_v2(backup_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(
                 {name: sum(rs) for name, rs in results.items()}
             )
 
         # Backup kv pools
         super()._page_backup(operation)
+
+    def should_backup(self, transfer: PoolTransfer) -> bool:
+        if not self.backup_skip:
+            return True
+
+        # Kimi-K3 Mamba/KDA state is TP-sharded even when the primary MLA KV
+        # pool is replicated.
+        if transfer.name == PoolName.MAMBA:
+            return True
+
+        # Mooncake gives MHA draft and draft-SWA objects rank-specific keys.
+        # MLA/DeepSeek-V4 draft pools remain TP0-only.
+        if self.storage_backend_type == "mooncake" and transfer.name in (
+            PoolName.DRAFT,
+            PoolName.DRAFT_SWA,
+        ):
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            return entry is not None and isinstance(
+                entry.host_pool, MHATokenToKVPoolHost
+            )
+
+        return False
 
     def _resolve_sidecar_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:

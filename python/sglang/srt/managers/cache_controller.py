@@ -316,6 +316,11 @@ class HiCacheController:
         self.draft_page_get_func = None
         self.draft_page_set_func = None
 
+        # Packed MTP draft pools: draft layers appended as tail host layers of
+        # the target host pool (see hybrid_pool_assembler; #30393 port).
+        self.has_mtp_draft = False
+        self.mtp_draft_device_pools = ()
+
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
@@ -927,6 +932,11 @@ class HiCacheController:
         # Otherwise this will be deferred until attach_storage_backend().
         self._maybe_register_draft_with_storage()
 
+    def set_mtp_draft_pools(self, device_pools) -> None:
+        """Register packed MTP draft device pools used for L2 load-back."""
+        self.mtp_draft_device_pools = tuple(device_pools)
+        self.has_mtp_draft = bool(self.mtp_draft_device_pools)
+
     def _maybe_register_draft_with_storage(self) -> None:
         """Pick the draft L3 IO implementation."""
         self.draft_page_get_func = None
@@ -1282,14 +1292,18 @@ class HiCacheController:
     def _draft_page_set_generic(self, hash_values, host_indices) -> None:
         # `{hash}.draft` mirrors HiCacheStorage._get_component_key's
         # `{key}.{pool_name}` convention so target/draft pages never collide.
+        # Index with the draft host pool's own page size: the draft pool may
+        # have a different page size than the controller's target pool.
+        draft_page_size = self.mem_pool_host_draft.page_size
         draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
         draft_data = [
-            self.mem_pool_host_draft.get_data_page(host_indices[i * self.page_size])
+            self.mem_pool_host_draft.get_data_page(host_indices[i * draft_page_size])
             for i in range(len(draft_keys))
         ]
         self.storage_backend.batch_set(draft_keys, draft_data)
 
     def _draft_page_get_generic(self, hash_values, host_indices) -> None:
+        draft_page_size = self.mem_pool_host_draft.page_size
         draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
         draft_dummy = [
             self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
@@ -1300,7 +1314,7 @@ class HiCacheController:
         for i, p in enumerate(draft_pages):
             if p is not None:
                 self.mem_pool_host_draft.set_from_flat_data_page(
-                    host_indices[i * self.page_size], p
+                    host_indices[i * draft_page_size], p
                 )
 
     # Backup batch by batch

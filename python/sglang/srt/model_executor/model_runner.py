@@ -401,6 +401,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.capture_tail_hooks = []
         self.page_size = server_args.page_size
+        self.mtp_draft_device_pools = ()
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid_swa = model_config.is_hybrid_swa
