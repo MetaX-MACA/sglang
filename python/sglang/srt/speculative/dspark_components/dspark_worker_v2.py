@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
@@ -16,6 +17,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
+    PPProxyTensors,
     compute_position,
 )
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -138,6 +140,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
         self.device = target_worker.device
+        # Only the tail PP stage owns the complete DSPARK draft model and its
+        # private KV state. Earlier stages execute target forward only.
+        self._draft_worker = None
+        self._hosts_draft = get_pp_group().is_last_rank
+        if not self._hosts_draft:
+            return
         self._qwen3_5_family_enabled = is_qwen3_5_family_dspark_enabled(
             self.model_runner
         )
@@ -177,6 +185,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DSPARK",
+                random_seed=target_worker.random_seed,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -403,7 +412,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     @property
     def carries_confidence(self) -> bool:
-        return self._verify_planner.carries_confidence
+        return self._hosts_draft and self._verify_planner.carries_confidence
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -415,6 +424,8 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
+        if not self._hosts_draft:
+            return super().spec_v2_attn_backends
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -440,6 +451,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if not self._hosts_draft:
+            return
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
@@ -447,10 +460,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
+        if not self._hosts_draft:
+            return
         with self._draft_context():
             self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
+        if not self._hosts_draft:
+            return
         capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -512,6 +529,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         pass
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
+        if not self._hosts_draft:
+            return
         self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
 
@@ -527,7 +546,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         return bs + min(budget, bs * (max_len - 1))
 
     def dump_sps_records(self) -> Optional[dict]:
-        if self._sps_recorder is None:
+        if not self._hosts_draft or self._sps_recorder is None:
             return None
         dumped = {
             "mode": self._verify_planner.mode_value,
@@ -542,6 +561,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         return dumped
 
     def dump_info_records(self) -> Optional[dict]:
+        if not self._hosts_draft:
+            return None
         dumped = self._info_dumper.dump()
         if dumped is None:
             return None
@@ -553,15 +574,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         return dumped
 
     def clear_info_records(self) -> None:
+        if not self._hosts_draft:
+            return
         self._info_dumper.clear()
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
-        if self._block_accept_recorder is None:
+        if not self._hosts_draft or self._block_accept_recorder is None:
             return None
         return self._block_accept_recorder.estimate_log_suffix()
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
-        if self._block_accept_recorder is None:
+        if not self._hosts_draft or self._block_accept_recorder is None:
             return
         self._block_accept_recorder.note_request_finished(
             rid=rid, natural_stop=natural_stop
@@ -571,7 +594,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish=None,
+        *,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
+        if not self._hosts_draft:
+            batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, pp_proxy_tensors=pp_proxy_tensors
+            )
+            batch_output.new_seq_lens = batch.seq_lens
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
+            return batch_output
+
         if getattr(batch, "return_logprob", False):
             raise ValueError(
                 "DSpark speculative decoding does not support return_logprob yet."
@@ -584,21 +619,28 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._info_dumper.note_non_decode_step()
             if self._block_accept_recorder is not None:
                 self._block_accept_recorder.flush()
-            return self._forward_prefill(batch, on_publish)
+            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish)
 
     def _forward_prefill(
-        self, batch: ScheduleBatch, on_publish
+        self,
+        batch: ScheduleBatch,
+        on_publish,
+        pp_proxy_tensors: Optional[PPProxyTensors],
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if self.server_args.enable_dp_attention:
                 batch.capture_hidden_mode = CaptureHiddenMode.FULL
-                self.target_worker.forward_batch_generation(batch)
+                self.target_worker.forward_batch_generation(
+                    batch, pp_proxy_tensors=pp_proxy_tensors
+                )
             return self._decode_idle_result(on_publish=on_publish)
 
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch_output = self.target_worker.forward_batch_generation(batch)
+        batch_output = self.target_worker.forward_batch_generation(
+            batch, pp_proxy_tensors=pp_proxy_tensors
+        )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens
@@ -1290,6 +1332,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def get_confidence_budget_prepare(self):
-        if not self._verify_planner.schedules_verify_budget:
+        if not self._hosts_draft or not self._verify_planner.schedules_verify_budget:
             return None
         return self._verify_planner.prepare_verify_budget

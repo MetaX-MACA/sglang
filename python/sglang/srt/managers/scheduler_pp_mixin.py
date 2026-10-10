@@ -1334,13 +1334,27 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        batch.input_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        next_token_ids = pp_outputs["next_token_ids"].to(
+            device=self.device, dtype=torch.int64
+        )
+        batch.input_ids = next_token_ids
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
         self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=batch.input_ids)
+            batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
         )
+        next_draft_input = None
+        if batch.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                make_next_draft_input,
+            )
+
+            next_draft_input = make_next_draft_input(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
+            batch.spec_info = next_draft_input
         pd_aux_hidden = {
             key: value
             for key, value in pp_outputs.tensors.items()
@@ -1356,6 +1370,7 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
             pp_batch_debug_info=received_info,
+            next_draft_input=next_draft_input,
         )
         return output_result
 

@@ -3311,11 +3311,29 @@ class Scheduler(
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
             elif not batch.spec_algorithm.is_none():
-                # Non-overlap: drive the V2 worker synchronously (no
-                # future_map relay / on_publish).
+                is_dspark_pp = (
+                    self.spec_algorithm.is_dspark()
+                    and self.pp_group.world_size > 1
+                )
+                is_dspark_pp_nonlast = (
+                    is_dspark_pp and not self.pp_group.is_last_rank
+                )
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch,
+                        **(
+                            {"pp_proxy_tensors": pp_proxy_tensors}
+                            if is_dspark_pp
+                            else {}
+                        ),
+                    )
+                if is_dspark_pp_nonlast:
+                    self.update_cache_from_scheduler(batch, batch_result)
+                    return batch_result
+
+                # Non-overlap: drive the V2 worker synchronously (no
+                # future_map relay / on_publish).
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
@@ -3335,7 +3353,7 @@ class Scheduler(
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
+                    if self.spec_algorithm.is_none() or self.spec_algorithm.is_dspark()
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)

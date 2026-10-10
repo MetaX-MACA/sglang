@@ -241,6 +241,7 @@ class TpModelWorker(BaseTpWorker):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
+        random_seed: Optional[int] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -300,13 +301,17 @@ class TpModelWorker(BaseTpWorker):
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
-        # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
-        )[0]
+        # The tail-only PP draft worker inherits the target worker's already
+        # synchronized seed. It must not join the target PP seed broadcast.
+        if random_seed is None:
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                self.tp_size * self.pp_rank + tp_rank,
+                self.world_group.cpu_group,
+                src=self.world_group.ranks[0],
+            )[0]
+        else:
+            self.random_seed = random_seed
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
