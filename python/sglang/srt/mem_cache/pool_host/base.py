@@ -88,8 +88,11 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        *,
+        pool_label: str = "kv",
     ):
         self.device_pool = device_pool
+        self.pool_label = pool_label
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
@@ -132,9 +135,28 @@ class HostKVCache(abc.ABC):
                 f"size of the hierarchical cache."
             )
         else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+            # Host pools that pack MTP draft layers (MHA/MLA/DSA) set
+            # target_layer_num; others fall back to layer_num (no draft layers).
+            draft_layer_num = self.layer_num - getattr(
+                self, "target_layer_num", self.layer_num
             )
+            if draft_layer_num > 0:
+                logger.info(
+                    "Allocating %.2f GB host memory for %s hierarchical KV cache, "
+                    "packed MTP KV layers: target_layers=%d, draft_layers=%d, "
+                    "total_layers=%d.",
+                    requested_bytes / 1e9,
+                    self.pool_label,
+                    self.target_layer_num,
+                    draft_layer_num,
+                    self.layer_num,
+                )
+            else:
+                logger.info(
+                    "Allocating %.2f GB host memory for %s hierarchical KV cache.",
+                    requested_bytes / 1e9,
+                    self.pool_label,
+                )
 
         self.kv_buffer = self.init_kv_buffer()
 
