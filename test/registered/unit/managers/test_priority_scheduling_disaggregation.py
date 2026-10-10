@@ -90,6 +90,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             sampling_params=SimpleNamespace(max_new_tokens=8),
             cache_protected_len=0,
             time_stats=MagicMock(),
+            bootstrap_host=None,
         )
         return SimpleNamespace(
             req=req,
@@ -100,6 +101,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
 
     def _new_queue(self, decode_reqs, *, low_priority_values_first: bool = False):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
         queue.queue = list(decode_reqs)
         queue.pending_reqs = []
         queue.retracted_queue = []
