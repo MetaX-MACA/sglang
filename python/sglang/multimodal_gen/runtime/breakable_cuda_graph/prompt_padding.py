@@ -299,6 +299,7 @@ def _ensure_model_padders_registered() -> None:
         ming_image,
         minimax_h3,
         qwen_image,
+        qwen_image21,
         sana_video,
         zimage,
     )
