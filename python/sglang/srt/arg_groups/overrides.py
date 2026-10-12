@@ -510,8 +510,6 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         logger.warning(
             f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."
         )
-    if kv_cache_dtype == "bf16":
-        kv_cache_dtype = "bfloat16"
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
@@ -686,6 +684,12 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         if not user_set_decode:
             declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
 
+    from sglang.srt.utils.common import is_maca
+    if is_maca():
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "flashmla_sparse"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "flashmla_kv"
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
     _check_dsa_backend_constraints(

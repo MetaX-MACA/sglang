@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.dsa_backend import DSAFlashMLAMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 _is_cuda = is_cuda()
@@ -51,8 +52,9 @@ class PrecomputedMetadata:
     max_len: int  # for decode/draft_extend
     max_seqlen_k: int  # for target_verify
 
-    # FlashMLA (optional)
-    flashmla_metadata: Optional[torch.Tensor] = None
+    # MACA does not use FlashMLA scheduler metadata, but replay consumers
+    # share this optional field with the CUDA backend.
+    flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
 
 
 def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
@@ -209,7 +211,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         else:
             real_page_table = None  # Will use page_indices directly
 
-        # Compute FlashMLA metadata if needed
         flashmla_metadata = None
         if self.dsa_decode_impl == "flashmla_kv":
             flashmla_metadata = self._compute_flashmla_metadata(
@@ -360,7 +361,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         else:
             real_page_table = None
 
-        # FlashMLA metadata
         flashmla_metadata = None
         if self.dsa_decode_impl == "flashmla_kv":
             flashmla_metadata = self._compute_flashmla_metadata(

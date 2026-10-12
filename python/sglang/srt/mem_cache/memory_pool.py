@@ -35,6 +35,8 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+
+from sglang.srt.utils.common import is_maca
 import triton
 import triton.language as tl
 
@@ -42,6 +44,7 @@ from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
@@ -51,7 +54,11 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.attention.dsa.utils import (
+    aiter_can_use_preshuffle_paged_mqa,
+    get_nsa_index_cache_dtype,
+    get_nsa_index_cache_storage_dtype,
+)
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
@@ -4868,7 +4875,12 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
-    index_k_with_scale_buffer_dtype = torch.uint8
+    index_cache_dtype = get_nsa_index_cache_dtype()
+    fp8_cache = index_cache_dtype == "fp8"
+    int8_cache = index_cache_dtype == "int8"
+    index_k_with_scale_buffer_dtype = get_nsa_index_cache_storage_dtype(
+        index_cache_dtype
+    )
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
     def __init__(
@@ -5134,12 +5146,41 @@ class DSATokenToKVPool(MLATokenToKVPool):
             layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
         )
 
+    def get_index_batched_k_buffer(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ):
+        """
+        Fused method to get multi batch index K in a single call using Triton.
+        More efficient than calling get_index_k_continuous separately.
+
+        :param layer_id: Layer index
+        :param seq_len_tensor: multi-bacth Sequence length
+        :param page_indices: Page indices tensor
+        :param seq_len_sum: sum of multi-batch seq len
+        :param max_seq_len: max len of multi-batch seq
+        :return: k_fp8: (seq_len, index_head_dim), dtype is same to buf
+        """
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return index_buf_accessor.GetBatchedK.execute(
+            self,
+            buf,
+            page_indices=page_indices,
+            seq_len_tensor=seq_len_tensor,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
+        )
+
     def set_index_k_scale_buffer(
         self,
         layer_id: int,
         loc: torch.Tensor,
         index_k: torch.Tensor,
-        index_k_scale: torch.Tensor,
+        index_k_scale: Optional[torch.Tensor] = None,
     ) -> None:
         self.index_key_cache.store_quantized(layer_id, loc, index_k, index_k_scale)
 

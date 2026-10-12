@@ -25,6 +25,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
+from sglang.srt.utils.common import is_maca
 
 logger = logging.getLogger(__name__)
 
@@ -238,8 +239,10 @@ def _compile_deep_gemm_one_type_all(
             kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
         )
 
-        has_compile_mode_api = hasattr(deep_gemm, "get_compile_mode") and hasattr(
-            deep_gemm, "set_compile_mode"
+        has_compile_mode_api = (
+            not is_maca()
+            and hasattr(deep_gemm, "get_compile_mode")
+            and hasattr(deep_gemm, "set_compile_mode")
         )
         if has_compile_mode_api:
             old_compile_mode = deep_gemm.get_compile_mode()

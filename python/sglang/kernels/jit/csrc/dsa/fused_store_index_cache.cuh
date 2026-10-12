@@ -35,7 +35,7 @@ SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
 }
 
 template <typename KeyT, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
-__global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCacheParam param) {
+__global__ void fused_store_indexer_cache(const  FusedStoreCacheParam param) {
   using namespace device;
 
   /// NOTE: 132 = 128 + 4

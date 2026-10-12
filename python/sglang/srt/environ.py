@@ -1300,7 +1300,7 @@ class Envs:
     # the tuned production path); the Triton path is bit-exact on DeepSeek-V3.2 e2e
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
-    SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends
@@ -1671,6 +1671,8 @@ class Envs:
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    # DSA/NSA indexer cache dtype: int8, fp8, or bf16.
+    MX_NSA_INDEXER_CACHE_DTYPE = EnvStr("int8")
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)

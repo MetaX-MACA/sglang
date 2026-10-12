@@ -62,7 +62,7 @@ struct FusedKIndexerNormRopeParams {
 };
 
 template <typename DType, typename PosT, bool kUsePDL>
-K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIndexerNormRopeParams params) {
+K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const   FusedKIndexerNormRopeParams params) {
   using namespace device;
 
   constexpr int64_t kHeadDim = 128;
@@ -238,7 +238,7 @@ struct FusedKIndexerNormRopeStoreParams {
 };
 
 template <typename DType, typename PosT, bool kUsePDL, int32_t kPageBits>
-K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ FusedKIndexerNormRopeStoreParams params) {
+K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const   FusedKIndexerNormRopeStoreParams params) {
   using namespace device;
 
   constexpr int64_t kHeadDim = 128;

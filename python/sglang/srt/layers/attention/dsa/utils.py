@@ -1,6 +1,8 @@
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
+import os
+
 import torch
 import triton
 
@@ -18,8 +20,42 @@ from sglang.srt.runtime_context import (
     get_parallel,
     process_model_config,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_maca, is_musa
 from sglang.srt.utils.common import ceil_div
+
+
+def get_nsa_index_cache_dtype() -> str:
+    """Return the normalized DSA indexer-cache dtype selected by the user."""
+    configured_dtype = (
+        envs.MX_NSA_INDEXER_CACHE_DTYPE.get()
+        if is_maca() or os.getenv("MX_NSA_INDEXER_CACHE_DTYPE") is not None
+        else "fp8"
+    )
+    dtype = configured_dtype.strip().lower()
+    aliases = {
+        "bfloat16": "bf16",
+        "float8": "fp8",
+        "fp8_e4m3": "fp8",
+        "fp8_e4m3fn": "fp8",
+        "fp8_e4m3fnuz": "fp8",
+    }
+    dtype = aliases.get(dtype, dtype)
+    if dtype not in ("int8", "fp8", "bf16"):
+        raise ValueError(
+            "MX_NSA_INDEXER_CACHE_DTYPE must be one of int8, fp8, or bf16; "
+            f"got {configured_dtype!r}"
+        )
+    return dtype
+
+
+def get_nsa_index_cache_storage_dtype(cache_dtype: str) -> torch.dtype:
+    """Map the logical cache mode to its page-buffer storage dtype."""
+    return {
+        "int8": torch.int8,
+        # FP8 K and its FP32 scale share one byte-addressable packed buffer.
+        "fp8": torch.uint8,
+        "bf16": torch.bfloat16,
+    }[cache_dtype]
 
 
 @lru_cache(maxsize=1)

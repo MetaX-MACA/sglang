@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -31,6 +31,9 @@ class IndexKeyCache:
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
         pool = self.pool
+        if pool.index_k_with_scale_buffer_dtype is torch.bfloat16:
+            return (num_pages, pool.page_size * pool.index_head_dim)
+        assert pool.index_k_with_scale_buffer_dtype in (torch.int8, torch.uint8)
         return (
             num_pages,
             pool.page_size
@@ -88,7 +91,7 @@ class IndexKeyCache:
         layer_id: int,
         loc: torch.Tensor,
         index_k: torch.Tensor,
-        index_k_scale: torch.Tensor,
+        index_k_scale: Optional[torch.Tensor],
     ) -> None:
         buf = self.buffer[layer_id - self.pool.start_layer]
         index_buf_accessor.SetKAndS.execute(

@@ -228,6 +228,148 @@ class TestMacaMergeContracts(unittest.TestCase):
             self.assertEqual(impl.call_args.args[7:9], (inplace, "gelu"))
 
 
+    def test_dsa_index_cache_dtype_selection_and_storage(self):
+        source = "python/sglang/srt/layers/attention/dsa/utils.py"
+        for maca, configured, expected in (
+            (True, None, "int8"),
+            (True, "fp8_e4m3fn", "fp8"),
+            (True, "bf16", "bf16"),
+            (False, None, "fp8"),
+            (False, "int8", "int8"),
+        ):
+            with self.subTest(maca=maca, configured=configured):
+                ns = {
+                    "os": os,
+                    "is_maca": lambda: maca,
+                    "envs": NS(
+                        MX_NSA_INDEXER_CACHE_DTYPE=NS(get=lambda: configured or "int8")
+                    ),
+                }
+                selector = load(source, "get_nsa_index_cache_dtype", ns)
+                env = (
+                    {}
+                    if configured is None
+                    else {"MX_NSA_INDEXER_CACHE_DTYPE": configured}
+                )
+                with patch.dict(os.environ, env, clear=True):
+                    self.assertEqual(selector(), expected)
+
+        storage = load(
+            source, "get_nsa_index_cache_storage_dtype", {"torch": TorchStub}
+        )
+        self.assertIs(storage("int8"), DType.INT8)
+        self.assertIs(storage("fp8"), DType.UINT8)
+        self.assertIs(storage("bf16"), DType.BF16)
+
+
+    def test_precomputed_flashmla_contract_in_fused_and_fallback_replay(self):
+        precomputed_type = load(
+            "python/sglang/srt/layers/attention/dsa/dsa_backend_mtp_precompute.py",
+            "PrecomputedMetadata",
+            {"dataclass": dataclass, "__name__": __name__},
+        )
+        copy_buffers = load(
+            "python/sglang/srt/layers/attention/dsa/dsa_metadata_manager.py",
+            "_copy_base_replay_buffers",
+            {"_is_hip": False},
+            owner="DSAMetadataManagementMixin",
+        )
+        for has_flashmla in (False, True):
+            for fused in (False, True):
+                with self.subTest(has_flashmla=has_flashmla, fused=fused):
+                    values = {
+                        field.name: MagicMock()
+                        for field in fields(precomputed_type)
+                        if field.name != "flashmla_metadata"
+                    }
+                    values.update(
+                        max_len=4,
+                        max_seqlen_k=4,
+                        seqlens_expanded_size=2,
+                        real_page_table=None,
+                    )
+                    if has_flashmla:
+                        values["flashmla_metadata"] = Mock()
+                    precomputed = precomputed_type(**values)
+                    if not has_flashmla:
+                        self.assertIsNone(precomputed.flashmla_metadata)
+
+                    metadata = MagicMock()
+                    kernel = Mock(
+                        side_effect=None if fused else RuntimeError("force fallback")
+                    )
+                    module = "sglang.kernels.ops.attention.fused_metadata_copy"
+                    mode = NS(is_decode_or_idle=lambda: True)
+                    with (
+                        patch.dict(
+                            sys.modules, {module: NS(fused_metadata_copy_cuda=kernel)}
+                        ),
+                        patch("builtins.print") as warning,
+                    ):
+                        copy_buffers(NS(), 2, metadata, precomputed, mode)
+                    kernel.assert_called_once()
+                    self.assertEqual(warning.call_count, 0 if fused else 1)
+                    if fused:
+                        metadata.cache_seqlens_int32.copy_.assert_not_called()
+                    else:
+                        metadata.cache_seqlens_int32.copy_.assert_called_once_with(
+                            precomputed.cache_seqlens
+                        )
+                        flashmla_copy = (
+                            metadata.flashmla_metadata.slice.return_value.copy_
+                        )
+                        if has_flashmla:
+                            flashmla_copy.assert_called_once_with(
+                                precomputed.flashmla_metadata
+                            )
+                        else:
+                            flashmla_copy.assert_not_called()
+
+
+    def test_maca_mqa_schedule_does_not_read_device_scalar(self):
+        context_lens = Mock()
+        context_lens.item.side_effect = RuntimeError("host sync during capture")
+        schedule = object()
+
+        def backend(lengths, block_kv, num_sms, *, workers_per_sm=None):
+            if workers_per_sm is None:
+                lengths.item()
+            self.assertEqual((block_kv, num_sms, workers_per_sm), (64, 80, 8))
+            return schedule
+
+        ns = {"is_maca": lambda: True}
+        fn = load(
+            "python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py",
+            "get_paged_mqa_logits_metadata",
+            ns,
+        )
+        with patch.dict(
+            sys.modules, {"deep_gemm": NS(get_paged_mqa_logits_metadata=backend)}
+        ):
+            self.assertIs(fn(context_lens, 64, 80), schedule)
+        context_lens.item.assert_not_called()
+
+
+    def test_nvidia_mqa_schedule_preserves_three_argument_api(self):
+        schedule = object()
+        lengths = object()
+
+        def backend(context_lens, block_kv, num_sms):
+            self.assertIs(context_lens, lengths)
+            self.assertEqual((block_kv, num_sms), (64, 80))
+            return schedule
+
+        fn = load(
+            "python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py",
+            "get_paged_mqa_logits_metadata",
+            {"is_maca": lambda: False},
+        )
+        with patch.dict(
+            sys.modules, {"deep_gemm": NS(get_paged_mqa_logits_metadata=backend)}
+        ):
+            self.assertIs(fn(lengths, 64, 80), schedule)
+
+
     def test_portable_capture_status_queries_requested_stream(self):
         original_stream = NS(cuda_stream=1234)
         requested_stream = NS(cuda_stream=5678)

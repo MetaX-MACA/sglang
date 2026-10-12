@@ -19,7 +19,7 @@
 """Inference-only DeepseekV2 model."""
 
 from __future__ import annotations
-
+import os
 import logging
 from contextlib import contextmanager, nullcontext
 from functools import cached_property
@@ -212,6 +212,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.common import is_maca
 from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter:
@@ -221,6 +222,8 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
         get_dsv3_gemm_output_zero_allocator_size,
     )
+
+_is_maca = is_maca()
 
 if _use_aiter:
     pass
@@ -537,7 +540,9 @@ class MoEGate(nn.Module):
                 return torch.mm(hidden_states, self.weight.t(), out_dtype=torch.float32)
             return F.linear(hidden_states.float(), self.weight.float(), None)
 
-        if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
+        if _is_maca and not self.is_deepseek_v4:
+            logits = F.linear(hidden_states, self.weight, None)
+        elif not _is_maca and hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
             logits = tiny_gemm_bf16(
                 hidden_states,
                 self.weight,
@@ -2050,8 +2055,8 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
             )
 
-        self.skip_topk = None
-        self.next_skip_topk = None
+        self.skip_topk = False
+        self.next_skip_topk = False
         self.indexer = None
         if self.use_dsa:
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
@@ -2178,6 +2183,9 @@ class DeepseekV2AttentionMLA(
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
 
+        self.w_kc_scale = None
+        self.w_vc_scale = None
+
         self.w_scale_k = None
         self.w_scale_v = None
         self.use_deep_gemm_bmm = False
@@ -2193,9 +2201,14 @@ class DeepseekV2AttentionMLA(
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
             in {"awq", "awq_marlin", "moe_wna16"}
         )
-        self._use_min_latency_fused_a_gemm: bool | None = None
+        # self.use_min_latency_fused_a_gemm = (
+        #     self.has_fused_proj
+        #     and not get_exec().deterministic.enable_deterministic_inference
+        #     and not self.is_packed_weight
+        #     and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
+        # )
         self.fused_a_gemm_backend = "auto"
-
+        self._use_min_latency_fused_a_gemm = False
         self.has_q_b_proj = hasattr(self, "q_b_proj")
         q_b_proj_verified_shapes = {(2048, 2048), (4096, 2048)}
         q_b_weight = (
@@ -3198,6 +3211,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
+        self.enable_dequant_bf16 = True if os.getenv("MX_ENABLE_DEQUANT_BF16") else False
         self.determine_num_fused_shared_experts()
         self.use_dsa = is_deepseek_dsa(config)
         self.model = DeepseekV2Model(

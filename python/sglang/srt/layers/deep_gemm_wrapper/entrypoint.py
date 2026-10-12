@@ -12,36 +12,51 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
+from sglang.srt.utils.common import is_maca
 
 logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
-    from deep_gemm.utils.layout import (
-        get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
-    )
+
+    if DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        from deep_gemm.utils.layout import (
+            get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
+        )
 
     def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
-        """Transform ``sf`` into an MN-major, TMA-aligned layout for DeepGEMM.
+        """Return the scale layout required by the active DeepGEMM backend."""
+        if not DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+            # MetaX and other non-TMA paths consume the native scale layout.
+            return sf
 
-        When ``sf`` is already in that layout, sgl-deep-gemm's fast path
-        (<= 0.1.4.post1) returns a NON-OWNING ``torch::from_blob`` alias of
-        ``sf`` across the TVM-FFI boundary. Callers rebind the result over
-        their only reference (``x = get_mn_major_tma_aligned_tensor(x)``),
-        which frees the storage while the GEMM still reads through the alias
-        -- a use-after-free that surfaces as NaN logits or "pointer resides
-        on host memory" during CUDA graph capture once the allocator reuses
-        the block. Hand back ``sf`` itself in that case so ownership is
-        preserved.
-        """
         out = _get_mn_major_tma_aligned_tensor(sf)
         if out.data_ptr() == sf.data_ptr():
+            # Some versions return a non-owning alias. Preserve the input
+            # tensor so its storage remains alive for the GEMM.
             assert out.shape == sf.shape and out.stride() == sf.stride()
             return sf
         return out
 
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
+
+# MetaX DeepGEMM accepts a backend override; the upstream API does not.
+_deep_gemm_backend_kwargs = {"backend": "torch_bf16"} if is_maca() else {}
+
+
+def get_paged_mqa_logits_metadata(
+    context_lens: torch.Tensor, block_kv: int, num_sms: int
+) -> torch.Tensor:
+    import deep_gemm
+
+    # MetaX's automatic density selection reads a GPU scalar with .item().
+    # Pin the legacy density so schedules have stable shapes and can be
+    # rebuilt inside graph capture without synchronizing with the host.
+    kwargs = {"workers_per_sm": 8} if is_maca() else {}
+    return deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens, block_kv, num_sms, **kwargs
+    )
 
 
 # TODO maybe rename these functions
@@ -84,6 +99,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
                 out,
                 masked_m,
                 expected_m,
+                **_deep_gemm_backend_kwargs,
                 **fp4_kwargs,
                 **(
                     dict(
@@ -155,7 +171,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            lhs, rhs, out, m_indices, **fp4_kwargs
+            lhs, rhs, out, m_indices, **_deep_gemm_backend_kwargs, **fp4_kwargs
         )
 
 
@@ -234,6 +250,7 @@ def gemm_nt_f8f8bf16(
             lhs,
             rhs,
             out,
+            **_deep_gemm_backend_kwargs,
         )
 
 
@@ -286,6 +303,13 @@ def tf32_hc_prenorm_gemm(
 ):
     if x.shape[0] == 0:
         return
+
+    # The MetaX MHC prenorm op is provided by the installed deep_gemm package
+    # even when the JIT wrapper is disabled.  Import it at the call site instead
+    # of relying on the module-level ENABLE_JIT_DEEPGEMM guard; otherwise the
+    # default-enabled MHC prenorm path fails with an undefined `deep_gemm` name.
+    import deep_gemm
+
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
 
 
@@ -300,7 +324,7 @@ def update_deep_gemm_config(gpu_id: int):
 
 @contextmanager
 def configure_deep_gemm_num_sms(num_sms):
-    if num_sms is None or not ENABLE_JIT_DEEPGEMM:
+    if num_sms is None or not ENABLE_JIT_DEEPGEMM or is_maca():
         yield
     else:
         original_num_sms = deep_gemm.get_num_sms()

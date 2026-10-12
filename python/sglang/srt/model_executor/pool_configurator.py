@@ -352,19 +352,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             local_dense_layer_ids = [
-                l
-                for l in dense_layer_ids
-                if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+                layer_id
+                for layer_id in dense_layer_ids
+                if kvc.layer_info.start_layer <= layer_id < kvc.layer_info.end_layer
             ]
             local_sparse_layer_ids = [
-                l
-                for l in sparse_layer_ids
-                if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+                layer_id
+                for layer_id in sparse_layer_ids
+                if kvc.layer_info.start_layer <= layer_id < kvc.layer_info.end_layer
             ]
             num_dense = len(local_dense_layer_ids)
             num_sparse = len(local_sparse_layer_ids)
             num_indexer_k_only = sum(
-                1 for l in local_sparse_layer_ids if l in indexer_k_only_layer_ids
+                1
+                for layer_id in local_sparse_layer_ids
+                if layer_id in indexer_k_only_layer_ids
             )
             num_indexer_kv = num_sparse - num_indexer_k_only
 
@@ -477,9 +479,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
-        indexer_size_per_token = (
-            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
-        )
+        if DSATokenToKVPool.index_k_with_scale_buffer_dtype in (
+            torch.int8,
+            torch.uint8,
+        ):
+            indexer_size_per_token = (
+                index_head_dim
+                + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+            )
+        else:
+            assert DSATokenToKVPool.index_k_with_scale_buffer_dtype is torch.bfloat16
+            indexer_size_per_token = index_head_dim
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
@@ -604,10 +614,20 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             )
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
-                index_elements = (
-                    index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
-                )
+                if DSATokenToKVPool.index_k_with_scale_buffer_dtype in (
+                    torch.int8,
+                    torch.uint8,
+                ):
+                    index_elements = (
+                        index_head_dim
+                        + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+                    )
+                else:
+                    assert (
+                        DSATokenToKVPool.index_k_with_scale_buffer_dtype
+                        is torch.bfloat16
+                    )
+                    index_elements = index_head_dim
                 self._full_per_token += index_elements * torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )

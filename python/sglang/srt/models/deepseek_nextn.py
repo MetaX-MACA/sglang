@@ -19,6 +19,7 @@ import os
 from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
+import os
 import torch
 from safetensors.torch import load_file
 from torch import nn
@@ -282,6 +283,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_parallel().pp_group
         self.determine_num_fused_shared_experts()
+        self.enable_dequant_bf16 = bool(os.getenv("MX_ENABLE_DEQUANT_BF16"))
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 
         self.model = DeepseekModelNextN(

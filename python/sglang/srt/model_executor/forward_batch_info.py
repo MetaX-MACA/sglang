@@ -564,6 +564,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
     global_forward_mode: Optional[ForwardMode] = None
+    is_dsa: bool = False
+    is_ds_compressed: bool = False
 
     # Current layer-stack invocation; each TBO child owns a separate stream.
     residual_stream: Optional[ResidualStream] = None
@@ -1073,6 +1075,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret.init_mlp_sync_metadata(
             batch, device, is_draft_worker=model_runner.is_draft_worker
         )
+
+        # Identify compressed-attention families before the idle-rank fast return.
+        from sglang.srt.configs.model_config import (
+            is_deepseek_dsa,
+            is_deepseek_v4,
+        )
+
+        ret.is_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
+        ret.is_ds_compressed = is_deepseek_v4(model_runner.model_config.hf_config)
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -1653,11 +1664,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         bs = self.batch_size
 
+        is_idle = (
+            self.forward_mode.is_idle()
+            and not self.is_dsa
+            and not self.is_ds_compressed
+        )
+
         if (
             self.forward_mode.is_decode()
             or self.forward_mode.is_target_verify()
             or self.forward_mode.is_draft_extend_v2()
-            or self.forward_mode.is_idle()
+            or is_idle
         ):
             # TARGET_VERIFY counts as extend; hybrid-SSM verify batches keep their
             # verify layout. MTP draft workers ("*E", no mamba layer) count as hybrid.
