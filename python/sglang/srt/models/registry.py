@@ -15,6 +15,11 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
+def _should_suppress_gemma4_import_error(module_name: str, err: Exception) -> bool:
+    if "gemma4" not in module_name.lower():
+        return False
+    err_msg = str(err)
+    return ("Gemma4" in err_msg) and ("from 'transformers'" in err_msg)
 
 @dataclass
 class _ModelRegistry:
@@ -129,6 +134,8 @@ def import_model_classes(package_name: str, strict: bool = False):
             except Exception as e:
                 if strict:
                     raise
+                if _should_suppress_gemma4_import_error(name, e):
+                    continue
                 logger.warning(f"Ignore import error when loading {name}: {e}")
                 continue
             if hasattr(module, "EntryClass"):

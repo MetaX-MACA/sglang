@@ -50,7 +50,6 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 if _is_cuda:
-    from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
 
     from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 
@@ -747,6 +746,8 @@ class VisionFlashInferAttention(nn.Module):
 
         _, _, head_size = q.shape
         scale = softmax_scale if softmax_scale is not None else head_size**-0.5
+
+        from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
 
         output, _ = cudnn_batch_prefill_with_kv_cache(
             q,

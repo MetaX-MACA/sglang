@@ -141,6 +141,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.srt.utils.common import is_maca
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -1841,7 +1842,7 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Check flashinfer version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
-        if (
+        if not is_maca() and (
             "flashinfer" in attention_backends_of(resolved_view(cfg))
             or cfg.dsa_topk_backend == "flashinfer"
             or cfg.speculative_dsa_topk_backend == "flashinfer"

@@ -96,6 +96,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
+    ForwardMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import (
@@ -1681,6 +1682,30 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         return kwargs
 
+    def _should_reroute_padding_only_extend_to_idle(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        # Fix DP MAX_LEN error for Qwen3.5 in hybrid linear attention backend
+        # For DP MAX_LEN pure local empty ranks can be temporarily marked as
+        # EXTEND for shared padding logic even though they carry no real
+        # request/view state. Reroute only that narrow case back to IDLE before
+        # backend/model dispatch so extend-specific metadata is never consumed.
+        original_forward_mode = getattr(forward_batch, "_original_forward_mode", None)
+        return (
+            forward_batch.global_num_tokens_cpu is not None
+            and forward_batch.dp_padding_mode is not None
+            and forward_batch.dp_padding_mode.is_max_len()
+            and forward_batch.is_extend_in_batch
+            and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+            and original_forward_mode is not None
+            and original_forward_mode.is_idle()
+            and forward_batch.batch_size == 0
+            and forward_batch.spec_info is None
+            and forward_batch.seq_lens.numel() == 0
+            and forward_batch.req_pool_indices.numel() == 0
+            and forward_batch.input_ids.numel() > 0
+        )
+
     def forward_split_prefill(
         self,
         forward_batch: ForwardBatch,
@@ -1899,6 +1924,8 @@ class ModelRunner:
             # global_dp_buffer_len / padded token counts that graph eligibility
             # and the collectives depend on.
             self._prepare_eager_forward_batch(forward_batch)
+            if self._should_reroute_padding_only_extend_to_idle(forward_batch):
+                forward_batch.forward_mode = ForwardMode.IDLE
 
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.
@@ -1950,7 +1977,13 @@ class ModelRunner:
                 forward_batch.global_num_tokens_cpu is not None
                 and self.pp_group.is_last_rank
             ):
-                forward_batch.post_forward_mlp_sync_batch(ret)
+                if hasattr(ret, "next_token_logits"):
+                    forward_batch.post_forward_mlp_sync_batch(ret)
+                else:
+                    logging.debug(
+                        "Skipping post_forward_mlp_sync_batch because ret has no "
+                        "next_token_logits (PPProxyTensors?)."
+                    )
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 

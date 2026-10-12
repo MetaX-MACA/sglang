@@ -1,9 +1,10 @@
+from __future__ import annotations
+
 import json
 import logging
 from collections.abc import Mapping
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
-from xgrammar import StructuralTag
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -23,6 +24,9 @@ from sglang.srt.parser.inkling_tokenizer import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from xgrammar import StructuralTag
 
 
 def _reject_nonfinite_number(value: str) -> float:
@@ -252,7 +256,9 @@ class InklingDetector(BaseFormatDetector):
         API and intentionally does not restrict names to the request's tools.
         """
         del tools, thinking_mode, parallel_tool_calls
-        return StructuralTag.model_validate(
+        from xgrammar import StructuralTag as XGrammarStructuralTag
+
+        return XGrammarStructuralTag.model_validate(
             {
                 "type": "structural_tag",
                 "format": {

@@ -37,7 +37,7 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.utils import get_device_module, is_hip, is_maca, is_xpu
 
 _is_xpu = is_xpu()
 
@@ -85,11 +85,11 @@ def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
 
 
 def _is_stream_capturing(stream: torch.Stream) -> bool:
-    # On ROCm/HIP and XPU, cuda-python is unavailable, so use the portable torch
-    # API (which maps to the HIP / XPU runtime). On NVIDIA, keep querying the
-    # CUDA runtime directly via cuda-python: torch.cuda.is_current_stream_capturing()
+    # On MACA, ROCm/HIP and XPU, use the portable torch API, which queries the
+    # platform runtime instead of NVIDIA's cuda-python bindings. On NVIDIA, query
+    # CUDA directly via cuda-python: torch.cuda.is_current_stream_capturing()
     # has proven unreliable there, so we preserve the original behavior.
-    if is_hip() or _is_xpu:
+    if is_maca() or is_hip() or _is_xpu:
         with get_device_module().stream(stream):
             return get_device_module().is_current_stream_capturing()
     return (
@@ -364,8 +364,8 @@ class BreakableCUDAGraphCapture:
     def _begin_new_segment(self) -> None:
         graph_cls = torch.xpu.XPUGraph if _is_xpu else torch.cuda.CUDAGraph
         # keep_graph retains the raw graph for dedup; skip it on the plain path.
-        # Dedup is CUDA-only (it introspects the raw graph via cuda-python), so
-        # XPU always takes the plain path below.
+        # Dedup uses NVIDIA CUDA bindings to introspect the raw graph, so
+        # MACA and XPU take the plain path below.
         if self.cuda_graph._deduped_cuda_graph is not None:
             try:
                 graph = graph_cls(keep_graph=True)

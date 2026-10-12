@@ -942,6 +942,7 @@ class Envs:
     # 288 GB MI355 in nightly-4-gpu-mi35x-minimax-m3). Worth setting only when the
     # scaled fraction is itself too small to hold the model weights.
     SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION = EnvBool(False)
+    OVERLAP_QK_NORM = EnvBool(False)
     # Route Kimi-K3-style h12 + fp8 MLA decode through aiter Triton Gluon when
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).

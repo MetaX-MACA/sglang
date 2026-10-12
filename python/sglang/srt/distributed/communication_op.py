@@ -8,6 +8,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.utils import broadcast_pyobj
+from sglang.srt.utils.common import get_bool_env_var
 
 from .parallel_state import (
     get_attn_cp_group,
@@ -20,6 +21,8 @@ from .parallel_state import (
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
+    if get_bool_env_var("MX_ALLREDUCE_SYNC"):
+        torch.cuda.synchronize()
     return get_tp_group().all_reduce(input_)
 
 

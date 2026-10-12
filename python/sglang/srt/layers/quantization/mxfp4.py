@@ -117,13 +117,19 @@ def _prepare_flashinfer_mxfp8_activations(
     return x, prepared_packed_topk, x_quant, x_scale
 
 
+_FI_HAS_TRTLLM_MXFP4 = False
+_FI_TRTLLM_MXFP4_IMPORT_ERROR = None
 if is_flashinfer_available():
-    from flashinfer import (
-        nvfp4_block_scale_interleave,
-    )
-    from flashinfer.fused_moe.core import (
-        get_w2_permute_indices_with_cache,
-    )
+    try:
+        from flashinfer import (
+            nvfp4_block_scale_interleave,
+        )
+        from flashinfer.fused_moe.core import (
+            get_w2_permute_indices_with_cache,
+        )
+        _FI_HAS_TRTLLM_MXFP4 = True
+    except ImportError as e:
+        _FI_TRTLLM_MXFP4_IMPORT_ERROR = e
 
     # SM90 mixed-input helpers landed in FlashInfer #3084 (post-0.6.10). Older
     # versions don't ship them; gate at import so unrelated code paths still load.
@@ -408,6 +414,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # paths already run MXFP8 activations, so the flag is inert there
             # rather than an error -- one config can move across hardware.
             if get_platform().is_sm100:
+                if not _FI_HAS_TRTLLM_MXFP4:
+                    raise RuntimeError(
+                        "moe_runner_backend=flashinfer_mxfp4 on SM100 requires "
+                        "FlashInfer's NVFP4/TRT-LLM MoE APIs. Install a compatible "
+                        "flashinfer-python build or select another MoE runner."
+                    ) from _FI_TRTLLM_MXFP4_IMPORT_ERROR
                 self._fi_kernel = "trtllm_sm100"
             elif get_platform().is_sm120:
                 self._fi_kernel = "cutlass_sm120"

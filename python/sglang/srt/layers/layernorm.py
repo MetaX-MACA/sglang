@@ -33,6 +33,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.utils.common import is_maca
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -82,7 +83,7 @@ if _is_cuda or _is_xpu or _is_musa:
             ) -> torch.Tensor:
                 return flashinfer.norm.layernorm(input, gamma, beta, eps)
 
-            _flashinfer_layernorm_available = True
+            _flashinfer_layernorm_available = not is_maca()
         except (ImportError, AttributeError):
             _flashinfer_layernorm_available = False
 
@@ -99,12 +100,13 @@ if _is_cuda or _is_xpu or _is_musa:
         _flashinfer_layernorm_available = False
         _flashinfer_rmsnorm_quant_available = False
 
-    from sgl_kernel import (
-        fused_add_rmsnorm,
-        gemma_fused_add_rmsnorm,
-        gemma_rmsnorm,
-        rmsnorm,
-    )
+    from sgl_kernel import fused_add_rmsnorm
+
+    if is_maca():
+        from flashinfer import gemma_fused_add_rmsnorm, gemma_rmsnorm, rmsnorm
+    else:
+        from sgl_kernel import gemma_fused_add_rmsnorm, gemma_rmsnorm, rmsnorm
+    sgl_rmsnorm = rmsnorm
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 _has_rocm_triton_gemma_rms_norm = False
@@ -185,6 +187,18 @@ if _is_npu:
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
 _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE = 5120
+
+if _is_cuda and is_maca():
+
+    @torch.library.custom_op("sglang::rmsnorm", mutates_args=())
+    def sgl_rmsnorm(
+        input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+    ) -> torch.Tensor:
+        return rmsnorm(input, weight, eps)
+
+    @sgl_rmsnorm.register_fake
+    def _(input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        return torch.empty_like(input)
 
 
 @lru_cache(maxsize=1)
@@ -610,7 +624,7 @@ class RMSNorm(BaseFusedOp):
                 fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
                 result = x, residual
         else:
-            result = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            result = sgl_rmsnorm(x, self.weight.data, self.variance_epsilon)
 
         if needs_reshape:
             if residual is not None:

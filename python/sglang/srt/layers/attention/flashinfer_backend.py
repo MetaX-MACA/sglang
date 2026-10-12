@@ -56,6 +56,7 @@ from sglang.srt.utils import (
     get_cuda_graph_max_batch_size,
     get_int_env_var,
     is_flashinfer_available,
+    is_maca,
     next_power_of_2,
 )
 
@@ -64,6 +65,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+_is_maca = is_maca()
 
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
@@ -76,8 +78,11 @@ if is_flashinfer_available():
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
-        fast_decode_plan,
     )
+
+    if not _is_maca:
+        from flashinfer import fast_decode_plan
+
     from flashinfer.cascade import merge_state
 
     from sglang.kernels.ops.attention.merge_state import merge_state_triton
@@ -494,7 +499,9 @@ class FlashInferAttnBackend(AttentionBackend):
             ):
                 fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
+            self.workspace_buffer,
+            "NHD",
+            **({} if _is_maca else {"backend": fmha_backend}),
         )
 
         # Two wrappers: one for sliding window attention and one for full attention.
@@ -522,7 +529,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 BatchDecodeWithPagedKVCacheWrapper(
                     self.workspace_buffer,
                     "NHD",
-                    backend=self.decode_backend,
+                    **({} if _is_maca else {"backend": self.decode_backend}),
                     use_tensor_cores=self.decode_use_tensor_cores,
                 )
             )
@@ -815,6 +822,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if (
             in_capture
+            and not _is_maca
             and forward_mode.is_draft_extend_v2()
             and self.prefill_backend == "fa2"
             # Host-rebuilt layout only matches full attention (single wrapper);
@@ -829,6 +837,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if (
             in_capture
+            and not _is_maca
             and forward_mode.is_target_verify()
             and spec_info is not None
             and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
@@ -1094,7 +1103,7 @@ class FlashInferAttnBackend(AttentionBackend):
             BatchDecodeWithPagedKVCacheWrapper(
                 self.workspace_buffer,
                 "NHD",
-                backend=self.decode_backend,
+                **({} if _is_maca else {"backend": self.decode_backend}),
                 use_cuda_graph=True,
                 use_tensor_cores=self.decode_use_tensor_cores,
                 paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
@@ -1767,50 +1776,32 @@ class FlashInferIndicesUpdaterDecode:
             global_override_indptr_cpu[0] = 0
             global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
 
-        # Check if this specific wrapper's begin_forward has been replaced with fast_decode_plan
-        # by checking if it's a partial function with fast_decode_plan as the func
-        wrapper_uses_fast_decode_plan = (
-            hasattr(wrapper.begin_forward, "func")
-            and wrapper.begin_forward.func == fast_decode_plan
+        plan_kwargs = {}
+        if not _is_maca:
+            plan_kwargs = {
+                "fixed_split_size": fixed_split_size,
+                "disable_split_kv": disable_split_kv
+                if disable_split_kv is not None
+                else False,
+            }
+            if (
+                hasattr(wrapper.begin_forward, "func")
+                and wrapper.begin_forward.func is fast_decode_plan
+            ):
+                plan_kwargs["global_override_indptr_cpu"] = global_override_indptr_cpu
+        wrapper.begin_forward(
+            kv_indptr,
+            kv_indices,
+            self.kv_last_page_len[:bs],
+            self.num_qo_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            1,
+            data_type=self.data_type,
+            q_data_type=self.q_data_type,
+            non_blocking=True,
+            **plan_kwargs,
         )
-
-        if wrapper_uses_fast_decode_plan:
-            # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
-            wrapper.begin_forward(
-                kv_indptr,
-                kv_indices,
-                self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                1,
-                data_type=self.data_type,
-                q_data_type=self.q_data_type,
-                non_blocking=True,
-                fixed_split_size=fixed_split_size,
-                disable_split_kv=(
-                    disable_split_kv if disable_split_kv is not None else False
-                ),
-                global_override_indptr_cpu=global_override_indptr_cpu,
-            )
-        else:
-            # When using original begin_forward, don't pass global_override_indptr_cpu
-            wrapper.begin_forward(
-                kv_indptr,
-                kv_indices,
-                self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                1,
-                data_type=self.data_type,
-                q_data_type=self.q_data_type,
-                non_blocking=True,
-                fixed_split_size=fixed_split_size,
-                disable_split_kv=(
-                    disable_split_kv if disable_split_kv is not None else False
-                ),
-            )
 
         if locally_override:
             global_override_indptr_cpu = None
@@ -2297,6 +2288,17 @@ class FlashInferIndicesUpdaterPrefill:
             # selects the module with the per-element window mask compiled in
             paged_plan_kwargs["window_left"] = window_left
 
+        if _is_maca:
+            paged_plan_kwargs = {}
+        else:
+            paged_plan_kwargs.update(
+                fixed_split_size=fixed_split_size,
+                prefix_len_ptr=prefix_len_ptr,
+                token_pos_in_items_ptr=token_pos_in_items_ptr,
+                token_pos_in_items_len=token_pos_in_items_len,
+                max_item_len_ptr=max_item_len_ptr,
+            )
+
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
@@ -2310,11 +2312,6 @@ class FlashInferIndicesUpdaterPrefill:
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,
             non_blocking=True,
-            fixed_split_size=fixed_split_size,
-            prefix_len_ptr=prefix_len_ptr,
-            token_pos_in_items_ptr=token_pos_in_items_ptr,
-            token_pos_in_items_len=token_pos_in_items_len,
-            max_item_len_ptr=max_item_len_ptr,
             **paged_plan_kwargs,
         )
 
@@ -2536,3 +2533,163 @@ def should_use_tensor_core(
         return gqa_group_size >= 4
     else:
         return False
+
+
+def _maca_fast_decode_plan(
+    self,
+    indptr: torch.Tensor,
+    indices: torch.Tensor,
+    last_page_len: torch.Tensor,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    pos_encoding_mode: str = "NONE",
+    window_left: int = -1,
+    logits_soft_cap: Optional[float] = None,
+    q_data_type: Optional[Union[str, torch.dtype]] = None,
+    kv_data_type: Optional[Union[str, torch.dtype]] = None,
+    data_type: Optional[Union[str, torch.dtype]] = None,
+    sm_scale: Optional[float] = None,
+    rope_scale: Optional[float] = None,
+    rope_theta: Optional[float] = None,
+    non_blocking: bool = True,
+    fixed_split_size: Optional[int] = None,
+    disable_split_kv: bool = False,
+) -> None:
+    """
+    A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for FlashInferMultiStepDraftBackend.
+    Modifications:
+    - Remove unnecessary device-to-device copy for the cuda graph buffers.
+    - Remove unnecessary host-to-device copy for the metadata buffers.
+    """
+    from flashinfer.decode import _get_range_buf, get_seq_lens
+
+    batch_size = len(last_page_len)
+    if logits_soft_cap is None:
+        logits_soft_cap = 0.0
+
+    # Handle data types consistently
+    if data_type is not None:
+        if q_data_type is None:
+            q_data_type = data_type
+        if kv_data_type is None:
+            kv_data_type = data_type
+    elif q_data_type is None:
+        q_data_type = "float16"
+
+    if kv_data_type is None:
+        kv_data_type = q_data_type
+
+    if self.use_tensor_cores:
+        qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
+        # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
+        if fixed_split_size is None:
+            fixed_split_size = -1
+
+    if self.is_cuda_graph_enabled:
+        if batch_size != self._fixed_batch_size:
+            raise ValueError(
+                "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
+                " mismatches the batch size set during initialization {}".format(
+                    batch_size, self._fixed_batch_size
+                )
+            )
+        if len(indices) > len(self._paged_kv_indices_buf):
+            raise ValueError(
+                "The size of indices should be less than or equal to the allocated buffer"
+            )
+    else:
+        self._paged_kv_indptr_buf = indptr
+        self._paged_kv_indices_buf = indices
+        self._paged_kv_last_page_len_buf = last_page_len
+        if self.use_tensor_cores:
+            self._qo_indptr_buf = qo_indptr_host.to(
+                self.device, non_blocking=non_blocking
+            )
+
+    # Create empty tensors for dtype info if needed
+    empty_q_data = torch.empty(
+        0,
+        dtype=(
+            getattr(torch, q_data_type) if isinstance(q_data_type, str) else q_data_type
+        ),
+        device=self.device,
+    )
+
+    empty_kv_cache = torch.empty(
+        0,
+        dtype=(
+            getattr(torch, kv_data_type)
+            if isinstance(kv_data_type, str)
+            else kv_data_type
+        ),
+        device=self.device,
+    )
+
+    indptr_host = (
+        global_override_indptr_cpu
+        if global_override_indptr_cpu is not None
+        else indptr.cpu()
+    )
+
+    with torch.cuda.device(self.device):
+        if self.use_tensor_cores:
+            # ALSO convert last_page_len to CPU
+            if page_size == 1:
+                # When page size is 1, last_page_len is always 1.
+                # Directly construct the host tensor rather than executing a device-to-host copy.
+                last_page_len_host = torch.ones(
+                    (batch_size,), dtype=torch.int32, device="cpu"
+                )
+            else:
+                last_page_len_host = last_page_len.cpu()
+
+            kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
+
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_host,
+                indptr_host,
+                kv_lens_arr_host,
+                batch_size,  # total_num_rows
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                head_dim,
+                head_dim,
+                False,  # causal
+            )
+        else:
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                indptr_host,
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                window_left,
+                logits_soft_cap,
+                head_dim,
+                head_dim,
+                empty_q_data,
+                empty_kv_cache,
+            )
+
+    self._pos_encoding_mode = pos_encoding_mode
+    self._window_left = window_left
+    self._logits_soft_cap = logits_soft_cap
+    self._sm_scale = sm_scale
+    self._rope_scale = rope_scale
+    self._rope_theta = rope_theta
+
+
+if _is_maca:
+    fast_decode_plan = _maca_fast_decode_plan

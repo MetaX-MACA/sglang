@@ -28,6 +28,7 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_gfx1250_supported,
     is_hip,
+    is_maca,
     is_musa,
     is_npu,
     is_xpu,
@@ -36,12 +37,27 @@ from sglang.srt.utils.common import (
 if is_cuda():
     from flashinfer.sampling import (
         min_p_sampling_from_probs,
+        top_k_renorm_probs as top_k_renorm_prob,
         top_k_top_p_sampling_from_probs,
+        top_p_renorm_probs as top_p_renorm_prob,
     )
-    from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-    )
+
+    if is_maca():
+        # MACA FlashInfer requires caller-provided random samples and returns
+        # a success mask for top-k/top-p sampling.
+        _maca_min_p_sampling = min_p_sampling_from_probs
+        _maca_top_k_top_p_sampling = top_k_top_p_sampling_from_probs
+
+        def min_p_sampling_from_probs(probs, min_ps):
+            uniform_samples = torch.rand((32, probs.shape[0]), device=probs.device)
+            return _maca_min_p_sampling(probs, uniform_samples, min_ps)
+
+        def top_k_top_p_sampling_from_probs(probs, top_ks, top_ps, **kwargs):
+            uniform_samples = torch.rand((32, probs.shape[0]), device=probs.device)
+            token_ids, _ = _maca_top_k_top_p_sampling(
+                probs, uniform_samples, top_ks, top_ps, **kwargs
+            )
+            return token_ids
 
 if is_musa() or is_xpu():
     from sgl_kernel import (

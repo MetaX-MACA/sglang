@@ -796,6 +796,9 @@ class LogitsProcessor(nn.Module):
                 pin_memory=is_pin_memory_available(),
             ).to(pruned_states.device, non_blocking=True)
 
+        if logits_metadata.forward_mode.is_idle():
+            pruned_states = hidden_states[:0]
+
         return (
             pruned_states,
             pruned_states_before_norm,

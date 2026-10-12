@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Mapping, Optional
@@ -94,6 +95,11 @@ def _ffn_decl(
     can_move_output = output_transform is None or output_transform.before_reduce_scatter
     use_reduce_scatter = strategy in ("rs", "rs+rsv") and can_move_output
     use_reduce_scatterv = strategy in ("rsv", "rs+rsv") and can_move_output
+    # The pre-0.5.21 LayerCommunicator switch now belongs to the dense
+    # producer contract, shared by all model stage declarations.
+    if not sparse and os.getenv("MX_DISABLE_DENSE_REDUCE_SCATTER"):
+        use_reduce_scatter = False
+        use_reduce_scatterv = False
     cp_shards = _generic_prefill_cp_shards_tokens()
     axes, attention, local, full = _rows(variant)
     on_local = (

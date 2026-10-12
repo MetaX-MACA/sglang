@@ -32,7 +32,7 @@ from sglang.srt.runtime_context import (
     get_resources,
     get_stream,
 )
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_maca
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -169,16 +169,11 @@ class DpPaddingMode(IntEnum):
         if moe_a2a_backend.is_deepep_v2() and envs.SGLANG_DEEPEP_V2_FORCE_MAX_LEN.get():
             return DpPaddingMode.MAX_LEN
 
-        # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
-        # overhead from uneven token distribution.
-        # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
-        # to enable symmetric memory optimization (needed for DSA CP, etc.).
         if is_extend_in_batch and dp_size > 1:
-            # Hybrid-SSM models materialize idle ranks via the MAX_LEN
-            # fabricated-row conversion; other models keep mainline SUM_LEN.
             if get_flags().dp.max_len_with_idle and min(global_num_tokens) == 0:
                 return DpPaddingMode.MAX_LEN
-            return DpPaddingMode.SUM_LEN
+            if not is_maca():
+                return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
         # prefer MAX_LEN when communication cost is equal to enable symmetric memory
@@ -221,6 +216,8 @@ class _DpGatheredBufferWrapper:
     _dp_max_padding: bool = False
     _global_num_tokens: Optional[List[int]] = None
     _global_num_tokens_gpu: Optional[torch.Tensor] = None
+    _global_dp_buffer: Optional[torch.Tensor] = None
+    _local_dp_buffer: Optional[torch.Tensor] = None
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -229,6 +226,8 @@ class _DpGatheredBufferWrapper:
         dp.buffer_hidden_size = hidden_size
         dp.buffer_dtype = dtype
         dp.buffer_device = device
+        cls._global_dp_buffer = None
+        cls._local_dp_buffer = None
 
     @classmethod
     def set_dp_buffer_len(
@@ -244,18 +243,21 @@ class _DpGatheredBufferWrapper:
         cls._dp_max_padding = dp_max_padding
         cls._global_num_tokens = global_num_tokens
         cls._global_num_tokens_gpu = global_num_tokens_gpu
+        cls._global_dp_buffer = None
+        cls._local_dp_buffer = None
 
     @classmethod
     def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
 
         dp = get_flags().dp
-        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
-            buffer = torch.empty(
-                (cls._global_dp_buffer_len, dp.buffer_hidden_size),
-                dtype=dp.buffer_dtype,
-                device=dp.buffer_device,
-            )
-        return buffer
+        if cls._global_dp_buffer is None:
+            with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
+                cls._global_dp_buffer = torch.empty(
+                    (cls._global_dp_buffer_len, dp.buffer_hidden_size),
+                    dtype=dp.buffer_dtype,
+                    device=dp.buffer_device,
+                )
+        return cls._global_dp_buffer
 
     @classmethod
     def get_local_dp_buffer(
@@ -263,13 +265,13 @@ class _DpGatheredBufferWrapper:
     ) -> torch.Tensor:
 
         dp = get_flags().dp
-        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
-            buffer = torch.empty(
-                (cls._local_dp_buffer_len, hidden_size or dp.buffer_hidden_size),
-                dtype=dp.buffer_dtype,
-                device=dp.buffer_device,
-            )
-        return buffer
+        shape = (cls._local_dp_buffer_len, hidden_size or dp.buffer_hidden_size)
+        if cls._local_dp_buffer is None or cls._local_dp_buffer.shape != shape:
+            with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
+                cls._local_dp_buffer = torch.empty(
+                    shape, dtype=dp.buffer_dtype, device=dp.buffer_device
+                )
+        return cls._local_dp_buffer
 
     @classmethod
     def get_global_dp_buffer_len(cls) -> int:

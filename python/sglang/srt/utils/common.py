@@ -181,6 +181,9 @@ def register_xpu_device_properties_for_dynamo() -> None:
     if xpu_props_type is not None:
         dynamo_utils.common_constant_types.add(xpu_props_type)
 
+def is_maca() -> bool:
+    return "metax" in torch.__version__
+
 
 @lru_cache(maxsize=1)
 def is_npu() -> bool:
@@ -900,6 +903,22 @@ def get_mtgpu_memory_capacity():
             "mthreads-gmi not found. Ensure Moore Threads drivers are installed and accessible."
         )
 
+def get_mxgpu_memory_capacity():
+    try:
+        output = subprocess.check_output(["mx-smi", "--show-memory"], text=True)
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            "mx-smi not found. Ensure MACA drivers are installed and accessible."
+        ) from error
+    memory_values = [
+        float(line.split()[3]) / 1024
+        for line in output.splitlines()
+        if "vis_vram total" in line
+    ]
+    if not memory_values:
+        raise ValueError("No GPU memory values found in mx-smi output.")
+    return min(memory_values)
+
 
 def get_device_memory_capacity(device: str = None):
     # OOT platforms provide their own memory query via the platform class.
@@ -909,7 +928,10 @@ def get_device_memory_capacity(device: str = None):
             return mem_bytes / (1 << 20)  # bytes -> MiB
         return None
     if is_cuda():
-        gpu_mem = get_nvgpu_memory_capacity()
+        if is_maca():
+            gpu_mem = get_mxgpu_memory_capacity()
+        else:
+            gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
         gpu_mem = get_amdgpu_memory_capacity()
     elif device == "hpu":
