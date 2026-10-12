@@ -1334,7 +1334,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
         # prefill with NaN draft logits, see #23269).
         # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
-        if not enable_cp_v2():
+        # Only extend batches are CP-split; TARGET_VERIFY needs exact bs * draft tokens.
+        if not enable_cp_v2() and self.is_extend_in_batch:
             cp_align_size = get_cp_padding_align_size()
             for i in range(sync_group_size):
                 global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
