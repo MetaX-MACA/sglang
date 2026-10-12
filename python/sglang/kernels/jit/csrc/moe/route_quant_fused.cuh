@@ -43,7 +43,7 @@ inline constexpr uint32_t kQuantHidden_ = kQuantGroupsPerRow_ * RouteQuantTrait:
 
 template <bool kUsePDL, typename TScore, typename TX>
 __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
-    void route_quant_fused_kernel(const __grid_constant__ RouteQuantFusedParams params) {
+    void route_quant_fused_kernel(const   RouteQuantFusedParams params) {
   const auto M = static_cast<uint32_t>(params.route.M);
   if (blockIdx.x < M) {
     __shared__ typename LargeRouterRadixTrait::Smem smem;

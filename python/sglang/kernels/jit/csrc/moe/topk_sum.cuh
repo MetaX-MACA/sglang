@@ -25,7 +25,7 @@ struct TopkSumParams {
 };
 
 template <int kThreads, bool kUsePDL>
-__global__ void topk_sum_kernel(const TopkSumParams __grid_constant__ params) {
+__global__ void topk_sum_kernel(const TopkSumParams   params) {
   using namespace device;
 
   constexpr int kVecN = 8;  // 8 bf16 = 128 bits

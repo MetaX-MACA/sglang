@@ -326,7 +326,7 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
 
 template <bool kUsePDL, typename TScore>
 __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
-    void route_radix_kernel(const __grid_constant__ RouteRadixParams params) {
+    void route_radix_kernel(const   RouteRadixParams params) {
   __shared__ typename LargeRouterRadixTrait::Smem smem;
   route_radix_block<kUsePDL, TScore>(params, smem);
 }
@@ -553,7 +553,7 @@ SGL_DEVICE void fgt_select_topk(
 /// during the radix rounds) or after it.
 template <bool kUsePDL, uint32_t kBlockSize, uint32_t kCastVec, bool kCastFirst>
 __global__ __launch_bounds__(kBlockSize)  //
-    void fused_front_epilogue_kernel(const __grid_constant__ MoEFrontParams params) {
+    void fused_front_epilogue_kernel(const   MoEFrontParams params) {
   using namespace device;
   using T = MoEFrontTrait<kBlockSize>;
   __shared__ typename T::Smem smem;

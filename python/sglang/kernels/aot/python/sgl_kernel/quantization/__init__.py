@@ -6,3 +6,7 @@ from .gguf import (
     ggml_mul_mat_a8,
     ggml_mul_mat_vec_a8,
 )
+
+from .quantization import (
+    scaled_int8_quant
+)

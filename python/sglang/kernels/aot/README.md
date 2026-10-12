@@ -19,6 +19,41 @@ Requires torch == 2.13.0
 pip3 install sglang-kernel --upgrade
 ```
 
+### MACA: choose sgl_kernel or mcoplib
+
+`SGLANG_USE_MCOPLIB=1` loads the operators from mcoplib through the existing
+`sgl_kernel` Python API. `SGLANG_USE_MCOPLIB=0` loads the native `common_ops`
+extension. The default is `1` for Metax PyTorch and `0` otherwise. Set the
+variable before starting Python; only one `sgl_kernel` operator namespace is
+loaded per process. On MACA, int8 quantization and fused MoE gating use
+`mcoplib._C` and `mcoplib.op` with either setting, so mcoplib is required when
+those functions run.
+The switch also controls the MACA FP8 and AWQ paths that import mcoplib directly.
+MACA W8A8 linear and batched GEMM use mctlassEx with either backend and require
+BF16 output. mctlassEx does not provide an FP16 W8A8 output path; FP16 requests
+raise `NotImplementedError`.
+MoE defaults to `ENABLE_MCTLASS_FUSED_MOE_PYTHON_API=1`; setting it to `0`
+uses Triton instead of local W8A8 AOT operators. `ENABLE_MCTLASS_FUSED_MOE=1`
+also enables the INT8 W8A8 MoE optimization. Asymmetric INT8 linear GEMM is not
+exposed by this package.
+
+Both builds use this directory. With MACA PyTorch installed:
+
+```bash
+# Python wrappers only; install compatible mcoplib and mctlassEx separately.
+SGLANG_USE_MCOPLIB=1 pip install --no-build-isolation --no-deps .
+
+# Build native common_ops with the MACA SDK and FlashInfer installed.
+SGLANG_USE_MCOPLIB=0 pip install --no-build-isolation --no-deps .
+```
+
+Runtime selection uses the same variable, for example
+`SGLANG_USE_MCOPLIB=0 python -m sglang.launch_server ...`.
+Selecting `0` requires an installed native extension; the wrappers-only build
+does not contain `common_ops`. To switch without reinstalling, build the native
+package and install a compatible mcoplib alongside it. A missing selected backend
+raises an import error instead of loading the other implementation.
+
 ## Building from Source
 Requires
 - CMake ≥3.31,

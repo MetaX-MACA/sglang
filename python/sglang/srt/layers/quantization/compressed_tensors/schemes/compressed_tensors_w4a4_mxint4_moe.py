@@ -4,6 +4,8 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
+
+from sglang.srt.utils.common import is_maca
 from compressed_tensors import CompressionFormat
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -34,7 +36,7 @@ if TYPE_CHECKING:
         CompressedTensorsConfig,
     )
 
-if is_flashinfer_available():
+if is_flashinfer_available() and not is_maca():
     from flashinfer.fp4_quantization import block_scale_interleave
     from flashinfer.fused_moe import (
         convert_to_block_layout,

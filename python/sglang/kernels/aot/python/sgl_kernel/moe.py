@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+from sgl_kernel.platform import is_maca
 
 
 def moe_align_block_size(
@@ -109,46 +110,46 @@ def moe_sum(
 # python/sglang/kernels/ops/moe/moe_fused_gate.py (sglang issue #26771).
 
 
-def fp8_blockwise_scaled_grouped_mm(
-    output,
-    a_ptrs,
-    b_ptrs,
-    out_ptrs,
-    a_scales_ptrs,
-    b_scales_ptrs,
-    a,
-    b,
-    scales_a,
-    scales_b,
-    stride_a,
-    stride_b,
-    stride_c,
-    layout_sfa,
-    layout_sfb,
-    problem_sizes,
-    expert_offsets,
-    workspace,
-):
-    torch.ops.sgl_kernel.fp8_blockwise_scaled_grouped_mm.default(
-        output,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        a,
-        b,
-        scales_a,
-        scales_b,
-        stride_a,
-        stride_b,
-        stride_c,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes,
-        expert_offsets,
-        workspace,
-    )
+# def fp8_blockwise_scaled_grouped_mm(
+#     output,
+#     a_ptrs,
+#     b_ptrs,
+#     out_ptrs,
+#     a_scales_ptrs,
+#     b_scales_ptrs,
+#     a,
+#     b,
+#     scales_a,
+#     scales_b,
+#     stride_a,
+#     stride_b,
+#     stride_c,
+#     layout_sfa,
+#     layout_sfb,
+#     problem_sizes,
+#     expert_offsets,
+#     workspace,
+# ):
+#     torch.ops.sgl_kernel.fp8_blockwise_scaled_grouped_mm.default(
+#         output,
+#         a_ptrs,
+#         b_ptrs,
+#         out_ptrs,
+#         a_scales_ptrs,
+#         b_scales_ptrs,
+#         a,
+#         b,
+#         scales_a,
+#         scales_b,
+#         stride_a,
+#         stride_b,
+#         stride_c,
+#         layout_sfa,
+#         layout_sfb,
+#         problem_sizes,
+#         expert_offsets,
+#         workspace,
+#     )
 
 
 def prepare_moe_input(
@@ -187,7 +188,6 @@ def apply_shuffle_mul_sum(
         input, output, permutation, factors
     )
 
-
 def fused_qk_norm_rope(
     qkv: torch.Tensor,
     num_heads_q: int,
@@ -223,4 +223,44 @@ def fused_qk_norm_rope(
         high,
         attention_factor,
         rotary_dim if rotary_dim is not None else head_dim,
+    )
+
+def fused_moe_gate_opt(
+    gating_outputs: torch.Tensor,
+    correction_bias: torch.Tensor,
+    out_routing_weights: torch.Tensor,
+    out_selected_experts: torch.Tensor,
+    topk: int = None,
+    renormalize: bool = None,
+    num_expert_group: int = None,
+    topk_group: int = None,
+    num_shared_experts: Optional[int] = None,
+    scale_factor: Optional[float] = None,
+) -> int :
+    if is_maca():
+        from mcoplib.op import fused_moe_gate_opt as mcoplib_fused_moe_gate_opt
+
+        return mcoplib_fused_moe_gate_opt(
+            gating_outputs,
+            correction_bias,
+            out_routing_weights,
+            out_selected_experts,
+            topk,
+            renormalize,
+            num_expert_group,
+            topk_group,
+            num_shared_experts,
+            scale_factor,
+        )
+    return torch.ops.sgl_kernel.fused_moe_gate_opt.default(
+        gating_outputs,
+        correction_bias,
+        out_routing_weights,
+        out_selected_experts,
+        topk,
+        renormalize,
+        num_expert_group,
+        topk_group,
+        num_shared_experts,
+        scale_factor
     )

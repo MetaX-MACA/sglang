@@ -29,7 +29,7 @@ struct AlignSingleTokenParams {
 };
 
 template <bool kUsePDL>
-__global__ void align_single_token_kernel(const AlignSingleTokenParams __grid_constant__ params) {
+__global__ void align_single_token_kernel(const AlignSingleTokenParams   params) {
   using namespace device;
   const uint32_t lane = threadIdx.x;  // one warp
   const uint32_t topk = params.topk;

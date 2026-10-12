@@ -2,16 +2,16 @@ import torch.distributed as dist
 
 from sglang.srt.utils import is_flashinfer_available
 
-if is_flashinfer_available():
-    from flashinfer.comm.mnnvl import CommBackend
-else:
+# if is_flashinfer_available():
+#     from flashinfer.comm.mnnvl import CommBackend
+# else:
 
-    class CommBackend:
-        """
-        Placeholder base class when flashinfer is not available
-        """
+class CommBackend:
+    """
+    Placeholder base class when flashinfer is not available
+    """
 
-        pass
+    pass
 
 
 class TorchDistributedCommBackend(CommBackend):

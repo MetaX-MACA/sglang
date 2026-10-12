@@ -21,13 +21,16 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_maca
 
 __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sgl_kernel import int8_scaled_mm
+    if is_maca():
+        from sgl_kernel import cutlass_scaled_mm as int8_scaled_mm
+    else:
+        from sgl_kernel import int8_scaled_mm
 
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
@@ -95,8 +98,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # ampere and up
-        return 80
+        return 75 if is_maca() else 80
 
     def process_weights_after_loading(self, layer) -> None:
         # If per tensor, when we have a fused module (e.g. QKV) with per
@@ -170,11 +172,21 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        # TODO: add cutlass_scaled_mm_azp support
-        x_q, x_scale = per_token_quant_int8(x)
+        if isinstance(x, tuple):
+            out_dtype, x_q, x_scale = x
+        else:
+            x_q, x_scale = per_token_quant_int8(x)
+            out_dtype = x.dtype
 
+        if is_maca():
+            assert self.input_symmetric, "MACA W8A8 requires symmetric activations"
         return int8_scaled_mm(
-            x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
+            x_q,
+            layer.weight,
+            x_scale,
+            layer.weight_scale,
+            out_dtype=out_dtype,
+            bias=bias,
         )
 
 

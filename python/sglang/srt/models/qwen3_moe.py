@@ -730,6 +730,7 @@ class Qwen3MoeAttention(nn.Module):
                     )
                     if enable_fused_set_kv_buffer(forward_batch)
                     and self.compatible_with_fused_kv_buffer
+                    and not torch.compiler.is_compiling()
                     else None
                 ),
             )

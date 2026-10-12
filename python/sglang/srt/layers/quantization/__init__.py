@@ -35,14 +35,9 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 )
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
-from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
-from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
 from sglang.srt.layers.quantization.npu_mxfp4_w4a4 import Mxfp4W4A4Config
-from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
-from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
-from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.platforms import current_platform
@@ -51,12 +46,22 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_maca,
     is_mps,
     is_npu,
     is_xpu,
 )
 
 _is_gfx95_supported = is_gfx95_supported()
+_is_maca = is_maca()
+
+if not _is_maca:
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+    from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
+    from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
+    from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
+    from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
+
 
 # Base quantization methods
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
@@ -66,7 +71,6 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "modelopt": ModelOptFp8Config,  # Auto-detect, defaults to FP8
     "modelopt_fp8": ModelOptFp8Config,
     "modelopt_fp4": ModelOptFp4Config,
-    "nvfp4_online": NvFp4OnlineConfig,
     "modelopt_mixed": ModelOptMixedPrecisionConfig,
     "w8a8_int8": W8A8Int8Config,
     "w8a8_fp8": W8A8Fp8Config,
@@ -74,27 +78,35 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "gguf": GGUFConfig,
-    "gptq_marlin": GPTQMarlinConfig,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
-    "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
     "quark": QuarkConfig,
     "quark_mxfp4": QuarkConfig,
     "auto-round": AutoRoundConfig,
     "auto-round-int8": W8A8Int8Config,
     "modelslim": ModelSlimConfig,
-    "quark_int4fp8_moe": QuarkInt4Fp8Config,
-    "humming": HummingConfig,
-    "mxfp_w4a8": Mxfp4W4A8Config,
 }
+
+
+if not _is_maca:
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "nvfp4_online": NvFp4OnlineConfig,
+            "gptq_marlin": GPTQMarlinConfig,
+            "w4afp8": W4AFp8Config,
+            "quark_int4fp8_moe": QuarkInt4Fp8Config,
+            "humming": HummingConfig,
+            "mxfp_w4a8": Mxfp4W4A8Config,
+        }
+    )
 
 
 # On XPU the OCP-MoE `Mxfp4Config` path is served by the sgl-kernel-xpu grouped
 # GEMM, which consumes the packed e2m1 + ue8m0 g32 checkpoint layout directly.
 # Other backends without that kernel keep the existing "unknown quantization
 # method" error rather than falling through to a bf16 upcast.
-if is_cpu() or is_cuda() or _is_gfx95_supported or is_xpu():
+if not _is_maca and (is_cpu() or is_cuda() or _is_gfx95_supported or is_xpu()):
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
@@ -150,9 +162,11 @@ CPU_QUANTIZATION_METHODS = {
     "compressed-tensors": CompressedTensorsConfig,
     "awq": AWQCPUConfig,
     "gptq": CPUGPTQConfig,
-    "mxfp4": Mxfp4Config,
     "auto-round": AutoRoundConfig,
 }
+if not _is_maca:
+    CPU_QUANTIZATION_METHODS["mxfp4"] = Mxfp4Config
+
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}
 

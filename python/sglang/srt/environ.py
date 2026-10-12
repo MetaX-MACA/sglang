@@ -943,6 +943,7 @@ class Envs:
     # scaled fraction is itself too small to hold the model weights.
     SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION = EnvBool(False)
     OVERLAP_QK_NORM = EnvBool(False)
+    ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16 = EnvBool(False)
     # Route Kimi-K3-style h12 + fp8 MLA decode through aiter Triton Gluon when
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).

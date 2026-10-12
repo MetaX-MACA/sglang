@@ -28,6 +28,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_maca,
     is_host_cpu_arm64,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -43,7 +44,10 @@ _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_cuda:
-    from sgl_kernel import int8_scaled_mm
+    if is_maca():
+        from sgl_kernel import cutlass_scaled_mm as int8_scaled_mm
+    else:
+        from sgl_kernel import int8_scaled_mm
 
     @register_fake_if_exists("sgl_kernel::int8_scaled_mm")
     def _int8_scaled_mm_abstract(
@@ -216,18 +220,19 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
-        x_q, x_scale = per_token_quant_int8(x)
 
-        x_q_2d = x_q.view(-1, x_q.shape[-1])
-        x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
+        if isinstance(x, tuple):
+            out_dtype, x_q, x_scale = x
+        else:
+            x_q, x_scale = per_token_quant_int8(x)
+            out_dtype = x.dtype
         output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
-
         output = int8_scaled_mm(
-            x_q_2d,
+            x_q.view(-1, x_q.shape[-1]),
             layer.weight,
-            x_scale_2d,
+            x_scale.view(-1, x_scale.shape[-1]),
             layer.weight_scale,
-            out_dtype=x.dtype,
+            out_dtype=out_dtype,
             bias=bias,
         )
 

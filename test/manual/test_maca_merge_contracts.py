@@ -160,6 +160,74 @@ class TestMacaMergeContracts(unittest.TestCase):
                 instance.ncclCommInitRank.assert_called_once_with(2, "id", 1)
 
 
+    def test_w8a8_preserves_batched_prequantized_input_shape(self):
+        q = Mock(shape=(2, 3, 128))
+        scale = Mock(shape=(2, 3, 1))
+        output = Mock()
+        gemm = Mock(return_value=output)
+        fn = load(
+            "python/sglang/srt/layers/quantization/w8a8_int8.py",
+            "apply",
+            {
+                "use_intel_amx_backend": lambda _: False,
+                "_is_cpu_arm64": False,
+                "int8_scaled_mm": gemm,
+            },
+            owner="W8A8Int8LinearMethod",
+        )
+        layer = NS(weight=NS(shape=(128, 256)), weight_scale=object())
+        fn(None, layer, (DType.BF16, q, scale))
+        q.view.assert_called_once_with(-1, 128)
+        scale.view.assert_called_once_with(-1, 1)
+        self.assertIs(gemm.call_args.args[0], q.view.return_value)
+        output.view.assert_called_once_with([2, 3, 256])
+
+
+    def test_moe_runner_conversion_matches_fused_execution_signature(self):
+        import inspect
+        import copy
+
+        runner = ast.parse((ROOT / "python/sglang/srt/layers/moe/moe_runner/triton.py").read_text())
+        source = ast.parse((ROOT / "python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py").read_text())
+        sequence = copy.deepcopy(next(n for n in source.body if isinstance(n, ast.FunctionDef)
+                                     and n.name == "_fused_moe_kernel_sequence"))
+        sequence.body = [ast.Pass()]
+        namespace = {}
+        exec("from __future__ import annotations\n" + ast.unparse(sequence), namespace)
+        call = next(n for n in ast.walk(runner) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name) and n.func.id == sequence.name)
+        inspect.signature(namespace[sequence.name]).bind(
+            *[None] * len(call.args), **{k.arg: None for k in call.keywords})
+        converter = next(n for n in runner.body if isinstance(n, ast.FunctionDef)
+                         and n.name == "pre_permute_standard_to_triton")
+        unpack = next(n for n in converter.body if isinstance(n, ast.Assign)
+                      and isinstance(n.value, ast.Call)
+                      and isinstance(n.value.func, ast.Name)
+                      and n.value.func.id == "_prepare_fused_moe_run")
+        prepare = next(n for n in source.body if isinstance(n, ast.FunctionDef)
+                       and n.name == "_prepare_fused_moe_run")
+        returned = next(n for n in prepare.body if isinstance(n, ast.Return))
+        self.assertEqual(len(unpack.targets[0].elts), len(returned.value.elts))
+
+
+    def test_moe_activation_reaches_kernel_sequence(self):
+        for name, inplace in (
+            ("inplace_fused_experts", True),
+            ("outplace_fused_experts", False),
+        ):
+            impl = Mock()
+            fn = load(
+                "python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py",
+                name,
+                {
+                    "register_custom_op": lambda *a, **kw: lambda fn: fn,
+                    "fused_experts_impl": impl,
+                },
+            )
+            fn(*[object() for _ in range(5)], activation="gelu")
+            self.assertEqual(impl.call_args.args[7:9], (inplace, "gelu"))
+
+
     def test_portable_capture_status_queries_requested_stream(self):
         original_stream = NS(cuda_stream=1234)
         requested_stream = NS(cuda_stream=5678)
@@ -377,6 +445,255 @@ class TestMacaMergeContracts(unittest.TestCase):
         ):
             with patch.object(fb, name, value):
                 self.assertFalse(fn(None, fb))
+
+
+    def test_mctlass_rejects_unsupported_output_semantics(self):
+        path = ROOT / "python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py"
+        tree = ast.parse(path.read_text())
+        fn = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "invoke_fused_moe_kernel"
+        )
+        assignment = next(
+            n
+            for n in fn.body
+            if isinstance(n, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "mctlass_output_supported"
+                for t in n.targets
+            )
+        )
+        code = compile(
+            ast.Module(body=[assignment], type_ignores=[]), str(path), "exec"
+        )
+        ns = dict(
+            bias=None,
+            block_shape=None,
+            C=NS(is_contiguous=lambda: True, dtype=TorchStub.bfloat16),
+            torch=TorchStub,
+            c_sorted=False,
+            fuse_add_to_output=False,
+            mask_output=False,
+            lora_preserve_base=False,
+            fuse_sum_all_reduce=False,
+            fuse_swiglu=False,
+        )
+        exec(code, ns)
+        self.assertTrue(ns["mctlass_output_supported"])
+        for name, value in (
+            ("bias", object()),
+            ("block_shape", [128, 128]),
+            ("C", NS(is_contiguous=lambda: False)),
+            ("c_sorted", True),
+            ("mask_output", True),
+            ("fuse_add_to_output", True),
+            ("lora_preserve_base", True),
+            ("fuse_sum_all_reduce", True),
+            ("fuse_swiglu", True),
+        ):
+            with patch.dict(ns, {name: value}):
+                exec(code, ns)
+                self.assertFalse(ns["mctlass_output_supported"], name)
+
+
+    def test_mctlass_int8_dispatch_preserves_scales_and_route_weights(self):
+        class Tensor:
+            dtype = DType.BF16
+            shape = (5, 2, 8)
+
+            @property
+            def ndim(self):
+                return len(self.shape)
+
+            def stride(self, dim):
+                return 1
+
+            def is_contiguous(self):
+                return True
+
+            def size(self, dim):
+                return self.shape[dim]
+
+            def view(self, *shape):
+                return self
+
+            def contiguous(self):
+                return self
+
+            def numel(self):
+                return 10
+
+        a, b, c = Tensor(), Tensor(), Tensor()
+        a.shape = (5, 8)
+        b.shape = (3, 8, 8)
+        weights, ids = Tensor(), Tensor()
+        scale_a, scale_b = Tensor(), Tensor()
+        scale_a.shape = (5, 1)
+        scale_b.shape = (3, 8)
+        gemm = Mock()
+        triton_kernel = MagicMock()
+        ns = {
+            "torch": NS(bfloat16=DType.BF16, float16=object()),
+            "tl": NS(bfloat16=object()),
+            "triton": NS(cdiv=lambda a, b: (a + b - 1) // b),
+            "_is_maca": True,
+            "enable_mctlass_fused_moe": True,
+            "enable_mctlass_fused_moe_python_api": True,
+            "per_token_quant_int8": lambda x: (a, scale_a),
+            "envs": NS(
+                ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16=NS(get=lambda: False)
+            ),
+            "gemm": gemm,
+            "fused_moe_kernel": triton_kernel,
+            "is_arch_support_pdl": lambda: False,
+        }
+        fn = load(
+            "python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py",
+            "invoke_fused_moe_kernel",
+            ns,
+        )
+        for python_api in (True, False):
+            with self.subTest(python_api=python_api):
+                ns["enable_mctlass_fused_moe_python_api"] = python_api
+                gemm.reset_mock()
+                triton_kernel.reset_mock()
+                fn(
+                    a, b, None, c, None, scale_b, None, weights, ids,
+                    Tensor(), Tensor(), Tensor(), True, 2,
+                    {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 8, "BLOCK_SIZE_K": 8},
+                    object(),
+                    use_fp8_w8a8=False,
+                    use_int8_w8a8=True,
+                    use_int8_w8a16=False,
+                    use_int4_w4a8=False,
+                    use_int4_w4a16=False,
+                    per_channel_quant=True,
+                    filter_expert=True,
+                )
+                if python_api:
+                    args = gemm.call_args.args
+                    self.assertIs(args[9], scale_a)
+                    self.assertIs(args[10], scale_b)
+                    self.assertIs(args[12], weights)
+                    self.assertTrue(args[-1])
+                    self.assertTrue(gemm.call_args.kwargs["filter_expert"])
+                    triton_kernel.__getitem__.assert_not_called()
+                else:
+                    gemm.assert_not_called()
+                    launch = triton_kernel.__getitem__.return_value
+                    launch.assert_called_once()
+                    self.assertIs(launch.call_args.args[6], scale_a)
+                    self.assertIs(launch.call_args.args[7], scale_b)
+                    self.assertIs(launch.call_args.args[8], weights)
+
+
+    def test_mctlass_mxfp4_queries_each_stage_and_aligns_down_tile(self):
+        path = (
+            ROOT / "python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py"
+        )
+        tree = ast.parse(path.read_text())
+        fn = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_fused_moe_kernel_sequence"
+        )
+        calls = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "get_kernel_m"
+        ]
+        packed = [
+            n for n in calls if any(k.arg == "is_b_e2m1fp4x2" for k in n.keywords)
+        ]
+        self.assertEqual(len(packed), 2)
+        self.assertTrue(
+            all(any(k.arg == "mul_weight" for k in n.keywords) for n in packed)
+        )
+        # Execute the production re-alignment branch with intentionally different tiles.
+        down_branch = next(
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.If)
+            and ast.unparse(n.test) == "down_m != stage1_config['BLOCK_SIZE_M']"
+        )
+        align = Mock(return_value=("tokens", "experts", "padded"))
+        ns = dict(
+            down_m=64,
+            stage1_config={"BLOCK_SIZE_M": 16},
+            moe_align_block_size=align,
+            topk_ids=object(),
+            E=3,
+        )
+        exec(
+            compile(ast.Module(body=[down_branch], type_ignores=[]), str(path), "exec"),
+            ns,
+        )
+        self.assertEqual(ns["sorted_token_ids"], "tokens")
+        align.assert_called_once_with(ns["topk_ids"], 64, 3)
+
+
+    def test_triton_kernels_do_not_capture_host_platform_flags(self):
+        path = ROOT / "python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py"
+        tree = ast.parse(path.read_text())
+        platform_probes = {"is_maca", "is_cuda", "is_hip", "is_cpu"}
+        host_flags = {
+            target.id
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id in platform_probes
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        for fn in tree.body:
+            if not isinstance(fn, ast.FunctionDef) or not any(
+                isinstance(decorator, ast.Attribute)
+                and isinstance(decorator.value, ast.Name)
+                and decorator.value.id == "triton"
+                and decorator.attr == "jit"
+                for decorator in fn.decorator_list
+            ):
+                continue
+            referenced_flags = {
+                node.id
+                for node in ast.walk(fn)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+            } & host_flags
+            self.assertFalse(
+                referenced_flags,
+                f"{fn.name} captures non-constexpr host flags: {referenced_flags}",
+            )
+
+
+    def test_quantizers_keep_empty_groups_on_original_device(self):
+        ns = {
+            "torch": TorchStub,
+            "fp8_dtype": DType.FP8,
+            "_mcoplib_per_token_cast_to_fp8": lambda *a: None,
+            "per_token_cast_to_fp8": lambda x: (None, None),
+        }
+        fn = load(
+            "python/sglang/kernels/ops/quantization/fp8_kernel.py",
+            "per_token_cast_to_fp8_3d",
+            ns,
+        )
+        x = NS(shape=(0, 2, 256), device="cuda:3", dim=lambda: 3)
+        with (
+            patch.object(
+                TorchStub,
+                "empty_like",
+                create=True,
+                side_effect=lambda x, dtype: TorchStub.empty(x.shape, dtype, x.device),
+            ),
+            patch.object(TorchStub, "float32", DType.BF16, create=True),
+        ):
+            q, scales = fn(x)
+        self.assertEqual((q.shape, scales.shape), ((0, 2, 256), (0, 2, 2)))
+        self.assertEqual((q.device, scales.device), ("cuda:3", "cuda:3"))
 
 
 if __name__ == "__main__":

@@ -31,6 +31,8 @@ from typing import (
 )
 
 import torch
+
+from sglang.srt.utils.common import is_maca
 import torch.nn.functional as F
 import triton
 import triton.language as tl
@@ -179,6 +181,7 @@ def _use_rocm_triton_softmax_topk(
 
 
 if _is_cuda:
+
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
 
@@ -2562,18 +2565,37 @@ def select_experts(
                 scoring_func=scoring_func,
             )
         else:
-            topk_weights, topk_ids = biased_grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                num_fused_shared_experts=num_fused_shared_experts_for_gate,
-                routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            gate_supported = (
+                (router_logits.shape[1], num_expert_group, topk_group)
+                in ((256, 8, 4), (320, 1, 1), (384, 1, 1), (448, 1, 1))
+                and ((top_k == 8 and num_fused_shared_experts_for_gate == 0)
+                     or (top_k == 9 and num_fused_shared_experts_for_gate == 1))
             )
+            if (is_maca() and gate_supported
+                and num_fused_shared_experts_for_gate == num_fused_shared_experts
+                and not apply_routed_scaling_factor_on_output):
+                from sgl_kernel import fused_moe_gate_opt
+                topk_ids = torch.empty((hidden_states.shape[0], top_k), dtype=torch.int32, device=hidden_states.device)
+                topk_weights = torch.empty((hidden_states.shape[0], top_k), dtype=torch.float32, device=hidden_states.device)
+                fused_moe_gate_opt(
+                    router_logits, correction_bias.to(router_logits.dtype),
+                    topk_weights, topk_ids, top_k, renormalize,
+                    num_expert_group, topk_group, num_fused_shared_experts_for_gate,
+                    routed_scaling_factor,
+                )
+            else:
+                topk_weights, topk_ids = biased_grouped_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=num_routed_topk if _use_aiter else top_k,
+                    renormalize=renormalize,
+                    num_expert_group=num_expert_group,
+                    topk_group=topk_group,
+                    num_fused_shared_experts=num_fused_shared_experts_for_gate,
+                    routed_scaling_factor=routed_scaling_factor,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                )
     elif torch_native and custom_routing_function is None:
         assert num_token_non_padded is None, (
             "num_token_non_padded is not yet supported in fused_topk_native"

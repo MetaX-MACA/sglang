@@ -4,6 +4,8 @@ import logging
 from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
+
+from sglang.srt.utils.common import is_maca
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
@@ -26,7 +28,7 @@ from sglang.srt.utils.common import next_power_of_2, print_warning_once
 
 _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
 
-if is_flashinfer_available():
+if is_flashinfer_available() and not is_maca():
     from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
     from flashinfer.fp4_quantization import block_scale_interleave
     from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe

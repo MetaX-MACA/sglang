@@ -156,9 +156,9 @@ def per_token_group_quant(
 
 __all__ = [
     "sgl_per_token_quant_fp8",
-    "sgl_per_token_group_quant_8bit",
-    "sgl_per_token_group_quant_fp8",
-    "sgl_per_token_group_quant_int8",
+    # "sgl_per_token_group_quant_8bit",
+    # "sgl_per_token_group_quant_fp8",
+    # "sgl_per_token_group_quant_int8",
     "per_token_group_quant",
 ]
 

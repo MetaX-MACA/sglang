@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 from collections import OrderedDict
+import os
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -20,7 +21,9 @@ from sglang.kernels.ops.quantization.int8_kernel import (
     sglang_per_token_group_quant_int8,
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import get_moe_padding_size
+from sglang.srt.utils.common import is_maca
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -39,6 +42,7 @@ except:
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_maca = is_maca()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -51,6 +55,13 @@ elif _is_hip:
     pass
 
 padding_size = get_moe_padding_size(_use_aiter)
+enable_mctlass_fused_moe = _is_maca and (os.getenv("ENABLE_MCTLASS_FUSED_MOE", "0") == "1")
+enable_mctlass_fused_moe_python_api = _is_maca and (os.getenv("ENABLE_MCTLASS_FUSED_MOE_PYTHON_API", "1") == "1")
+
+if enable_mctlass_fused_moe_python_api:
+    from mctlassEx import FusedMoeGEMM
+
+    gemm = FusedMoeGEMM()
 
 
 def support_tensor_descriptor():
@@ -371,6 +382,7 @@ def fused_moe_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    IS_MACA: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
@@ -583,15 +595,28 @@ def fused_moe_kernel(
                 if swap_ab:
                     a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
                     a_scale, b_scale = b_scale, a_scale
-                if BLOCK_SIZE_N > group_n:
-                    accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                if use_fp8_w8a8 and IS_MACA:
+                    # MetaX Triton does not support fp8e4nv as tl.dot's RHS.
+                    # FP8 values are exactly representable in BF16/FP16, so
+                    # promote both operands to the model compute type while
+                    # retaining the existing FP32 accumulation and scale math.
+                    dot_result = tl.dot(a.to(compute_type), b.to(compute_type))
                 else:
-                    accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
+                    dot_result = tl.dot(a, b)
+                if BLOCK_SIZE_N > group_n:
+                    accumulator += dot_result * a_scale[:, None] * b_scale[None, :]
+                else:
+                    accumulator += dot_result * (a_scale[:, None] * b_scale)
             else:
                 if use_fp8_w8a8:
                     if swap_ab:
                         a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
-                    accumulator = tl.dot(a, b, acc=accumulator)
+                    if IS_MACA:
+                        accumulator = tl.dot(
+                            a.to(compute_type), b.to(compute_type), acc=accumulator
+                        )
+                    else:
+                        accumulator = tl.dot(a, b, acc=accumulator)
                 else:
                     accumulator += tl.dot(a, b)
         else:
@@ -821,9 +846,16 @@ def invoke_fused_moe_kernel(
     mask_output: bool = False,
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
+    is_fp4_experts: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+    mctlass_output_supported = (
+        bias is None and block_shape is None and C.is_contiguous()
+        and C.dtype == torch.bfloat16
+        and not (c_sorted or fuse_add_to_output or mask_output
+                 or lora_preserve_base or fuse_sum_all_reduce or fuse_swiglu)
+    )
 
     if fuse_swiglu:
         # The epilogue assumes an interleaved-gate/up bf16 up-GEMM writing a
@@ -881,14 +913,14 @@ def invoke_fused_moe_kernel(
             # activation block-wise int8 quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
-            if _is_cuda:
-                A, A_scale = sglang_per_token_group_quant_int8(A, block_k)
-            else:
-                A, A_scale = per_token_group_quant_int8(A, block_k)
+            # if _is_cuda:
+            #     A, A_scale = sglang_per_token_group_quant_int8(A, block_k)
+            # else:
+            A, A_scale = per_token_group_quant_int8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
-    elif use_int8_w8a16 or use_int4_w4a16:
+    elif use_int8_w8a16 or use_int4_w4a16 or is_fp4_experts:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
     else:
@@ -928,7 +960,58 @@ def invoke_fused_moe_kernel(
         )
     # ===== END TO BE REFACTORED ====
 
-    if (
+    packed_mctlass_supported = (
+        enable_mctlass_fused_moe_python_api
+        and A.dtype in (torch.bfloat16, torch.float16)
+        and C.dtype == A.dtype
+        and C.is_contiguous()
+        and bias is None
+        and not (
+            c_sorted
+            or fuse_add_to_output
+            or mask_output
+            or lora_preserve_base
+            or fuse_sum_all_reduce
+            or fuse_swiglu
+        )
+    )
+    if is_fp4_experts or (
+        _is_maca
+        and envs.ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16.get()
+        and use_int4_w4a16
+        and B_zp is None
+        and block_shape == [0, 32]
+        and packed_mctlass_supported
+    ):
+        assert packed_mctlass_supported, "MXFP4 requires the MACA mctlass Python API"
+        gemm(
+            A.shape[0],
+            B.shape[1],
+            A.shape[1],
+            B.shape[0],
+            sorted_token_ids.shape[0],
+            top_k,
+            A,
+            B.view(dtype=torch.quint4x2),
+            C.view(-1, C.shape[-1]),
+            A_scale,
+            B_scale,
+            None,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            filter_expert=filter_expert,
+            is_blockwise=True,
+            group_size=32,
+            is_scale_a_1d=is_fp4_experts,
+            is_scale_b_1d=is_fp4_experts,
+            scale_b_layout="n-major" if is_fp4_experts else "k-major",
+            is_scale_ue8m0=is_fp4_experts,
+            is_b_e2m1fp4x2=is_fp4_experts,
+        )
+    elif (
         (use_int8_w8a16 or use_int4_w4a16)
         and block_shape is not None
         and block_shape[1] > 0
@@ -977,7 +1060,45 @@ def invoke_fused_moe_kernel(
             filter_expert=filter_expert,
             **config,
         )
-
+    elif (
+        use_int8_w8a8
+        and enable_mctlass_fused_moe
+        and enable_mctlass_fused_moe_python_api
+        and mctlass_output_supported
+    ):
+        C1 = C.view(-1, C.size(-1)).contiguous()
+        gemm(
+            A.shape[0], B.shape[1], A.shape[1], B.shape[0],
+            sorted_token_ids.shape[0], top_k, A, B, C1, A_scale, B_scale,
+            None, topk_weights, sorted_token_ids, expert_ids,
+            num_tokens_post_padded, mul_routed_weight,
+            filter_expert=filter_expert,
+        )
+    elif use_int4_w4a8:
+        assert enable_mctlass_fused_moe_python_api, (
+            "int4_w4a8 only support enable_mctlass_fused_moe_python_api now"
+        )
+        EM = sorted_token_ids.shape[0]
+        B = B.view(dtype=torch.quint4x2)
+        gemm(
+            A.size(0),
+            B.size(1),
+            A.size(1),
+            B.size(0),
+            EM,
+            top_k,
+            A,
+            B,
+            C,
+            A_scale,
+            B_scale,
+            None,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+        )
     else:
         if a_use_tma or b_use_tma:
             _set_triton_tma_allocator()
@@ -997,6 +1118,44 @@ def invoke_fused_moe_kernel(
             )
         else:
             b_desc = None
+
+        if (
+            enable_mctlass_fused_moe_python_api
+            and mctlass_output_supported
+            and A.dtype == torch.bfloat16
+            and not any(
+                (use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16)
+            )
+            and bias is None
+            and not c_sorted
+            and not fuse_add_to_output
+            and not mask_output
+            and not lora_preserve_base
+            and not fuse_sum_all_reduce
+            and not fuse_swiglu
+        ):
+            C1 = C.view(-1, C.size(-1)).contiguous()
+            gemm(
+                A.shape[0],
+                B.shape[1],
+                A.shape[1],
+                B.shape[0],
+                sorted_token_ids.shape[0],
+                top_k,
+                A,
+                B,
+                C1,
+                A_scale,
+                B_scale,
+                None,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                mul_routed_weight,
+                filter_expert=filter_expert,
+            )
+            return
 
         pdl_kwargs = (
             {"USE_GDC": True, "launch_pdl": True, "GDC_EARLY": A.shape[0] <= 512}
@@ -1040,6 +1199,7 @@ def invoke_fused_moe_kernel(
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,
+            IS_MACA=_is_maca,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,

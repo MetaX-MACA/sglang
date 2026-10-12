@@ -61,13 +61,15 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator, is_maca
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
+
+_is_maca = is_maca()
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -103,7 +105,16 @@ def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
 
 
 if _is_cuda:
-    from sglang.kernels.ops.gemm import bmm_fp8
+    if _is_maca:
+        from mctlassEx import ScaledGEMM
+        from sgl_kernel import scaled_int8_quant
+
+        scaled_gemm_int8 = ScaledGEMM()
+    try:
+        from sglang.kernels.ops.gemm import bmm_fp8
+    except:
+        bmm_fp8 = None
+
 
 
 def should_defer_dsa_cp_kv_gather(
@@ -338,7 +349,8 @@ class DeepseekMLAForwardMixin:
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            overlap_qk_norm = envs.OVERLAP_QK_NORM.get()
+            if overlap_qk_norm and self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -876,6 +888,27 @@ class DeepseekMLAForwardMixin:
                     torch.bfloat16,
                 )
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        elif _is_maca and self.w_vc.dtype == torch.int8:
+            attn_output_quant_val, attn_output_quant_scale, _ = scaled_int8_quant(
+                attn_output.transpose(0, 1).contiguous()
+            )
+            num_heads, num_tokens, kv_lora = attn_output_quant_val.shape
+            v_head_dim = self.w_vc.shape[2]
+            attn_bmm_output = torch.empty(
+                (num_heads, num_tokens, v_head_dim),
+                dtype=attn_output.dtype,
+                device=attn_output.device,
+            )
+            scaled_gemm_int8(
+                [num_tokens, v_head_dim, kv_lora],
+                attn_output_quant_val,
+                self.w_vc,
+                attn_bmm_output,
+                attn_output_quant_scale.reshape(num_heads, num_tokens, 1),
+                self.w_vc_scale,
+                None,
+            )
+            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         elif _is_musa:
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1), self.w_vc

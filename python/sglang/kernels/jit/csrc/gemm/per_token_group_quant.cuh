@@ -396,7 +396,7 @@ struct QuantTrait {
 // ---------------------------------------------------------------------------
 template <typename Trait, bool kUsePDL>
 __global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_flat_kernel(
-    const __grid_constant__ QuantKernelParams params) {
+    const   QuantKernelParams params) {
   using namespace device;
   constexpr uint32_t kNumLanes = Trait::kNumLanes;
   constexpr uint32_t kWorkPerWarp = kWarpThreads / kNumLanes;
@@ -422,7 +422,7 @@ __global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_flat_
 // ---------------------------------------------------------------------------
 template <typename Trait, bool kUsePDL>
 __global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_masked_kernel(
-    const __grid_constant__ MaskedQuantKernelParams params) {
+    const   MaskedQuantKernelParams params) {
   using namespace device;
   constexpr uint32_t kNumLanes = Trait::kNumLanes;
   constexpr uint32_t kWorkPerWarp = kWarpThreads / kNumLanes;

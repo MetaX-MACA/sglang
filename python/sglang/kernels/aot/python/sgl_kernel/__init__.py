@@ -65,6 +65,10 @@ else:
         es_sm100_mxfp8_blockscaled_grouped_quant,
     )
     from sgl_kernel.gemm import shuffle_rows
+    from sgl_kernel.cutlass_mm import (
+        cutlass_scaled_batch_mm,
+        cutlass_scaled_mm,
+    )
     from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
     from sgl_kernel.kvcacheio import (
         copy_all_layer_kv_cache_cpu,
@@ -84,6 +88,7 @@ else:
     from sgl_kernel.moe import (
         apply_shuffle_mul_sum,
         fused_qk_norm_rope,
+        fused_moe_gate_opt,
         moe_align_block_size,
         moe_sum,
         moe_sum_reduce,
@@ -98,6 +103,7 @@ else:
         ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
+        scaled_int8_quant,
     )
     from sgl_kernel.sampling import (
         top_k_renorm_prob,

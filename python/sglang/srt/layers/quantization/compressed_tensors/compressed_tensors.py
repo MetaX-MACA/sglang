@@ -58,6 +58,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
     XPUCompressedTensorsWNA16,
+    CompressedTensorsW8A8Int8DynamicMoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
@@ -600,6 +601,14 @@ class CompressedTensorsConfig(QuantizationConfig):
             and is_symmetric
         )
 
+    def _is_dynamic_token_int8_w8a8(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+        # Confirm weights and activations quantized.
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_int8_w8a8 = (weight_quant.type == QuantizationType.INT and input_quant.type == QuantizationType.INT)
+        return is_int8_w8a8 and self._is_dynamic_token_w8a8(weight_quant, input_quant)
+
     def _is_wNa16_group_channel(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -842,8 +851,8 @@ class CompressedTensorsConfig(QuantizationConfig):
                     and get_moe_runner_backend().is_flashinfer_trtllm()
                 ):
                     return CompressedTensorsMxInt4MoE(self, weight_quant=weight_quant)
-                elif _is_hip:
-                    logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
+                elif _is_hip or _is_cuda:
+                    logger.info_once("Using CompressedTensorsWNA16TritonMoE")
                     return CompressedTensorsWNA16TritonMoE(
                         self, weight_quant=weight_quant
                     )
@@ -888,6 +897,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         elif self._is_fp8_w8a8(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
             return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
+        elif not _is_npu and self._is_dynamic_token_int8_w8a8(weight_quant, input_quant):
+            logger.info_once("Using CompressedTensorsW8A8Int8DynamicMoE")
+            return CompressedTensorsW8A8Int8DynamicMoE(weight_quant, input_quant)
         elif self._is_dynamic_token_w8a8(weight_quant, input_quant):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW8A8Int8DynamicMoE")

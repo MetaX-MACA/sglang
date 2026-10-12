@@ -56,7 +56,7 @@ SGL_DEVICE void quant_row(const T* __restrict__ src, fp8_e4m3_t* __restrict__ ds
 }
 
 template <typename T, typename IdxT, int kVecN, bool kUsePDL, bool kQuantizeQ>
-__global__ void fused_fp8_qkv_kv_cache_kernel(const __grid_constant__ FusedQkvParams params) {
+__global__ void fused_fp8_qkv_kv_cache_kernel(const   FusedQkvParams params) {
   using namespace device;
   const uint32_t token = blockIdx.x;
   if (token >= params.num_tokens) return;

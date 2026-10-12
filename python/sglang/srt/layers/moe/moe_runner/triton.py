@@ -30,9 +30,6 @@ class TritonRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
-    sorted_token_ids: torch.Tensor
-    expert_ids: torch.Tensor
-    num_tokens_post_padded: torch.Tensor
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -70,6 +67,7 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     # w13 rows were permuted to interleave gate/up at load, so the activation
     # must be applied by the fused up-GEMM epilogue (see fused_moe_kernel).
     fuse_swiglu_interleaved: bool = False
+    is_fp4_experts: bool = False
 
 
 def _topk_ids_may_be_nonlocal(config: MoeRunnerConfig) -> bool:
@@ -138,9 +136,6 @@ class TritonRunnerCore(MoeRunnerCore):
             quant_info.w2_weight,
             runner_input.topk_weights,
             runner_input.topk_ids,
-            runner_input.sorted_token_ids,
-            runner_input.expert_ids,
-            runner_input.num_tokens_post_padded,
             running_state["config"],
             running_state.get("down_config"),
             running_state.get("down_moe_use_tma", False),
@@ -171,6 +166,7 @@ class TritonRunnerCore(MoeRunnerCore):
             hooks=hooks,
             swiglu_limit=self.config.swiglu_limit,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
+            is_fp4_experts=quant_info.is_fp4_experts,
         )
 
         return TritonRunnerOutput(hidden_states=out)
@@ -257,6 +253,7 @@ def fused_experts_none_to_triton(
             block_shape=quant_info.block_shape,
             a1_q=a1_q,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
+            is_fp4_experts=quant_info.is_fp4_experts,
         )
 
     return StandardCombineInput(
@@ -291,9 +288,6 @@ def pre_permute_standard_to_triton(
         down_config,
         down_moe_use_tma,
         up_moe_use_tma,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
     ) = _prepare_fused_moe_run(
         hidden_states,
         quant_info.w13_weight,
@@ -316,9 +310,6 @@ def pre_permute_standard_to_triton(
         hidden_states=hidden_states,
         topk_weights=topk_output.topk_weights,
         topk_ids=topk_output.topk_ids,
-        sorted_token_ids=sorted_token_ids,
-        expert_ids=expert_ids,
-        num_tokens_post_padded=num_tokens_post_padded,
     )
 
 

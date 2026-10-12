@@ -4,8 +4,8 @@
 #include <cuda.h>
 #include <torch/all.h>
 
-#include "cutlass/bfloat16.h"
-#include "cutlass/float8.h"
+#include "mctlass/bfloat16.h"
+#include "mctlass/float8.h"
 
 template <
     typename ElementAB,

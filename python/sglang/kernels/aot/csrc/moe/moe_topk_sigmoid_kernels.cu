@@ -23,7 +23,7 @@ limitations under the License.
 #ifndef USE_ROCM
 #include <cub/cub.cuh>
 #include <cub/util_type.cuh>
-#include <cuda/functional>
+#include <cuda/std/functional>
 #else
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
