@@ -330,12 +330,27 @@ class BaseSpecWorker(ABC):
             if draft_model_runner is None:
                 return ()
             return (draft_model_runner,)
-        # EAGLE family: resolve the nested draft runner (the fork has no
-        # .draft_runners tuple; keep the legacy resolution).
+        # EAGLE family: resolve the draft ModelRunner(s) from whichever layout
+        # is actually in use. V1 nested the draft runner behind
+        # draft_worker.draft_worker.draft_runner(_list); the V2 worker (this
+        # image) instead keeps the alias on itself (EAGLEWorkerV2.draft_runner)
+        # or on the draft TpModelWorker as .model_runner. Tolerate all three.
         server_args = self.target_worker.model_runner.server_args
         if server_args.enable_multi_layer_eagle:
-            return tuple(draft_worker.draft_worker.draft_runner_list)
-        return (draft_worker.draft_worker.draft_runner,)
+            inner = getattr(draft_worker, "draft_worker", None)
+            runners = getattr(draft_worker, "draft_runner_list", None) or getattr(
+                inner, "draft_runner_list", None
+            )
+            return () if not runners else tuple(runners)
+        inner = getattr(draft_worker, "draft_worker", None)
+        runner = getattr(draft_worker, "draft_runner", None)
+        if runner is None and inner is not None:
+            runner = getattr(inner, "draft_runner", None)
+        if runner is None:
+            runner = getattr(draft_worker, "model_runner", None)
+        if runner is None:
+            return ()
+        return (runner,)
 
     @property
     def primary_draft_kv_pool(self):
