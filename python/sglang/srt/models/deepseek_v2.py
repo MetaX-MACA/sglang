@@ -2865,6 +2865,7 @@ class DeepseekV2Model(nn.Module):
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
+        self.dspark_layers_to_capture: Optional[list[int]] = None
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.mla_enable_prefill_cp = (
             is_prefill_context_parallel_enabled() and not self.use_dsa
@@ -3101,6 +3102,14 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = normal_start_layer = 0
         # Append-compatible, so the shared capture path below is unchanged.
         aux_hidden_states = AuxHiddenStatePacker(len(self.layers_to_capture))
+        capture_dspark = self.dspark_layers_to_capture is not None
+        dspark_aux_hidden_states: List[torch.Tensor] = []
+        if (
+            capture_dspark
+            and not self.pp_group.is_first_rank
+        ):
+            if "dspark_hidden_states" in pp_proxy_tensors.tensors:
+                dspark_aux_hidden_states.append(pp_proxy_tensors["dspark_hidden_states"])
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -3127,6 +3136,11 @@ class DeepseekV2Model(nn.Module):
                     ),
                 )
                 index_topk_share.update(topk_indices)
+            if capture_dspark and i in self.dspark_layers_to_capture:
+                if residual is None:
+                    dspark_aux_hidden_states.append(hidden_states)
+                else:
+                    dspark_aux_hidden_states.append(hidden_states + residual)
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -3168,6 +3182,15 @@ class DeepseekV2Model(nn.Module):
                         (0, get_dsa_index_topk(self.config)), dtype=torch.int32
                     )
                 proxy_tensors["topk_indices"] = topk_indices
+            if capture_dspark:
+                if dspark_aux_hidden_states:
+                    proxy_tensors["dspark_hidden_states"] = torch.cat(
+                        dspark_aux_hidden_states, dim=-1
+                    )
+                else:
+                    proxy_tensors["dspark_hidden_states"] = hidden_states.new_empty(
+                        hidden_states.shape[0], 0
+                    )
             return PPProxyTensors(proxy_tensors)
         else:
             if not forward_batch.forward_mode.is_idle():
@@ -3184,6 +3207,8 @@ class DeepseekV2Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+        if capture_dspark:
+            return hidden_states, dspark_aux_hidden_states
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states.finalize()
@@ -3345,6 +3370,20 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
 
+    def get_pp_proxy_dspark_hidden_size(self) -> int:
+        layers = self.model.dspark_layers_to_capture or []
+        return self.config.hidden_size * sum(
+            layer < self.model.start_layer - 1 for layer in layers
+        )
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = list(layer_ids)
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
@@ -3394,11 +3433,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
                 )
 
-        aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
-
         if self.pp_group.is_last_rank:
+            aux_hidden_states = None
+            if self.capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = hidden_states
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
