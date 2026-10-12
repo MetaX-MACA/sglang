@@ -117,7 +117,7 @@ struct Compress128OnlinePrefillParams {
 
 // 4 elements per thread, kHeadDim / 4 threads per block
 template <int64_t kHeadDim, bool kUsePDL>
-__global__ void flash_c128_online_decode(const __grid_constant__ Compress128OnlineDecodeParams params) {
+__global__ void flash_c128_online_decode(const  Compress128OnlineDecodeParams params) {
   using namespace device;
   constexpr uint32_t kVecSize = 4;
   constexpr uint32_t kBlockSize = kHeadDim / kVecSize;
@@ -325,7 +325,7 @@ constexpr float kPadScore = -FLT_MAX;
 /// that all reads in pass 1 finish before any writes in pass 2 start.
 template <int64_t kHeadDim, bool kWrite, bool kUsePDL>
 __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
-    void flash_c128_online_prefill(const __grid_constant__ Compress128OnlinePrefillParams params) {
+    void flash_c128_online_prefill(const  Compress128OnlinePrefillParams params) {
   using namespace device;
 
   constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 64

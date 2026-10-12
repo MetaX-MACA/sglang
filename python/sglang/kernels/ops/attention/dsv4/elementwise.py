@@ -95,9 +95,11 @@ def _jit_main_k_norm_rope_q_flashmla_module(
 
 
 @cache_once
-def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
-    """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant"""
-    args = make_cpp_args(dtype, is_arch_support_pdl())
+def _jit_main_q_indexer_rope_hadamard_quant_module(
+    dtype: torch.dtype, output_dtype: torch.dtype = torch.float8_e4m3fn
+):
+    """C4 indexer Q kernel: RoPE + 128-pt Hadamard + quantization."""
+    args = make_cpp_args(dtype, is_arch_support_pdl(), output_dtype)
     return load_jit(
         make_name("main_q_indexer_rope_hadamard_quant"),
         *args,
@@ -112,7 +114,7 @@ def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
 # drops the Hadamard rotation (kHadamard=false).
 @cache_once
 def _jit_main_q_indexer_rope_first_quant_module(dtype: torch.dtype):
-    args = make_cpp_args(dtype, is_arch_support_pdl(), True, False)
+    args = make_cpp_args(dtype, is_arch_support_pdl(), torch.float8_e4m3fn, True, False)
     return load_jit(
         make_name("main_q_indexer_rope_first_quant"),
         *args,
@@ -190,16 +192,21 @@ def fused_q_indexer_rope_hadamard_quant(
     weight_scale: float,
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
+    output_dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
+    q_output = torch.empty(q_input.shape, dtype=output_dtype, device=q_input.device)
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )
     if _is_hip:
+        if output_dtype != torch.float8_e4m3fn:
+            raise NotImplementedError(
+                "The HIP DSV4 indexer kernel only supports FP8 query output"
+            )
         torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant(
             q_input,
-            q_fp8,
+            q_output,
             weight,
             weights_out,
             float(weight_scale),
@@ -207,11 +214,15 @@ def fused_q_indexer_rope_hadamard_quant(
             positions,
         )
     elif _is_xpu:
+        if output_dtype != torch.float8_e4m3fn:
+            raise NotImplementedError(
+                "The XPU DSV4 indexer kernel only supports FP8 query output"
+            )
         from sgl_kernel import fused_q_indexer_rope_hadamard_quant
 
         fused_q_indexer_rope_hadamard_quant(
             q_input,
-            q_fp8,
+            q_output,
             weight,
             weights_out,
             float(weight_scale),
@@ -219,17 +230,19 @@ def fused_q_indexer_rope_hadamard_quant(
             positions,
         )
     else:
-        module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
+        module = _jit_main_q_indexer_rope_hadamard_quant_module(
+            q_input.dtype, output_dtype
+        )
         module.forward(
             q_input,
-            q_fp8,
+            q_output,
             weight,
             weights_out,
             float(weight_scale),
             freqs_real,
             positions,
         )
-    return q_fp8, weights_out
+    return q_output, weights_out
 
 
 def fused_q_indexer_rope_first_quant(

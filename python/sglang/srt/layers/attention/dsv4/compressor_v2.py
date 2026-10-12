@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, List, Literal, Optional, TypeAlias, Union, cas
 
 import torch
 
+from sglang.srt.utils.common import is_maca
+
 from sglang.kernels.jit.utils import is_hip_runtime
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
@@ -233,7 +235,7 @@ class CompressorBackendMixin:
             head_dim=compressor.head_dim,
             norm=compressor.norm,
             freqs_cis_cache=compressor.freqs_cis,
-            kv_cache=kv_cache if use_hip_fp4 else kv_cache.view(dtype=torch.uint8),
+            kv_cache=kv_cache if use_hip_fp4 or is_maca() else kv_cache.view(dtype=torch.uint8),
             is_indexer=compressor.is_in_indexer,
             rotate=compressor.rotate,
             compress_ratio=compressor.ratio,

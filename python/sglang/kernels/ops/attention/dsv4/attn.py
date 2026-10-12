@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils.common import is_maca
 from sglang.srt.utils import is_gfx95_supported
 
 from .kv_layout import KVLayout
@@ -31,9 +32,21 @@ def _jit_fused_store_module(
     name: Literal["flashmla", "indexer"],
     input_dtype: torch.dtype,
     index_dtype: torch.dtype,
+    store_dtype: torch.dtype,
     page_size: int,
     layout: KVLayout,
 ):
+    if is_maca() and layout is KVLayout.V4:
+        args = make_cpp_args(
+            input_dtype, index_dtype, store_dtype, page_size, is_arch_support_pdl()
+        )
+        cname = "FlashMLA" if name == "flashmla" else "Indexer"
+        kernel_class = f"FusedStoreCache{cname}Kernel<{args}>"
+        return load_jit(
+            make_name("store_" + name + "_maca"), *args,
+            cuda_files=["deepseek_v4/store_maca.cuh"],
+            cuda_wrappers=[("run", f"{kernel_class}::run")],
+        )
     if name == "flashmla":
         args = make_cpp_args(
             input_dtype, index_dtype, page_size, layout.cpp_name, is_arch_support_pdl()
@@ -96,6 +109,10 @@ def fused_store_cache(
         RoPE tail in-kernel, so ``input`` must then be the un-rotated latent.
     """
     layout = KVLayout.parse(layout)
+    if is_maca() and type == "flashmla" and cache.dtype is torch.bfloat16:
+        assert layout is KVLayout.V4
+        from .index_buf_accessor import _set_k_bf16_triton
+        return _set_k_bf16_triton(cache, indices, input.to(torch.bfloat16), page_size)
     if is_hip_runtime() and layout is KVLayout.V4:
         assert freqs_cis is None, "the V4 store receives already-rotated inputs"
         from sglang.kernels.ops.kvcache.triton_store_cache import (
@@ -111,6 +128,7 @@ def fused_store_cache(
             name=type,
             input_dtype=input.dtype,
             index_dtype=indices.dtype,
+            store_dtype=cache.dtype,
             page_size=page_size,
             layout=layout,
         )

@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -263,9 +264,21 @@ class SoftmaxTemp:
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
-        if _flashinfer_softmax is not None:
+        backend = envs.SGLANG_DSPARK_KERNEL_SOFTMAX_TEMP.get().lower()
+        if backend == "triton":
+            return cls.triton(*args, **kwargs)
+        if backend == "torch":
+            return cls.torch(*args, **kwargs)
+        if backend == "flashinfer":
             return cls.flashinfer(*args, **kwargs)
-        return cls.triton(*args, **kwargs)
+        if backend == "auto" and _flashinfer_softmax is not None:
+            return cls.flashinfer(*args, **kwargs)
+        if backend == "auto":
+            return cls.triton(*args, **kwargs)
+        raise ValueError(
+            "SGLANG_DSPARK_KERNEL_SOFTMAX_TEMP must be one of "
+            f"auto, triton, torch, or flashinfer; got {backend!r}"
+        )
 
     @classmethod
     def torch(

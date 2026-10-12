@@ -74,7 +74,7 @@ def _set_k_and_s_triton(
     assert buf.dtype == torch.uint8
     assert loc.dtype in [torch.int64, torch.int32], f"{loc.dtype=}"
 
-    assert k_nope.dtype == fp8_dtype
+    assert k_nope.dtype in (fp8_dtype, torch.int8)
     assert k_rope.dtype == torch.bfloat16
     assert scale_k_nope.dtype == torch.uint8, f"{scale_k_nope.dtype=}"
 
@@ -84,7 +84,7 @@ def _set_k_and_s_triton(
     assert k_rope.is_contiguous()
     assert scale_k_nope.is_contiguous()
 
-    buf_fp8 = buf.view(fp8_dtype)
+    buf_quant = buf.view(k_nope.dtype)
     buf_bf16 = buf.view(torch.bfloat16)
     buf_uint8 = buf.view(torch.uint8)
 
@@ -92,7 +92,7 @@ def _set_k_and_s_triton(
     s_offset_nbytes_in_page = page_size * (nope_dim + rope_dim * 2)
 
     _set_k_and_s_triton_kernel[(num_tokens_to_write,)](
-        buf_fp8,
+        buf_quant,
         buf_bf16,
         buf_uint8,
         loc,
@@ -219,7 +219,7 @@ def _set_k_and_s_torch(
         torch.int32,
     ], f"{loc.dtype=}"
 
-    assert k_nope.dtype == fp8_dtype
+    assert k_nope.dtype in (fp8_dtype, torch.int8)
     assert k_rope.dtype == torch.bfloat16
     assert scale_k_nope.dtype == torch.uint8
 
@@ -229,7 +229,7 @@ def _set_k_and_s_torch(
     assert k_rope.is_contiguous()
     assert scale_k_nope.is_contiguous()
 
-    buf_fp8 = buf.view(fp8_dtype).flatten()
+    buf_quant = buf.view(k_nope.dtype).flatten()
     buf_bf16 = buf.view(torch.bfloat16).flatten()
     buf_scale = buf.view(torch.uint8).flatten()
 
@@ -254,6 +254,122 @@ def _set_k_and_s_torch(
     )
 
     for i in range(num_tokens_to_write):
-        buf_fp8[nope_offset[i] : nope_offset[i] + nope_dim] = k_nope[i]
+        buf_quant[nope_offset[i] : nope_offset[i] + nope_dim] = k_nope[i]
         buf_bf16[rope_offset[i] : rope_offset[i] + rope_dim] = k_rope[i]
         buf_scale[s_offset[i] : s_offset[i] + scale_dim] = scale_k_nope[i]
+
+
+def _set_k_bf16_triton(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_size: int,
+):
+    num_pages, buf_numel_per_page = buf.shape
+    (num_tokens_to_write,) = loc.shape
+    num_tokens_to_write_k, nope_rope_dim = k_cache.shape
+
+    assert num_tokens_to_write == num_tokens_to_write_k, (
+        f"{num_tokens_to_write=} {num_tokens_to_write_k=}"
+    )
+    assert buf.dtype == torch.bfloat16
+    assert loc.dtype in [torch.int64, torch.int32], f"{loc.dtype=}"
+    assert k_cache.dtype == torch.bfloat16
+    assert buf.is_contiguous()
+    assert loc.is_contiguous()
+    assert k_cache.is_contiguous()
+
+    block_size = triton.next_power_of_2(nope_rope_dim)
+    _set_k_bf16_triton_kernel[(num_tokens_to_write,)](
+        buf,
+        loc,
+        k_cache,
+        k_cache.stride(0),
+        PAGE_SIZE=page_size,
+        BUF_NUMEL_PER_PAGE=buf_numel_per_page,
+        NOPE_ROPE_DIM=nope_rope_dim,
+        BLOCK_SIZE=block_size,
+    )
+
+
+@triton.jit
+def _set_k_bf16_triton_kernel(
+    buf_ptr,
+    loc_ptr,
+    k_cache_ptr,
+    k_cache_stride: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    NOPE_ROPE_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < NOPE_ROPE_DIM
+
+    loc = tl.load(loc_ptr + token_idx)
+    loc_page_index = loc // PAGE_SIZE
+    loc_token_offset_in_page = loc % PAGE_SIZE
+    out_offset = (
+        loc_page_index * BUF_NUMEL_PER_PAGE
+        + loc_token_offset_in_page * NOPE_ROPE_DIM
+        + offsets
+    )
+    in_offset = token_idx * k_cache_stride + offsets
+    values = tl.load(k_cache_ptr + in_offset, mask=mask)
+    # Match the fused FlashMLA writer: negative locations have no write target
+    # (e.g. padded or out-of-window rows after full-to-SWA translation).
+    tl.store(buf_ptr + out_offset, values, mask=mask & (loc >= 0))
+
+
+class SetK:
+    @classmethod
+    def execute(cls, pool, buf, loc, k_cache):
+        cls.triton(pool, buf, loc, k_cache)
+
+    @classmethod
+    def torch(cls, pool, buf, loc, k_cache):
+        _set_k_bf16_torch(buf, loc, k_cache, pool.page_size)
+
+    @classmethod
+    def triton(cls, pool, buf, loc, k_cache):
+        _set_k_bf16_triton(buf, loc, k_cache, pool.page_size)
+
+
+def _set_k_bf16_torch(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_size: int,
+):
+    _, buf_numel_per_page = buf.shape
+    (num_tokens_to_write,) = loc.shape
+    num_tokens_to_write_k, nope_rope_dim = k_cache.shape
+
+    assert num_tokens_to_write == num_tokens_to_write_k, (
+        f"{num_tokens_to_write=} {num_tokens_to_write_k=}"
+    )
+
+    assert buf.dtype == torch.bfloat16
+    assert loc.dtype in [
+        torch.int64,
+        torch.int32,
+    ], f"{loc.dtype=}"
+
+    assert k_cache.dtype == torch.bfloat16
+
+    assert buf.is_contiguous()
+    assert loc.is_contiguous()
+    assert k_cache.is_contiguous()
+
+    buf_bf16 = buf.flatten()
+
+    loc_page_index = loc // page_size
+    loc_token_offset_in_page = loc % page_size
+
+    offset = loc_page_index * buf_numel_per_page + loc_token_offset_in_page * (
+        nope_rope_dim
+    )
+
+    for i in range(num_tokens_to_write):
+        buf_bf16[offset[i] : offset[i] + nope_rope_dim] = k_cache[i]

@@ -1070,6 +1070,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             if ratio != 1
         }
 
+        self.kv_cache_dtype = kvc.kv_cache_dtype
         self.num_layers_total = len(self.stage_compress_ratios)
         # The low-ratio indexer pools are built with force_fp4=True
         # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
@@ -1241,6 +1242,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return ceil_align(cap + headroom, self.page_size)
 
     def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
+        if self.kv_cache_dtype is torch.bfloat16 and not self._unified:
+            return (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
         # Unified rings, the NPU pool and the trtllm uniform-FP8 pool do not go
         # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
         if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":

@@ -48,9 +48,9 @@ using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
 using bf16_t = __hip_bfloat16;
 using bf16x2_t = __hip_bfloat162;
 using fp8x2_e4m3_t = uint16_t;
-#ifndef __grid_constant__
-#define __grid_constant__
-#endif
+// #ifndef
+// #define
+// #endif
 #endif
 
 // ============================================================================
@@ -231,7 +231,7 @@ struct QKernelTraits {
 
 template <int64_t kHeadDim, int64_t kRopeDim>
 __global__ __launch_bounds__(kFusedQBlockSize, 16) void fused_q_norm_rope_kernel(
-    const __grid_constant__ FusedQNormRopeParams params) {
+    const  FusedQNormRopeParams params) {
   using Traits = QKernelTraits<kHeadDim, kRopeDim>;
   constexpr int64_t kVecSize = Traits::kVecSize;
   constexpr int64_t kLocalSize = Traits::kLocalSize;
@@ -338,7 +338,7 @@ struct FusedKNormRopeFlashMLAParams {
 
 template <int64_t kHeadDim, int64_t kRopeDim, int32_t kPageBits>
 __global__ __launch_bounds__(kFusedKBlockSize, 8) void fused_k_norm_rope_flashmla_kernel(
-    const __grid_constant__ FusedKNormRopeFlashMLAParams params) {
+    const  FusedKNormRopeFlashMLAParams params) {
   constexpr int64_t kVecSize = 2;
   constexpr uint32_t kRopeWarp = kFusedKNumWarps - 1;
   constexpr int64_t kPageBytes = ((584ll << kPageBits) + 575) / 576 * 576;
@@ -434,7 +434,7 @@ struct FusedQIndexerRopeHadamardQuantParams {
 };
 
 __global__ __launch_bounds__(kFusedQBlockSize, 16) void fused_q_indexer_rope_hadamard_quant_kernel(
-    const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
+    const  FusedQIndexerRopeHadamardQuantParams params) {
   constexpr int64_t kHeadDim = 128;
   constexpr int64_t kRopeDim = 64;
   constexpr int64_t kVecSize = 4;

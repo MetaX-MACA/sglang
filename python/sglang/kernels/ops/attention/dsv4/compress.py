@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
 )
+from sglang.srt.utils.common import is_maca
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_xpu
 
 from .kv_layout import KVLayout
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
 @cache_once
 def _jit_compress_norm_rope_module(
     dtype: torch.dtype,
+    cache_dtype: torch.dtype,
     head_dim: int,
     rope_dim: int,
     page_size: int,
@@ -53,6 +55,20 @@ def _jit_compress_norm_rope_module(
     layout: KVLayout,
     fp8_2buff: bool = False,
 ) -> Module:
+    if is_maca() and layout is KVLayout.V4 and not fp8_2buff:
+        args = make_cpp_args(
+            dtype, cache_dtype, head_dim, rope_dim, page_size,
+            is_arch_support_pdl(),
+            INDEXER_K_CACHE_PRESHUFFLE_TILE if aiter_can_use_preshuffle_paged_mqa() else 0,
+        )
+        wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
+        if head_dim == 128:
+            wrappers.append(("forward_fp4", f"FusedNormRopeKernel<{args}>::forward_fp4"))
+        return load_jit(
+            make_name("fused_norm_rope_v2_maca"), *args,
+            cuda_files=["deepseek_v4/fused_norm_rope_v2_maca.cuh"],
+            cuda_wrappers=wrappers,
+        )
     args = make_cpp_args(
         dtype,
         head_dim,
@@ -517,6 +533,7 @@ def compress_norm_rope_store(
     else:
         module = _jit_compress_norm_rope_module(
             kv.dtype,
+            kvcache.dtype,
             kv.shape[-1],
             freq_cis.shape[-1],
             page_size,

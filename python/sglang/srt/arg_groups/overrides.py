@@ -510,6 +510,8 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         logger.warning(
             f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."
         )
+    if kv_cache_dtype == "bf16":
+        kv_cache_dtype = "bfloat16"
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
@@ -864,6 +866,8 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
         kv_cache_dtype = "fp8_e4m3"
         logger.warning(f"Setting KV cache dtype to {kv_cache_dtype} for {model_arch}.")
     if view.device == "npu":
+        kv_cache_dtype = "bfloat16"
+    if kv_cache_dtype == "bf16":
         kv_cache_dtype = "bfloat16"
     assert kv_cache_dtype in [
         "fp8_e4m3",

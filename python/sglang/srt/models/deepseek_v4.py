@@ -2625,8 +2625,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-            alt_streams=alt_streams,
+            prefix=add_prefix("attn", prefix),
+            alt_streams=None if _is_npu else alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
         moe_alt_stream = (
@@ -5641,8 +5641,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and (
                                     name.endswith(".wq_a.weight")
                                     or name.endswith(".wq_a.weight_scale_inv")
+                                    or name.endswith(".wq_a.weight_scale")
                                     or name.endswith(".wkv.weight")
                                     or name.endswith(".wkv.weight_scale_inv")
+                                    or name.endswith(".wkv.weight_scale")
                                     or name.endswith(".wq_a.qweight")
                                     or name.endswith(".wkv.qweight")
                                     or name.endswith(".wq_a.qweight_type")

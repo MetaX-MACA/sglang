@@ -92,7 +92,6 @@ class TestMacaMergeContracts(unittest.TestCase):
             with patch.object(os.path, "isfile", return_value=nvcc_exists):
                 self.assertEqual(fn(), f"/opt/maca/tools/cu-bridge/bin/{compiler}")
 
-
     def test_memcpy_masks_offsets_past_either_buffer(self):
         class Scalar(int):
             def to(self, dtype):
@@ -117,7 +116,6 @@ class TestMacaMergeContracts(unittest.TestCase):
             tl.program_id = lambda axis: Scalar(row)
             fn(2000, 1000, Scalar(offset), Scalar(8), 8, 5, source_offset, 1, 1)
             self.assertEqual(bool(store.call_args.kwargs["mask"]), expected)
-
 
     def test_collective_library_binds_native_and_maca_symbols(self):
         descriptor = NS(name="ncclAllReduce", restype=int, argtypes=[])
@@ -159,6 +157,53 @@ class TestMacaMergeContracts(unittest.TestCase):
                 self.assertEqual(init_config(instance, 2, "id", 1), "communicator")
                 instance.ncclCommInitRank.assert_called_once_with(2, "id", 1)
 
+    def test_dsv4_query_dtype_preserves_native_fp8(self):
+        path = ROOT / "python/sglang/srt/layers/attention/dsv4/indexer.py"
+        tree = ast.parse(path.read_text())
+        owner = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "C4Indexer"
+        )
+        fn = next(
+            n
+            for n in owner.body
+            if isinstance(n, ast.FunctionDef) and n.name == "compute_q"
+        )
+        start = next(
+            i
+            for i, node in enumerate(fn.body)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "index_cache_type"
+                for t in node.targets
+            )
+        )
+        # Execute the selection and quantizer call, omitting the projection setup.
+        body = ast.FunctionDef(
+            name="select_query",
+            args=ast.arguments(
+                posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]
+            ),
+            body=fn.body[start:],
+            decorator_list=[],
+        )
+        module = ast.fix_missing_locations(ast.Module(body=[body], type_ignores=[]))
+        for maca, expected in ((False, DType.FP8), (True, DType.INT8)):
+            quantize = Mock()
+            ns = {
+                "is_maca": lambda: maca,
+                "envs": NS(SGLANG_DSV4_INDEX_CACHE_TYPE=NS(get=lambda: "int8")),
+                "torch": TorchStub,
+                "q": object(),
+                "weight": object(),
+                "positions": object(),
+                "self": NS(weight_scale=1.0, freqs_cis=object()),
+                "fused_q_indexer_rope_hadamard_quant": quantize,
+            }
+            exec(compile(module, str(path), "exec"), ns)
+            ns["select_query"]()
+            self.assertIs(quantize.call_args.args[-1], expected)
 
     def test_w8a8_preserves_batched_prequantized_input_shape(self):
         q = Mock(shape=(2, 3, 128))
@@ -181,7 +226,6 @@ class TestMacaMergeContracts(unittest.TestCase):
         scale.view.assert_called_once_with(-1, 1)
         self.assertIs(gemm.call_args.args[0], q.view.return_value)
         output.view.assert_called_once_with([2, 3, 256])
-
 
     def test_moe_runner_conversion_matches_fused_execution_signature(self):
         import inspect
@@ -209,7 +253,6 @@ class TestMacaMergeContracts(unittest.TestCase):
         returned = next(n for n in prepare.body if isinstance(n, ast.Return))
         self.assertEqual(len(unpack.targets[0].elts), len(returned.value.elts))
 
-
     def test_moe_activation_reaches_kernel_sequence(self):
         for name, inplace in (
             ("inplace_fused_experts", True),
@@ -226,7 +269,6 @@ class TestMacaMergeContracts(unittest.TestCase):
             )
             fn(*[object() for _ in range(5)], activation="gelu")
             self.assertEqual(impl.call_args.args[7:9], (inplace, "gelu"))
-
 
     def test_dsa_index_cache_dtype_selection_and_storage(self):
         source = "python/sglang/srt/layers/attention/dsa/utils.py"
@@ -260,7 +302,6 @@ class TestMacaMergeContracts(unittest.TestCase):
         self.assertIs(storage("int8"), DType.INT8)
         self.assertIs(storage("fp8"), DType.UINT8)
         self.assertIs(storage("bf16"), DType.BF16)
-
 
     def test_precomputed_flashmla_contract_in_fused_and_fallback_replay(self):
         precomputed_type = load(
@@ -325,7 +366,6 @@ class TestMacaMergeContracts(unittest.TestCase):
                         else:
                             flashmla_copy.assert_not_called()
 
-
     def test_maca_mqa_schedule_does_not_read_device_scalar(self):
         context_lens = Mock()
         context_lens.item.side_effect = RuntimeError("host sync during capture")
@@ -349,7 +389,6 @@ class TestMacaMergeContracts(unittest.TestCase):
             self.assertIs(fn(context_lens, 64, 80), schedule)
         context_lens.item.assert_not_called()
 
-
     def test_nvidia_mqa_schedule_preserves_three_argument_api(self):
         schedule = object()
         lengths = object()
@@ -368,7 +407,6 @@ class TestMacaMergeContracts(unittest.TestCase):
             sys.modules, {"deep_gemm": NS(get_paged_mqa_logits_metadata=backend)}
         ):
             self.assertIs(fn(lengths, 64, 80), schedule)
-
 
     def test_portable_capture_status_queries_requested_stream(self):
         original_stream = NS(cuda_stream=1234)
@@ -420,7 +458,6 @@ class TestMacaMergeContracts(unittest.TestCase):
                     device.is_current_stream_capturing.assert_called_once_with()
                     native_query.assert_not_called()
 
-
     def test_nvidia_capture_status_keeps_native_runtime_query(self):
         stream = NS(cuda_stream=1234)
         query = Mock()
@@ -444,7 +481,6 @@ class TestMacaMergeContracts(unittest.TestCase):
             self.assertEqual(fn(stream), status == 1)
             query.assert_called_with(stream.cuda_stream)
         portable_device.assert_not_called()
-
 
     def test_maca_graph_dedup_uses_plain_torch_graphs(self):
         native_graph = Mock(return_value=NS(raw_cuda_graph=Mock()))
@@ -471,7 +507,6 @@ class TestMacaMergeContracts(unittest.TestCase):
         native_graph.assert_called_once_with(keep_graph=True)
         registry.assert_called_once_with()
 
-
     def test_dp_local_cache_reuses_shape_and_preserves_hidden_size(self):
         dp = NS()
         ns = {
@@ -492,7 +527,6 @@ class TestMacaMergeContracts(unittest.TestCase):
         wrapper.set_dp_buffer_len(8, 6, False)
         self.assertEqual(wrapper.get_local_dp_buffer(None, hidden_size=4).shape, (6, 4))
 
-
     def test_dp_metadata_change_invalidates_both_buffers(self):
         dp = NS()
         ns = {
@@ -512,7 +546,6 @@ class TestMacaMergeContracts(unittest.TestCase):
         self.assertIsNot(old, new)
         self.assertEqual((new.shape, new.device), ((8, 32), "cuda:1"))
         self.assertIsNone(wrapper._local_dp_buffer)
-
 
     def test_dense_reduce_scatter_switch_preserves_sparse_routing(self):
         variant = NS(
@@ -558,6 +591,87 @@ class TestMacaMergeContracts(unittest.TestCase):
                         (result.rs, result.rsv), (not disabled or sparse,) * 2
                     )
 
+    def test_bf16_paged_kv_has_correct_physical_size(self):
+        layout = NS(V4=NS(page_bytes=lambda size: ((size * 584 + 575) // 576) * 576))
+        ns = {
+            "torch": TorchStub,
+            "KVLayout": layout,
+            "KVCache": object,
+            "ceil_div": lambda a, b: (a + b - 1) // b,
+        }
+        cls = load(
+            "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py",
+            "DeepSeekV4SingleKVPool",
+            ns,
+        )
+        for dtype in (DType.BF16, DType.FP8):
+            pool = cls.__new__(cls)
+            pool.dtype = dtype
+            pool.store_dtype = DType.BF16 if dtype is DType.BF16 else DType.UINT8
+            pool.qk_nope_head_dim, pool.qk_rope_head_dim = 448, 64
+            pool.quantize_block_size, pool.scale_pad = 64, 1
+            pool.rope_storage_dtype = DType.BF16
+            pool.kv_layout, pool.page_size, pool.device = layout.V4, 64, "cuda:3"
+            buf = pool.create_buffer(num_pages=3)
+            expected = (
+                64 * 1024 if dtype is DType.BF16 else ((64 * 584 + 575) // 576) * 576
+            )
+            self.assertEqual(buf.nbytes, 3 * expected)
+            self.assertEqual(pool.bytes_per_page_padded, expected)
+            self.assertEqual(buf.dtype, pool.store_dtype)
+
+    def test_dsv4_bf16_cache_view_uses_elements_not_fp8_bytes(self):
+        path = "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py"
+        ns = {"torch": TorchStub}
+        swa_bytes = load(
+            path, "get_swa_key_bytes_per_token", ns, owner="DeepSeekV4TokenToKVPool"
+        )
+        extra_bytes = load(
+            path, "get_extra_key_bytes_per_token", ns, owner="DeepSeekV4TokenToKVPool"
+        )
+        for dtype, expected_bytes in ((DType.BF16, 1024), (DType.FP8, 584)):
+            with self.subTest(dtype=dtype):
+                pool = NS(
+                    dtype=dtype,
+                    uniform_fp8=False,
+                    qk_nope_head_dim=448,
+                    qk_rope_head_dim=64,
+                    kv_layout=NS(bytes_per_token=584),
+                    layer_mapping={
+                        0: (None, None, NS(kv_cache_total_dim=expected_bytes))
+                    },
+                )
+                view_dim = expected_bytes // dtype.itemsize
+                self.assertEqual(swa_bytes(pool) // dtype.itemsize, view_dim)
+                self.assertEqual(extra_bytes(pool, 0) // dtype.itemsize, view_dim)
+                self.assertEqual(view_dim, 512 if dtype is DType.BF16 else 584)
+
+    def test_unified_fp8_accounting_includes_rope_pool(self):
+        ns = {"get_tensor_size_bytes": lambda b: b.nbytes}
+        fn = load(
+            "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py",
+            "get_kv_size_bytes",
+            ns,
+            owner="DeepSeekV4UnifiedKVPool",
+        )
+        pool = NS(fp8=True, kv_buffer=[NS(nbytes=512)], kv_buffer_rope=[NS(nbytes=128)])
+        self.assertEqual(fn(pool), 640)
+
+    def test_stage_accounting_handles_missing_c4_and_low_ratio_pools(self):
+        ns = {}
+        fn = load(
+            "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py",
+            "get_kv_size_bytes",
+            ns,
+            owner="DeepSeekV4TokenToKVPool",
+        )
+        pool = NS(
+            _unified_kv=False,
+            swa_kv_pool=NS(get_kv_size_bytes=lambda: 10),
+            kv_pools={1: NS(get_kv_size_bytes=lambda: 20), 4: None},
+            index_pools={1: NS(get_kv_size_bytes=lambda: 3)},
+        )
+        self.assertEqual(fn(pool), 33)
 
     def test_padding_only_idle_detection_excludes_real_and_speculative_batches(self):
         ns = {}
@@ -587,7 +701,6 @@ class TestMacaMergeContracts(unittest.TestCase):
         ):
             with patch.object(fb, name, value):
                 self.assertFalse(fn(None, fb))
-
 
     def test_mctlass_rejects_unsupported_output_semantics(self):
         path = ROOT / "python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py"
@@ -637,7 +750,6 @@ class TestMacaMergeContracts(unittest.TestCase):
             with patch.dict(ns, {name: value}):
                 exec(code, ns)
                 self.assertFalse(ns["mctlass_output_supported"], name)
-
 
     def test_mctlass_int8_dispatch_preserves_scales_and_route_weights(self):
         class Tensor:
@@ -729,7 +841,6 @@ class TestMacaMergeContracts(unittest.TestCase):
                     self.assertIs(launch.call_args.args[7], scale_b)
                     self.assertIs(launch.call_args.args[8], weights)
 
-
     def test_mctlass_mxfp4_queries_each_stage_and_aligns_down_tile(self):
         path = (
             ROOT / "python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py"
@@ -776,7 +887,6 @@ class TestMacaMergeContracts(unittest.TestCase):
         self.assertEqual(ns["sorted_token_ids"], "tokens")
         align.assert_called_once_with(ns["topk_ids"], 64, 3)
 
-
     def test_triton_kernels_do_not_capture_host_platform_flags(self):
         path = ROOT / "python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py"
         tree = ast.parse(path.read_text())
@@ -809,7 +919,6 @@ class TestMacaMergeContracts(unittest.TestCase):
                 referenced_flags,
                 f"{fn.name} captures non-constexpr host flags: {referenced_flags}",
             )
-
 
     def test_quantizers_keep_empty_groups_on_original_device(self):
         ns = {

@@ -77,7 +77,7 @@ void tree_speculative_sampling_target_only(
   if (batch_size.unwrap() == 0) return;
 
   constexpr uint32_t block_threads = 1024;
-  constexpr size_t smem_size = sizeof(SamplingTempStorage<block_threads, SCAN_ALGO, REDUCE_ALGO>);
+  constexpr size_t smem_size = sizeof(speculative_sampling::SamplingStorage<float, block_threads, SCAN_ALGO, REDUCE_ALGO>);
   auto kernel = speculative_sampling::TreeSpeculativeSamplingTargetOnly<
       block_threads,
       SCAN_ALGO,

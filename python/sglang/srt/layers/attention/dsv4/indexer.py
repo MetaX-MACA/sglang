@@ -13,6 +13,8 @@ from typing import (
 )
 
 import torch
+
+from sglang.srt.utils.common import is_maca
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -578,6 +580,8 @@ class C4IndexerBackendMixin:
         # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
         if not is_cuda() or is_hip():
             return False
+        if is_maca() and envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() != "fp8":
+            return False
         # The gather plan is built from eager, child-local ForwardBatch metadata.
         # Rewritten, TBO-split, and graph-backed batches must use the paged path.
         if (
@@ -842,7 +846,10 @@ class C4IndexerBackendMixin:
 
             fn = fp8_paged_mqa_logits_triton
         else:
-            from deep_gemm import fp8_paged_mqa_logits as fn
+            if not is_maca() or envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":
+                from deep_gemm import fp8_paged_mqa_logits as fn
+            else:
+                from deep_gemm import int8_paged_mqa_logits as fn
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
 
@@ -1194,8 +1201,19 @@ class C4Indexer(nn.Module):
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
             )
+        index_cache_type = (
+            envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() if is_maca() else "fp8"
+        )
+        if index_cache_type == "fp8":
+            output_dtype = torch.float8_e4m3fn
+        elif index_cache_type == "int8":
+            output_dtype = torch.int8
+        else:
+            raise NotImplementedError(
+                f"DSV4 index cache type {index_cache_type!r} is not supported"
+            )
         return fused_q_indexer_rope_hadamard_quant(
-            q, weight, self.weight_scale, self.freqs_cis, positions
+            q, weight, self.weight_scale, self.freqs_cis, positions, output_dtype
         )
 
     def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:

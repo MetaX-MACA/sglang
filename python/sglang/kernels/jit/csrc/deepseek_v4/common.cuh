@@ -26,7 +26,7 @@ inline constexpr uint32_t kBlockSize = 1024;
 
 #define PLAN_KERNEL __global__ __launch_bounds__(kBlockSize, 1) inline
 
-PLAN_KERNEL void plan_prefill_cuda(const __grid_constant__ CompressParams params) {
+PLAN_KERNEL void plan_prefill_cuda(const  CompressParams params) {
   const auto &[
     compress_plan, write_plan, seq_lens, extend_lens, // pointers
     batch_size, num_tokens, compress_ratio, is_overlap // values

@@ -44,7 +44,7 @@ struct FusedStoreCacheV41Param {
 };
 
 template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
-__global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCacheParam param) {
+__global__ void fused_store_flashmla_cache(const  FusedStoreCacheParam param) {
   using namespace device;
 
   using Paged = deepseek_v4::PagedKV<deepseek_v4::KVLayout::V4, kPageBits>;
@@ -144,7 +144,7 @@ __global__ void fused_store_flashmla_cache_v41(const __grid_constant__ FusedStor
 }
 
 template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
-__global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCacheParam param) {
+__global__ void fused_store_indexer_cache(const  FusedStoreCacheParam param) {
   using namespace device;
 
   /// NOTE: 132 = 128 + 4

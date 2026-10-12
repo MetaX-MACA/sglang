@@ -200,7 +200,7 @@ SGL_DEVICE void paged_transform(const TopKProblem& problem, int32_t* out, const 
  * It must however land after the PDL wait, or the indexer overwrites it.
  */
 template <bool kPDL>
-TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams params) {
+TOPK_KERNEL void topk_ragged_kernel(const   TopKRaggedParams params) {
   device::enable_smem_spilling();
   constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
   const auto bx = blockIdx.x;
@@ -357,7 +357,7 @@ TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams par
  * - Level 3: max_seq_len > cluster_floor   -> + epilogue process of cluster path
  */
 template <bool kPDL, int kLevel, TopKMode kMode>
-TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params) {
+TOPK_KERNEL void topk_main_kernel(const   TopKPagedParams params) {
   device::enable_smem_spilling();
   constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
   constexpr bool kHandleCluster = (kLevel == 3);

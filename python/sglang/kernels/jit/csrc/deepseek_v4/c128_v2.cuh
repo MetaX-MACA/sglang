@@ -282,7 +282,7 @@ SGL_DEVICE void c128_write_decode(BufferFloat* kv_buf, const InputFloat* kv_src)
 
 /// \brief Need to reduce register usage to increase occupancy.
 template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
-C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodeParams params) {
+C128_KERNEL void flash_c128_decode(const Compress128DecodeParams params) {
   using namespace device;
   using Trait = C128Trait<kHeadDim>;
 
@@ -315,7 +315,7 @@ C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodePara
 
 // compress kernel
 template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
-C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
+C128_KERNEL void flash_c128_prefill(const Compress128PrefillParams params) {
   using namespace device;
   using Trait = C128Trait<kHeadDim>;
 
@@ -340,7 +340,7 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
 }
 
 template <int64_t kHeadDim, typename BufferFloat, typename InputFloat, typename OutFloat, bool kUsePDL>
-WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
+WRITE_KERNEL void write_c128_prefill(const Compress128PrefillParams params) {
   using namespace device;
   using Trait = C128Trait<kHeadDim>;
   using StorageInput = AlignedVector<InputFloat, Trait::kTileElements>;

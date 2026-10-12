@@ -101,7 +101,7 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {
 
 template <uint32_t kGroupSize, bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
-    silu_mul_quant_varlen_kernel(const SiluMulQuantVarlenParams __grid_constant__ params) {
+    silu_mul_quant_varlen_kernel(const SiluMulQuantVarlenParams  params) {
   using namespace device;
 
   constexpr uint32_t kWorkThreads = kGroupSize / 8u;
@@ -213,7 +213,7 @@ SGL_DEVICE bf16x2_t to_bf16x2(DType2 value) {
 
 template <typename DType, bool kUsePDL>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
-    silu_mul_clamp_kernel(const SiluAndMulClampParams __grid_constant__ params) {
+    silu_mul_clamp_kernel(const SiluAndMulClampParams  params) {
   using namespace device;
   static_assert(sizeof(DType) == 2, "only fp16/bf16 supported");
   using DType2 = packed_t<DType>;
@@ -386,7 +386,7 @@ struct SiluMulQuantContigParams {
 
 template <uint32_t kGroupSize, bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
-    silu_mul_quant_contig_kernel(const SiluMulQuantContigParams __grid_constant__ params) {
+    silu_mul_quant_contig_kernel(const SiluMulQuantContigParams  params) {
   using namespace device;
 
   constexpr uint32_t kWorkThreads = kGroupSize / 8u;

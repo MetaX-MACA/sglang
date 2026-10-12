@@ -1943,7 +1943,9 @@ class DeepseekV4HipRadixBackend(
         k_rope: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
-        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
+        # Idle DP ranks may have padding tokens for MLP synchronization, but
+        # no attention work or live metadata, with or without MTP.
+        if forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
 
         assert k is v, "DeepseekV4 shares k and v"
