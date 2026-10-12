@@ -973,6 +973,7 @@ class DeepseekV2MoE(nn.Module):
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
+        self._moe_int8_quant_once: Optional[bool] = None
         self.balance_tensor = None
         work_rank = get_tensor_model_parallel_rank()
         if 'ENABLE_EP_MOCK_BALANCE' in os.environ:
@@ -1271,7 +1272,18 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if pre_quant_input is not None:
+        fuse_shared_add = (
+            shared_output is not None
+            and self._can_fuse_moe_sum_add(hidden_states, shared_output, defer_shared)
+        )
+        if fuse_shared_add:
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
+                shared_output=shared_output,
+            )
+        elif pre_quant_input is not None:
             final_hidden_states = self.experts(
                 hidden_states,
                 topk_output,
@@ -1306,7 +1318,7 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
             final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
+            None if (self._shared_expert_tp1 or fuse_shared_add) else shared_output,
             self.routed_scaling_factor,
         )
 
@@ -1672,6 +1684,42 @@ class DeepseekV2MoE(nn.Module):
         else:
             return None
 
+    def _can_fuse_moe_sum_add(
+        self,
+        hidden_states: torch.Tensor,
+        shared_output: torch.Tensor,
+        defer_shared: bool,
+    ) -> bool:
+        if not envs.MX_FUSE_MOE_SUM_ADD.get() or defer_shared:
+            return False
+        if self._enable_a2a_moe or self._fuse_shared_experts_inside_sbo:
+            return False
+        if self.num_fused_shared_experts != 0 or self._shared_expert_tp1:
+            return False
+        runner_config = self.experts.moe_runner_config
+        if (
+            runner_config.no_combine
+            or self.experts.top_k <= 1
+            or runner_config.apply_router_weight_on_input
+        ):
+            return False
+        if self.experts.should_fuse_routed_scaling_factor_in_topk:
+            return False
+        if get_exec().moe.enable_fused_moe_sum_all_reduce:
+            return False
+        if is_in_tc_piecewise_cuda_graph():
+            return False
+        runner = getattr(self.experts, "runner", None)
+        if runner is None or not runner.runner_backend.is_triton():
+            return False
+        return (
+            hidden_states.dtype == torch.bfloat16
+            and shared_output.dtype == torch.bfloat16
+            and hidden_states.shape == shared_output.shape
+            and hidden_states.is_contiguous()
+            and shared_output.is_contiguous()
+        )
+
     def _moe_quant_once_enabled(self) -> bool:
         """SGLANG_OPT_MOE_QUANT_ONCE: quantize the (dp-gathered) MoE input to
         per-token-group-128 fp8 once per layer and feed both the fused shared
@@ -1689,6 +1737,37 @@ class DeepseekV2MoE(nn.Module):
                     self.layer_id,
                 )
         return self._moe_quant_once
+
+    def _moe_int8_quant_once_enabled(self) -> bool:
+        """MX_ENABLE_MOE_INT8_QUANT_ONCE: quantize dynamic W8A8-Int8 input once."""
+        if self._moe_int8_quant_once is None:
+            from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
+            from sglang.srt.layers.quantization.w8a8_int8 import (
+                W8A8Int8LinearMethod,
+                W8A8Int8MoEMethod,
+            )
+
+            experts = self.experts
+            runner = getattr(experts, "runner", None)
+            gate_up = self.shared_experts.gate_up_proj
+            self._moe_int8_quant_once = (
+                not self._enable_a2a_moe
+                and not self._fuse_shared_experts_inside_sbo
+                and self.num_fused_shared_experts == 0
+                and hasattr(self, "shared_experts")
+                and self.shared_experts_is_int8
+                and isinstance(gate_up.quant_method, W8A8Int8LinearMethod)
+                and isinstance(experts, FusedMoE)
+                and isinstance(experts.quant_method, W8A8Int8MoEMethod)
+                and runner is not None
+                and runner.runner_backend.is_triton()
+                and runner.fused_func is not None
+                and not runner.lora_enabled
+                and isinstance(experts.dispatcher, StandardDispatcher)
+                and not experts.moe_runner_config.apply_router_weight_on_input
+                and experts.w13_input_scale is None
+            )
+        return self._moe_int8_quant_once
 
     def _compute_moe_quant_once_enabled(self) -> Tuple[bool, str]:
         """Returns (eligible, reason); reason names the first failing check."""
@@ -1764,6 +1843,15 @@ class DeepseekV2MoE(nn.Module):
         and the routed dispatch, or return None when ineligible."""
         if hidden_states.shape[0] == 0 or hidden_states.dtype != torch.bfloat16:
             return None
+        if envs.MX_ENABLE_MOE_INT8_QUANT_ONCE.get():
+            if self._moe_int8_quant_once_enabled():
+                if is_in_tc_piecewise_cuda_graph():
+                    return None
+                from sglang.kernels.ops.quantization.int8_kernel import (
+                    per_token_quant_int8,
+                )
+
+                return per_token_quant_int8(hidden_states)
         if not self._moe_quant_once_enabled():
             return None
         if is_in_tc_piecewise_cuda_graph():

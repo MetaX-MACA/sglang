@@ -14,6 +14,7 @@ from sglang.srt.environ import envs
 
 import torch
 import torch.nn.functional as F
+import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -337,12 +338,57 @@ def fused_experts(
     w13_scale_t: Optional[torch.Tensor] = None,
     w2_scale_b: Optional[torch.Tensor] = None,
     w2_scale_t: Optional[torch.Tensor] = None,
+    shared_output: Optional[torch.Tensor] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
     )
+    if shared_output is not None:
+        assert not moe_runner_config.no_combine
+        return fused_experts_impl(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            b1,
+            b2,
+            inplace=False,
+            activation=moe_runner_config.activation,
+            is_gated=moe_runner_config.is_gated,
+            apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a8=use_int4_w4a8,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_zp=w1_zp,
+            w2_zp=w2_zp,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_shape=block_shape,
+            no_combine=False,
+            routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+            gemm1_alpha=moe_runner_config.gemm1_alpha,
+            gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+            filter_expert=filter_expert,
+            swiglu_limit=moe_runner_config.swiglu_limit,
+            gate_up_interleaved=moe_runner_config.gate_up_interleaved,
+            a1_q=a1_q,
+            fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            is_fp4_experts=is_fp4_experts,
+            use_fp4_w4a8=use_fp4_w4a8,
+            w13_scale_b=w13_scale_b,
+            w13_scale_t=w13_scale_t,
+            w2_scale_b=w2_scale_b,
+            w2_scale_t=w2_scale_t,
+            shared_output=shared_output,
+        )
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         inplace_fused_experts(
@@ -432,6 +478,63 @@ def fused_experts(
 def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     torch.sum(x, dim=1, out=out)
     out.mul_(routed_scaling_factor)
+
+
+@triton.jit
+def _moe_sum_reduce_add_kernel(
+    x_ptr,
+    shared_ptr,
+    out_ptr,
+    scale,
+    hidden_size,
+    K: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    token = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = cols < hidden_size
+    acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    for expert in tl.static_range(K):
+        acc += tl.load(
+            x_ptr + (token * K + expert) * hidden_size + cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+    shared = tl.load(shared_ptr + token * hidden_size + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    result = acc * scale + shared
+    tl.store(
+        out_ptr + token * hidden_size + cols,
+        result.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def _moe_sum_reduce_add(
+    x: torch.Tensor,
+    shared_output: torch.Tensor,
+    out: torch.Tensor,
+    routed_scaling_factor: float,
+) -> None:
+    """Sum top-k expert outputs and add shared_output in one launch."""
+    assert x.ndim == 3
+    num_tokens, topk, hidden_size = x.shape
+    assert topk > 1
+    assert x.is_contiguous() and shared_output.is_contiguous() and out.is_contiguous()
+    assert shared_output.shape == out.shape == (num_tokens, hidden_size)
+    assert x.dtype == shared_output.dtype == out.dtype
+    block_h = min(4096, triton.next_power_of_2(hidden_size))
+    _moe_sum_reduce_add_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
+        x,
+        shared_output,
+        out,
+        routed_scaling_factor,
+        hidden_size,
+        K=topk,
+        BLOCK_H=block_h,
+        num_warps=8,
+    )
 
 
 @torch.compile
@@ -586,6 +689,7 @@ def _fused_moe_kernel_sequence(
     w13_scale_t: Optional[torch.Tensor] = None,
     w2_scale_b: Optional[torch.Tensor] = None,
     w2_scale_t: Optional[torch.Tensor] = None,
+    shared_output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -617,15 +721,26 @@ def _fused_moe_kernel_sequence(
         down_moe_use_tma = False
 
     if a1_q is not None:
-        assert (
-            use_fp8_w8a8
-            and block_shape is not None
-            and a1_scale is not None
-            and a1_q.dtype == torch.float8_e4m3fn
-            and a1_q.is_contiguous()
-            and a1_q.shape[0] >= num_tokens
-            and a1_q.shape[1] == hidden_states.shape[1]
-        ), "a1_q requires block-wise fp8 with matching pre-quantized activation"
+        if use_fp8_w8a8:
+            assert (
+                block_shape is not None
+                and a1_scale is not None
+                and a1_q.dtype == torch.float8_e4m3fn
+                and a1_q.is_contiguous()
+                and a1_q.shape[0] >= num_tokens
+                and a1_q.shape[1] == hidden_states.shape[1]
+            ), "a1_q requires block-wise fp8 with matching pre-quantized activation"
+        else:
+            assert (
+                use_int8_w8a8
+                and block_shape is None
+                and per_channel_quant
+                and a1_scale is not None
+                and a1_q.dtype == torch.int8
+                and a1_q.is_contiguous()
+                and a1_q.shape == hidden_states.shape
+                and a1_scale.shape == (num_tokens, 1)
+            ), "a1_q requires dynamic per-token int8 with matching scales"
 
     padded_tokens = (
         min(num_tokens * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
@@ -634,6 +749,12 @@ def _fused_moe_kernel_sequence(
     )
     total_tokens = num_tokens * topk + padded_tokens
 
+    use_shared_add_reduce = shared_output is not None and not no_combine and topk > 1
+    if use_shared_add_reduce:
+        assert shared_output.shape == hidden_states.shape
+        assert shared_output.dtype == hidden_states.dtype
+        assert shared_output.is_contiguous()
+
     if no_combine:
         assert not inplace
         out_hidden_states = torch.empty(
@@ -641,6 +762,8 @@ def _fused_moe_kernel_sequence(
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
+    elif use_shared_add_reduce:
+        out_hidden_states = shared_output
     elif inplace:
         out_hidden_states = hidden_states
     else:
@@ -1131,6 +1254,13 @@ def _fused_moe_kernel_sequence(
 
     if no_combine:
         pass
+    elif use_shared_add_reduce:
+        _moe_sum_reduce_add(
+            intermediate_cache3,
+            shared_output,
+            out_hidden_states,
+            routed_scaling_factor,
+        )
     elif _is_cuda or _is_musa:
         if use_fused_moe_sum_all_reduce:
             if routed_scaling_factor != 1.0:
@@ -1255,6 +1385,7 @@ def fused_experts_impl(
     w13_scale_t: Optional[torch.Tensor] = None,
     w2_scale_b: Optional[torch.Tensor] = None,
     w2_scale_t: Optional[torch.Tensor] = None,
+    shared_output: Optional[torch.Tensor] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1339,6 +1470,7 @@ def fused_experts_impl(
         w13_scale_t=w13_scale_t,
         w2_scale_b=w2_scale_b,
         w2_scale_t=w2_scale_t,
+        shared_output=shared_output,
     )
 
 
