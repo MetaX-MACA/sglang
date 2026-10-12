@@ -71,7 +71,7 @@ struct StoreTrait {
 };
 
 template <typename Trait, typename T>
-__global__ void store_kv_index_kernel(const __grid_constant__ StoreKVIndexParams params) {
+__global__ void store_kv_index_kernel(const StoreKVIndexParams params) {
   Trait::template forward<T>(params);
 }
 
