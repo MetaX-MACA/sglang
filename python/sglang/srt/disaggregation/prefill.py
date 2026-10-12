@@ -808,8 +808,17 @@ class SchedulerDisaggregationPrefillMixin:
 
         if self.spec_algorithm.carries_draft_hidden_states():
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
-            # worker, so a single accessor covers both shapes.
-            draft_runner = self.draft_worker.draft_worker.draft_runner
+            # worker, so a single accessor covers both shapes. Resolve it in a
+            # layout-agnostic way: V1 nested it at draft_worker.draft_worker.
+            # draft_runner; the V2 worker keeps the alias on itself
+            # (EAGLEWorkerV2.draft_runner) or on the draft TpModelWorker as
+            # .model_runner. Fall back across all of them.
+            dw, dwn = self.draft_worker, getattr(self.draft_worker, "draft_worker", None)
+            draft_runner = getattr(dw, "draft_runner", None) or (
+                (getattr(dwn, "draft_runner", None) if dwn is not None else None)
+                or (getattr(dw, "model_runner", None))
+                or (getattr(dwn, "model_runner", None) if dwn is not None else None)
+            )
             disagg_hidden_size, disagg_hidden_states_dtype = (
                 get_draft_recurrent_hidden_state_spec(draft_runner)
             )
