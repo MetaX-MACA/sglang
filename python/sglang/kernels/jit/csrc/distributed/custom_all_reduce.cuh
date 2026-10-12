@@ -134,7 +134,7 @@ struct MultiCastImpl {
 #define ALL_REDUCE_KERNEL __global__ __launch_bounds__(1024, 1)
 
 template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
-ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllReducePushParams<kWorldSize> params) {
+ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const   AllReducePushParams<kWorldSize> params) {
   using namespace device;
   constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
   using vec_t = AlignedVector<packed_t<T>, kVecSize>;
@@ -209,7 +209,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
 }
 
 template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
-ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const __grid_constant__ AllReducePullParams<kWorldSize> params) {
+ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const   AllReducePullParams<kWorldSize> params) {
   using namespace device;
   constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
   using vec_t = AlignedVector<packed_t<T>, kVecSize>;
@@ -238,7 +238,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const __grid_constant__ AllR
 }
 
 template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
-ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllReducePullParams<kWorldSize> params) {
+ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const   AllReducePullParams<kWorldSize> params) {
   using namespace device;
   constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
   using vec_t = AlignedVector<packed_t<T>, kVecSize>;

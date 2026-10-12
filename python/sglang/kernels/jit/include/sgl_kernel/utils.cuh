@@ -128,7 +128,7 @@ namespace device {
 // Architecture detection: SGL_CUDA_ARCH is injected by load_jit() and is
 // available in both host and device compilation passes, whereas __CUDA_ARCH__
 // is only defined by nvcc during the device pass.
-#if !defined(USE_ROCM)
+#if !defined(USE_ROCM) && !defined(__MACACC__)
 #if !defined(SGL_CUDA_ARCH)
 #error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
 #endif
@@ -161,7 +161,7 @@ inline constexpr uint32_t kWarpSize = kWarpThreads;
  *
  * \note Equals the true in-warp lane only when `blockDim.x` is a multiple of
  * `kNumThreads`; every caller in this tree satisfies that.
- * \note On CUDA prefer this over `threadIdx.x % kNumThreads` when the value
+ * \note On NVIDIA CUDA prefer this over `threadIdx.x % kNumThreads` when the value
  * feeds an address: `%laneid` is one register read that folds straight into
  * `IMAD.WIDE`, while the modulo makes ptxas re-derive the mask at every address
  * scale. Worth 8 instructions in a two-tile warp copy, measured on sm_100a.
@@ -172,10 +172,15 @@ template <uint32_t kNumThreads = kWarpThreads>
 SGL_DEVICE uint32_t get_lane_id() {
 #ifndef USE_ROCM
   static_assert(kNumThreads <= 32 && host::is_pow2(kNumThreads));
+#ifdef __MACACC__
+  // MetaX cu-bridge does not support the PTX lane-id register instruction.
+  return threadIdx.x % kNumThreads;
+#else
   uint32_t lane_id;
   asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
   if constexpr (kNumThreads != 32) lane_id %= kNumThreads;
   return lane_id;
+#endif
 #else
   static_assert(kNumThreads <= 64 && host::is_pow2(kNumThreads));
   // AMD has no lane-id register: `__lane_id()` is computed from the exec mask as

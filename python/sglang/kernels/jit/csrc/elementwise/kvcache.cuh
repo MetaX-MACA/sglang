@@ -42,7 +42,7 @@ struct StoreKVCacheParams {
  * \tparam TLoc The data type of the indices (`int32_t` or `int64_t`).
  */
 template <int64_t kKBytes, int64_t kVBytes, uint32_t kNumThreads, bool kUsePDL, typename TLoc>
-__global__ void store_kvcache_kernel(const __grid_constant__ StoreKVCacheParams params) {
+__global__ void store_kvcache_kernel(const StoreKVCacheParams params) {
   using namespace device;
   static_assert(kNumThreads % kWarpThreads == 0, "TODO: support sub-warp copy for small items");
   constexpr uint32_t kNumSplit = kNumThreads / kWarpThreads;

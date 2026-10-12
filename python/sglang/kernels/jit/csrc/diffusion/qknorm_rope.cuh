@@ -215,7 +215,7 @@ template <
     bool kCacheHasFullWidth,
     typename IdType,
     bool kOutOfPlace = false>
-__global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPlace> __grid_constant__ params) {
+__global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPlace> params) {
   using namespace device;
   static_assert(!(kPackKV && kOutOfPlace), "KV packing and out-of-place output are exclusive");
 

@@ -22,7 +22,11 @@ from typing import List, Tuple
 import torch
 
 from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
-from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime
+from sglang.kernels.jit.utils.common import (
+    cache_once,
+    is_hip_runtime,
+    is_maca_runtime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +45,10 @@ def cuda_home() -> str:
     nvcc_path = shutil.which("nvcc")
     if nvcc_path is not None:
         return os.path.dirname(os.path.dirname(nvcc_path))
+    if is_maca_runtime():
+        return os.path.join(
+            os.environ.get("MACA_PATH", "/opt/maca"), "tools", "cu-bridge"
+        )
     return "/usr/local/cuda"
 
 
@@ -63,6 +71,29 @@ def rocm_home() -> str:
 
 
 @cache_once
+def maca_home() -> str:
+    """MACA install root.
+
+    cu-bridge exposes an nvcc-compatible compiler under
+    ``$MACA_PATH/tools/cu-bridge/bin`` while the runtime library lives under the
+    MACA root.
+    """
+    configured = os.environ.get("MACA_PATH")
+    if configured is not None:
+        return configured
+
+    compiler = pathlib.Path(device_compiler_path())
+    parents = compiler.parents
+    if (
+        len(parents) >= 4
+        and parents[1].name == "cu-bridge"
+        and parents[2].name == "tools"
+    ):
+        return str(parents[3])
+    return "/opt/maca"
+
+
+@cache_once
 def device_compiler_path() -> str:
     """The nvcc/hipcc that JIT builds actually invoke.
 
@@ -71,7 +102,10 @@ def device_compiler_path() -> str:
     """
     if is_hip_runtime():
         return os.path.join(rocm_home(), "bin", "hipcc")
-    return os.path.join(cuda_home(), "bin", "nvcc")
+    compiler = os.path.join(cuda_home(), "bin", "nvcc")
+    if is_maca_runtime() and not os.path.isfile(compiler):
+        return os.path.join(cuda_home(), "bin", "cucc")
+    return compiler
 
 
 @cache_once
@@ -172,6 +206,12 @@ def base_link_flags(*, with_device: bool) -> List[str]:
         return flags
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
+    if is_maca_runtime():
+        return flags + [
+            f"-L{maca_home()}/lib",
+            f"-L{maca_home()}/lib64",
+            "-lruntime_cu",
+        ]
     return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
 
 

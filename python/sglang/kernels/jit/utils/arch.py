@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
-import shutil
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -47,15 +45,9 @@ def _jit_cuda_version() -> tuple[int, ...]:
     (`CUDA_HOME` / `CUDA_PATH`, then `$PATH`, then `/usr/local/cuda`) and fall
     back to `torch.version.cuda` when it cannot be probed.
     """
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if cuda_home is None:
-        nvcc_path = shutil.which("nvcc")
-        cuda_home = (
-            os.path.dirname(os.path.dirname(nvcc_path))
-            if nvcc_path is not None
-            else "/usr/local/cuda"
-        )
-    nvcc = os.path.join(cuda_home, "bin", "nvcc")
+    from sglang.kernels.jit.utils.compile.toolchain import device_compiler_path
+
+    nvcc = device_compiler_path()
     try:
         output = subprocess.check_output([nvcc, "--version"], text=True)
         match = re.search(r"release (\d+)\.(\d+)", output)

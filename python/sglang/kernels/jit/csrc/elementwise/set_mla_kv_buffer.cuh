@@ -29,7 +29,7 @@ struct SetMlaKVBufferParams {
 };
 
 template <int64_t kNopeBytes, int64_t kRopeBytes, bool kUsePDL, typename TLoc>
-__global__ void set_mla_kv_buffer_kernel(const __grid_constant__ SetMlaKVBufferParams params) {
+__global__ void set_mla_kv_buffer_kernel(const SetMlaKVBufferParams params) {
   using namespace device;
   using enum warp::LoadStorePattern::type;
   const auto global_warp_id = threadIdx.y + blockIdx.x * blockDim.y;

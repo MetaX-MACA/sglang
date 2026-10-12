@@ -114,7 +114,7 @@ template <
     typename QDType,
     typename IdType,
     uint32_t kWorkThreads>
-__global__ void fused_rope_kernel(const __grid_constant__ FusedRopeParams params) {
+__global__ void fused_rope_kernel(const FusedRopeParams params) {
   using namespace device;
 
   constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(float);
@@ -174,7 +174,7 @@ template <
     typename QDType,
     typename IdType,
     uint32_t kWorkThreads>
-__global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStoreParams params) {
+__global__ void fused_rope_store_kernel(const FusedRopeStoreParams params) {
   using namespace device;
 
   constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(float);

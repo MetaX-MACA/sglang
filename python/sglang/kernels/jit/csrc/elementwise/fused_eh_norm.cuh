@@ -25,7 +25,7 @@ struct FusedEHNormParams {
 };
 
 template <int64_t kHidden, bool kUsePDL, typename T>
-__global__ void fused_eh_norm_kernel(const __grid_constant__ FusedEHNormParams params) {
+__global__ void fused_eh_norm_kernel(const   FusedEHNormParams params) {
   using namespace device;
   using Storage = norm::StorageType<T, kHidden>;
 

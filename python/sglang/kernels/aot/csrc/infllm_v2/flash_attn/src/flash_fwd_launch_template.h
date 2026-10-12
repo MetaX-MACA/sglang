@@ -13,7 +13,7 @@
 // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define ARCH_SUPPORTS_FLASH
-#define KERNEL_PARAM_MODIFIER __grid_constant__
+#define KERNEL_PARAM_MODIFIER
 #else
 #define KERNEL_PARAM_MODIFIER
 #endif

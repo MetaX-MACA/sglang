@@ -7,6 +7,8 @@ import os
 import pathlib
 from typing import Callable, Dict, List, Optional
 
+from sglang.kernels.jit.utils.common import is_maca_runtime
+
 
 def _find_package_root(package: str) -> Optional[pathlib.Path]:
     spec = importlib.util.find_spec(package)
@@ -49,6 +51,10 @@ def get_flashinfer_include_paths() -> List[str]:
 
     for path in candidates:
         if not path.exists():
+            # MetaX FlashInfer does not bundle spdlog. Its sampling headers
+            # compile without it; keep the core header directories mandatory.
+            if path == flashinfer_data / "spdlog" / "include" and is_maca_runtime():
+                continue
             raise RuntimeError(
                 f"Required header path {path} for flashinfer dependency not found."
                 " Please check your flashinfer installation."

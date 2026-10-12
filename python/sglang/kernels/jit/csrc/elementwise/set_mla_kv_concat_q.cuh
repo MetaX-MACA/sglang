@@ -44,7 +44,7 @@ struct SetMlaKVConcatQParams {
 };
 
 template <int64_t kNopeBytes, int64_t kRopeBytes, int kNumWarps, bool kUsePDL, typename TLoc>
-__global__ void set_mla_kv_concat_q_kernel(const __grid_constant__ SetMlaKVConcatQParams params) {
+__global__ void set_mla_kv_concat_q_kernel(const   SetMlaKVConcatQParams params) {
   using namespace device;
   static_assert((kNopeBytes + kRopeBytes) % 16 == 0, "TMA bulk store requires total row to be 16-byte aligned");
 
@@ -341,7 +341,7 @@ SGL_DEVICE uint2 bf16x8_to_fp8x8(const int4 v) {
 }
 
 template <int kNumWarps, bool kUsePDL, typename TLoc>
-__global__ void set_mla_kv_concat_q_fp8_kernel(const __grid_constant__ SetMlaKVConcatQFp8Params params) {
+__global__ void set_mla_kv_concat_q_fp8_kernel(const   SetMlaKVConcatQFp8Params params) {
   using namespace device;
 
   // Per-warp smem slots for the KV role (fp8 rows); concat warps leave

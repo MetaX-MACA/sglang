@@ -62,7 +62,7 @@ template <
     bool kFilterExpert,
     bool kRoundActivation = false,
     bool kReuseInput = false>
-__global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams params) {
+__global__ void act_and_mul_kernel(const  ActivationParams params) {
   using namespace device;
   constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
   using vec_t = AlignedVector<T, kMaxVecBytes / sizeof(T)>;
@@ -107,7 +107,7 @@ struct UnaryActivationParams {
 };
 
 template <typename T, ActivationKind kAct, bool kUsePDL>
-__global__ void act_kernel(const __grid_constant__ UnaryActivationParams params) {
+__global__ void act_kernel(const  UnaryActivationParams params) {
   using namespace device;
   constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
   using vec_t = AlignedVector<T, kMaxVecBytes / sizeof(T)>;

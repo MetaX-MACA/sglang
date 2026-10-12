@@ -22,12 +22,30 @@ else:
     if torch.version.cuda is not None:
         _preload_cuda_library()
 
+    # These operators are not built by the MACA AOT extension.
+    if "metax" not in torch.__version__:
+        from sgl_kernel.cutlass_moe import (
+            cutlass_w4a8_moe_mm,
+            get_cutlass_w4a8_moe_mm_data,
+        )
+        from sgl_kernel.elementwise import (
+            gemma_fused_add_rmsnorm,
+            gemma_rmsnorm,
+            rmsnorm,
+        )
+        from sgl_kernel.gemm import (
+            fp8_scaled_mm,
+            int8_scaled_mm,
+            sgl_per_token_group_quant_8bit,
+            sgl_per_token_group_quant_fp8,
+            sgl_per_token_group_quant_int8,
+            sgl_per_token_quant_fp8,
+        )
+        from sgl_kernel.infllm_v2 import infllmv2_attn_stage1, max_pooling_1d_varlen
+        from sgl_kernel.moe import fp8_blockwise_scaled_grouped_mm
+
     from sgl_kernel.allreduce import *
     from sgl_kernel.attention import merge_state_v2
-    from sgl_kernel.cutlass_moe import (
-        cutlass_w4a8_moe_mm,
-        get_cutlass_w4a8_moe_mm_data,
-    )
     from sgl_kernel.elementwise import (
         concat_mla_absorb_q,
         concat_mla_k,
@@ -38,9 +56,6 @@ else:
         fused_add_rmsnorm,
         gelu_and_mul,
         gelu_tanh_and_mul,
-        gemma_fused_add_rmsnorm,
-        gemma_rmsnorm,
-        rmsnorm,
         rotary_embedding,
         silu_and_mul,
     )
@@ -49,20 +64,8 @@ else:
         es_sm100_mxfp8_blockscaled_grouped_mm,
         es_sm100_mxfp8_blockscaled_grouped_quant,
     )
-    from sgl_kernel.gemm import (
-        fp8_scaled_mm,
-        int8_scaled_mm,
-        sgl_per_token_group_quant_8bit,
-        sgl_per_token_group_quant_fp8,
-        sgl_per_token_group_quant_int8,
-        sgl_per_token_quant_fp8,
-        shuffle_rows,
-    )
+    from sgl_kernel.gemm import shuffle_rows
     from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
-    from sgl_kernel.infllm_v2 import (
-        infllmv2_attn_stage1,
-        max_pooling_1d_varlen,
-    )
     from sgl_kernel.kvcacheio import (
         copy_all_layer_kv_cache_cpu,
         transfer_kv_all_layer,
@@ -80,7 +83,6 @@ else:
     from sgl_kernel.memory import weak_ref_tensor
     from sgl_kernel.moe import (
         apply_shuffle_mul_sum,
-        fp8_blockwise_scaled_grouped_mm,
         fused_qk_norm_rope,
         moe_align_block_size,
         moe_sum,

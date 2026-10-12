@@ -84,7 +84,7 @@ struct KernelTrait {
 
 template <typename Trait>
 __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel_qknorm_across_head(
-    const ParallelQKNormParams __grid_constant__ params, Counter* const __restrict__ counters) {
+    const ParallelQKNormParams params, Counter* const __restrict__ counters) {
   using namespace device;
 
   // each cta will handle exactly 1 token
