@@ -1488,6 +1488,7 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        shared_output: Optional[torch.Tensor] = None,
     ):
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
@@ -1517,11 +1518,17 @@ class FusedMoE(torch.nn.Module):
             else:
                 # Make sure there is torch lib op registration for the whole moe layer
                 return self.forward_impl(
-                    hidden_states, topk_output, pre_quant_input=pre_quant_input
+                    hidden_states,
+                    topk_output,
+                    pre_quant_input=pre_quant_input,
+                    shared_output=shared_output,
                 )
         else:
             return self.forward_impl(
-                hidden_states, topk_output, pre_quant_input=pre_quant_input
+                hidden_states,
+                topk_output,
+                pre_quant_input=pre_quant_input,
+                shared_output=shared_output,
             )
 
     def forward_impl(
@@ -1529,6 +1536,7 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        shared_output: Optional[torch.Tensor] = None,
     ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
@@ -1552,6 +1560,14 @@ class FusedMoE(torch.nn.Module):
             dispatch_output = dispatch_output._replace(
                 hidden_states_pre_quant=pre_quant_input
             )
+        if (
+            shared_output is not None
+            and dispatch_output.format.is_standard()
+            and dispatch_output.hidden_states_scale is None
+        ):
+            # MX_FUSE_MOE_SUM_ADD: standard dispatch is a pure passthrough, so
+            # the shared output remains token-aligned with routed hidden_states.
+            dispatch_output = dispatch_output._replace(shared_output=shared_output)
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,

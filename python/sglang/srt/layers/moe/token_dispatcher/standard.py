@@ -74,6 +74,8 @@ class StandardDispatchOutput(NamedTuple):
     # multiple of 4). Consumed by the standard->triton fused runner so it can
     # skip its own activation quant; ``hidden_states`` itself stays bf16.
     hidden_states_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # MX_FUSE_MOE_SUM_ADD: shared-expert output fused into the top-k reduction.
+    shared_output: Optional[torch.Tensor] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
