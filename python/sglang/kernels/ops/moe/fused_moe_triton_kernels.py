@@ -831,6 +831,7 @@ def invoke_fused_moe_kernel(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int4_w4a8: bool,
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
@@ -901,12 +902,12 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
-    elif use_int8_w8a8:
+    elif use_int8_w8a8 or use_int4_w4a8:
         assert B_scale is not None
         if block_shape is None:
-            # activation channel-wise int8 quantization
+            # Per-token activation quantization with per-channel weight scales.
             assert per_channel_quant, (
-                "int8 quantization only supports channel-wise quantization except for block-wise quantization"
+                "INT8 activation quantization requires per-channel weight scales"
             )
             A, A_scale = per_token_quant_int8(A)
         else:

@@ -380,7 +380,17 @@ class DeepseekV2WeightLoaderMixin:
                             name = name.replace("weight_packed", "weight")
                         name = name.replace(weight_name, param_name)
                         if name not in params_dict:
-                            continue
+                            # W4A8 stores expert weights as ``*_packed`` while
+                            # MXFP4 stores expert scales as ``*_inv``. Resolve
+                            # both from the unchanged base name so the fallbacks
+                            # cannot accidentally form ``*_packed_inv``.
+                            for suffix in ("_packed", "_inv"):
+                                compatible_name = name + suffix
+                                if compatible_name in params_dict:
+                                    name = compatible_name
+                                    break
+                            else:
+                                continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(

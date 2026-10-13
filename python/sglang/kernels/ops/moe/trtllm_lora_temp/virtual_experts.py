@@ -876,6 +876,7 @@ def _merged_experts_fused_moe_lora_add_impl(
             False,
             False,
             False,
+            False,
             None,
             fuse_add_to_output=fuse_add_to_output,
             fuse_sum_all_reduce=fuse_sum_all_reduce,
