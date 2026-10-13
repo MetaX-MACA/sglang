@@ -715,6 +715,10 @@ class Envs:
     # Off falls back to the native sglang Triton kernels; requires a recent
     # mcoplib build.
     MX_USE_MCOPLIB_KDA = EnvBool(False)
+    # GLM5.3 prefill MoE: fuse top-k reduction with the shared-expert add.
+    MX_FUSE_MOE_SUM_ADD = EnvBool(False)
+    # GLM5.3 prefill MoE W8A8-Int8: quantize the shared/routed expert input once.
+    MX_ENABLE_MOE_INT8_QUANT_ONCE = EnvBool(False)
     # DSA sparse attention via mcoplib's tilelang_sparse_fwd instead of the
     # in-tree tilelang kernels (MACA).
     MX_ENABLE_MCOPLIB_TILELANG_DSA = EnvBool(False)

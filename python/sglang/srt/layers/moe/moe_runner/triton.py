@@ -34,6 +34,7 @@ class TritonRunnerInput(RunnerInput):
     sorted_token_ids: torch.Tensor
     expert_ids: torch.Tensor
     num_tokens_post_padded: torch.Tensor
+    shared_output: Optional[torch.Tensor] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -182,6 +183,7 @@ class TritonRunnerCore(MoeRunnerCore):
             w13_scale_t=quant_info.w13_scale_t,
             w2_scale_b=quant_info.w2_scale_b,
             w2_scale_t=quant_info.w2_scale_t,
+            shared_output=runner_input.shared_output,
         )
 
         return TritonRunnerOutput(hidden_states=out)
@@ -274,6 +276,7 @@ def fused_experts_none_to_triton(
             w13_scale_t=quant_info.w13_scale_t,
             w2_scale_b=quant_info.w2_scale_b,
             w2_scale_t=quant_info.w2_scale_t,
+            shared_output=dispatch_output.shared_output,
         )
 
     return StandardCombineInput(
@@ -337,6 +340,7 @@ def pre_permute_standard_to_triton(
         sorted_token_ids=sorted_token_ids,
         expert_ids=expert_ids,
         num_tokens_post_padded=num_tokens_post_padded,
+        shared_output=dispatch_output.shared_output,
     )
 
 
