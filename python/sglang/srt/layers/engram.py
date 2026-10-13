@@ -46,6 +46,10 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.deepseek_common.online_rotation import (
+    build_rotation,
+    get_online_rotation_module_config,
+)
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda, is_maca, load_library_fn
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
@@ -909,9 +913,14 @@ def engram_gate(
     k_weight: torch.Tensor,
     eps: float,
     clamp_value: float,
+    *,
+    gate_input: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
     followed by the shared value. Adds the gated value to every copy."""
+    query = x if gate_input is None else gate_input
+    if query.shape != x.shape or query.device != x.device:
+        raise ValueError("gate_input must have the same shape and device as x")
     if (
         _cuda_kernels(x)
         and x.ndim == 3
@@ -920,19 +929,23 @@ def engram_gate(
         and x.dtype in (torch.bfloat16, torch.float32)
         and q_weight.dtype in (torch.bfloat16, torch.float32)
         and k_weight.dtype in (torch.bfloat16, torch.float32)
-        and all(t.is_contiguous() for t in (x, kv, q_weight, k_weight))
+        and query.dtype in (torch.bfloat16, torch.float32)
+        and all(t.is_contiguous() for t in (x, kv, q_weight, k_weight, query))
     ):
-        return fused_engram_gate(x, kv, q_weight, k_weight, eps, clamp_value)
+        return fused_engram_gate(
+            x, kv, q_weight, k_weight, eps, clamp_value, gate_input=gate_input
+        )
     hc_mult, dim = x.shape[-2:]
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
     key = key.float().unflatten(-1, (hc_mult, dim))
     weight = q_weight.float() * k_weight.float()
     h = x.float()
+    q = query.float()
     # Normalized per (token, hc copy) over dim, not jointly over the copies.
-    rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(
+    rstd = torch.rsqrt(q.square().mean(-1) + eps) * torch.rsqrt(
         key.square().mean(-1) + eps
     )
-    dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
+    dot = (q * weight * key).sum(-1) * rstd * dim**-0.5
     # Signed square root before the sigmoid, matching the training kernel.
     gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(clamp_value).sqrt(), dot))
     return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
@@ -952,6 +965,24 @@ class Engram(nn.Module):
         self.eps = config.rms_norm_eps
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
+        rotation_name = (
+            add_prefix("global_rotation", prefix)
+            if prefix
+            else f"model.layers.{layer_id}.engram.global_rotation"
+        )
+        rotation_config = get_online_rotation_module_config(config, rotation_name)
+        self.global_rotation = None
+        if rotation_config is not None:
+            if int(rotation_config["hidden_size"]) != dim:
+                raise ValueError(f"{rotation_name}: hidden_size must equal {dim}")
+            if rotation_config.get("inverse") is not True:
+                raise ValueError(f"{rotation_name}: Engram requires inverse=true")
+            offline_fusions = config.online_rotation.get("offline_fusions", {})
+            if offline_fusions.get("engram_value") is not True:
+                raise ValueError(
+                    f"{rotation_name}: requires offline_fusions.engram_value=true"
+                )
+            self.global_rotation = build_rotation(rotation_config)
         use_int8 = (
             quant_config is not None
             and quant_config.get_name() == "w8a8_int8"
@@ -987,6 +1018,24 @@ class Engram(nn.Module):
             # empty M.
             return x
         kv, _ = self.wkv(emb.flatten(-2))
+        return self.apply_gate(x, kv)
+
+    def project(
+        self, hash_ids: torch.Tensor, *, cp_all_tokens: bool = False
+    ) -> torch.Tensor:
+        kv, _ = self.wkv(self.embed(hash_ids, cp_all_tokens=cp_all_tokens).flatten(-2))
+        return kv
+
+    def apply_gate(self, x: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        gate_input = (
+            self.global_rotation(x) if self.global_rotation is not None else None
+        )
         return engram_gate(
-            x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
+            x,
+            kv,
+            self.q_weight,
+            self.k_weight,
+            self.eps,
+            self.clamp_value,
+            gate_input=gate_input,
         )
