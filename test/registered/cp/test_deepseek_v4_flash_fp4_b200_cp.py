@@ -133,5 +133,48 @@ class TestDSV4FlashFP4B200Balanced_CP_NonDeepEP(
             kill_process_tree(cls.process.pid)
 
 
+# DSPARK draft is bundled with the -DSpark checkpoint.
+DSPARK_MODEL = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+
+
+class TestDSV4FlashFP4B200_CP_DSpark(
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
+    """DSPARK speculation with DeepSeek-V4 prefill CP."""
+
+    gsm8k_accuracy_thres = 0.90
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(DSPARK_MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--attn-cp-size",
+                "4",
+                "--speculative-algorithm",
+                "DSPARK",
+                "--enable-dsa-prefill-context-parallel",
+                "--dsa-prefill-cp-mode",
+                "round-robin-split",
+                "--moe-runner-backend",
+                "flashinfer_mxfp4",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+
 if __name__ == "__main__":
     unittest.main()
