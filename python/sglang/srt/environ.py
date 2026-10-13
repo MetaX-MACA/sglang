@@ -686,6 +686,9 @@ class Envs:
     # ===================================================================
     MX_ENABLE_WARMUP_OUTPUT = EnvBool(False)
     MX_DSV4_PAGED_MQA_LOGITS_BACKEND = EnvStr("maca_c")
+    MX_ENABLE_NSA_FP8_KV_STORE = EnvBool(False)
+    MX_ENABLE_NSA_FP8_KV_OPTIMIZED_QDQ = EnvBool(False)
+    MX_ENABLE_NSA_FP8_KV_UNIQUE_SLOTS = EnvBool(False)
     MX_ENABLE_FUSE_RMSNORM_QUANT = EnvBool(False)
     # GLM5.3 prefill-side variant of MX_ENABLE_FUSE_RMSNORM_QUANT: enables the
     # fused-quant input RMSNorm on the prefill server only (post-attention

@@ -217,6 +217,8 @@ def dequantize_k_cache_paged(
         dtype=torch.bfloat16,
         device=quant_k_cache.device,
     )
+    if num_tokens == 0:
+        return output
 
     # cdiv(512 + 64, 128) = 5
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)

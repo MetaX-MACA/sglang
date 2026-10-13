@@ -98,6 +98,11 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
+if envs.MX_ENABLE_NSA_FP8_KV_OPTIMIZED_QDQ.get():
+    from sglang.kernels.ops.attention.dsa.quant_k_cache_optimized import (
+        quantize_k_cache_separate_optimized as quantize_k_cache_separate,
+    )
+
 logger = logging.getLogger(__name__)
 
 # Debug-only invariant in the Mamba slot-donation path calls tensor.item(), which
