@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -186,12 +186,14 @@ def dequantize_k_cache_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     group_size: int = QUANT_GROUP_SIZE,
+    row_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     De-quantize the k-cache with paged layout
     Args:
         quant_k_cache: [total_num_tokens, 1, dim_quant] or [num_blocks, block_size, 1, dim_quant], the quantized k-cache in paged layout
         page_table_1_flattened: [num_tokens], the flattened page_table_1 with the page indices in each requests concatenated together
+        row_mask: optional [num_tokens] int8; rows with 0 are skipped and left uninitialized
     Returns:
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
@@ -240,6 +242,7 @@ def dequantize_k_cache_paged(
         input_nope_s,
         input_rope,
         page_table_1_flattened,
+        row_mask,
         output.stride(0),
         input_nope_q.stride(0),
         input_nope_s.stride(0),
@@ -248,9 +251,64 @@ def dequantize_k_cache_paged(
         GROUP_SIZE=group_size,
         DIM_NOPE=dim_nope,
         DIM_ROPE=dim_rope,
+        HAS_ROW_MASK=row_mask is not None,
     )
 
     return output
+
+
+def mark_selected_kv_rows(
+    topk_indices: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    kv_token_capacity: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Flag the logical KV rows referenced by ragged top-k, without host sync.
+
+    Returns ``(row_mask, sanitized_topk)``: ``row_mask`` is [num_rows] int8 for
+    ``dequantize_k_cache_paged(..., row_mask=)``; ``sanitized_topk`` matches
+    ``topk_indices`` with every entry that has no valid physical slot set to -1.
+    Invalid entries must be -1, not a zero row: a zero KV row still adds
+    exp(0) to the softmax denominator.
+    """
+    num_rows = page_table_1_flattened.shape[0]
+    flat_topk = topk_indices.contiguous().view(-1)
+    sanitized_topk = torch.empty_like(flat_topk)
+    row_mask = torch.zeros(num_rows, dtype=torch.int8, device=flat_topk.device)
+    num_indices = flat_topk.numel()
+    if num_indices > 0:
+        block = 1024
+        _mark_selected_kv_rows_kernel[(triton.cdiv(num_indices, block),)](
+            flat_topk,
+            sanitized_topk,
+            page_table_1_flattened,
+            row_mask,
+            num_indices,
+            num_rows,
+            kv_token_capacity,
+            BLOCK=block,
+        )
+    return row_mask, sanitized_topk.view_as(topk_indices)
+
+
+@triton.jit
+def _mark_selected_kv_rows_kernel(
+    topk_ptr,
+    out_topk_ptr,
+    page_table_ptr,
+    row_mask_ptr,
+    num_indices,
+    num_rows,
+    kv_token_capacity,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    in_range = offs < num_indices
+    idx = tl.load(topk_ptr + offs, mask=in_range, other=-1)
+    ok = in_range & (idx >= 0) & (idx < num_rows)
+    phys = tl.load(page_table_ptr + idx, mask=ok, other=-1)
+    ok = ok & (phys >= 0) & (phys < kv_token_capacity)
+    tl.store(row_mask_ptr + idx, 1, mask=ok)
+    tl.store(out_topk_ptr + offs, tl.where(ok, idx, -1), mask=in_range)
 
 
 def dequantize_k_cache_paged_ref(
@@ -307,6 +365,7 @@ def _dequantize_k_cache_paged_kernel(
     input_nope_s_ptr,
     input_rope_ptr,
     page_table_1_ptr,
+    row_mask_ptr,
     output_stride_0: int,
     input_nope_q_stride_0: int,
     input_nope_s_stride_0: int,
@@ -315,8 +374,12 @@ def _dequantize_k_cache_paged_kernel(
     GROUP_SIZE: tl.constexpr,
     DIM_NOPE: tl.constexpr,
     DIM_ROPE: tl.constexpr,
+    HAS_ROW_MASK: tl.constexpr,
 ):
     token_id = tl.program_id(0).to(tl.int64)
+    if HAS_ROW_MASK:
+        if tl.load(row_mask_ptr + token_id) == 0:
+            return
     token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int64)
     raw_block_id = tl.program_id(1)
 
