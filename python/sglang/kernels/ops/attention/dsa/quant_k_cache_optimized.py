@@ -479,6 +479,7 @@ def dequantize_k_cache_paged_optimized(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     group_size: int = 128,
+    row_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather and dequantize a paged FP8 K cache with one program per token."""
     dim_quant = quant_k_cache.shape[-1]
@@ -522,6 +523,7 @@ def dequantize_k_cache_paged_optimized(
         input_nope_s,
         input_rope,
         page_table_1_flattened,
+        row_mask,
         OUTPUT_STRIDE=output.stride(0),
         INPUT_NOPE_Q_STRIDE=input_nope_q_stride,
         INPUT_NOPE_S_STRIDE=input_nope_s.stride(0),
@@ -531,6 +533,7 @@ def dequantize_k_cache_paged_optimized(
         DIM_ROPE=DIM_ROPE,
         USE_INT64_INPUT_INDEX=use_int64_input_index,
         USE_INT64_OUTPUT_INDEX=use_int64_output_index,
+        HAS_ROW_MASK=row_mask is not None,
         num_warps=1,
         num_stages=1,
     )
@@ -544,6 +547,7 @@ def _dequantize_k_cache_paged_optimized_kernel(
     input_nope_s_ptr,
     input_rope_ptr,
     page_table_1_ptr,
+    row_mask_ptr,
     OUTPUT_STRIDE: tl.constexpr,
     INPUT_NOPE_Q_STRIDE: tl.constexpr,
     INPUT_NOPE_S_STRIDE: tl.constexpr,
@@ -553,8 +557,12 @@ def _dequantize_k_cache_paged_optimized_kernel(
     DIM_ROPE: tl.constexpr,
     USE_INT64_INPUT_INDEX: tl.constexpr,
     USE_INT64_OUTPUT_INDEX: tl.constexpr,
+    HAS_ROW_MASK: tl.constexpr,
 ):
     token_id = tl.program_id(0)
+    if HAS_ROW_MASK:
+        if tl.load(row_mask_ptr + token_id) == 0:
+            return
     paged_token_id = tl.load(page_table_1_ptr + token_id)
     paged_token_id = (
         paged_token_id.to(tl.int64)
