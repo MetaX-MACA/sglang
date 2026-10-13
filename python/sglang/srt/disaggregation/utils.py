@@ -173,12 +173,19 @@ def unified_memory_disagg_move_gate(scheduler):
 
 
 def should_bypass_dsa_cp_prefix_cache() -> bool:
-    """Bypass prefix cache under DSA Prefill CP until CP-aware radix resharding
-    exists; without it, cache hits let attention read non-local page rows."""
+    """Bypass prefix cache on a DSA Prefill CP PD prefill worker only when a CP
+    rank holds a partial KV cache (CP-v2 local shards or layer-split cache):
+    there a cache hit would read non-local page rows. The default DSA CP path
+    all-gathers the full KV / indexer keys on every rank before writing the
+    cache (materialize_full_kv_cp), so prefix hits stay local and the radix
+    cache can remain enabled."""
+    from sglang.srt.layers.cp.utils import enable_cp_v2
+
     return (
         get_disagg().disaggregation_mode == DisaggregationMode.PREFILL.value
         and get_parallel().attn_cp_size > 1
         and get_parallel().enable_dsa_prefill_context_parallel
+        and (enable_cp_v2() or get_parallel().enable_dsa_cache_layer_split)
     )
 
 
