@@ -3289,12 +3289,22 @@ class DeepseekV2Model(nn.Module):
 
         if self.pp_group.is_last_rank and use_cp_v1:
             # allgather + rerrange
+            stream = torch.cuda.current_stream()
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
-                torch.cuda.current_stream(),
+                stream,
             )
+            # Gather DSpark aux tensors on the same CP token split.
+            if capture_dspark:
+                dspark_aux_hidden_states = [
+                    cp_all_gather_rerange_output(
+                        aux, self.cp_size, forward_batch, stream
+                    )
+                    for aux in dspark_aux_hidden_states
+                ]
+
         if capture_dspark:
             return hidden_states, dspark_aux_hidden_states
         if len(aux_hidden_states) == 0:

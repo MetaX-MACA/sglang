@@ -124,7 +124,11 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._draft_is_moe = draft_is_deepseek_v4()
         self._draft_dp_context_enabled = (
-            get_parallel().enable_dp_attention and not self._draft_is_moe
+                not self._draft_is_moe
+                and (
+                        server_args.enable_dp_attention
+                        or ps.attn_cp_size > 1
+                )
         )
         self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
