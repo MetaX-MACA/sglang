@@ -404,6 +404,21 @@ class EagerRunner(BaseRunner):
                 forward_batch,
                 **model_kwargs,
             )
+
+        if not model.pp_group.is_last_rank:
+            # DSpark context is accumulated across PP stages in full token
+            # order, matching the final stage's gathered auxiliary features.
+            # Keep the backbone hidden states/residual CP-sharded for the next
+            # stage; only the DSpark side channel needs gathering here.
+            aux = hidden_states.tensors.get("dspark_hidden_states")
+            if aux is not None and aux.shape[-1] > 0:
+                hidden_states.tensors["dspark_hidden_states"] = (
+                    cp_gather_after_forward(
+                        aux, forward_batch, torch.cuda.current_stream()
+                    )
+                )
+            return hidden_states
+
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None
         if capture_aux_hidden_states:
