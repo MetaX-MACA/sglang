@@ -93,6 +93,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
     cpu_has_amx_support,
+    envs,
     get_bool_env_var,
     get_compiler_backend,
     is_cpu,
@@ -102,6 +103,7 @@ from sglang.srt.utils import (
     is_xpu,
     make_layers,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import align_packed_tensor_size
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -566,7 +568,7 @@ class MiniMaxM2MoE(nn.Module):
         )
 
         self.layer_id = layer_id
-        self.use_fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
+        self.use_fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
 
         if get_moe_a2a_backend().is_deepep():
             self.ep_size = get_parallel().moe_ep_size
@@ -1021,10 +1023,8 @@ class MiniMaxM2DecoderLayer(nn.Module):
         )
 
         packed_quant = True
-        fused_quant = get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
-        fused_quant_pd = fused_quant or get_bool_env_var(
-            "FUSED_RMSNORM_QUANT_PREFILL", default="false"
-        )
+        fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
+        fused_quant_pd = fused_quant or envs.MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL.get()
 
         self.input_layernorm = RMSNorm(
             config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6),
