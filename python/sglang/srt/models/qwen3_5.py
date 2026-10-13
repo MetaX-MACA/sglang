@@ -411,7 +411,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         )
 
-        # Decode-only Qwen3.6-27B TP2 specialization. The model owner binds all
+        # Decode-only Qwen3.6-27B TP2/TP4 specialization. The model owner binds all
         # eligible layers to slices of one large allocation after construction;
         # using one allocation avoids per-layer large-block allocator rounding.
         self.register_buffer("_fused_in_proj_weight", None, persistent=False)
@@ -638,7 +638,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
     def _init_qwen36_tp2_fused_in_proj(self) -> None:
-        """Enable the shape-specialized decode path when it is supported."""
+        """Enable the shape-specialized decode path when it is supported.
+
+        Keep the legacy TP2 environment names for both TP2 and TP4.
+        """
         enabled = os.environ.get(
             "SGLANG_QWEN36_TP2_FUSED_IN_PROJ", "1"
         ).strip().lower() not in ("0", "false", "off", "no")
@@ -648,7 +651,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         try:
             decode_max_tokens = int(
                 os.environ.get(
-                    "SGLANG_QWEN36_TP2_FUSED_IN_PROJ_DECODE_MAX_TOKENS", "128"
+                    "SGLANG_QWEN36_TP2_FUSED_IN_PROJ_DECODE_MAX_TOKENS", "256"
                 )
             )
         except ValueError:
@@ -660,10 +663,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         qkvz = self.in_proj_qkvz
         ba = self.in_proj_ba
+        # Local (per-rank) reference shapes: TP2 -> (8192, 5120) / (48, 5120),
+        # TP4 -> (4096, 5120) / (24, 5120).
+        qkvz_rows = (2 * self.key_dim + 2 * self.value_dim) // self.attn_tp_size
+        ba_rows = (2 * self.num_v_heads) // self.attn_tp_size
         if not (
             _is_cuda
             and decode_max_tokens > 0
-            and self.attn_tp_size == 2
+            and self.attn_tp_size in (2, 4)
             and self.hidden_size == 5120
             and isinstance(qkvz.quant_method, UnquantizedLinearMethod)
             and isinstance(ba.quant_method, UnquantizedLinearMethod)
@@ -671,8 +678,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and ba.bias is None
             and qkvz.weight.dtype == torch.bfloat16
             and ba.weight.dtype == torch.bfloat16
-            and tuple(qkvz.weight.shape) == (8192, 5120)
-            and tuple(ba.weight.shape) == (48, 5120)
+            and tuple(qkvz.weight.shape) == (qkvz_rows, 5120)
+            and tuple(ba.weight.shape) == (ba_rows, 5120)
             and qkvz.weight.device == ba.weight.device
         ):
             return
