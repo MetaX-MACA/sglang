@@ -170,6 +170,7 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     exit_late_layer_dp,
     late_layer_dp_counts,
 )
+from sglang.srt.models.deepseek_common.online_rotation import check_online_rotation_weights
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
@@ -5595,6 +5596,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 + ", ".join(f"{k}={v}" for k, v in sorted(skipped_by_group.items())),
             )
         unloaded_params = params_dict.keys() - loaded_params
+        check_online_rotation_weights(self, loaded_params)
 
         skipped_checking_patterns = [
             "attn_mqa.k_scale",
