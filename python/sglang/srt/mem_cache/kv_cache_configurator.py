@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
+    glm5_next_config,
     hybrid_gdn_config,
     kimi_linear_config,
     mambaish_config,
@@ -1029,6 +1030,8 @@ class KVCacheConfigurator:
                 and (
                     self.hybrid_gdn_config is not None
                     or kimi_linear_config(self.model_config) is not None
+                    or glm5_next_config(self.model_config) is not None
+                    or kimi_linear_config(self.model_config) is not None
                 )
             ),
         )
@@ -1109,6 +1112,7 @@ class KVCacheConfigurator:
                 and (
                     self.hybrid_gdn_config is not None
                     or kimi_linear_config(self.model_config) is not None
+                    or glm5_next_config(self.model_config) is not None
                 )
             ),
         )
@@ -2306,6 +2310,7 @@ class KVCacheConfigurator:
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
             self.hybrid_gdn_config is not None
             or kimi_linear_config(self.model_config) is not None
+            or glm5_next_config(self.model_config) is not None
         )
         if replayssm_active:
             # GDN sizes the fold window to the draft maximum; the KDA ring
