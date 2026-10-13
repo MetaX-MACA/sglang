@@ -4241,6 +4241,18 @@ class DeepseekSparseAttnBackend(
                 tilelang_sparse_fwd as ops,
             )
 
+        # FP8 KV store on a TileLang build without native FP8 support (MACA):
+        # dequantize only the top-k selected rows, mirroring the flashmla_sparse
+        # decode branch. Off by default; requires MX_ENABLE_NSA_FP8_KV_STORE=1.
+        if (
+            kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            and envs.MX_ENABLE_NSA_FP8_KV_STORE.get()
+            and envs.MX_ENABLE_NSA_FP8_DEQUANT_TILELANG.get()
+        ):
+            kv_cache, page_table_1 = _dequantize_selected_kv_cache(
+                kv_cache, page_table_1
+            )
+
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
         # index_topk columns. TileLang processes indices in 64-column blocks,
         # so mask-pad the tail-extended table to the next complete block.
