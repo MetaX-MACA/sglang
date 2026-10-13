@@ -158,6 +158,23 @@ def _kda_projs_unquantized(quant_config, prefix: str) -> bool:
         return True
     names = [f"{prefix}.{n}" for n in _KDA_PROJ_NAMES]
     fused = quant_config.packed_modules_mapping
+    from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+
+    if isinstance(quant_config, W8A8Int8Config):
+        from sglang.srt.layers.quantization.compressed_tensors.utils import (
+            should_ignore_layer,
+        )
+
+        # W8A8Int8Config has no packed mapping for qkv_proj: check the BF16
+        # source projections (q/k/v unpacked) against the ignore list directly.
+        return all(
+            should_ignore_layer(
+                f"{prefix}.{n}", ignore=quant_config.ignore, fused_mapping=fused
+            )
+            for n in ("q_proj", "k_proj", "v_proj", "b_proj",
+                      "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj")
+        )
+
     if type(quant_config) is Fp8Config:
         return all(
             is_layer_skipped(n, quant_config.ignored_layers, fused_mapping=fused)
@@ -411,6 +428,7 @@ class Glm5NextLinearAttention(nn.Module):
         # Both fused projections shard on attention TP, including under DP
         # attention where the attention and global TP groups differ.
         # LoRA wraps the original projections, not these fused module types.
+        self._fused_qkvbfg_original_n = None
         self.do_fuse_qkvbfg = (
             envs.MX_ENABLE_KDA_PROJECTION_FUSION.get()
             and not (get_lora().enable_lora or get_lora().lora_paths)
@@ -425,10 +443,18 @@ class Glm5NextLinearAttention(nn.Module):
             ]
             self.fg_sizes = [self.head_dim, self.head_dim]
 
+            # Allocate the fused weight with N already padded to a multiple of 128:
+            # the extra rows are a never-loaded partition, zeroed after load and
+            # sliced off in forward, so no second copy of the weight is created.
+            local_n = sum(x // head_shard_size for x in self.qkvb_sizes) + sum(
+                self.fg_sizes
+            )
+            pad_n = (-local_n) % 128
+            self._fused_qkvbfg_original_n = local_n if pad_n else None
             self.fused_qkvbfg_a_proj = MergedColumnParallelRepeatedLinear(
                 self.hidden_size,
                 self.qkvb_sizes,
-                self.fg_sizes,
+                self.fg_sizes + ([pad_n] if pad_n else []),
                 # Eligibility is resolved using the original projection names.
                 quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
@@ -593,6 +619,11 @@ class Glm5NextLinearAttention(nn.Module):
             g_proj_states,
         )
 
+    def _zero_fused_qkvbfg_pad(self) -> None:
+        """Zero the never-loaded padding rows of the fused projection weight."""
+        if self.do_fuse_qkvbfg and self._fused_qkvbfg_original_n is not None:
+            self.fused_qkvbfg_a_proj.weight.data[self._fused_qkvbfg_original_n :].zero_()
+
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
@@ -601,6 +632,9 @@ class Glm5NextLinearAttention(nn.Module):
                 hidden_states, get_parallel().attn_cp_size
             )
         fused_states = self.fused_qkvbfg_a_proj(hidden_states)
+        if self._fused_qkvbfg_original_n is not None:
+            # View only: drop the zero-padded tail.
+            fused_states = fused_states[..., : self._fused_qkvbfg_original_n]
 
         qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
 
@@ -1943,6 +1977,18 @@ class Glm5NextForConditionalGeneration(nn.Module):
         if run_post:
             DeepseekV2WeightLoaderMixin.post_load_weights(
                 self, is_nextn=is_nextn, weight_names=weight_names
+            )
+
+        if envs.MX_ENABLE_KDA_PROJECTION_FUSION.get():
+            total = padded = 0
+            for layer in getattr(getattr(self, "model", None), "layers", ()):
+                module = getattr(layer, "self_attn", None)
+                if isinstance(module, Glm5NextLinearAttention):
+                    total += 1
+                    module._zero_fused_qkvbfg_pad()
+                    padded += module._fused_qkvbfg_original_n is not None
+            logger.info(
+                f"KDA fused projection N padding summary: total={total} padded={padded}"
             )
 
         missing = set(params_dict.keys()) - loaded_params
