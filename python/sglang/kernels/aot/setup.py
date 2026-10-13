@@ -15,15 +15,42 @@
 
 import os
 import platform
+import runpy
 import sys
 from pathlib import Path
 
-import torch
-import flashinfer
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+try:
+    import torch
+
+    torch_version = torch.__version__
+except ImportError:
+    torch_version = "unknown"
 
 root = Path(__file__).parent.resolve()
+version = runpy.run_path(str(root / "python/sgl_kernel/version.py"))["__version__"]
+platform_helpers = runpy.run_path(str(root / "python/sgl_kernel/platform.py"))
+is_maca = platform_helpers["is_maca"]
+use_mcoplib = platform_helpers["use_mcoplib"]
+version += f"+maca{os.environ.get('MACA_AI_VERSION', '0.0.0.0')}"
+version += f".torch{torch_version.split('+')[0]}"
+setup_kwargs = dict(
+    name="sglang-kernel",
+    version=version,
+    packages=find_packages(where="python"),
+    package_dir={"": "python"},
+)
+
+# mcoplib supplies the native operators; only install the Python wrappers.
+if use_mcoplib(is_maca(torch_version) or torch_version == "unknown"):
+    setup(**setup_kwargs)
+    sys.exit(0)
+
+import flashinfer
+import torch
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
 maca_path = Path(os.getenv("MACA_PATH", "/opt/maca")).resolve()
 flashinfer_path = Path(flashinfer.__file__).parent.resolve()
 
@@ -42,13 +69,6 @@ def _get_device_sm():
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
-
-
-def _get_version():
-    with open(root / "pyproject.toml") as f:
-        for line in f:
-            if line.startswith("version"):
-                return line.split("=")[1].strip().strip('"')
 
 
 operator_namespace = "sgl_kernel"
@@ -190,15 +210,8 @@ ext_modules = [
     ),
 ]
 
-version = _get_version()
-maca_ai_version = os.environ.get("MACA_AI_VERSION", "0.0.0.0")
-version += "+maca" + maca_ai_version
-
 setup(
-    name="sglang-kernel",
-    version=version,
-    packages=find_packages(where="python"),
-    package_dir={"": "python"},
+    **setup_kwargs,
     ext_modules=ext_modules,
     cmdclass={
         "build_ext": BuildExtension.with_options(use_ninja=True),

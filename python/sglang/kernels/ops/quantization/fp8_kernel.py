@@ -22,6 +22,7 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     ceil_align,
     get_bool_env_var,
@@ -99,7 +100,7 @@ logger = logging.getLogger(__name__)
 _mcoplib_loaded = False
 _mcoplib_per_token_cast_to_fp8 = None
 _mcoplib_per_token_group_quant_fp8 = None
-if _is_maca:
+if _is_maca and envs.SGLANG_USE_MCOPLIB.get():
     try:
         # Do not import mcoplib.sgl_kernel here: it registers the whole
         # sgl_kernel namespace and conflicts with SGLang's own AOT extension.

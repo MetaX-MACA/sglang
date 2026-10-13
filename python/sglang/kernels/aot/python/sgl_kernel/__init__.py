@@ -14,16 +14,25 @@ else:
         _load_architecture_specific_ops,
         _preload_cuda_library,
     )
+    from sgl_kernel.platform import is_maca, use_mcoplib
 
-    # Initialize the ops library based on current GPU
-    common_ops = _load_architecture_specific_ops()
+    _is_maca = is_maca()
 
-    # Preload the CUDA library to avoid the issue of libcudart.so.12 not found
+    # Preload the CUDA library to avoid the issue of libcudart.so.12 not found.
     if torch.version.cuda is not None:
         _preload_cuda_library()
 
+    # On MACA, mcoplib owns the sgl_kernel torch operator namespace.
+    # Loading local common_ops as well would register the same operators twice.
+    if use_mcoplib(_is_maca):
+        import mcoplib._C  # noqa: F401
+        import mcoplib.sgl_grouped_gemm_cuda  # noqa: F401
+        import mcoplib.sgl_kernel as common_ops
+    else:
+        common_ops = _load_architecture_specific_ops()
+
     # These operators are not built by the MACA AOT extension.
-    if "metax" not in torch.__version__:
+    if not _is_maca:
         from sgl_kernel.cutlass_moe import (
             cutlass_w4a8_moe_mm,
             get_cutlass_w4a8_moe_mm_data,
