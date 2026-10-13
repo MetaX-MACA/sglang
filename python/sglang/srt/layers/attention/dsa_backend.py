@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -109,6 +110,11 @@ from sglang.srt.utils import (
     print_warning_once,
 )
 
+if envs.MX_ENABLE_NSA_FP8_KV_OPTIMIZED_QDQ.get():
+    from sglang.kernels.ops.attention.dsa.quant_k_cache_optimized import (
+        dequantize_k_cache_paged_optimized as dequantize_k_cache_paged,
+    )
+
 logger = logging.getLogger(__name__)
 
 # Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
@@ -181,6 +187,98 @@ def _dequantize_selected_kv_cache(
         valid_mask, local_page_table, torch.full_like(local_page_table, -1)
     )
     return selected_kv_cache, local_page_table.view_as(page_table_1)
+
+
+@lru_cache(maxsize=None)
+def _support_fp8_mma(device_index: int = 0) -> bool:
+    major, minor = torch.cuda.get_device_capability(device_index)
+    arch = major * 10 + minor
+    if arch not in (80, 86, 89):
+        raise RuntimeError(
+            f"Unsupported GPU architecture: sm_{arch}, supported: sm_80, sm_86, sm_89"
+        )
+    return arch == 89
+
+
+def _remap_ragged_topk_to_unique_kv_slots(
+    page_table_1_flattened: torch.Tensor,
+    topk_indices: torch.Tensor,
+    kv_token_capacity: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Map ragged logical top-k indices to deduplicated physical KV slots."""
+    flat_topk_indices = topk_indices.reshape(-1)
+    local_page_table = torch.full_like(flat_topk_indices, -1)
+    if page_table_1_flattened.numel() == 0 or flat_topk_indices.numel() == 0:
+        return (
+            page_table_1_flattened.new_empty((0,)),
+            local_page_table.view_as(topk_indices),
+        )
+
+    logical_capacity = page_table_1_flattened.numel()
+    valid_logical_mask = (flat_topk_indices >= 0) & (
+        flat_topk_indices < logical_capacity
+    )
+    safe_logical_indices = torch.where(
+        valid_logical_mask,
+        flat_topk_indices,
+        torch.zeros_like(flat_topk_indices),
+    )
+    selected_physical_slots = page_table_1_flattened[safe_logical_indices]
+    valid_mask = (
+        valid_logical_mask
+        & (selected_physical_slots >= 0)
+        & (selected_physical_slots < kv_token_capacity)
+    )
+    # torch.unique has a dynamic output shape and stays on eager prefill.
+    unique_physical_slots, inverse_indices = torch.unique(
+        selected_physical_slots[valid_mask], sorted=True, return_inverse=True
+    )
+    local_page_table[valid_mask] = inverse_indices.to(local_page_table.dtype)
+    return unique_physical_slots.contiguous(), local_page_table.view_as(topk_indices)
+
+
+def _dequantize_selected_ragged_kv_cache(
+    kv_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    topk_indices: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize each physical KV slot selected by ragged top-k exactly once.
+
+    This stays on eager prefill because ``torch.unique`` has a data-dependent shape.
+    FlashMLA still needs one addressable KV row when every top-k entry is invalid.
+    """
+    kv_token_capacity = kv_cache.numel() // kv_cache.shape[-1]
+    unique_physical_slots, local_page_table = _remap_ragged_topk_to_unique_kv_slots(
+        page_table_1_flattened, topk_indices, kv_token_capacity
+    )
+    selected_kv_cache = dequantize_k_cache_paged(kv_cache, unique_physical_slots)
+    if selected_kv_cache.shape[0] == 0:
+        selected_kv_cache = selected_kv_cache.new_zeros(
+            (1, *selected_kv_cache.shape[1:])
+        )
+    return selected_kv_cache, local_page_table
+
+
+def _dequantize_selected_kv_cache_for_flashmla_kv(
+    kv_cache: torch.Tensor, page_table_1: torch.Tensor, page_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    selected_kv_cache, local_page_table = _dequantize_selected_kv_cache(
+        kv_cache, page_table_1
+    )
+    num_tokens = selected_kv_cache.shape[0]
+    padding = (-num_tokens) % page_size
+    if padding:
+        selected_kv_cache = torch.cat(
+            [
+                selected_kv_cache,
+                selected_kv_cache.new_zeros((padding, *selected_kv_cache.shape[1:])),
+            ],
+            dim=0,
+        )
+    return (
+        selected_kv_cache.view(-1, page_size, 1, selected_kv_cache.shape[-1]),
+        local_page_table,
+    )
 
 
 def materialize_full_kv_cp(
@@ -3208,9 +3306,14 @@ class DeepseekSparseAttnBackend(
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
-                    )
+                    if envs.MX_ENABLE_NSA_FP8_KV_UNIQUE_SLOTS.get():
+                        kv_cache, page_table_1 = _dequantize_selected_ragged_kv_cache(
+                            kv_cache, page_table_1_flattened, topk_indices
+                        )
+                    else:
+                        kv_cache = dequantize_k_cache_paged(
+                            kv_cache, page_table_1_flattened
+                        )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
@@ -3238,6 +3341,9 @@ class DeepseekSparseAttnBackend(
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             )
         elif dsa_impl == "flashmla_kv":
+            kv_cache, page_table_1, kv_cache_is_fp8 = self._prepare_flashmla_kv_cache(
+                kv_cache, page_table_1
+            )
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
@@ -3249,6 +3355,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                kv_cache_is_fp8=kv_cache_is_fp8,
             )
         elif dsa_impl == "fa3":
             fa3_page_table = page_table_1
@@ -3427,6 +3534,9 @@ class DeepseekSparseAttnBackend(
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             )
         elif dsa_impl == "flashmla_kv":
+            kv_cache, page_table_1, kv_cache_is_fp8 = self._prepare_flashmla_kv_cache(
+                kv_cache, page_table_1
+            )
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
@@ -3438,6 +3548,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                kv_cache_is_fp8=kv_cache_is_fp8,
             )
         elif dsa_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -3957,6 +4068,21 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
+    def _prepare_flashmla_kv_cache(
+        self, kv_cache: torch.Tensor, page_table_1: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+        kv_cache_is_fp8 = self.dsa_kv_cache_store_fp8
+        if (
+            kv_cache_is_fp8
+            and envs.MX_ENABLE_NSA_FP8_KV_STORE.get()
+            and not _support_fp8_mma(torch.cuda.current_device())
+        ):
+            kv_cache, page_table_1 = _dequantize_selected_kv_cache_for_flashmla_kv(
+                kv_cache, page_table_1, self.real_page_size
+            )
+            kv_cache_is_fp8 = False
+        return kv_cache, page_table_1, kv_cache_is_fp8
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -3966,6 +4092,7 @@ class DeepseekSparseAttnBackend(
         layer,
         metadata: DSAMetadata,
         page_table_1,
+        kv_cache_is_fp8: bool,
     ) -> torch.Tensor:
         from flash_mla import get_mla_metadata
 
@@ -3982,7 +4109,11 @@ class DeepseekSparseAttnBackend(
             self.dsa_kv_cache_is_quantized
             and envs.SGLANG_DSA_TRITON_FLASHMLA_KV.get()
         )
-        if self.dsa_kv_cache_store_fp8 and not use_functional_triton:
+        if (
+            kv_cache_is_fp8
+            and not use_functional_triton
+            and not _support_fp8_mma(torch.cuda.current_device())
+        ):
             # The xcore1600 FlashMLA FP8 KV sparse-decode path expects only the
             # absorbed NoPE query part (512 dims for DeepSeek V3.2), not q_nope
             # concatenated with the 64-dim RoPE query.
@@ -3998,7 +4129,7 @@ class DeepseekSparseAttnBackend(
         else:
             q_input = q_all
 
-        kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
+        kv_cache = kv_cache.view(-1, self.real_page_size, 1, kv_cache.shape[-1])
         assert self.real_page_size == 64, "only page size 64 is supported"
 
         # if not self.dsa_kv_cache_store_fp8:
@@ -4024,7 +4155,7 @@ class DeepseekSparseAttnBackend(
             "block_table": torch.empty(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
-            "is_fp8_kvcache": self.dsa_kv_cache_store_fp8,
+            "is_fp8_kvcache": kv_cache_is_fp8,
         }
         if flashmla_opt:
             flashmla_kwargs["indices_all_valid_per_q"] = (indices != -1).all(
@@ -4652,7 +4783,18 @@ class DeepseekSparseAttnBackend(
             # dispatch lives inside the RAGGED branch of forward_extend; without this the
             # transform is PAGED, the q8 path is skipped, and the bf16 kernel crashes on
             # fp8 KV ("kv must have dtype kBFloat16").
-            and forward_mode == ForwardMode.EXTEND
+            and (
+                forward_mode == ForwardMode.EXTEND
+                or (
+                    # Keep forced-FP8 bulk prefill dequantization proportional
+                    # to resident KV tokens instead of query_count * topk.
+                    envs.MX_ENABLE_NSA_FP8_KV_STORE.get()
+                    and self.dsa_kv_cache_store_fp8
+                    and self.dsa_prefill_impl == "flashmla_sparse"
+                    and forward_mode is not None
+                    and forward_mode.is_extend_without_speculative()
+                )
+            )
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
         else:

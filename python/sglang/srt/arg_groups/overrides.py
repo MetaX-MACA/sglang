@@ -1804,7 +1804,18 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         )
 
     kv_cache_dtype = view.kv_cache_dtype
-    if kv_cache_dtype == "auto":
+    if envs.MX_ENABLE_NSA_FP8_KV_STORE.get():
+        if kv_cache_dtype not in ("auto", "fp8_e4m3"):
+            logger.warning(
+                "MX_ENABLE_NSA_FP8_KV_STORE overrides --kv-cache-dtype to fp8_e4m3."
+            )
+        kv_cache_dtype = "fp8_e4m3"
+        logger.warning(
+            "MX_ENABLE_NSA_FP8_KV_STORE=1 forces FP8 KV cache storage; "
+            "backend selection is unchanged; FlashMLA KV uses native FP8 when "
+            "supported and dequantizes selected KV otherwise."
+        )
+    elif kv_cache_dtype == "auto":
         kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
         logger.warning(
             f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."
