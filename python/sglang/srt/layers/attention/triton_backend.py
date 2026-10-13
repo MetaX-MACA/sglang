@@ -230,6 +230,15 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
+        full_kv_pool = getattr(self.token_to_kv_pool, "full_kv_pool", None)
+        self.mla_kv_pool = (
+            full_kv_pool if full_kv_pool is not None else self.token_to_kv_pool
+        )
+        self.mla_kv_cache_store_int8 = self.use_mla and getattr(
+            self.mla_kv_pool,
+            "mla_kv_cache_store_int8",
+            False,
+        )
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_head = (
@@ -1336,6 +1345,32 @@ class TritonAttnBackend(AttentionBackend):
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
+    def _get_kv_buffers(
+        self,
+        layer: RadixAttention,
+        kv_indices: torch.Tensor,
+        kv_indptr: Optional[torch.Tensor] = None,
+    ):
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if not self.mla_kv_cache_store_int8:
+            return (
+                k_buffer,
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            )
+
+        from sglang.kernels.ops.kimi_k3.int8_kv_cache import (
+            dequantize_k_cache_paged_int8_to_workspace,
+        )
+
+        kv_buffer = self.mla_kv_pool.get_mla_int8_dequant_workspace()
+        dequantize_k_cache_paged_int8_to_workspace(
+            k_buffer,
+            kv_indices,
+            kv_buffer,
+            kv_indptr[-1:] if kv_indptr is not None else None,
+        )
+        return kv_buffer, kv_buffer[..., : layer.v_head_dim]
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1477,6 +1512,7 @@ class TritonAttnBackend(AttentionBackend):
             verify_fwd = None
         if (
             verify_fwd is not None
+            and not self.mla_kv_cache_store_int8
             and score_mod is None
             and forward_batch.forward_mode.is_target_verify()
             and verify_fwd(
@@ -1506,13 +1542,14 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
+        k_buffer, v_buffer = self._get_kv_buffers(layer, kv_indices, kv_indptr)
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            k_buffer,
+            v_buffer,
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
@@ -1994,10 +2031,11 @@ class TritonAttnBackend(AttentionBackend):
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
+        k_buffer, v_buffer = self._get_kv_buffers(layer, kv_indices, kv_indptr)
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            k_buffer,
+            v_buffer,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             kv_indptr,
             kv_indices,
