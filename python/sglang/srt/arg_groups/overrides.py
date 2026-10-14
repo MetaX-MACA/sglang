@@ -503,6 +503,16 @@ def _require_kimi_k3_cutedsl_dcp_support() -> None:
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
+    if cfg.kv_cache_dtype == "int8":
+        if cfg.dcp_size > 1:
+            raise ValueError("Kimi-K3 INT8 KV cache does not support DCP.")
+        if attention_backends_of(cfg) == (None, None):
+            logger.info("Kimi-K3 INT8 KV cache selects the Triton attention backend.")
+            return {
+                "prefill_attention_backend": "triton",
+                "decode_attention_backend": "triton",
+            }
+
     if cfg.dcp_size > 1:
         overrides = {}
         if cfg.enable_symm_mem:
@@ -2439,6 +2449,36 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
     handler: the TRT-LLM and tokenspeed MLA backends constrain the resolved
     kv-cache dtype (declarations never reach the field, so the checks read
     the view)."""
+    if (
+        view.kv_cache_dtype == "int8"
+        and model_config_of(view).hf_config.architectures[0]
+        == "KimiK3ForConditionalGeneration"
+    ):
+        prefill_backend, decode_backend = attention_backends_of(view)
+        supported_backends = {"triton"}
+        if (
+            prefill_backend not in supported_backends
+            or decode_backend not in supported_backends
+        ):
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache requires Triton for "
+                "both prefill and decode attention."
+            )
+        if view.dtype not in ("auto", "bfloat16", "bf16"):
+            raise ValueError("Kimi-K3 INT8 KV cache requires BF16 model inputs.")
+        if view.enable_deterministic_inference:
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache does not support deterministic attention."
+            )
+        if view.enable_unified_memory:
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache does not support --enable-unified-memory."
+            )
+        if view.enable_hierarchical_cache or view.enable_lmcache:
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache does not support host-tiered KV cache."
+            )
+
     if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"

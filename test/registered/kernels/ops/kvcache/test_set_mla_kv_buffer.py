@@ -4,6 +4,11 @@ import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
+from sglang.kernels.ops.kimi_k3.int8_kv_cache import (
+    dequantize_k_cache_paged_int8,
+    dequantize_k_cache_paged_int8_to_workspace,
+    quantize_k_cache_int8_separate,
+)
 from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
@@ -113,6 +118,60 @@ def test_set_mla_kv_buffer_uint8_byte_layout():
     _ref(kv_ref, loc, cache_k_nope, cache_k_rope)
 
     assert torch.equal(kv_buffer, kv_ref)
+
+
+def test_int8_mla_kv_cache_round_trip():
+    torch.manual_seed(0)
+    num_tokens = 7
+    k_nope = torch.randn((num_tokens, 1, 512), dtype=torch.bfloat16, device=DEVICE)
+    k_rope = torch.randn((num_tokens, 1, 64), dtype=torch.bfloat16, device=DEVICE)
+    nope_part, rope_part = quantize_k_cache_int8_separate(k_nope, k_rope)
+    kv_buffer = torch.zeros((32, 1, 656), dtype=torch.uint8, device=DEVICE)
+    loc = torch.tensor([2, 5, 8, 11, 14, 17, 20], device=DEVICE)
+    set_mla_kv_buffer_triton(kv_buffer, loc, nope_part, rope_part)
+
+    order = torch.tensor([3, 0, 6, 3], device=DEVICE)
+    actual = dequantize_k_cache_paged_int8(
+        kv_buffer.view(torch.int8), loc[order].to(torch.int32)
+    )
+    torch.testing.assert_close(actual[..., :512], k_nope[order], atol=0.03, rtol=0)
+    assert torch.equal(actual[..., 512:], k_rope[order])
+
+    padded_indices = torch.cat([loc[order], torch.tensor([30, 31], device=DEVICE)]).to(
+        torch.int32
+    )
+    num_valid = torch.tensor([order.numel()], dtype=torch.int32, device=DEVICE)
+    workspace = torch.full(
+        (32, 1, 576), float("nan"), dtype=torch.bfloat16, device=DEVICE
+    )
+    dequantize_k_cache_paged_int8_to_workspace(
+        kv_buffer.view(torch.int8), padded_indices, workspace, num_valid
+    )
+    actual = workspace[loc[order]]
+    torch.testing.assert_close(actual[..., :512], k_nope[order], atol=0.03, rtol=0)
+    assert torch.equal(actual[..., 512:], k_rope[order])
+    assert torch.isnan(workspace[30:]).all()
+
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dequantize_k_cache_paged_int8_to_workspace(
+            kv_buffer.view(torch.int8), padded_indices, workspace, num_valid
+        )
+
+    replay_order = torch.tensor([1, 5, 2], device=DEVICE)
+    padded_indices.fill_(31)
+    padded_indices[: replay_order.numel()].copy_(loc[replay_order].to(torch.int32))
+    num_valid.fill_(replay_order.numel())
+    workspace.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    actual = workspace[loc[replay_order]]
+    torch.testing.assert_close(
+        actual[..., :512], k_nope[replay_order], atol=0.03, rtol=0
+    )
+    assert torch.equal(actual[..., 512:], k_rope[replay_order])
+    assert torch.isnan(workspace[31]).all()
 
 
 @CUDA_TMA_ONLY
