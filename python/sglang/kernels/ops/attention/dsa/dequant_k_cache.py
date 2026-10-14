@@ -198,9 +198,13 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert dim_quant == PACKED_BYTES_PER_TOKEN, (
-        f"dim_quant: {dim_quant} != {PACKED_BYTES_PER_TOKEN} detected in "
-        "dequantize_k_cache_paged"
+    # 528-byte rows are NoPE MLA (rope dim 0, e.g. GLM-5.3); 656-byte rows
+    # carry 64 bf16 rope values. Derive the rope width from the row size.
+    _nope_scale_bytes = NOPE_DIM + NUM_QUANT_GROUPS * 4
+    dim_rope = (dim_quant - _nope_scale_bytes) // 2
+    assert dim_rope in (0, ROPE_DIM) and dim_quant == _nope_scale_bytes + dim_rope * 2, (
+        f"dim_quant: {dim_quant} (derived rope {dim_rope}) not a valid DSA "
+        "quantized row width"
     )
     assert group_size == QUANT_GROUP_SIZE
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
@@ -211,7 +215,6 @@ def dequantize_k_cache_paged(
     cache_format = get_kv_cache_format(quant_k_cache.dtype)
     assert cache_format in (DSAKVCacheFormat.FP8, DSAKVCacheFormat.INT8)
     dim_nope = NOPE_DIM
-    dim_rope = ROPE_DIM
     num_tiles = dim_nope // group_size  # 512 // 128 = 4
 
     output = torch.empty(
@@ -222,9 +225,9 @@ def dequantize_k_cache_paged(
     if num_tokens == 0:
         return output
 
-    # cdiv(512 + 64, 128) = 5
+    # cdiv(512 + 64, 128) = 5 with rope; cdiv(512, 128) = 4 for NoPE
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
-    assert num_blocks_per_token == 5
+    assert num_blocks_per_token in (4, 5)
 
     assert dim_nope % group_size == 0
 

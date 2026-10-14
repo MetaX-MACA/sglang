@@ -124,7 +124,15 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
 
     nope_q_view = nope_part_u8[:, :dim_nope].view(get_available_fp8_dtype())
     nope_s_view = nope_part_u8[:, dim_nope:].view(torch.float32)
-    rope_view = rope_part_u8.view(torch.bfloat16)
+    if rope_part_bytes > 0:
+        rope_view = rope_part_u8.view(torch.bfloat16)
+    else:
+        # NoPE: a fresh (N, 0) uint8 tensor has stride(0)=1, which torch
+        # refuses to view as bf16; hand the kernel an empty bf16 tensor
+        # instead (never dereferenced when DIM_ROPE == 0).
+        rope_view = torch.empty(
+            (num_tokens, 0), dtype=torch.bfloat16, device=k_rope.device
+        )
 
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
     NUM_NOPE_BLOCKS = dim_nope // group_size
@@ -158,6 +166,14 @@ def quantize_k_cache_separate_optimized(
 ):
     """Quantize FP8 MLA K cache with multiple tokens handled per program."""
     k_nope_2d = k_nope.squeeze(1) if k_nope.ndim == 3 else k_nope
+    if k_rope is None or k_rope.numel() == 0:
+        # No-PE MLA (e.g. GLM-5.3: rope dim 0, 528-byte rows). The multi-token
+        # optimized kernels below assume the 656-byte rope layout, so route to
+        # the generic per-token kernel, which handles DIM_ROPE=0 natively.
+        k_rope_2d = torch.empty(
+            (k_nope_2d.shape[0], 0), dtype=k_nope_2d.dtype, device=k_nope_2d.device
+        )
+        return _quantize_k_cache_fast_separate(k_nope_2d, k_rope_2d, group_size=tile_size)
     k_rope_2d = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
 
     if k_nope_2d.ndim != 2 or k_nope_2d.shape[1] != DIM_NOPE:
@@ -483,9 +499,13 @@ def dequantize_k_cache_paged_optimized(
 ) -> torch.Tensor:
     """Gather and dequantize a paged FP8 K cache with one program per token."""
     dim_quant = quant_k_cache.shape[-1]
-    assert dim_quant == PACKED_BYTES, (
-        f"dim_quant: {dim_quant} != {PACKED_BYTES} detected in "
-        "dequantize_k_cache_paged_optimized"
+    # 528-byte rows are NoPE MLA (rope dim 0, e.g. GLM-5.3); 656-byte rows
+    # carry 64 bf16 rope values. Derive the rope width from the row size.
+    _nope_scale_bytes = DIM_NOPE + NUM_NOPE_BLOCKS * 4
+    dim_rope = (dim_quant - _nope_scale_bytes) // 2
+    assert dim_rope in (0, DIM_ROPE) and dim_quant == _nope_scale_bytes + dim_rope * 2, (
+        f"dim_quant: {dim_quant} (derived rope {dim_rope}) != {PACKED_BYTES} or "
+        "the NoPE 528-byte row width"
     )
     assert quant_k_cache.dtype == get_available_fp8_dtype()
     assert page_table_1_flattened.ndim == 1
@@ -496,7 +516,7 @@ def dequantize_k_cache_paged_optimized(
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
     num_tokens = page_table_1_flattened.shape[0]
     output = torch.empty(
-        (num_tokens, 1, DIM_NOPE + DIM_ROPE),
+        (num_tokens, 1, DIM_NOPE + dim_rope),
         dtype=torch.bfloat16,
         device=quant_k_cache.device,
     )
@@ -516,7 +536,7 @@ def dequantize_k_cache_paged_optimized(
         and quant_k_cache.shape[0] > (2**31 - 1) // input_nope_q_stride
     )
     # BF16 output offsets exceed int32 once num_tokens reaches 3,728,271.
-    use_int64_output_index = num_tokens > (2**31 - 1) // (DIM_NOPE + DIM_ROPE)
+    use_int64_output_index = num_tokens > (2**31 - 1) // (DIM_NOPE + dim_rope)
     _dequantize_k_cache_paged_optimized_kernel[(num_tokens,)](
         output,
         input_nope_q,
@@ -530,7 +550,7 @@ def dequantize_k_cache_paged_optimized(
         INPUT_ROPE_STRIDE=input_rope.stride(0),
         GROUP_SIZE=group_size,
         DIM_NOPE=DIM_NOPE,
-        DIM_ROPE=DIM_ROPE,
+        DIM_ROPE=dim_rope,
         USE_INT64_INPUT_INDEX=use_int64_input_index,
         USE_INT64_OUTPUT_INDEX=use_int64_output_index,
         HAS_ROW_MASK=row_mask is not None,
@@ -585,12 +605,15 @@ def _dequantize_k_cache_paged_optimized_kernel(
         quantized * scales,
     )
 
-    rope_offsets = tl.arange(0, DIM_ROPE)
-    rope = tl.load(input_rope_ptr + paged_token_id * INPUT_ROPE_STRIDE + rope_offsets)
-    tl.store(
-        output_ptr + output_token_id * OUTPUT_STRIDE + DIM_NOPE + rope_offsets,
-        rope,
-    )
+    if DIM_ROPE > 0:
+        rope_offsets = tl.arange(0, DIM_ROPE)
+        rope = tl.load(
+            input_rope_ptr + paged_token_id * INPUT_ROPE_STRIDE + rope_offsets
+        )
+        tl.store(
+            output_ptr + output_token_id * OUTPUT_STRIDE + DIM_NOPE + rope_offsets,
+            rope,
+        )
 
 
 def dequantize_k_cache_paged(
