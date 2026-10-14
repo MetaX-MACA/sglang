@@ -944,6 +944,12 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        # Keep proxy tensors rank-local when scattered attention is configured.
+        all_gather_group = (
+            None
+            if msg_type == "proxy" and get_parallel().enable_attn_tp_input_scattered
+            else self.attn_tp_group
+        )
         p2p_work = []
         with self.pp_comm_stream_ctx:
             if ready_event is not None:
@@ -951,7 +957,7 @@ class SchedulerPPMixin:
             p2p_work.extend(
                 self.pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,
-                    all_gather_group=(self.attn_tp_group),
+                    all_gather_group=all_gather_group,
                     async_send=async_send,
                 )
             )
@@ -988,7 +994,12 @@ class SchedulerPPMixin:
         while True:
             with self.pp_comm_stream_ctx:
                 tensor_dict = self.pp_group.recv_tensor_dict(
-                    all_gather_group=all_gather_group
+                    all_gather_group=all_gather_group,
+                    all_gather_group_by_msg_type=(
+                        {"proxy": None}
+                        if get_parallel().enable_attn_tp_input_scattered
+                        else None
+                    ),
                 )
                 recv_event = self._pp_record_comm_event()
             received_kind = tensor_dict.get("__msg_type__", "default")
