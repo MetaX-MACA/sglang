@@ -689,6 +689,9 @@ class Envs:
     MX_ENABLE_NSA_FP8_KV_STORE = EnvBool(False)
     MX_ENABLE_NSA_FP8_KV_OPTIMIZED_QDQ = EnvBool(False)
     MX_ENABLE_NSA_FP8_KV_UNIQUE_SLOTS = EnvBool(False)
+    # Dequantize FP8 KV rows selected by top-k before the TileLang decode/verify
+    # kernel on platforms without a native-FP8 TileLang build (e.g. MACA C550).
+    MX_ENABLE_NSA_FP8_DEQUANT_TILELANG = EnvBool(False)
     MX_ENABLE_FUSE_RMSNORM_QUANT = EnvBool(False)
     # GLM5.3 prefill-side variant of MX_ENABLE_FUSE_RMSNORM_QUANT: enables the
     # fused-quant input RMSNorm on the prefill server only (post-attention
