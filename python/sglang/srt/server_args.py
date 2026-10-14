@@ -3480,13 +3480,24 @@ class ServerArgs:
     prefill_delayer_max_delay_ms: A[
         Optional[float],
         (
-            "Wall-clock cap (ms) on a single queue-trigger delay; once exceeded, "
-            "prefill is force-released to bound worst-case TTFT. Only consulted "
-            "when --prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ "
-            "5000; defaults to 5000 if unset."
+            "Wall-clock cap (ms) on a single delay episode; once exceeded, "
+            "prefill is force-released to bound worst-case TTFT. Used by the "
+            "queue trigger (--prefill-delayer-queue-min-ratio) and token trigger "
+            "(--prefill-delayer-min-tokens). Defaults to 5000 if unset."
         ),
         NS("schedule"),
     ] = None
+    prefill_delayer_min_tokens: A[
+        int,
+        (
+            "Opt-in token-threshold delay: while decode is running, hold prefill "
+            "until pending prefill tokens reach this threshold, accounting for "
+            "matched prefixes and chunked requests. Release on the timeout or "
+            "delay-pass cap, or when no decode is running. "
+            "0 disables the trigger. Clamped to --max-prefill-tokens."
+        ),
+        NS("schedule"),
+    ] = 0
 
     # -------------------------------------------------------------------------
     # Min free slots delay (prefill refill batching)
