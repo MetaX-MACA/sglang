@@ -8,8 +8,7 @@ import torch
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8Int8MoEMethod,
 )
-from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig, get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
@@ -157,15 +156,22 @@ class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEScheme):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Quantize and pack once before DeepEP; dispatch transports the BF16
         # byte carrier directly to the masked W4A8 GEMM.
-        if self.runner.runner_backend.is_deep_gemm() and hasattr(
-            layer, "dispatcher"
-        ):
-            layer.dispatcher.set_quant_config(
-                {
-                    "bf16_dispatch": True,
-                    "per_token_quant_int8_pack": True,
-                }
-            )
+        from sglang.srt.configs.model_config import is_kimi_k3
+        if self.runner.runner_backend.is_deep_gemm() and hasattr(layer, "dispatcher"):
+            if is_kimi_k3((self.quant_config.config or {}).get("hf_config")):
+                layer.dispatcher.set_quant_config(
+                    {
+                        "bf16_dispatch": True,
+                        "per_token_quant_int8_pack": True,
+                    }
+                )
+            else:
+                layer.dispatcher.set_quant_config(
+                    {
+                        "bf16_dispatch": True,
+                        "per_token_quant_int8_pack": False,
+                    }
+                )
 
     def apply_weights(
         self,
