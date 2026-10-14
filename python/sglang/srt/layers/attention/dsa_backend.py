@@ -30,6 +30,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged,
     gather_dequant_requant_fp8_paged,
+    mark_selected_kv_rows,
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.kernels.ops.attention.dsa.transform_index import (
@@ -200,63 +201,29 @@ def _support_fp8_mma(device_index: int = 0) -> bool:
     return arch == 89
 
 
-def _remap_ragged_topk_to_unique_kv_slots(
-    page_table_1_flattened: torch.Tensor,
-    topk_indices: torch.Tensor,
-    kv_token_capacity: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Map ragged logical top-k indices to deduplicated physical KV slots."""
-    flat_topk_indices = topk_indices.reshape(-1)
-    local_page_table = torch.full_like(flat_topk_indices, -1)
-    if page_table_1_flattened.numel() == 0 or flat_topk_indices.numel() == 0:
-        return (
-            page_table_1_flattened.new_empty((0,)),
-            local_page_table.view_as(topk_indices),
-        )
-
-    logical_capacity = page_table_1_flattened.numel()
-    valid_logical_mask = (flat_topk_indices >= 0) & (
-        flat_topk_indices < logical_capacity
-    )
-    safe_logical_indices = torch.where(
-        valid_logical_mask,
-        flat_topk_indices,
-        torch.zeros_like(flat_topk_indices),
-    )
-    selected_physical_slots = page_table_1_flattened[safe_logical_indices]
-    valid_mask = (
-        valid_logical_mask
-        & (selected_physical_slots >= 0)
-        & (selected_physical_slots < kv_token_capacity)
-    )
-    # torch.unique has a dynamic output shape and stays on eager prefill.
-    unique_physical_slots, inverse_indices = torch.unique(
-        selected_physical_slots[valid_mask], sorted=True, return_inverse=True
-    )
-    local_page_table[valid_mask] = inverse_indices.to(local_page_table.dtype)
-    return unique_physical_slots.contiguous(), local_page_table.view_as(topk_indices)
-
-
 def _dequantize_selected_ragged_kv_cache(
     kv_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     topk_indices: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Dequantize each physical KV slot selected by ragged top-k exactly once.
+    """Dequantize only the logical KV rows selected by ragged top-k.
 
-    This stays on eager prefill because ``torch.unique`` has a data-dependent shape.
-    FlashMLA still needs one addressable KV row when every top-k entry is invalid.
+    Output keeps all logical rows so top-k indices need no remap; unselected
+    rows stay uninitialized because the sparse kernel only reads selected ones.
     """
     kv_token_capacity = kv_cache.numel() // kv_cache.shape[-1]
-    unique_physical_slots, local_page_table = _remap_ragged_topk_to_unique_kv_slots(
-        page_table_1_flattened, topk_indices, kv_token_capacity
+    row_mask, page_table_1 = mark_selected_kv_rows(
+        topk_indices, page_table_1_flattened, kv_token_capacity
     )
-    selected_kv_cache = dequantize_k_cache_paged(kv_cache, unique_physical_slots)
+    selected_kv_cache = dequantize_k_cache_paged(
+        kv_cache, page_table_1_flattened, row_mask=row_mask
+    )
     if selected_kv_cache.shape[0] == 0:
+        # FlashMLA still needs one addressable KV row when every top-k entry is -1.
         selected_kv_cache = selected_kv_cache.new_zeros(
             (1, *selected_kv_cache.shape[1:])
         )
-    return selected_kv_cache, local_page_table
+    return selected_kv_cache, page_table_1
 
 
 def _dequantize_selected_kv_cache_for_flashmla_kv(
