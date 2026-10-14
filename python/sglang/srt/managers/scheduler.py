@@ -3560,6 +3560,23 @@ class Scheduler(
 
         return res
 
+    def _get_num_pending_prefill_tokens(self) -> int:
+        """Pending prefill tokens, for the delayer's token-threshold trigger.
+
+        Each waiting-queue request contributes its not-yet-cached length
+        (seqlen minus the prefix already matched in the radix cache, so prefix
+        cache hits are accounted for); the in-flight chunked request
+        contributes whatever remains of it.
+        """
+        pending = sum(
+            max(req.seqlen - len(req.prefix_indices), 0)
+            for req in self.waiting_queue
+        )
+        if self.chunked_req is not None:
+            req = self.chunked_req
+            pending += max(req.seqlen - len(req.prefix_indices), 0)
+        return pending
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3568,7 +3585,13 @@ class Scheduler(
                 self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
             )
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
-                self.prefill_delayer, token_usage=max_pool_usage
+                self.prefill_delayer,
+                token_usage=max_pool_usage,
+                pending_tokens=(
+                    self._get_num_pending_prefill_tokens()
+                    if get_schedule().prefill_delayer_min_tokens > 0
+                    else 0
+                ),
             )
 
         ret, running_batch = self._get_new_batch_prefill_raw(
