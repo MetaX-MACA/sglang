@@ -369,6 +369,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * effective_num_layers
                 * kv_size
             )
+            if (
+                kv_cache_dtype == torch.int8
+                and not is_deepseek_dsa(model_config.hf_config)
+                and model_config.hf_config.architectures[0]
+                == "KimiK3ForConditionalGeneration"
+            ):
+                cell_size += (
+                    model_config.kv_lora_rank + model_config.qk_rope_head_dim
+                ) * torch.bfloat16.itemsize
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16

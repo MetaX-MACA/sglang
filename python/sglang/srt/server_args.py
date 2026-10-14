@@ -618,7 +618,8 @@ class ServerArgs:
                 '"bf16" or "bfloat16" for BF16 KV cache. "int8" enables an '
                 'INT8 KV cache on supported backends. "fp8_e5m2" and '
                 '"fp8_e4m3" are supported for CUDA 11.8+. "mxfp8" is supported '
-                'by the FA4 backend. "nvfp4" selects '
+                'by the FA4 backend. "int8" is supported for Kimi-K3 with '
+                'the Triton attention backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
                 "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
@@ -5457,6 +5458,17 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import _mla_kv_cache_dtype_checks
 
         run_post_process_pass(self, _mla_kv_cache_dtype_checks)
+
+        if (
+            resolving_view(self).kv_cache_dtype == "int8"
+            and model_config_of(self).hf_config.architectures[0]
+            == "KimiK3ForConditionalGeneration"
+        ):
+            if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                logger.warning(
+                    "Kimi-K3 INT8 KV cache disables prefill CUDA Graph capture."
+                )
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         # The CuteDSL MLA validation + prefill fill moved to the resolution
         # pipeline (arg_groups/overrides.py: _cutedsl_prefill_backend_fill),

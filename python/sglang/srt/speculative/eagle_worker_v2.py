@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from dataclasses import replace
 from typing import List, Optional
@@ -130,6 +131,8 @@ _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
+
+_DRAFT_SEED_GRAPH = os.environ.get("MX_DRAFT_SEED_GRAPH", "1") == "1"
 
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
@@ -534,6 +537,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and not forward_batch.forward_mode.is_idle()
             and self.seed_dsa_topk_from_draft_extend
             and draft_input.dsa_topk_indices is None
+            and not _DRAFT_SEED_GRAPH
         ):
             can_run_decode_cuda_graph = False
 

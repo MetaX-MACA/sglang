@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -11,6 +12,8 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
 
+
+_DRAFT_SEED_GRAPH = os.environ.get("MX_DRAFT_SEED_GRAPH", "1") == "1"
 
 @dataclass
 class EagleVerifyInput(SpecInput):
@@ -262,6 +265,31 @@ class EagleDraftInput(SpecInput):
             self.dsa_topk_indices = torch.cat(
                 [self.dsa_topk_indices, spec_info.dsa_topk_indices]
             )
+        elif _DRAFT_SEED_GRAPH and (
+            self.dsa_topk_indices is not None or spec_info.dsa_topk_indices is not None
+        ):
+            # A newly admitted request has no draft-extend seed. Dropping the seed
+            # of the whole batch forces an eager draft round for every request on
+            # this rank (and stalls all DP ranks); pad the missing rows with zeros
+            # (what the draft graph does for a missing seed) instead.
+            n_other = len(spec_info.topk_index)
+            n_self = len(self.topk_index) - n_other
+            ref = (
+                self.dsa_topk_indices
+                if self.dsa_topk_indices is not None
+                else spec_info.dsa_topk_indices
+            )
+            mine = (
+                self.dsa_topk_indices
+                if self.dsa_topk_indices is not None
+                else ref.new_zeros((n_self,) + tuple(ref.shape[1:]))
+            )
+            other = (
+                spec_info.dsa_topk_indices
+                if spec_info.dsa_topk_indices is not None
+                else ref.new_zeros((n_other,) + tuple(ref.shape[1:]))
+            )
+            self.dsa_topk_indices = torch.cat([mine, other])
         else:
             self.dsa_topk_indices = None
         if self.draft_probs is not None and spec_info.draft_probs is not None:

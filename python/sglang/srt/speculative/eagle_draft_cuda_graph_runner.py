@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -55,6 +57,8 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class EagleDraftInputBuffers(ForwardInputBuffers):
@@ -277,15 +281,40 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
-        # Metadata glue graph is intentionally not used for the EAGLE draft
-        # runner.  FlashInferMLAMultiStepDraftBackend.init_forward_metadata_out_graph
-        # re-plans the per-step CUDA-graph wrappers that were already captured
-        # (decode_cuda_graph_metadata dict entries).  Capturing that re-plan
-        # into a secondary glue graph would corrupt the wrapper's internal GPU
-        # state on replay.  The main decode runner (DecodeCudaGraphRunner) is
-        # where the glue graph saves latency; draft metadata is cheaper and
-        # already amortised over speculative_num_steps.
-        self._metadata_glue = None
+        self._metadata_glue = self._init_metadata_glue()
+
+    def _init_metadata_glue(self):
+        """Capture the per-replay draft-step DSA metadata prep (dozens of tiny
+        host-launched ops across the speculative_num_steps-1 draft backends) into
+        one CUDA graph. Narrow qualification; any mismatch keeps the eager path."""
+        if not envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get():
+            return None
+        from sglang.srt.layers.attention.dsa_backend import (
+            DeepseekSparseAttnMultiStepBackend,
+        )
+        from sglang.srt.model_executor.runner.metadata_glue_graph import (
+            MetadataGlueGraph,
+        )
+
+        backend = self.draft_attn_backend
+        if not isinstance(backend, DeepseekSparseAttnMultiStepBackend):
+            return None
+        if self.topk != 1 or self.model_runner.lora_manager is not None:
+            return None
+        if getattr(self.model_runner.server_args, "enable_two_batch_overlap", False):
+            return None
+        if getattr(self.model_runner.server_args, "enable_pdmux", False):
+            return None
+        leaves = list(backend.attn_backends)
+        for leaf in leaves:
+            if not (
+                leaf.dsa_index_kpool == 4
+                and leaf.real_page_size == 64
+                and leaf.dsa_index_topk == 2048
+            ):
+                return None
+        logger.info("Draft metadata glue graph enabled (%d leaf backends).", len(leaves))
+        return MetadataGlueGraph(self.device, leaves=leaves)
 
     def _replay_graph(self, shape_key, forward_batch):
         return self.backend.replay(shape_key, forward_batch)
@@ -673,7 +702,19 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Prepare per-step draft attention metadata (kv_indptr / kv_indices for
         # each speculative step).  The glue-graph optimisation is not applied
         # here — see __init__ comment for why.
-        self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
+        if (
+            self._metadata_glue is not None
+            and not self._metadata_glue.disabled
+            and raw_bs == bs
+        ):
+            # Unpadded ForwardBatch inputs can change address between replays;
+            # the static-buffer slices keep them stable for the captured prep.
+            metadata_view = copy.copy(forward_batch)
+            metadata_view.seq_lens = buffers.seq_lens[:bs]
+            metadata_view.req_pool_indices = buffers.req_pool_indices[:bs]
+            self._metadata_glue.run(self.draft_attn_backend, metadata_view, (bs,))
+        else:
+            self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
         self.raw_bs = raw_bs
         self.bs = bs
 
