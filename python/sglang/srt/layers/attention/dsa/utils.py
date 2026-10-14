@@ -297,7 +297,7 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # (not cp-aligned). Applying cp_align here over-pads the flashmla metadata past q, so
     # num_splits ends up longer than q -> fwd_kvcache_mla fails "num_splits must have shape (b+1)".
     # (attn_cp analog of the attn_tp fix in PR #30642 / issue #30296.)
-    if not enable_cp_v2():
+    if not enable_cp_v2() and forward_batch.is_extend_in_batch:
         cp_align_size = get_cp_padding_align_size()
         for i in range(sync_group_size):
             global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
