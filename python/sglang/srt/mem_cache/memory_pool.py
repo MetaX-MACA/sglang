@@ -203,18 +203,8 @@ def _set_kv_buffer_impl(
             row_dim,
         )
 
-    from sglang.srt.model_executor.runner import get_is_capture_mode
-
-    if get_is_capture_mode() and alt_stream is not None:
-        current_stream = device_module.current_stream()
-        alt_stream.wait_stream(current_stream)
-        k_cache[indices] = k
-        with device_module.stream(alt_stream):
-            v_cache[indices] = v
-        current_stream.wait_stream(alt_stream)
-    else:  # fallback to naive implementation
-        k_cache[indices] = k
-        v_cache[indices] = v
+    k_cache[indices] = k
+    v_cache[indices] = v
 
 
 def _set_kv_buffer_prefix_valid_impl(
