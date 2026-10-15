@@ -19,6 +19,9 @@ from sglang.kernels.ops.attention.fla.utils import (
     is_nvidia_hopper,
 )
 
+# C500/MetaX-C550 optimized fast path (self-contained; default off).
+from .kda_opt_c500 import _c500_kda_opt_enabled
+
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
@@ -326,6 +329,13 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: Optional[torch.LongTensor] = None,
     use_exp2: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if _c500_kda_opt_enabled():
+        from .kda_opt_c500 import chunk_gated_delta_rule_fwd_h as _c500_impl
+
+        return _c500_impl(
+            k, w, u, g, gk, initial_state, initial_state_indices,
+            save_new_value, cu_seqlens, chunk_indices, use_exp2,
+        )
     assert not (
         use_exp2 and g is not None
     ), "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"

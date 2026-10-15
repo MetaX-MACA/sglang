@@ -39,6 +39,9 @@ if is_intel:
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_maca
 
+# C500/MetaX-C550 optimized fast paths (self-contained; default off).
+from .kda_opt_c500 import _c500_kda_opt_enabled
+
 _USE_MCOPLIB_KDA_CHUNK_H = is_maca() and envs.MX_USE_MCOPLIB_KDA.get()
 if _USE_MCOPLIB_KDA_CHUNK_H:
     from mcoplib.triton_sglang_chunk_delta_h import (
@@ -887,6 +890,12 @@ def chunk_gla_fwd_o_gk(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
 ):
+    if _c500_kda_opt_enabled():
+        from .kda_opt_c500 import chunk_gla_fwd_o_gk as _c500_impl
+
+        return _c500_impl(
+            q, v, g, A, h, o, scale, cu_seqlens, chunk_size, chunk_indices,
+        )
     B, T, H, K, V = *q.shape, v.shape[-1]
     BT = chunk_size
 
@@ -1053,6 +1062,13 @@ def kda_gate_chunk_cumsum(
     Returns:
         Cumulative-summed gated tensor of shape [B, T, H, K].
     """
+    if _c500_kda_opt_enabled():
+        from .kda_opt_c500 import kda_gate_chunk_cumsum as _c500_impl
+
+        return _c500_impl(
+            g, A_log, chunk_size, scale, dt_bias, cu_seqlens, output_dtype,
+            chunk_indices, lower_bound,
+        )
     if cu_seqlens is not None:
         assert (
             g.shape[0] == 1

@@ -18,6 +18,9 @@ from sglang.kernels.ops.attention.fla.utils import (
     is_tf32_supported,
 )
 
+# C500/MetaX-C550 optimized fast path (self-contained; default off).
+from .kda_opt_c500 import _c500_kda_opt_enabled
+
 if is_tf32_supported:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
 else:
@@ -921,6 +924,13 @@ def chunk_kda_fwd_intra(
     fuse_recompute: bool = False,
     fuse_diagonal: bool = False,
 ):
+    if _c500_kda_opt_enabled():
+        from .kda_opt_c500 import chunk_kda_fwd_intra as _c500_impl
+
+        return _c500_impl(
+            q, k, v, gk, beta, scale, cu_seqlens, chunk_size, chunk_indices,
+            safe_gate, fuse_recompute, fuse_diagonal,
+        )
     B, T, H, K = k.shape
     V = v.shape[-1]
     BT = chunk_size
