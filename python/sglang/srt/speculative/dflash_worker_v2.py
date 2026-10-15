@@ -305,8 +305,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._logged_first_verify = False
         self._tp_sync = SpecTpSync(get_tp_group())
 
+        # MX: a bf16 DFlash2 checkpoint is not int8-calibrated; letting the
+        # draft inherit the target's --quantization collapses draft quality
+        # (accept len 1.0). Keep the draft in checkpoint dtype;
+        # MX_DFLASH_DRAFT_INHERIT_QUANT=1 restores the old behavior.
+        from sglang.srt.utils.common import get_bool_env_var
+
+        draft_server_args = server_args
+        if not get_bool_env_var("MX_DFLASH_DRAFT_INHERIT_QUANT"):
+            draft_server_args = replace(server_args, quantization=None)
         bundle = build_draft_tp_worker(
-            server_args=server_args,
+            server_args=draft_server_args,
             gpu_id=gpu_id,
             ps=replace(ps, pp_rank=0, pp_size=1),
             nccl_port=nccl_port,
