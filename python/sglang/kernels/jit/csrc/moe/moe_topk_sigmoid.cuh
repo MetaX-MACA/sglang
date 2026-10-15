@@ -510,7 +510,7 @@ void topk_sigmoid(
 
   // correction_bias validation
   if (correction_bias.has_value()) {
-    const auto& bias = correction_bias.value();
+    auto bias = correction_bias.value();
     RuntimeCheck(bias.dim() == 1, "correction_bias must be 1-D");
     RuntimeCheck(bias.shape()[0] == num_experts, "correction_bias size must equal num_experts");
     RuntimeCheck(

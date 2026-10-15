@@ -947,5 +947,80 @@ class TestMacaMergeContracts(unittest.TestCase):
         self.assertEqual((q.device, scales.device), ("cuda:3", "cuda:3"))
 
 
+    def test_minimax_composite_pool_quantization_policy(self):
+        identity = NS(name="unquantized")
+        fn = load(
+            "python/sglang/srt/mem_cache/memory_pool.py",
+            "get_kv_cache_quant_method",
+            {
+                "is_float4_e2m1fn_x2": lambda dtype: dtype == "fp4",
+                "UnquantizedKVCacheMethod": lambda: identity,
+            },
+            owner="KVCache",
+        )
+        quantized = NS(name="fp8")
+        self.assertIs(fn(NS(dtype="bf16", main_pool=NS(quant_method=quantized))), quantized)
+        self.assertIs(fn(NS(dtype="bf16")), identity)
+        self.assertIs(fn(NS(dtype="bf16", quant_method=identity)), identity)
+        with self.assertRaisesRegex(ValueError, "does not expose"):
+            fn(NS(dtype="fp4"))
+
+    def test_minimax_block_tuning_is_maca_only(self):
+        source = ROOT / "python/sglang/srt/layers/attention/minimax_sparse_backend.py"
+        tree = ast.parse(source.read_text())
+        owner = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                     and n.name == "MiniMaxSparseAttnBackend")
+        init = next(n for n in owner.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "__init__")
+        body = [n for n in init.body if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Attribute)
+                        and t.attr in ("block_size_q", "block_size_k")
+                        for t in n.targets)]
+        self.assertEqual(len(body), 2)
+        code = compile(ast.Module(body=body, type_ignores=[]), str(source), "exec")
+        for maca, expected in ((False, (1, 128)), (True, (2, 32))):
+            instance = NS()
+            exec(code, {"self": instance, "is_maca": lambda: maca,
+                        "sparse_cfg": {"sparse_block_size": 128}})
+            self.assertEqual((instance.block_size_q, instance.block_size_k), expected)
+
+
+    def test_kernel_version_gate_preserves_platform_minimums(self):
+        source = ROOT / "python/sglang/srt/entrypoints/engine.py"
+        tree = ast.parse(source.read_text())
+        guards = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "_is_cuda"
+            and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "assert_pkg_version"
+                and call.args
+                and isinstance(call.args[0], ast.Constant)
+                and call.args[0].value == "sglang-kernel"
+                for call in ast.walk(node)
+            )
+        ]
+        self.assertEqual(len(guards), 1)
+        code = compile(ast.Module(body=guards, type_ignores=[]), str(source), "exec")
+        for cuda, maca, expected in (
+            (True, True, "0.4.6.post1"),
+            (True, False, "0.4.7"),
+            (False, False, None),
+            (False, True, None),
+        ):
+            check = Mock()
+            exec(code, {"_is_cuda": cuda, "is_maca": lambda: maca,
+                        "assert_pkg_version": check})
+            if expected is None:
+                check.assert_not_called()
+            else:
+                check.assert_called_once()
+                self.assertEqual(check.call_args.args[:2], ("sglang-kernel", expected))
+
+
 if __name__ == "__main__":
     unittest.main()

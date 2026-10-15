@@ -43,6 +43,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    ProducerReduction,
     declare_attn,
     declare_ffn,
     enable_moe_dense_fully_dp,
@@ -95,6 +96,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
     is_cuda,
+    is_maca,
     is_gfx95_supported,
     is_hip,
     is_npu,
@@ -534,8 +536,8 @@ class MiniMaxM3MoE(nn.Module):
                 # NPU lacks aten::mm.dtype; bf16 mm then cast keeps topk semantics.
                 return torch.mm(hidden_states, self.gate.weight.t()).float()
             return torch.mm(
-                hidden_states, self.gate.weight.t(), out_dtype=torch.float32
-            )
+                hidden_states, self.gate.weight.t()
+            ).to(torch.float32)
         router_logits, _ = self.gate(hidden_states.to(torch.float32))
         return router_logits
 
@@ -1359,12 +1361,25 @@ class MiniMaxM3DecoderLayer(nn.Module):
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
+                    # MACA M3: defer-to-next-layer reduction caused no-EOS output
+                    # in the 0.5.19 adaptation. Preserve immediate completion.
+                    reduction=(
+                        ProducerReduction.EAGER
+                        if is_maca() and self.is_layer_sparse
+                        else ProducerReduction.SCOPED
+                    ),
                     next_sparse=is_next_layer_sparse,
                 ),
                 self.post_attention_layernorm,
             ),
             previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_sparse=self.is_layer_sparse
+                sparse=is_previous_layer_sparse,
+                next_sparse=self.is_layer_sparse,
+                reduction=(
+                    ProducerReduction.EAGER
+                    if is_maca() and is_previous_layer_sparse
+                    else ProducerReduction.SCOPED
+                ),
             )
             if layer_id != 0
             else None,

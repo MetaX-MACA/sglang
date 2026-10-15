@@ -27,7 +27,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
-from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_maca, is_npu
 
 if is_npu():
     from sglang.kernels.ops.attention.minimax_sparse.common.index import (
@@ -160,8 +160,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
 
-        self.block_size_q = 1
-        self.block_size_k = sparse_cfg["sparse_block_size"]
+        self.block_size_q = 2 if is_maca() else 1
+        self.block_size_k = 32 if is_maca() else sparse_cfg["sparse_block_size"]
         if "sparse_init_block" in sparse_cfg:
             self.init_blocks = sparse_cfg["sparse_init_block"]
         else:
@@ -259,6 +259,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.page_size = self.kv_pool.page_size
         self.use_dense_sparse_decode = (
             (not self.is_npu)
+            and not is_maca()
             and self.hisparse_coordinator is None
             and envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
             and self.block_size_k % self.page_size == 0
@@ -425,7 +426,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._extend_meta = None
             self._extend_meta_key = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if extend_lens is not None:
+        if extend_lens is not None and len(extend_lens) > 0:
             self._max_seqlen_q = int(max(extend_lens))
         else:
             self._max_seqlen_q = 1
@@ -436,8 +437,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
             self._max_seqlen_k = self.max_context_len
-        else:
+        elif forward_batch.seq_lens_cpu.numel() > 0:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+        else:
+            self._max_seqlen_k = 1
 
         # Build plan + page table eager (outside capture) so captured forward_decode
         # runs only device-side ops; host-side code can't be captured.

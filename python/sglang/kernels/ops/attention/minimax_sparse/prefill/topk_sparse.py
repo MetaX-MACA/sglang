@@ -19,6 +19,8 @@ from ..common.utils import (
 
 def _sparse_subk(block_size_k: int) -> int:
     """Sub-tile only the measured 128-token block; keep other widths unchanged."""
+    if "metax" in torch.__version__:
+        return min(64, block_size_k)
     return 64 if is_gfx95_supported() and block_size_k == 128 else 0
 
 
@@ -41,6 +43,7 @@ def _sparse_subk(block_size_k: int) -> int:
 @triton.autotune(
     # Keep the additional configs on gfx95; gfx942 retains the original set.
     configs=[
+        *([triton.Config({}, num_warps=nw, num_stages=ns) for nw in (2, 4, 8) for ns in (1, 2)] if "metax" in torch.__version__ else [
         # CDNA sub-tiled MFMA configs; NVIDIA's Triton rejects these launch kwargs.
         *(
             [
@@ -63,10 +66,11 @@ def _sparse_subk(block_size_k: int) -> int:
             for nw in (2, 4, 8)
             for ns in (2, 3, 4)
         ],
+        ]),
     ],
     key=[
-        "BLOCK_SIZE_Q",
-        "BLOCK_SIZE_K",
+        # "BLOCK_SIZE_Q",
+        # "BLOCK_SIZE_K",
         "qk_head_dim",
         "v_head_dim",
         "gqa_group_size",
@@ -180,8 +184,8 @@ def _gqa_share_sparse_fwd_kernel(
         # we assume that the topk_idx is right padded with -1
         off_t = tl.arange(0, BLOCK_SIZE_T)
         topk_idx = tl.load(t_ptr_j + off_t * stride_tk, mask=off_t < max_topk, other=-1)
-        valid_idx = tl.where(topk_idx >= 0, off_t, -1)
-        real_topk = tl.sum(valid_idx != -1, axis=0)
+        valid_idx = tl.where(topk_idx >= 0, 1, 0)
+        real_topk = tl.sum(valid_idx, axis=0)
         # init qkv pointer
         q_ptrs = tl.make_block_ptr(
             base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
@@ -222,7 +226,9 @@ def _gqa_share_sparse_fwd_kernel(
             # path (flash-softmax reassociation).
             NUM_SUB: tl.constexpr = BLOCK_SIZE_K // SUB_K
             for i in range(real_topk):
-                c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
+                raw = tl.load(t_ptr_j).to(tl.int32)
+                num_blocks = (seq_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+                c = tl.where((raw >= 0) & (raw < num_blocks), raw, 0) * BLOCK_SIZE_K
                 t_ptr_j = t_ptr_j + stride_tk
                 for sub_i in range(NUM_SUB):
                     off_sub = tl.arange(0, SUB_K) + sub_i * SUB_K
@@ -284,7 +290,9 @@ def _gqa_share_sparse_fwd_kernel(
         else:
             for i in range(real_topk):
                 # get current block start index (absolute K position)
-                c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
+                raw = tl.load(t_ptr_j).to(tl.int32)
+                num_blocks = (seq_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+                c = tl.where((raw >= 0) & (raw < num_blocks), raw, 0) * BLOCK_SIZE_K
                 t_ptr_j = t_ptr_j + stride_tk
                 # paged load K via req_to_token: pos -> slot -> k_cache
                 pos = c + off_n
@@ -369,7 +377,6 @@ def _gqa_share_sparse_fwd_kernel(
         )
         tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
 
-
 @torch.no_grad()
 def flash_prefill_with_gqa_share_sparse(
     q: torch.Tensor,
@@ -394,7 +401,7 @@ def flash_prefill_with_gqa_share_sparse(
     v_scale: Optional[float] = None,
     loc_mapping: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    triton.set_allocator(robust_allocator)
+    # triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="prefill")
     k_scale = unit_scale(k_scale)
     v_scale = unit_scale(v_scale)
@@ -436,6 +443,7 @@ def flash_prefill_with_gqa_share_sparse(
         num_k_heads,
         batch_size,
     )
+
     _gqa_share_sparse_fwd_kernel[grid](
         q,
         k_cache,

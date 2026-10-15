@@ -67,6 +67,11 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #endif
 
+// cu-bridge has no grid-constant parameter qualifier.
+#if defined(__MACACC__) && !defined(__grid_constant__)
+#define __grid_constant__
+#endif
+
 namespace sglang {
 
 #ifndef USE_ROCM

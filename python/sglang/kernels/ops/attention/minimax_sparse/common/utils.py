@@ -84,6 +84,11 @@ except Exception:
     make_tensor_descriptor = tl._experimental_make_tensor_descriptor
 
 
+def _check_dtypes(q, k_cache, v_cache):
+    assert q.dtype in (torch.bfloat16, torch.float16), f"q dtype must be bf16/fp16, got {q.dtype}"
+    assert k_cache.dtype == q.dtype, f"k_cache dtype {k_cache.dtype} != q dtype {q.dtype}"
+    assert v_cache.dtype == k_cache.dtype, f"v_cache dtype {v_cache.dtype} != k_cache dtype {k_cache.dtype}"
+
 def robust_allocator(size: int, alignment: int, stream: int = None):
     """Allocator for Triton TMA descriptors.
 

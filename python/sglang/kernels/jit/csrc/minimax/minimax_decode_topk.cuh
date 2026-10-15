@@ -9,7 +9,7 @@
 
 #include <cfloat>
 #include <cstdint>
-#ifdef USE_ROCM
+#if defined(USE_ROCM) || defined(__MACACC__)
 static constexpr unsigned long long kWarpSyncMask = 0xFFFFFFFFFFFFFFFFull;
 #else
 #include <math_constants.h>

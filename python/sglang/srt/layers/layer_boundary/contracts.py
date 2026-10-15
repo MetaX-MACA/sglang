@@ -38,6 +38,8 @@ class ProducerReduction(Enum):
 
     PARTIAL = auto()
     SCOPED = auto()
+    # Complete the FFN sum in this layer; a selected reduce-scatter is allowed.
+    EAGER = auto()
     # A replicated component is added after the sum inside compute.
     LOCAL_TAIL = auto()
 

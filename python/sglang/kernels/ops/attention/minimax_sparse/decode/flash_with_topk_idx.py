@@ -1,11 +1,23 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
+"""Standalone decode sparse-attention kernels (bf16 / fp16 only).
 
-from typing import Optional
+Step 1 (lightning indexer): ``flash_decode_with_topk_idx`` — score every KV
+block with the index head and select the top-k blocks (2-stage split-K Triton
+topk). Optionally also produces the index-head attention output.
+
+Step 3 (main sparse attention): ``flash_decode_with_gqa_share_sparse`` —
+attend only to the selected top-k blocks with the main head.
+
+No fp8, no sglang, no project utils. Paged KV via ``req_to_token`` / ``slot_ids``.
+"""
+
+from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+from ..common.utils import _check_dtypes
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_xpu
 
@@ -23,14 +35,14 @@ _JIT_TOPK_MAX_NUM_BLOCKS = 16384 if torch.version.hip else 4096
 
 
 def _prune_decode_configs(configs, named_args, **kwargs):
-    """Drop autotune configs whose token tile is smaller than a sparse block.
+    """Keep token sub-tiles that divide a sparse block.
 
     BLOCKS_PER_K_BLOCK = BLOCK_SIZE_N // block_size is 0 for those, so they
     cannot compile. Keep the full list if nothing survives (block_size larger
     than every tile) and let triton report the real failure.
     """
     block_size = named_args["block_size"]
-    kept = [c for c in configs if c.kwargs["BLOCK_SIZE_N"] >= block_size]
+    kept = [c for c in configs if c.kwargs["BLOCK_SIZE_N"] <= block_size and block_size % c.kwargs["BLOCK_SIZE_N"] == 0]
     return kept or list(configs)
 
 
@@ -39,7 +51,7 @@ _ON_HIP = torch.version.hip is not None
 
 def _decode_score_block_n(args):
     # gfx950 pick: 512 for tiny batches (few CTAs), else 128.
-    return max(512 if args["batch_size"] <= 4 else 128, args["block_size"])
+    return min(64, args["block_size"])
 
 
 # On ROCm the autotune sweep is replaced by a fixed config plus the
@@ -50,7 +62,7 @@ _DECODE_SCORE_CONFIGS = (
     if _ON_HIP
     else [
         triton.Config({"BLOCK_SIZE_N": BN}, num_warps=nw, num_stages=ns)
-        for BN in [64, 128, 256, 512]
+        for BN in [16, 32, 64]
         for nw in [4, 8, 16]
         for ns in [1, 2, 3]
     ]
@@ -68,13 +80,11 @@ _DECODE_SCORE_HEURISTICS = {
 
 @triton.heuristics(_DECODE_SCORE_HEURISTICS)
 @triton.autotune(
-    configs=_DECODE_SCORE_CONFIGS,
+    configs=([triton.Config({"BLOCK_SIZE_N": BN}, num_warps=nw, num_stages=ns) for BN in [16, 32, 64] for nw in [4, 8, 16] for ns in [1, 2, 3]] if "metax" in torch.__version__ else _DECODE_SCORE_CONFIGS),
     key=[
-        "BATCH_SIZE_BUCKET",
         "gqa_group_size",
         "head_dim",
         "block_size",
-        "SCORE_TYPE",
     ],
     prune_configs_by=(
         None if _ON_HIP else {"early_config_prune": _prune_decode_configs}
@@ -126,8 +136,14 @@ def _decode_score_kernel(
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
-    tl.static_assert(BLOCK_SIZE_N >= block_size)
-    BLOCKS_PER_K_BLOCK: tl.constexpr = BLOCK_SIZE_N // block_size
+    # BLOCK_SIZE_N is the K/V sub-tile; block_size is the topk block size (bsk).
+    # A chunk is processed in sub-tiles of BLOCK_SIZE_N (block_size must be a
+    # multiple of BLOCK_SIZE_N). Smaller sub-tile -> smaller K/V shared-mem
+    # tile -> higher occupancy; V load also tracks K sub-tile so its gather
+    # overlaps the QK dot (see prefill step1 for the same trick). Each bsk-block
+    # writes one score column, accumulated across its sub-tiles.
+    tl.static_assert(block_size % BLOCK_SIZE_N == 0)
+    SUB_TILES_PER_BLOCK: tl.constexpr = block_size // BLOCK_SIZE_N
     # get batch id and head id
     pid_bc, pid_kh = tl.program_id(0), tl.program_id(1)
     pid_b = pid_bc % batch_size
@@ -161,7 +177,7 @@ def _decode_score_kernel(
         shape=(gqa_group_size, chunk_end_block),
         strides=(stride_s_h, stride_s_n),
         offsets=(0, chunk_start_block),
-        block_shape=(BLOCK_SIZE_H, BLOCKS_PER_K_BLOCK),
+        block_shape=(BLOCK_SIZE_H, 1),
         order=(1, 0),
     )
     # load q
@@ -169,11 +185,10 @@ def _decode_score_kernel(
     # init statistics
     off_n = tl.arange(0, BLOCK_SIZE_N)
     off_d = tl.arange(0, BLOCK_SIZE_D)
-    off_bpk = tl.arange(0, BLOCKS_PER_K_BLOCK)
     dim_mask = off_d < head_dim
     # pre-compute local_start outside the loop (constant for entire batch)
     local_start = tl.maximum(0, num_blocks - local_blocks)
-    # prefetch first iteration's slots
+    # prefetch first sub-tile's slots/K so the paged gather overlaps the prologue.
     r2t_base = req_to_token_ptr + sid * stride_r2t_b
     prefetch_pos = chunk_start + off_n
     prefetch_mask = prefetch_pos < seq_len
@@ -182,67 +197,86 @@ def _decode_score_kernel(
         mask=prefetch_mask,
         other=0,
     ).to(tl.int64)
-    # score-only: compute block scores without loading V
-    for i in range(chunk_start, chunk_end, BLOCK_SIZE_N):
-        pos_mask = prefetch_mask
-        slots = prefetched_slots
-        # prefetch next iteration's slots
-        next_i = i + BLOCK_SIZE_N
-        if next_i < chunk_end:
-            next_pos = next_i + off_n
-            prefetch_mask = next_pos < seq_len
-            prefetched_slots = tl.load(
-                r2t_base + next_pos,
-                mask=prefetch_mask,
-                other=0,
-            ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots
-        # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
-        k_off = (
-            slots[None, :] * stride_k_s
-            + pid_kh * stride_k_h
-            + off_d[:, None] * stride_k_d
-        )
-        k = tl.load(
-            k_cache_ptr + k_off,
-            mask=dim_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        )
-        if IS_FP8:
-            # fp8 index K cache: widening cast with bf16/fp16 Q, no-op with fp8
-            # Q (fp8 attn-GEMM mode; tl.dot runs fp8x8). Compiled out for bf16.
-            k = k.to(q.dtype)
-        # compute qk
-        qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
-        qk += tl.where(off_n[None, :] < chunk_end - i, 0, float("-inf"))
-        # [H, D], [D, N] -> [H, N]
-        qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
-        # save qk to score
-        score = tl.reshape(
-            qk,
-            (BLOCK_SIZE_H, BLOCKS_PER_K_BLOCK, block_size),
-            can_reorder=False,
-        )
-        sub_max = tl.max(score, axis=2)
+    first_slots = (prefetched_slots + max_slots) % max_slots
+    k = tl.load(
+        k_cache_ptr
+        + first_slots[None, :] * stride_k_s
+        + pid_kh * stride_k_h
+        + off_d[:, None] * stride_k_d,
+        mask=dim_mask[:, None] & prefetch_mask[None, :],
+        other=0.0,
+    )
+    # score-only: outer loop steps by block_size (one bsk-block -> one score
+    # column); inner loop splits it into SUB_TILES_PER_BLOCK sub-tiles of
+    # BLOCK_SIZE_N. Score (max/lse) accumulates across sub-tiles. K is
+    # prefetched one sub-tile ahead to overlap gather with the QK dot.
+    for blk in range(chunk_start_block, chunk_end_block):
+        i = blk * block_size
+        blk_score_max = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+        blk_lse_m = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+        blk_lse_s = tl.zeros((BLOCK_SIZE_H,), dtype=tl.float32)
+        for s in tl.static_range(0, SUB_TILES_PER_BLOCK):
+            ks = i + s * BLOCK_SIZE_N
+            pos_mask = prefetch_mask
+            slots = prefetched_slots
+            # prefetch next sub-tile's slots+K
+            next_ks = ks + BLOCK_SIZE_N
+            if next_ks < chunk_end:
+                next_pos = next_ks + off_n
+                prefetch_mask = next_pos < seq_len
+                prefetched_slots = tl.load(
+                    r2t_base + next_pos,
+                    mask=prefetch_mask,
+                    other=0,
+                ).to(tl.int64)
+                next_slots = (prefetched_slots + max_slots) % max_slots
+                k_next = tl.load(
+                    k_cache_ptr
+                    + next_slots[None, :] * stride_k_s
+                    + pid_kh * stride_k_h
+                    + off_d[:, None] * stride_k_d,
+                    mask=dim_mask[:, None] & prefetch_mask[None, :],
+                    other=0.0,
+                )
+            else:
+                k_next = k
+            slots = (slots + max_slots) % max_slots
+            # compute qk
+            qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
+            qk += tl.where(off_n[None, :] < chunk_end - ks, 0, float("-inf"))
+            # [H, D], [D, N] -> [H, N]
+            if IS_FP8:
+                k = k.to(q.dtype)
+            qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
+            k = k_next
+            # accumulate this sub-tile into the bsk-block score
+            sub_max = tl.max(qk, axis=1)  # (BLOCK_SIZE_H,)
+            if SCORE_TYPE == "max":
+                blk_score_max = tl.maximum(blk_score_max, sub_max)
+            else:  # "lse"
+                new_m = tl.maximum(blk_lse_m, sub_max)
+                blk_lse_s = blk_lse_s * tl.exp2(blk_lse_m - new_m) + tl.sum(
+                    tl.exp2(qk - new_m[:, None]), axis=1
+                )
+                blk_lse_m = new_m
+        # finalize bsk-block score
         if SCORE_TYPE == "max":
-            score = sub_max
-        else:  # "lse"
-            score = sub_max + tl.log2(
-                tl.sum(tl.exp2(score - sub_max[:, :, None]), axis=2)
-            )
+            score = blk_score_max
+        else:
+            score = blk_lse_m + tl.log2(blk_lse_s)
             score = tl.where(score != score, float("-inf"), score)
-        # apply init_blocks and local_blocks efficiently
-        curr_block_idx = i // block_size + off_bpk
+        # apply init_blocks and local_blocks (scalar, per bsk-block)
+        curr_block_idx = blk
         is_init = curr_block_idx < init_blocks
         is_local = (curr_block_idx >= local_start) & (curr_block_idx < num_blocks)
-        score = tl.where(
-            is_local[None, :], 1e29, tl.where(is_init[None, :], 1e30, score)
-        )
-        tl.store(s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
-        # update ptrs
-        s_ptrs = tl.advance(s_ptrs, (0, BLOCKS_PER_K_BLOCK))
+        score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
+        tl.store(s_ptrs, tl.reshape(score, (BLOCK_SIZE_H, 1)).to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
+        s_ptrs = tl.advance(s_ptrs, (0, 1))
 
 
+# --------------------------------------------------------------------------- #
+# Step 1b: score + index-head attention kernel                                #
+# --------------------------------------------------------------------------- #
 @triton.heuristics(
     {
         "BLOCK_SIZE_H": lambda args: max(
@@ -255,7 +289,7 @@ def _decode_score_kernel(
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_SIZE_N": BN}, num_warps=nw, num_stages=ns)
-        for BN in [64, 128, 256, 512]
+        for BN in [16, 32, 64]
         for nw in [4, 8, 16]
         for ns in [1, 2, 3]
     ],
@@ -263,8 +297,6 @@ def _decode_score_kernel(
         "gqa_group_size",
         "head_dim",
         "block_size",
-        "HAS_SINK",
-        "SCORE_TYPE",
     ],
     prune_configs_by={"early_config_prune": _prune_decode_configs},
 )
@@ -331,8 +363,14 @@ def _decode_score_attn_kernel(
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
-    tl.static_assert(BLOCK_SIZE_N >= block_size)
-    BLOCKS_PER_K_BLOCK: tl.constexpr = BLOCK_SIZE_N // block_size
+    # BLOCK_SIZE_N is the K/V sub-tile; block_size is the topk block size (bsk).
+    # A chunk is processed in sub-tiles of BLOCK_SIZE_N (block_size must be a
+    # multiple of BLOCK_SIZE_N). Smaller sub-tile -> smaller K/V shared-mem
+    # tile -> higher occupancy; V load also tracks K sub-tile so its gather
+    # overlaps the QK dot (see prefill step1 for the same trick). Each bsk-block
+    # writes one score column, accumulated across its sub-tiles.
+    tl.static_assert(block_size % BLOCK_SIZE_N == 0)
+    SUB_TILES_PER_BLOCK: tl.constexpr = block_size // BLOCK_SIZE_N
     # get batch id and head id
     pid_bc, pid_kh = tl.program_id(0), tl.program_id(1)
     pid_b = pid_bc % batch_size
@@ -365,7 +403,7 @@ def _decode_score_attn_kernel(
         shape=(gqa_group_size, chunk_end_block),
         strides=(stride_s_h, stride_s_n),
         offsets=(0, chunk_start_block),
-        block_shape=(BLOCK_SIZE_H, BLOCKS_PER_K_BLOCK),
+        block_shape=(BLOCK_SIZE_H, 1),
         order=(1, 0),
     )
     # load q
@@ -373,7 +411,6 @@ def _decode_score_attn_kernel(
     # init statistics
     off_n = tl.arange(0, BLOCK_SIZE_N)
     off_d = tl.arange(0, BLOCK_SIZE_D)
-    off_bpk = tl.arange(0, BLOCKS_PER_K_BLOCK)
     dim_mask = off_d < head_dim
     if HAS_SINK:
         if pid_c == 0:
@@ -402,100 +439,116 @@ def _decode_score_attn_kernel(
     acc_o = tl.full((BLOCK_SIZE_H, BLOCK_SIZE_D), 0, dtype=tl.float32)
     # pre-compute local_start outside the loop (constant for entire batch)
     local_start = tl.maximum(0, num_blocks - local_blocks)
-    # full attention or causal attention
-    for i in range(chunk_start, chunk_end, BLOCK_SIZE_N):
-        pos = i + off_n
-        pos_mask = pos < seq_len
-        # resolve slot per position via req_to_token
-        slots = tl.load(
-            req_to_token_ptr + sid * stride_r2t_b + pos,
-            mask=pos_mask,
-            other=0,
-        ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots  # safety against negative
-        # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
-        k_off = (
-            slots[None, :] * stride_k_s
-            + pid_kh * stride_k_h
-            + off_d[:, None] * stride_k_d
-        )
-        k = tl.load(
-            k_cache_ptr + k_off,
-            mask=dim_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        )
-        if IS_FP8:
-            # fp8 index K cache: widening cast with bf16/fp16 Q, no-op with fp8
-            # Q (fp8 attn-GEMM mode; tl.dot runs fp8x8). Compiled out for bf16.
-            k = k.to(q.dtype)
-        # load V as (BLOCK_SIZE_N, head_dim) via indirect addressing
-        v_off = (
-            slots[:, None] * stride_v_s
-            + pid_kh * stride_v_h
-            + off_d[None, :] * stride_v_d
-        )
-        v = tl.load(
-            v_cache_ptr + v_off,
-            mask=pos_mask[:, None] & dim_mask[None, :],
-            other=0.0,
-        )
-        if IS_FP8:
-            # Cast V to the compute dtype (widening for bf16/fp16 Q; no-op for
-            # fp8 Q where P is quantized to e4m3 for the fp8 PV MMA).
-            v = v.to(q.dtype)
-        # compute qk
-        qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
-        qk += tl.where(off_n[None, :] < chunk_end - i, 0, float("-inf"))
-        # [H, D], [D, N] -> [H, N]
-        qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
-        # save qk to score
-        score = tl.reshape(
-            qk,
-            (BLOCK_SIZE_H, BLOCKS_PER_K_BLOCK, block_size),
-            can_reorder=False,
-        )
-        sub_max = tl.max(score, axis=2)
+    # prefetch first sub-tile's slots/K/V so the paged gather overlaps the prologue.
+    r2t_base = req_to_token_ptr + sid * stride_r2t_b
+    prefetch_pos = chunk_start + off_n
+    prefetch_mask = prefetch_pos < seq_len
+    prefetched_slots = tl.load(
+        r2t_base + prefetch_pos, mask=prefetch_mask, other=0
+    ).to(tl.int64)
+    first_slots = (prefetched_slots + max_slots) % max_slots
+    k = tl.load(
+        k_cache_ptr
+        + first_slots[None, :] * stride_k_s
+        + pid_kh * stride_k_h
+        + off_d[:, None] * stride_k_d,
+        mask=dim_mask[:, None] & prefetch_mask[None, :],
+        other=0.0,
+    )
+    v = tl.load(
+        v_cache_ptr
+        + first_slots[:, None] * stride_v_s
+        + pid_kh * stride_v_h
+        + off_d[None, :] * stride_v_d,
+        mask=prefetch_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    )
+    # outer loop steps by block_size (one bsk-block -> one score column); inner
+    # loop splits it into SUB_TILES_PER_BLOCK sub-tiles of BLOCK_SIZE_N. Score
+    # (max/lse) and the online softmax (m/l/acc_o) both accumulate across
+    # sub-tiles, so the split is exact. K/V prefetched one sub-tile ahead.
+    for blk in range(chunk_start_block, chunk_end_block):
+        i = blk * block_size
+        blk_score_max = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+        blk_lse_m = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+        blk_lse_s = tl.zeros((BLOCK_SIZE_H,), dtype=tl.float32)
+        for s in tl.static_range(0, SUB_TILES_PER_BLOCK):
+            ks = i + s * BLOCK_SIZE_N
+            pos_mask = prefetch_mask
+            slots = prefetched_slots
+            # prefetch next sub-tile's slots/K/V
+            next_ks = ks + BLOCK_SIZE_N
+            if next_ks < chunk_end:
+                next_pos = next_ks + off_n
+                prefetch_mask = next_pos < seq_len
+                prefetched_slots = tl.load(
+                    r2t_base + next_pos, mask=prefetch_mask, other=0
+                ).to(tl.int64)
+                next_slots = (prefetched_slots + max_slots) % max_slots
+                k_next = tl.load(
+                    k_cache_ptr
+                    + next_slots[None, :] * stride_k_s
+                    + pid_kh * stride_k_h
+                    + off_d[:, None] * stride_k_d,
+                    mask=dim_mask[:, None] & prefetch_mask[None, :],
+                    other=0.0,
+                )
+                v_next = tl.load(
+                    v_cache_ptr
+                    + next_slots[:, None] * stride_v_s
+                    + pid_kh * stride_v_h
+                    + off_d[None, :] * stride_v_d,
+                    mask=prefetch_mask[:, None] & dim_mask[None, :],
+                    other=0.0,
+                )
+            else:
+                k_next = k
+                v_next = v
+            slots = (slots + max_slots) % max_slots  # safety against negative
+            # compute qk
+            qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
+            qk += tl.where(off_n[None, :] < chunk_end - ks, 0, float("-inf"))
+            # [H, D], [D, N] -> [H, N]
+            if IS_FP8:
+                k = k.to(q.dtype)
+            qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
+            # accumulate this sub-tile into the bsk-block score
+            sub_max = tl.max(qk, axis=1)  # (BLOCK_SIZE_H,)
+            if SCORE_TYPE == "max":
+                blk_score_max = tl.maximum(blk_score_max, sub_max)
+            else:  # "lse"
+                new_m = tl.maximum(blk_lse_m, sub_max)
+                blk_lse_s = blk_lse_s * tl.exp2(blk_lse_m - new_m) + tl.sum(
+                    tl.exp2(qk - new_m[:, None]), axis=1
+                )
+                blk_lse_m = new_m
+            # online softmax attention update (per sub-tile)
+            m_ij = tl.maximum(m_i, sub_max)
+            p = tl.exp2(qk - m_ij[:, None])
+            l_ij = tl.sum(p, axis=1)
+            acc_o_scale = tl.exp2(m_i - m_ij)
+            acc_o = acc_o * acc_o_scale[:, None]
+            # [H, N], [N, D] -> [H, D]
+            if IS_FP8:
+                v = v.to(q.dtype)
+            acc_o += tl.dot(p.to(v.dtype), v) * v_scale
+            m_i = m_ij
+            l_i = l_i * acc_o_scale + l_ij
+            # advance to prefetched K/V for the next sub-tile
+            k = k_next
+            v = v_next
+        # finalize and save this bsk-block's score (one column)
         if SCORE_TYPE == "max":
-            score = sub_max
-        else:  # "lse"
-            score = sub_max + tl.log2(
-                tl.sum(tl.exp2(score - sub_max[:, :, None]), axis=2)
-            )
+            score = blk_score_max
+        else:
+            score = blk_lse_m + tl.log2(blk_lse_s)
             score = tl.where(score != score, float("-inf"), score)
-        # apply init_blocks and local_blocks efficiently
-        # current block indices: [BLOCKS_PER_K_BLOCK]
-        curr_block_idx = i // block_size + off_bpk
-        # Combined condition with single nested tl.where:
-        # - local_blocks (1e29) takes priority over init_blocks (1e30)
-        # - When init_blocks=0: curr_block_idx < 0 is always False
-        # - When local_blocks=0: local_start=num_blocks, so curr_block_idx >= num_blocks is always False
+        curr_block_idx = blk
         is_init = curr_block_idx < init_blocks
         is_local = (curr_block_idx >= local_start) & (curr_block_idx < num_blocks)
-        # Apply in one fused operation: local > init > original
-        score = tl.where(
-            is_local[None, :], 1e29, tl.where(is_init[None, :], 1e30, score)
-        )
-        if SKIP_TRIVIAL_TOPK_SCORE:
-            if num_blocks > topk:
-                tl.store(
-                    s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1)
-                )
-        else:
-            tl.store(
-                s_ptrs, score.to(score_ptr.dtype.element_ty), boundary_check=(0, 1)
-            )
-        # max-of-max == max(qk), avoids re-scanning qk
-        m_ij = tl.maximum(m_i, tl.max(sub_max, axis=1))
-        p = tl.exp2(qk - m_ij[:, None])
-        l_ij = tl.sum(p, axis=1)
-        acc_o_scale = tl.exp2(m_i - m_ij)
-        acc_o = acc_o * acc_o_scale[:, None]
-        # [H, N], [N, D] -> [H, D]
-        acc_o += tl.dot(p.to(v.dtype), v) * v_scale
-        m_i = m_ij
-        l_i = l_i * acc_o_scale + l_ij
-        # update ptrs
-        s_ptrs = tl.advance(s_ptrs, (0, BLOCKS_PER_K_BLOCK))
+        score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
+        tl.store(s_ptrs, tl.reshape(score, (BLOCK_SIZE_H, 1)).to(score_ptr.dtype.element_ty), boundary_check=(0, 1))
+        s_ptrs = tl.advance(s_ptrs, (0, 1))
     # final scale
     acc_o = acc_o / l_i[:, None]
     # compute lse in log2 scale for merge kernel
@@ -761,9 +814,6 @@ def _topk_index_merge_kernel(
     seq_len = tl.load(seq_lens + pid_b)
     num_blocks = (seq_len + block_size - 1) // block_size
 
-    # Layout: load NUM_TOPK_CHUNKS * BLOCK_SIZE_T candidates, padded to BLOCK_SIZE_K.
-    # candidate at flat position p comes from chunk = p // BLOCK_SIZE_T,
-    # in_chunk = p % BLOCK_SIZE_T.
     off = tl.arange(0, BLOCK_SIZE_K)
     chunk_idx = off // BLOCK_SIZE_T
     in_chunk_idx = off % BLOCK_SIZE_T
@@ -834,7 +884,6 @@ def flash_decode_with_topk_idx(
     init_blocks: int,
     local_blocks: int,
     sm_scale: Optional[float] = None,
-    use_tma: bool = True,
     score_type: str = "max",
     disable_index_value: bool = False,
     use_dense_main_attn: bool = False,  # NOTE: need transform idx in this case
@@ -856,7 +905,7 @@ def flash_decode_with_topk_idx(
     v_scale = unit_scale(v_scale)
     if not disable_index_value:
         assert v_cache is not None
-    # shape
+        _check_dtypes(q, k_cache, v_cache)
     batch_size, num_q_heads, head_dim = q.shape
     max_slots, num_kv_heads, _ = k_cache.shape
     max_kv_len = req_to_token.shape[1]
@@ -879,21 +928,37 @@ def flash_decode_with_topk_idx(
     # Must only depend on cuda-graph-constant quantities (BS, num_kv_heads), not seq_len.
     # Empty chunks early-return cheaply, so over-chunking is nearly free.
     # E.g. with num_kv_heads=1: BS=1→NKC=256,CTAs=256; BS=32→NKC=128,CTAs=4096.
+    # NUM_KV_CHUNKS: grid independent of seq_len (cuda-graph friendly). Empty
+    # chunks early-return cheaply, so over-chunking is nearly free — BUT each
+    # chunk must hold >= MIN_BLOCKS_PER_CHUNK blocks so the in-kernel K/V
+    # prefetch (which overlaps the next block's gather with this block's dot)
+    # actually fires. With 1 block/chunk the prefetch branch never runs and
+    # every paged gather stall is exposed.
+    #
+    # So cap NUM_KV_CHUNKS by max_seqblock // MIN_BLOCKS_PER_CHUNK — but only
+    # when batch*num_kv_heads is large enough that the grid fills the SMs
+    # without relying on split-K. At tiny batch (bs=1) the grid is propped up
+    # by split-K itself; capping there shrinks the grid below the SM count and
+    # loses occupancy, so we leave it uncapped.
     TARGET_GRID = 4096
     MAX_NUM_KV_CHUNKS = 256
+    MIN_BLOCKS_PER_CHUNK = 2
+    MIN_BATCH_FOR_CAP = 8
+    score_kv_len = min(max_seqlen, max_kv_len)
+    max_seqblock = triton.cdiv(score_kv_len, block_size)
     target = max(
         1,
         min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, batch_size * num_kv_heads)),
     )
     NUM_KV_CHUNKS = 1 << (target.bit_length() - 1)
-    score_kv_len = min(max_seqlen, max_kv_len)
+    # score_kv_len = min(max_seqlen, max_kv_len)
     # The score producers below write every valid block column
     # [0, ceil(seq_len / block_size)) for each (head, batch) row. All consumers
     # clamp their scan to the same per-row valid block count, so columns beyond
     # seq_len are never read. Avoid a full-tensor -inf memset here; on CUDA graph
     # capture the static score shape can be much larger than the live context.
     score = torch.empty(
-        (num_q_heads, batch_size, triton.cdiv(score_kv_len, block_size)),
+        (num_q_heads, batch_size, triton.cdiv(max_kv_len, block_size)),
         dtype=torch.float32,
         device=q.device,
     )
@@ -1009,17 +1074,23 @@ def flash_decode_with_topk_idx(
     # Fused top-k + page-table transform: emit the dense backend's page table
     # directly (page-size-aware) instead of block ids, skipping a separate gather.
     # The page table + per-query effective KV length are allocated and returned.
-    real_seq_lens = None
-    if use_dense_main_attn:
-        from sglang.kernels.ops.attention.minimax_decode_topk import (
-            minimax_decode_topk_page_table,
+    topk_idx = torch.empty(
+        (num_q_heads, batch_size, topk),
+        device=score.device,
+        dtype=torch.int32,
         )
-
-        # num_q_heads (= num index/kv heads) may be > 1 for DP attention; the
-        # kernel emits a flattened [batch*num_q_heads] page table + seq_lens with
-        # the kv head head-encoded (head-minor) into the page index.
-        topk_idx, real_seq_lens = minimax_decode_topk_page_table(
-            score, seq_lens, req_to_token, slot_ids, block_size, topk, page_size
+    real_seq_lens = None
+    # if use_dense_main_attn:
+    if use_jit_topk:
+        from sglang.kernels.ops.attention.minimax_decode_topk import (
+            # minimax_decode_topk_page_table,
+            minimax_decode_topk
+        )
+        # topk_idx, real_seq_lens = minimax_decode_topk_page_table(
+        #     score, seq_lens, req_to_token, slot_ids, block_size, topk, page_size
+        # )
+        topk_idx = minimax_decode_topk(
+            score, seq_lens, block_size, topk, topk_idx
         )
         if disable_index_value:
             return None, topk_idx, real_seq_lens
@@ -1029,12 +1100,12 @@ def flash_decode_with_topk_idx(
         _skip_block_topk = False
 
     # get topk index
-    if not _skip_block_topk:
-        topk_idx = torch.empty(
-            (num_q_heads, batch_size, topk),
-            device=score.device,
-            dtype=torch.int32,
-        )
+    # if not _skip_block_topk:
+    #     topk_idx = torch.empty(
+    #         (num_q_heads, batch_size, topk),
+    #         device=score.device,
+    #         dtype=torch.int32,
+    #     )
 
     if _skip_block_topk:
         pass

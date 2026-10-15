@@ -1,6 +1,17 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
+"""Standalone decode sparse-attention kernels (bf16 / fp16 only).
 
-from typing import Optional
+Step 1 (lightning indexer): ``flash_decode_with_topk_idx`` — score every KV
+block with the index head and select the top-k blocks (2-stage split-K Triton
+topk). Optionally also produces the index-head attention output.
+
+Step 3 (main sparse attention): ``flash_decode_with_gqa_share_sparse`` —
+attend only to the selected top-k blocks with the main head.
+
+No fp8, no sglang, no project utils. Paged KV via ``req_to_token`` / ``slot_ids``.
+"""
+
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -8,7 +19,6 @@ import triton.language as tl
 
 from ..common.utils import (
     check_sparse_kv_fp8,
-    robust_allocator,
     sparse_out_dtype,
     unit_scale,
 )
@@ -30,9 +40,9 @@ from ..common.utils import (
     configs=[
         triton.Config({}, num_warps=nw, num_stages=ns)
         for nw in [4, 8]
-        for ns in [2, 3, 4, 5]
+        for ns in [1, 2, 3]
     ],
-    key=["BATCH_SIZE_BUCKET", "gqa_group_size", "head_dim", "block_size", "HAS_SINK"],
+    key=["BATCH_SIZE_BUCKET", "gqa_group_size", "head_dim", "BLOCK_SIZE_N", "HAS_SINK"],
 )
 @triton.jit
 def _gqa_share_sparse_decode_kernel(
@@ -92,6 +102,7 @@ def _gqa_share_sparse_decode_kernel(
     BLOCK_SIZE_T: tl.constexpr,
     NUM_TOPK_CHUNKS: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    block_size: tl.constexpr,
     IS_FP8: tl.constexpr,
     HAS_HISPARSE_SLOTS: tl.constexpr,
 ):
@@ -110,6 +121,8 @@ def _gqa_share_sparse_decode_kernel(
     chunk_end_topk_compiletime = chunk_start_topk + chunk_size_topk
     # get q k start and len after rmpad
     seq_len = tl.minimum(tl.load(seq_lens + pid_b), max_kv_len)
+    # number of KV blocks; used to clamp stray topk_idx entries (see loop below).
+    num_blocks = (seq_len + block_size - 1) // block_size
     sid = (
         tl.load(slot_ids + pid_b).to(tl.int64) + max_slots
     ) % max_slots  # to avoid bugs when slot_ids is negative
@@ -118,139 +131,138 @@ def _gqa_share_sparse_decode_kernel(
     idx_base = idx_ptr + pid_kh * stride_ti_h + pid_b * stride_ti_b
     topk_idx = tl.load(idx_base + off_t * stride_ti_t, mask=off_t < max_topk, other=-1)
     valid_idx = tl.where(topk_idx >= 0, off_t, -1)
-    real_topk = tl.sum(valid_idx != -1, axis=0)
+    real_topk = tl.sum((valid_idx != -1).to(tl.int32), axis=0)
     chunk_end_topk = tl.minimum(chunk_end_topk_compiletime, real_topk)
     # init pointer
+    SUB_TILES_PER_BLOCK: tl.constexpr = block_size // BLOCK_SIZE_N
     off_n = tl.arange(0, BLOCK_SIZE_N)
     off_d = tl.arange(0, BLOCK_SIZE_D)
     dim_mask = off_d < head_dim
     # init statistics — kept at -inf so empty chunks (chunk_start >= real_topk)
     # naturally fall out as weight=0 in the merge step.
-    if HAS_SINK and pid_c == 0:
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
-            shape=(gqa_group_size, head_dim),
-            strides=(stride_q_h, stride_q_d),
-            offsets=(0, 0),
-            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(1, 0),
-        )
-        q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
-        sink_ptrs = tl.make_block_ptr(
-            base=sink_ptr + pid_h * stride_sink_h,
-            shape=(gqa_group_size, head_dim),
-            strides=(stride_sink_h, stride_sink_d),
-            offsets=(0, 0),
-            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(1, 0),
-        )
-        sink = tl.load(sink_ptrs, boundary_check=(0, 1), padding_option="zero").to(
-            tl.float32
-        )
-        qsink = tl.sum(q.to(tl.float32) * sink, axis=1) * sm_scale  # (BLOCK_SIZE_H,)
-        m_i = qsink
-        lse_i = qsink
+    # NOTE: nest `if HAS_SINK:` (constexpr, prunes sink_ptr use when False)
+    # around the runtime `if pid_c == 0:` — a single `if HAS_SINK and pid_c == 0`
+    # is NOT statically pruned by the compiler and would dereference sink_ptr
+    # (None) even when HAS_SINK is False.
+    q_ptrs = tl.make_block_ptr(
+        base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
+        shape=(gqa_group_size, head_dim),
+        strides=(stride_q_h, stride_q_d),
+        offsets=(0, 0),
+        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+        order=(1, 0),
+    )
+    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    if HAS_SINK:
+        if pid_c == 0:
+            sink_ptrs = tl.make_block_ptr(
+                base=sink_ptr + pid_h * stride_sink_h,
+                shape=(gqa_group_size, head_dim),
+                strides=(stride_sink_h, stride_sink_d),
+                offsets=(0, 0),
+                block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
+                order=(1, 0),
+            )
+            sink = tl.load(sink_ptrs, boundary_check=(0, 1), padding_option="zero").to(
+                tl.float32
+            )
+            qsink = tl.sum(q.to(tl.float32) * sink, axis=1) * sm_scale  # (BLOCK_SIZE_H,)
+            m_i = qsink
+            lse_i = qsink
+        else:
+            m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+            lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     else:
         m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
         lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + pid_b * stride_q_b + pid_h * stride_q_h,
-            shape=(gqa_group_size, head_dim),
-            strides=(stride_q_h, stride_q_d),
-            offsets=(0, 0),
-            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(1, 0),
-        )
-        q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
     acc_o = tl.full((BLOCK_SIZE_H, BLOCK_SIZE_D), 0, dtype=tl.float32)
     # only iterate over this chunk's topk slice. the load must respect the
     # per-chunk start offset.
     cur_idx_ptr = idx_base + chunk_start_topk * stride_ti_t
     hisparse_topk_counter = chunk_start_topk
-    for _ in tl.range(chunk_start_topk, chunk_end_topk):
-        # load index
-        c = tl.load(cur_idx_ptr).to(tl.int32) * BLOCK_SIZE_N
+    for _ in tl.range(chunk_start_topk, chunk_end_topk, num_stages=2):
+        # load index; c is the absolute start of this bsk-block (block_size
+        # tokens). Clamp out-of-range ids to 0: under cuda-graph capture the
+        # topk_idx buffer may be uninitialized, and a huge positive entry makes
+        # `raw * block_size` overflow int32 to a negative c; then pos = c + ...
+        # < 0 < seq_len is spuriously true and the masked req_to_token gather
+        # dereferences an unmapped address (MetaX Xnack/ATU fault). Legal ids
+        # are untouched on the real path.
+        raw = tl.load(cur_idx_ptr).to(tl.int32)
+        c = tl.where((raw >= 0) & (raw < num_blocks), raw, 0).to(tl.int32) * block_size
         cur_idx_ptr = cur_idx_ptr + stride_ti_t
-        pos = c + off_n
-        pos_mask = pos < seq_len
-        if HAS_HISPARSE_SLOTS:
-            slots = tl.load(
-                hisparse_slots_ptr
-                + pid_kh * hisparse_slots_stride_h
-                + pid_b * hisparse_slots_stride_b
-                + hisparse_topk_counter * BLOCK_SIZE_N
-                + off_n,
-                mask=off_n < BLOCK_SIZE_N,
-                other=0,
-            ).to(tl.int64)
-            hisparse_topk_counter = hisparse_topk_counter + 1
-        else:
-            slots = tl.load(
-                req_to_token_ptr + sid * stride_r2t_b + pos,
-                mask=pos_mask,
-                other=0,
-            ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots  # safety against negative
-        # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
-        k_off = (
-            slots[None, :] * stride_k_s
-            + pid_kh * stride_k_h
-            + off_d[:, None] * stride_k_d
-        )
-        k = tl.load(
-            k_cache_ptr + k_off,
-            mask=dim_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        )
-        if IS_FP8:
-            # fp8 KV cache: with bf16/fp16 Q this widens K to the compute dtype
-            # (unit-scaled cache -> exact inverse dequant; k_scale covers
-            # calibrated caches). With fp8 Q (fp8 attn-GEMM mode) the cast is a
-            # no-op and tl.dot below runs fp8x8 on tensor cores. Matches the
-            # bf16 path bit-for-bit when the cache is bf16 (IS_FP8 False ->
-            # this branch is compiled out).
-            k = k.to(q.dtype)
-        # load V as (BLOCK_SIZE_N, head_dim) via indirect addressing
-        v_off = (
-            slots[:, None] * stride_v_s
-            + pid_kh * stride_v_h
-            + off_d[None, :] * stride_v_d
-        )
-        v = tl.load(
-            v_cache_ptr + v_off,
-            mask=pos_mask[:, None] & dim_mask[None, :],
-            other=0.0,
-        )
-        if IS_FP8:
-            # Cast V to the compute dtype. With bf16/fp16 Q this widens (so the
-            # `p.to(v.dtype)` below keeps P in the compute dtype); with fp8 Q it
-            # is a no-op and P is quantized to e4m3 for the fp8 PV MMA — the
-            # same accuracy contract as fmha_sm100's fp8 kernel.
-            v = v.to(q.dtype)
-        # compute qk
-        qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
-        qk += tl.where(off_n[None, :] < seq_len - c, 0, float("-inf"))
-        # [H, D], [D, N] -> [H, N]
-        qk += tl.dot(q, k) * (sm_scale * k_scale)
-        # compute m_ij and l_ij
-        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp(qk - m_ij[:, None])
-        l_ij = tl.sum(p, axis=1)
-        # scale acc_o
-        acc_o_scale = tl.exp(m_i - m_ij)
-        acc_o = acc_o * acc_o_scale[:, None]
-        # load v and update acc_o
-        # [H, N], [N, D] -> [H, D]
-        acc_o += tl.dot(p.to(v.dtype), v) * v_scale
-        # update statistics
-        m_i = m_ij
-        lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
+        # split the bsk-block into sub-tiles of BLOCK_SIZE_N to shrink the K/V
+        # shared-mem tile and raise occupancy (see prefill step3). Online
+        # softmax accumulates across sub-tiles, so the split is exact.
+        for s in tl.static_range(0, SUB_TILES_PER_BLOCK):
+            cs = c + s * BLOCK_SIZE_N
+            # resolve slots for this sub-tile via req_to_token
+            pos = cs + off_n
+            pos_mask = pos < seq_len
+            if HAS_HISPARSE_SLOTS:
+                slots = tl.load(
+                    hisparse_slots_ptr
+                    + pid_kh * hisparse_slots_stride_h
+                    + pid_b * hisparse_slots_stride_b
+                    + hisparse_topk_counter * block_size
+                    + s * BLOCK_SIZE_N + off_n,
+                    mask=pos_mask, other=0,
+                ).to(tl.int64)
+            else:
+                slots = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + pos,
+                    mask=pos_mask,
+                    other=0,
+                ).to(tl.int64)
+            slots = (slots + max_slots) % max_slots  # safety against negative
+            # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
+            k_off = (
+                slots[None, :] * stride_k_s
+                + pid_kh * stride_k_h
+                + off_d[:, None] * stride_k_d
+            )
+            k = tl.load(
+                k_cache_ptr + k_off,
+                mask=dim_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            )
+            # load V as (BLOCK_SIZE_N, head_dim) via indirect addressing
+            v_off = (
+                slots[:, None] * stride_v_s
+                + pid_kh * stride_v_h
+                + off_d[None, :] * stride_v_d
+            )
+            v = tl.load(
+                v_cache_ptr + v_off,
+                mask=pos_mask[:, None] & dim_mask[None, :],
+                other=0.0,
+            )
+            # compute qk
+            qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
+            qk += tl.where(off_n[None, :] < seq_len - cs, 0, float("-inf"))
+            # [H, D], [D, N] -> [H, N]
+            if IS_FP8:
+                k = k.to(q.dtype)
+            qk += tl.dot(q, k) * (sm_scale * k_scale)
+            # compute m_ij and l_ij
+            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+            p = tl.exp(qk - m_ij[:, None])
+            l_ij = tl.sum(p, axis=1)
+            # scale acc_o
+            acc_o_scale = tl.exp(m_i - m_ij)
+            acc_o = acc_o * acc_o_scale[:, None]
+            # load v and update acc_o
+            if IS_FP8:
+                v = v.to(q.dtype)
+            # [H, N], [N, D] -> [H, D]
+            acc_o += tl.dot(p.to(v.dtype), v) * v_scale
+            # update statistics
+            m_i = m_ij
+            lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
+        hisparse_topk_counter = hisparse_topk_counter + 1
     # final scale (matches the old non-split kernel for chunks where lse_i>-inf).
-    # For empty chunks (chunk_start_topk >= real_topk) the inner loop never
-    # runs, so m_i = lse_i = -inf and naive `tl.exp(m_i - lse_i)` would compute
-    # exp(-inf - (-inf)) = exp(NaN) = NaN, then 0 * NaN = NaN poisons o_partial
-    # and the merge result. Gate the scale with tl.where so empty chunks emit a
-    # clean zero (lse_i stays -inf which the merge correctly turns into weight=0).
+    # For empty chunks the inner loop never runs, so m_i = lse_i = -inf and naive
+    # `tl.exp(m_i - lse_i)` would be NaN; gate with tl.where for a clean zero.
     scale = tl.where(
         lse_i > float("-inf"),
         tl.exp(m_i - lse_i),
@@ -334,13 +346,13 @@ def flash_decode_with_gqa_share_sparse(
     block_size: int,
     topk_idx: torch.Tensor,  # [num_kv_heads, batch_size, topk]
     sm_scale: Optional[float] = None,
-    use_tma: bool = True,
+    use_tma: bool = False,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     hisparse_slots: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    triton.set_allocator(robust_allocator)
+    # triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
     k_scale = unit_scale(k_scale)
     v_scale = unit_scale(v_scale)
@@ -369,6 +381,8 @@ def flash_decode_with_gqa_share_sparse(
     # only depend on shape constants (so grid is fixed within a cuda graph).
     # Capped by max_topk because chunks beyond real_topk early-fall-through to
     # the merge-as-zero path; capping avoids wasting blocks at tiny topk.
+    # Pick NUM_TOPK_CHUNKS so total grid ≈ TARGET_GRID. Must be power of 2 and
+    # only depend on shape constants (cuda-graph friendly).
     TARGET_GRID = 256
     target = max(
         1,
@@ -438,9 +452,10 @@ def flash_decode_with_gqa_share_sparse(
         lse_partial.stride(0),
         lse_partial.stride(1),
         lse_partial.stride(2),
-        BLOCK_SIZE_N=block_size,
+        block_size=block_size,
+        BLOCK_SIZE_N=min(16, triton.next_power_of_2(block_size)),
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
-        IS_FP8=is_fp8,
+        IS_FP8=is_fp8
     )
     # merge partials into chunk 0
     merge_grid = (batch_size, num_q_heads)

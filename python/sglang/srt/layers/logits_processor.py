@@ -478,6 +478,7 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        self.empty_hiddens = None
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -797,7 +798,14 @@ class LogitsProcessor(nn.Module):
             ).to(pruned_states.device, non_blocking=True)
 
         if logits_metadata.forward_mode.is_idle():
-            pruned_states = hidden_states[:0]
+            if self.empty_hiddens is None:
+                self.empty_hiddens = torch.empty(
+                    0,
+                    hidden_states.shape[1],
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+            pruned_states = self.empty_hiddens
 
         return (
             pruned_states,

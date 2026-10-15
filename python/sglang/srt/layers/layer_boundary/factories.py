@@ -292,8 +292,8 @@ def declare_attn(
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
     """
-    if reduction is ProducerReduction.LOCAL_TAIL:
-        raise ValueError("LOCAL_TAIL is not supported for attention stages")
+    if reduction in (ProducerReduction.LOCAL_TAIL, ProducerReduction.EAGER):
+        raise ValueError("LOCAL_TAIL and EAGER are not supported for attention stages")
     return StageDeclaration(
         StageKind.ATTENTION,
         read,
@@ -336,7 +336,8 @@ def declare_ffn(
             compute, or the full TP size.
         reduction: How compute cooperates with the exit's reduction decision:
             SCOPED (default) follows the exit scope; LOCAL_TAIL marks a
-            replicated tail after the sum. PARTIAL is rejected for FFN stages.
+            replicated tail after the sum. EAGER forbids cross-layer reduction
+            deferral without requiring a replicated tail. PARTIAL is rejected.
         handoff_rows: Explicit output-row requirement; otherwise derived from
             the adjacent FFN kinds and TBO configuration.
 
