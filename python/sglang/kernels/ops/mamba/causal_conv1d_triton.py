@@ -12,6 +12,9 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
+# C500/MetaX-C550 optimized fast path (self-contained; default off).
+from sglang.kernels.ops.attention.fla.kda_opt_c500 import _c500_kda_opt_enabled
+
 PAD_SLOT_ID = -1
 
 
@@ -443,6 +446,16 @@ def causal_conv1d_fn(
 
     out: same shape as `x`
     """
+    if _c500_kda_opt_enabled():
+        from sglang.kernels.ops.attention.fla.kda_opt_c500 import (
+            causal_conv1d_fn as _c500_impl,
+        )
+
+        return _c500_impl(
+            x, weight, bias, conv_states, query_start_loc, seq_lens_cpu,
+            cache_indices, has_initial_state, activation, pad_slot_id,
+            validate_data, **kwargs,
+        )
     if isinstance(activation, bool) and activation:
         activation = "silu"
 

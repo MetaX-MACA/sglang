@@ -6,6 +6,9 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
+# C500/MetaX-C550 optimized fast path (self-contained; default off).
+from .kda_opt_c500 import _c500_kda_opt_enabled
+
 
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
@@ -388,6 +391,20 @@ def fused_sigmoid_gating_delta_rule_update(
     - target_verify: multi-step with intermediate state caching, optional tree attention,
                      and optional state update disable
     """
+    if _c500_kda_opt_enabled():
+        from .kda_opt_c500 import (
+            fused_sigmoid_gating_delta_rule_update as _c500_impl,
+        )
+
+        return _c500_impl(
+            A_log, a, dt_bias, softplus_beta, softplus_threshold, q, k, v, b,
+            initial_state_source, initial_state_indices, scale,
+            use_qk_l2norm_in_kernel, cu_seqlens, is_kda, lower_bound,
+            disable_state_update, intermediate_states_buffer,
+            intermediate_state_indices, cache_steps, retrieve_parent_token,
+            cache_ring, replayssm_rawv, replayssm_rawk, replayssm_g,
+            replayssm_beta,
+        )
     B, T, H, K, V = *k.shape, v.shape[-1]
     stride_q = q.stride()[1]
     stride_k = k.stride()[1]
