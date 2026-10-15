@@ -8,6 +8,8 @@ import triton
 from sglang.srt.environ import envs
 from sglang.srt.utils import ceil_div, is_cuda, is_musa
 
+from typing import Optional
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,6 +23,7 @@ if _is_cuda or _is_musa:
 
 import triton.language as tl
 
+import mcoplib
 
 def _get_launch_config_1d(device, numel):
     MAX_THREADS_PER_BLOCK = 1024
@@ -2684,3 +2687,12 @@ def moe_unpermute(
 
     assert outputs is not None
     return outputs
+
+def silu_and_mul_masked_fwd(
+    input: torch.Tensor,
+    masked_m: torch.Tensor,
+):
+    out_stride = (input.shape[-1]//4 + 257) // 256 * 256
+    output = torch.empty((input.shape[0], input.shape[1], out_stride), device=input.device, dtype=input.dtype)
+    mcoplib.op.fused_silu_mul_dq_mask_quant(output, input, masked_m)
+    return output
