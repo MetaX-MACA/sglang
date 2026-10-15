@@ -14,6 +14,7 @@ import torch
 from sglang.kernels.jit.utils.common import (
     cache_once,
     is_hip_runtime,
+    is_maca_runtime,
     is_musa_runtime,
 )
 
@@ -168,7 +169,7 @@ def get_jit_cuda_arch() -> ArchInfo:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
-    if is_hip_runtime() or is_musa_runtime():
+    if is_hip_runtime() or is_musa_runtime() or is_maca_runtime():
         return False
     return get_jit_cuda_arch().major >= 9
 

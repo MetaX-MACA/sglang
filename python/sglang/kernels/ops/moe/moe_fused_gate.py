@@ -12,6 +12,7 @@ from sglang.kernels.jit.utils import (
     cache_once,
     get_jit_cuda_arch,
     is_arch_support_pdl,
+    is_maca_runtime,
     load_jit,
 )
 from sglang.kernels.kernel_api_logging import debug_kernel_api
@@ -436,7 +437,7 @@ def moe_fused_gate(
             routed_scaling_factor,
             apply_routed_scaling_factor_on_output,
         )
-        if moe_route_radix.covered(scores, bias, topk):
+        if not is_maca_runtime() and moe_route_radix.covered(scores, bias, topk):
             return moe_route_radix.route_radix(*radix_args, sorted=False)
 
     M, N = scores.shape
