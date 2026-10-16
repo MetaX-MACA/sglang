@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -379,6 +380,9 @@ class Indexer(MultiPlatformOp):
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
     _MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
+    _MQA_LOGITS_FORCE_CHUNK_BYTES = int(
+        os.environ.get("MX_SGLANG_MQA_LOGITS_FORCE_CHUNK_BYTES", 512 * 1024 * 1024)
+    )
     _mqa_logits_budget_bytes: Dict[int, int] = {}
 
     @staticmethod
@@ -897,7 +901,16 @@ class Indexer(MultiPlatformOp):
         logits_bytes = num_q * num_k * self._MQA_LOGITS_BYTES_PER_ELEM
         logits_budget_bytes = self._get_mqa_logits_budget_bytes(device_index)
 
-        need_chunk = logits_bytes > logits_budget_bytes
+        # If the full [num_q, num_k] fp32 logits buffer exceeds an absolute
+        # per-layer ceiling, always chunk. The budget above is derived from the
+        # CUDA-global free memory (mem_get_info) which does not reflect the
+        # contiguous blocks PyTorch's caching allocator can actually hand out;
+        # under fragmentation a logits buffer well below that budget can still
+        # fail (see OOM: "Tried to allocate 1.28 GiB"). A hard cap therefore
+        # guarantees per-layer allocations never grow unbounded with context.
+        need_chunk = (logits_bytes > logits_budget_bytes) or (
+            logits_bytes > self._MQA_LOGITS_FORCE_CHUNK_BYTES
+        )
         if need_chunk and _enable_mqa_chunk_empty_cache:
             # Return unused blocks held by PyTorch's caching allocator to CUDA,
             # then refresh the cached MQA logits budget before deciding to chunk.
@@ -909,7 +922,9 @@ class Indexer(MultiPlatformOp):
                 logits_budget_bytes = min(
                     logits_budget_bytes, self._MQA_LOGITS_MAX_BYTES_ROCM
                 )
-            need_chunk = logits_bytes > logits_budget_bytes
+            need_chunk = (logits_bytes > logits_budget_bytes) or (
+                logits_bytes > self._MQA_LOGITS_FORCE_CHUNK_BYTES
+            )
         return need_chunk, logits_budget_bytes
 
     def _get_topk_ragged(
@@ -1081,6 +1096,13 @@ class Indexer(MultiPlatformOp):
 
         bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
         max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
+        max_rows = min(
+            max_rows,
+            max(
+                1,
+                int(self._MQA_LOGITS_FORCE_CHUNK_BYTES // max(bytes_per_row, 1)),
+            ),
+        )
         max_rows = min(max_rows, q_offset)
 
         global_topk_offset = metadata.attn_metadata.topk_indices_offset
