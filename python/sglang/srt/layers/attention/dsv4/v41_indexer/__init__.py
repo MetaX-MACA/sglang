@@ -5,11 +5,13 @@ DeepGEMM sparse table (``sparse_table``) or dense block ids (``dense_blocks``)."
 from __future__ import annotations
 
 import functools
+import logging
 from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.layers.attention.dsv4.index_cache_kind import dsv4_index_cache_kind
+from sglang.srt.utils import is_cuda, is_maca
 
 from .full_topk import FullTopKIndexer
 from .types import (
@@ -22,6 +24,8 @@ from .types import (
 )
 from sglang.srt.utils.common import is_maca
 from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 ENABLE_DEEPGEMM_INDEXER = envs.SGLANG_DSV41_FORCE_DEEPGEMM_INDEXER.get() and is_maca()
 
 if TYPE_CHECKING:
@@ -36,6 +40,7 @@ __all__ = [
     "PrefillCandidates",
     "PrefillInputs",
     "has_dense_fp4_indexer",
+    "has_dense_int8_indexer",
     "is_sm100_or_newer",
     "make_candidate_indexer",
     "make_full_topk_indexer",
@@ -61,13 +66,30 @@ def has_dense_fp4_indexer() -> bool:
 
 
 @functools.cache
+def has_dense_int8_indexer() -> bool:
+    try:
+        import deep_gemm
+    except ImportError:
+        return False
+    return hasattr(deep_gemm, "int8_mqa_logits")
+
+
+@functools.cache
 def _use_deep_gemm_prefill() -> bool:
     # A CP rank scores rank-local rows, which only DeepGEMM serves, so CP ignores the env.
     from sglang.srt.runtime_context import get_parallel
 
+    kind = dsv4_index_cache_kind()
+    if kind.is_fp4:
+        has_func = has_dense_fp4_indexer()
+    elif kind.is_int8 and is_maca():
+        has_func = has_dense_int8_indexer()
+    else:
+        return False
+
     return (
         (is_sm100_or_newer() or ENABLE_DEEPGEMM_INDEXER)
-        and has_dense_fp4_indexer()
+        and has_func
         and (
             get_parallel().attn_cp_size > 1
             or not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
@@ -112,17 +134,17 @@ def make_candidate_indexer(
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
         DEEPGEMM_PAGED_SPARSE_MQA_LOGITS,
     )
-
     # Without candidate blocks no layer is a candidate source or consumer.
     if candidate_topk_blocks <= 0:
         return dense_blocks, dense_blocks
     # MACA platforms: The is_sm100_or_newer() check is intentionally NOT applied 
     elif is_maca():
         if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
+            logger.info(f"candidate indexer: prefill=dense_blocks decode=dense_blocks")
             return dense_blocks, dense_blocks
     elif not is_sm100_or_newer():
         return dense_blocks, dense_blocks
-
+    
     if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
         raise RuntimeError(
             "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
@@ -140,5 +162,7 @@ def make_candidate_indexer(
     # A CP rank's rows are an interleaved subset of the batch; the torch prefill
     # env keeps the sparse table on decode only.
     if not use_deep_gemm_prefill or get_parallel().attn_cp_size > 1:
+        logger.info(f"candidate indexer: prefill=dense_blocks decode=sparse_table")
         return dense_blocks, sparse_table
+    logger.info(f"candidate indexer: prefill=sparse_table decode=sparse_table")
     return sparse_table, sparse_table
