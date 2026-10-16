@@ -26,7 +26,7 @@ def _install_deep_gemm_stub() -> None:
 
 _install_deep_gemm_stub()
 
-from sglang.jit_kernel.deepseek_v4 import (  # noqa: E402
+from sglang.jit_kernel.dsv4 import (  # noqa: E402
     fused_k_norm_rope_flashmla,
     fused_q_norm_rope,
 )
@@ -35,6 +35,12 @@ from sglang.jit_kernel.utils import (  # noqa: E402
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
+)
+from sglang.srt.layers.attention.dsv4.dequant_k_cache import (  # noqa: E402
+    dequantize_k_cache_paged,
+)
+from sglang.srt.layers.fused_qk_norm_rope_store import (  # noqa: E402
+    fused_qk_norm_rope_swa_store,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -235,6 +241,10 @@ def _flashmla_fp8_page_bytes(page_size: int) -> int:
     return math.ceil(584 * page_size / 576) * 576
 
 
+def _flashmla_int8_page_bytes(page_size: int) -> int:
+    return math.ceil(608 * page_size / 576) * 576
+
+
 def test_fused_k_norm_rope_flashmla_fp8_cache_interface_regression() -> None:
     torch.manual_seed(2)
     batch_size = 4
@@ -269,6 +279,118 @@ def test_fused_k_norm_rope_flashmla_fp8_cache_interface_regression() -> None:
         triton.testing.assert_close(
             rope.float(), ref[i, -ROPE_DIM:].cpu().float(), atol=2e-2, rtol=2e-2
         )
+
+
+def test_fused_k_norm_rope_flashmla_int8_cache() -> None:
+    torch.manual_seed(3)
+    batch_size = 5
+    page_size = 8
+    num_pages = 3
+    page_bytes = _flashmla_int8_page_bytes(page_size)
+    kv = torch.randn(batch_size, HEAD_DIM_K, device=DEVICE, dtype=DTYPE)
+    kv_weight = torch.randn(HEAD_DIM_K, device=DEVICE, dtype=DTYPE)
+    positions = torch.randint(
+        0, MAX_POS, (batch_size,), device=DEVICE, dtype=torch.int32
+    )
+    out_loc = torch.tensor([0, 3, 7, 9, 17], device=DEVICE, dtype=torch.int32)
+    freqs_cis = _make_freqs_cis()
+    kvcache = torch.zeros(
+        (num_pages, page_bytes), device=DEVICE, dtype=torch.int8
+    )
+
+    fused_k_norm_rope_flashmla(
+        kv, kv_weight, EPS, freqs_cis, positions, out_loc, kvcache, page_size
+    )
+    torch.cuda.synchronize()
+
+    out = dequantize_k_cache_paged(kvcache, out_loc, page_size)[:, 0]
+    ref = _apply_tail_rope(
+        _rmsnorm_weighted(kv, kv_weight, EPS), freqs_cis, positions
+    )
+    groups = ref[:, :448].view(batch_size, 7, 64)
+    scales = groups.abs().amax(dim=-1).clamp(min=1.0e-4) / 127.0
+    quant = torch.round(groups / scales.unsqueeze(-1)).clamp(-127, 127)
+    expected = ref.to(torch.bfloat16)
+    expected[:, :448] = (quant * scales.unsqueeze(-1)).reshape(
+        batch_size, 448
+    ).to(torch.bfloat16)
+
+    triton.testing.assert_close(
+        out.float(), expected.float(), atol=4e-2, rtol=4e-2
+    )
+
+    # Verify the physical scale record directly: 7 FP32 values + 4-byte pad.
+    raw = kvcache.view(torch.uint8)
+    for i, loc in enumerate(out_loc.tolist()):
+        page, offset = divmod(loc, page_size)
+        scale_byte = page_size * 576 + offset * 32
+        stored_scales = raw[page, scale_byte : scale_byte + 28].view(torch.float32)
+        triton.testing.assert_close(
+            stored_scales, scales[i], atol=1e-6, rtol=1e-5
+        )
+
+
+def test_fused_qk_norm_rope_swa_store_int8_cache() -> None:
+    """Cover the primary Triton SWA writer used by deepseek_v4._forward_prepare."""
+    torch.manual_seed(4)
+    batch_size = 5
+    num_heads = 2
+    page_size = 8
+    num_pages = 3
+    q = torch.randn(
+        batch_size, num_heads * HEAD_DIM_K, device=DEVICE, dtype=DTYPE
+    )
+    kv = torch.randn(batch_size, HEAD_DIM_K, device=DEVICE, dtype=DTYPE)
+    kv_input = kv.clone()
+    kv_weight = torch.randn(HEAD_DIM_K, device=DEVICE, dtype=DTYPE)
+    positions = torch.randint(
+        0, MAX_POS, (batch_size,), device=DEVICE, dtype=torch.int32
+    )
+    out_loc = torch.tensor([0, 3, 7, 9, 17], device=DEVICE, dtype=torch.int32)
+    freqs_cis = _make_freqs_cis()
+    angles = torch.angle(freqs_cis)
+    cos_cache = torch.cos(angles).to(DTYPE)
+    sin_cache = torch.sin(angles).to(DTYPE)
+    cache = torch.zeros(
+        (num_pages, _flashmla_int8_page_bytes(page_size)),
+        device=DEVICE,
+        dtype=torch.int8,
+    )
+
+    fused_qk_norm_rope_swa_store(
+        q=q,
+        kv=kv,
+        q_norm_weight=None,
+        kv_norm_weight=kv_weight,
+        q_rms_eps=EPS,
+        kv_rms_eps=EPS,
+        rope_head_dim=ROPE_DIM,
+        cos_cache=cos_cache,
+        sin_cache=sin_cache,
+        positions=positions,
+        swa_cache=cache,
+        swa_loc=out_loc,
+        swa_page_size=page_size,
+        dtype=DTYPE,
+    )
+    torch.cuda.synchronize()
+
+    out = dequantize_k_cache_paged(cache, out_loc, page_size)[:, 0]
+    ref = _apply_tail_rope(
+        _rmsnorm_weighted(kv_input, kv_weight, EPS), freqs_cis, positions
+    )
+    # This fused Triton writer first publishes normalized NOPE back to the
+    # BF16 kv tensor, then reloads that BF16 value for cache quantization.
+    groups = ref[:, :448].to(torch.bfloat16).float().view(batch_size, 7, 64)
+    scales = groups.abs().amax(dim=-1).clamp(min=1.0e-4) / 127.0
+    quant = torch.round(groups / scales.unsqueeze(-1)).clamp(-127, 127)
+    expected = ref.to(torch.bfloat16)
+    expected[:, :448] = (quant * scales.unsqueeze(-1)).reshape(
+        batch_size, 448
+    ).to(torch.bfloat16)
+    triton.testing.assert_close(
+        out.float(), expected.float(), atol=4e-2, rtol=4e-2
+    )
 
 
 # ============================================================================

@@ -639,6 +639,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_bytes_per_full_token(self) -> float:
         if self.kv_cache_dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
             kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+        elif self.kv_cache_dtype is torch.int8:
+            # 448 INT8 NOPE + 64 BF16 RoPE + 7 FP32 scales + 4-byte pad.
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 32
         else:
             assert self.kv_cache_dtype is torch.bfloat16
             kv_bytes = (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
