@@ -5328,6 +5328,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             name = name.removesuffix(".scale") + ".weight_scale_inv"
         if ".engram.wkv." in name and name.endswith(".scale"):
             name = name.removesuffix(".scale") + ".weight_scale_inv"
+        if ".engram.embed." in name and name.endswith(".weight_scale"):
+            name = name.removesuffix(".weight_scale") + ".scale"
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")

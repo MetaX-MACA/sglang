@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.srt.layers.attention.dsv4.index_cache_kind import dsv4_index_cache_kind
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
@@ -32,7 +33,6 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache, get_tensor_size_bytes
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_hip
-from sglang.srt.utils.common import is_maca
 
 logger = logging.getLogger(__name__)
 
@@ -1512,6 +1512,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             for ratio, config in configs.items()
             if config.indexer_size is not None
         }
+        
+        index_k_fp4 = dsv4_index_cache_kind().is_fp4
         for ratio, sources in low_ratio_sources.items():
             # Reserved FULL page 0 pushes real slots past full_size, and one index
             # padding page is too small to cover that gap.
@@ -1523,7 +1525,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 len(sources),
                 device,
                 enable_memory_saver,
-                force_fp4=envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get()=="fp4",
+                force_fp4=index_k_fp4,
             )
 
         # HiCache and hardware backends still read these per-ratio attributes.

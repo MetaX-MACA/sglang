@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.layers.attention.dsv4.index_cache_kind import dsv4_index_cache_kind
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     INT8_SCALE_BYTES_PER_TOKEN,
     kv_cache_page_bytes,
@@ -1082,10 +1083,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         self.kv_cache_dtype = kvc.kv_cache_dtype
         self.num_layers_total = len(self.stage_compress_ratios)
-        # The low-ratio indexer pools are built with force_fp4=True
-        # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
-            self.indexer_head_dim, use_fp4_indexer=True
+            self.indexer_head_dim,
+            use_fp4_indexer=dsv4_index_cache_kind().is_fp4,
         )
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
