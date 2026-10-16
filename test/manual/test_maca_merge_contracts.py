@@ -5,6 +5,7 @@ AST extraction so GPU libraries are not needed; they do not check GPU numerics.
 """
 
 import ast
+import inspect
 import os
 import sys
 import unittest
@@ -377,7 +378,7 @@ class TestMacaMergeContracts(unittest.TestCase):
             self.assertEqual((block_kv, num_sms, workers_per_sm), (64, 80, 8))
             return schedule
 
-        ns = {"is_maca": lambda: True}
+        ns = {"is_maca": lambda: True, "inspect": inspect}
         fn = load(
             "python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py",
             "get_paged_mqa_logits_metadata",
@@ -398,10 +399,32 @@ class TestMacaMergeContracts(unittest.TestCase):
             self.assertEqual((block_kv, num_sms), (64, 80))
             return schedule
 
+        signature = Mock(side_effect=AssertionError("CUDA must not inspect MACA API"))
+        ns = {"is_maca": lambda: False, "inspect": NS(signature=signature)}
         fn = load(
             "python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py",
             "get_paged_mqa_logits_metadata",
-            {"is_maca": lambda: False},
+            ns,
+        )
+        with patch.dict(
+            sys.modules, {"deep_gemm": NS(get_paged_mqa_logits_metadata=backend)}
+        ):
+            self.assertIs(fn(lengths, 64, 80), schedule)
+        signature.assert_not_called()
+
+    def test_legacy_maca_mqa_schedule_preserves_backend_defaults(self):
+        schedule = object()
+        lengths = object()
+
+        def backend(context_lens, block_kv, num_sms, blocks_per_split=4):
+            self.assertIs(context_lens, lengths)
+            self.assertEqual((block_kv, num_sms, blocks_per_split), (64, 80, 4))
+            return schedule
+
+        fn = load(
+            "python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py",
+            "get_paged_mqa_logits_metadata",
+            {"is_maca": lambda: True, "inspect": inspect},
         )
         with patch.dict(
             sys.modules, {"deep_gemm": NS(get_paged_mqa_logits_metadata=backend)}

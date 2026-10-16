@@ -1,3 +1,4 @@
+import inspect
 import logging
 from contextlib import contextmanager
 from typing import Any, Optional, Tuple
@@ -50,10 +51,12 @@ def get_paged_mqa_logits_metadata(
 ) -> torch.Tensor:
     import deep_gemm
 
-    # MetaX's automatic density selection reads a GPU scalar with .item().
-    # Pin the legacy density so schedules have stable shapes and can be
-    # rebuilt inside graph capture without synchronizing with the host.
-    kwargs = {"workers_per_sm": 8} if is_maca() else {}
+    # Pin worker density where supported; legacy APIs keep their defaults.
+    kwargs = {}
+    if is_maca() and "workers_per_sm" in inspect.signature(
+        deep_gemm.get_paged_mqa_logits_metadata
+    ).parameters:
+        kwargs["workers_per_sm"] = 8
     return deep_gemm.get_paged_mqa_logits_metadata(
         context_lens, block_kv, num_sms, **kwargs
     )
