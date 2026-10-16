@@ -946,6 +946,11 @@ def _deepseek_v4_index_cache_dtype(view: Any) -> dict:
                 raise NotImplementedError
             index_cache.set(inferred)
             logger.warning(f"Setting Index cache dtype to {inferred} for {model_type}.")
+
+    if index_cache.is_set():
+        # The int8 index cache still runs on the DeepGEMM indexer, so the SM100
+        # bypass follows it: int8 turns the bypass on, every other kind off.
+        envs.SGLANG_DSV41_FORCE_DEEPGEMM_INDEXER.set(index_cache.get() == "int8")
     return {}
 
 
