@@ -856,7 +856,6 @@ def invoke_fused_moe_kernel(
     assert sorted_token_ids.stride(0) == 1
     mctlass_output_supported = (
         bias is None
-        and block_shape is None
         and C.is_contiguous()
         and C.dtype == torch.bfloat16
         and not (
@@ -885,7 +884,6 @@ def invoke_fused_moe_kernel(
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
     else:
         swap_ab = False
-
     padded_size = 0
     if use_fp8_w8a8:
         assert B_scale is not None
@@ -1077,6 +1075,7 @@ def invoke_fused_moe_kernel(
         and enable_mctlass_fused_moe
         and enable_mctlass_fused_moe_python_api
         and mctlass_output_supported
+        and block_shape is None
     ):
         C1 = C.view(-1, C.size(-1)).contiguous()
         gemm(
@@ -1098,6 +1097,42 @@ def invoke_fused_moe_kernel(
             num_tokens_post_padded,
             mul_routed_weight,
             filter_expert=filter_expert,
+        )
+    elif (
+        use_fp8_w8a8
+        and enable_mctlass_fused_moe_python_api
+        and mctlass_output_supported
+        # The vendor FP8 kernel supports square block quantization.
+        and block_shape is not None
+        and block_shape[0] == block_shape[1]
+    ):
+        C1 = C.view(-1, C.size(-1)).contiguous()
+        gemm(
+            A.shape[0],
+            B.shape[1],
+            A.shape[1],
+            B.shape[0],
+            sorted_token_ids.shape[0],
+            top_k,
+            A,
+            B,
+            C1,
+            A_scale.T.contiguous(),
+            B_scale.transpose(1, 2).contiguous(),
+            None,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            filter_expert=filter_expert,
+            use_fp8=True,
+            is_blockwise=True,
+            group_size=block_shape[0],
+            is_scale_a_1d=True,
+            is_scale_b_1d=False,
+            scale_a_layout="m-major",
+            scale_b_layout="n-major",
         )
     elif use_int4_w4a8:
         assert enable_mctlass_fused_moe_python_api, (

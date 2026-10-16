@@ -392,7 +392,6 @@ class TestMacaMergeContracts(CustomTestCase):
         self.assertTrue(ns["mctlass_output_supported"])
         for name, value in (
             ("bias", object()),
-            ("block_shape", [128, 128]),
             ("C", NS(is_contiguous=lambda: False)),
             ("c_sorted", True),
             ("mask_output", True),
