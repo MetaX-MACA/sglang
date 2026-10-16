@@ -33,13 +33,19 @@ assert "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator" not in sy
         """Diffusion modules must remain usable without the optional MLX path."""
         script = """
 import sys
+import torch
 from sglang.kernels.ops.diffusion import norm_infer
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 assert norm_infer is not None and RMSNorm is not None
+values = torch.randn(2, 8)
+actual = norm_infer(values, None, None, 1e-6)
+expected = torch.nn.functional.layer_norm(values, (8,), eps=1e-6)
+torch.testing.assert_close(actual, expected)
 assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
 """
         env = os.environ.copy()
         env.pop("SGLANG_USE_MLX", None)
+        env["CUDA_VISIBLE_DEVICES"] = ""
         completed = subprocess.run(
             [sys.executable, "-c", script],
             capture_output=True,

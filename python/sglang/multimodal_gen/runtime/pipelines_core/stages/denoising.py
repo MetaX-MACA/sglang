@@ -54,6 +54,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2PipelineConfig,
     FluxPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import HunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     quality_allows_kernel_fusions,
@@ -1173,8 +1174,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):
         """Builds a guidance tensor. This method is cached."""
+        # Hunyuan and FLUX.1 embed guidance on the same 1000-scaled axis as
+        # diffusion timesteps. FLUX.2 applies this scaling inside its model.
         if isinstance(
-            self.server_args.pipeline_config, FluxPipelineConfig
+            self.server_args.pipeline_config, (FluxPipelineConfig, HunyuanConfig)
         ) and not isinstance(self.server_args.pipeline_config, Flux2PipelineConfig):
             guidance_val = guidance_val * 1000.0
         return torch.full(
