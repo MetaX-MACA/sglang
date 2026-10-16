@@ -1231,6 +1231,7 @@ class Envs:
     MX_FUSED_MLA_ABSORB_ROPE = EnvBool(False)
     MX_ENABLE_FLASH_MLA_METADATA_CACHE = EnvBool(False)
     MX_ENABLE_DSA_INDEXER_GEMM_BF16 = EnvBool(False)
+    MX_USE_INDEXER_LOGITS_OPT = EnvBool(True)
 
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
