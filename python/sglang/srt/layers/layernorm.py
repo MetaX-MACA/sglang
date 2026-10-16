@@ -50,7 +50,6 @@ from mcoplib.custom_ops import (
     fused_add_rms_norm_dynamic_per_token_quant_padding_output as _mocop_fused_add_rms_norm_quant_pad,
 )
 from sgl_kernel import (
-    rms_norm_dynamic_per_group_quant_custom,
     rms_norm_dynamic_per_token_quant_custom,
 )
 
@@ -578,6 +577,41 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
     return False
 
 
+def mx_can_use_group_fp8_quant(quant_config) -> bool:
+    """The producer must match a group-128 block-FP8 consumer."""
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    return (
+        quant_config is not None
+        and getattr(quant_config, "weight_block_size", None) == [128, 128]
+        and quant_config.get_name() == "fp8"
+        and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+    )
+
+
+def _mx_rms_norm_group_fp8(input, weight, eps, residual=None):
+    """Call the registered op directly; column scales require trans_scale support."""
+    hidden = input.shape[-1]
+    x = input.contiguous().reshape(-1, hidden)
+    r = residual.reshape(-1, hidden) if residual is not None else None
+    q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    bf16 = torch.empty_like(x)
+    groups = hidden // 128
+    column = envs.MX_TRANS_FP8_SCALE_LAYOUT.get()
+    op = torch.ops.sgl_kernel.rms_norm_dynamic_per_group_quant.default
+    scale = torch.empty(
+        (groups, x.shape[0]) if column else (x.shape[0], groups),
+        device=input.device, dtype=torch.float32,
+    )
+    if column:
+        scale = scale.transpose(-1, -2)
+    op(
+        q, bf16, x, weight, scale, 128, eps, None, r,
+        *([True] if column else []),
+    )
+    return q, bf16, scale
+
+
 class RMSNorm(BaseFusedOp):
     def __init__(
         self,
@@ -645,7 +679,7 @@ class RMSNorm(BaseFusedOp):
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if isinstance(x, tuple):
-            x = x[0] 
+            x = x[2] if len(x) == 3 else x[0]
         if x.numel() == 0:
             if residual is not None:
                 if post_residual_addition is not None:
@@ -657,62 +691,22 @@ class RMSNorm(BaseFusedOp):
             self.return_quant_tuple
             and envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
         ):
+            assert x.shape[-1] % 128 == 0, (
+                "Fused group-FP8 RMSNorm requires hidden size divisible by 128"
+            )
             if residual is not None:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
                 if not residual.is_contiguous():
                     residual = residual.contiguous()
             original_shape = x.shape
-            if envs.MX_TRANS_FP8_SCALE_LAYOUT.get():
-                quant_group_size = 128
-                hidden_size = x.shape[-1]
-                tokens = x.numel() // hidden_size
-                groups = (hidden_size + quant_group_size - 1) // quant_group_size
-                quant_input = x.contiguous().reshape(tokens, hidden_size)
-                quant_residual = (
-                    residual.reshape(tokens, hidden_size)
-                    if residual is not None
-                    else None
-                )
-                bf16_out = torch.empty_like(quant_input)
-                fp8_out = torch.empty_like(quant_input, dtype=torch.float8_e4m3fn)
-                # Column-major scales: allocate (groups, tokens) storage and
-                # pass the transposed view; the trailing True asks the op to
-                # write scales in that layout, so a later scale.T.contiguous()
-                # becomes a no-op.  Requires an sgl_kernel build that accepts
-                # the column-major flag.
-                scales = torch.empty(
-                    (groups, tokens), device=x.device, dtype=torch.float32
-                ).transpose(-1, -2)
-                torch.ops.sgl_kernel.rms_norm_dynamic_per_group_quant(
-                    fp8_out,
-                    bf16_out,
-                    quant_input,
-                    self.weight.data,
-                    scales,
-                    quant_group_size,
-                    self.variance_epsilon,
-                    None,
-                    quant_residual,
-                    True,
-                )
-                fp8_out = fp8_out.reshape(original_shape)
-                bf16_out = bf16_out.reshape(original_shape)
-            else:
-                fp8_out, bf16_out, scales = rms_norm_dynamic_per_group_quant_custom(
-                    x,
-                    self.weight.data,
-                    self.variance_epsilon,
-                    torch.float8_e4m3fn,
-                    128,
-                    residual=residual,
-                )
-                fp8_out = fp8_out.reshape(original_shape)
-                bf16_out = bf16_out.reshape(original_shape)
+            fp8_out, bf16_out, scales = _mx_rms_norm_group_fp8(
+                x, self.weight.data, self.variance_epsilon, residual
+            )
             quant_tuple = (
-                fp8_out,
+                fp8_out.reshape(original_shape),
                 scales,
-                bf16_out,
+                bf16_out.reshape(original_shape),
             )
             if residual is not None:
                 return quant_tuple, residual

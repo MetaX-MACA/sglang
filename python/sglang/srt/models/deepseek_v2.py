@@ -90,7 +90,7 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import RMSNorm, mx_can_use_group_fp8_quant
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -2068,9 +2068,12 @@ class DeepseekV2AttentionMLA(
             self.q_a_layernorm = RMSNorm(
                 self.q_lora_rank,
                 eps=config.rms_norm_eps,
+                return_quant_tuple=mx_can_use_group_fp8_quant(
+                    self._get_q_b_proj_quant_config(quant_config)
+                ) or get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
+                or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL", default="false"),
                 fused_quant=get_bool_env_var("FUSED_RMSNORM_QUANT", default="false")
                 or get_bool_env_var("FUSED_RMSNORM_QUANT_PREFILL", default="false"),
-                return_quant_tuple=True,
             )
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
@@ -2699,7 +2702,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_quant=fused_quant_pd,
-            return_quant_tuple=True,
+            return_quant_tuple=fused_quant_pd or mx_can_use_group_fp8_quant(quant_config),
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,

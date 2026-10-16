@@ -1229,6 +1229,7 @@ class Envs:
     # When enabled, this sets the legacy FUSED_RMSNORM_QUANT switch globally.
     MX_ENABLE_FUSE_RMSNORM_QUANT = EnvBool(False)
     MX_FUSED_MLA_ABSORB_ROPE = EnvBool(False)
+    MX_DISABLE_INDEXER_ALT_STREAM = EnvBool(False)
     MX_ENABLE_FLASH_MLA_METADATA_CACHE = EnvBool(False)
     MX_ENABLE_DSA_INDEXER_GEMM_BF16 = EnvBool(False)
 

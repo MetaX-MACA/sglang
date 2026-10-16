@@ -286,7 +286,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
         )
-        self.alt_stream = alt_stream
+        self.alt_stream = (
+            None if envs.MX_DISABLE_INDEXER_ALT_STREAM.get() else alt_stream
+        )
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.index_cache_dtype = get_nsa_index_cache_dtype()
         self.fp8_cache = self.index_cache_dtype == "fp8"
@@ -418,10 +420,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _weights_proj_bf16_in_fp32_out(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
     ) -> torch.Tensor:
-        # aiter (ROCm gfx95): extract the passthrough bf16 tensor from the
-        # 3-tuple (fp8, scale, bf16) produced by fused_rms_fp8_group_quant,
-        # avoiding an expensive FP8-to-bf16 dequantization.
-        if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
+        # Fused RMSNorm producers preserve BF16 in the third tuple slot;
+        # reuse it for the gate projection without FP8 dequantization.
+        if isinstance(x, tuple) and len(x) == 3:
             x = x[2]
         if _is_cuda:
             if envs.MX_ENABLE_DSA_INDEXER_GEMM_BF16.get():
@@ -2055,17 +2056,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 else:
                     q_fp8, q_scale = query, None
 
-            # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
-            # fused_rms_fp8_group_quant is passed directly to _get_logits_head_gate,
-            # which extracts the bf16 tensor via _weights_proj_bf16_in_fp32_out,
-            # completely skipping the FP8 dequantization path below.
-            if (
-                _use_aiter
-                and _is_gfx95_supported
-                and isinstance(x, tuple)
-                and len(x) == 3
-            ):
-                x_for_gate = x
+            # Reuse the preserved BF16 side output before tensor-only graph/LoRA paths.
+            if isinstance(x, tuple) and len(x) == 3:
+                x_for_gate = x[2]
             elif isinstance(x, tuple):
                 assert len(x) in (
                     2,
