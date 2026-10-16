@@ -1398,6 +1398,10 @@ class DeepseekV4AttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
+            if self.token_to_kv_pool.dtype is torch.int8:
+                raise ValueError(
+                    "DeepSeek-V4 flashmla_sparse_q8 prefill requires an FP8 KV cache."
+                )
             if not get_platform().is_sm90:
                 raise ValueError(
                     "DeepSeek-V4 flashmla_sparse_q8 prefill requires SM90 CUDA GPUs."
@@ -3618,8 +3622,6 @@ class DeepseekV4AttnBackend(
 
             assert attn_sink is not None
 
-            flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
-
             assert swa_page_indices.shape[-1] % 64 == 0, (
                 f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
             )
@@ -3714,7 +3716,28 @@ class DeepseekV4AttnBackend(
                     extra_topk_lengths,
                 )
 
-            if get_platform().is_sm120:
+            use_triton_decode = (
+                self.token_to_kv_pool.dtype is torch.int8
+                and envs.SGLANG_DSV4_TRITON_FLASHMLA_KV.get()
+            )
+            if use_triton_decode:
+                from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
+                    flash_mla_sparse_decode_triton,
+                )
+
+                o = flash_mla_sparse_decode_triton(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    softmax_scale=self.softmax_scale,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
+            elif get_platform().is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     SM120_DECODE_MAX_TOKENS,
                     flash_mla_with_kvcache_sm120,
@@ -3749,6 +3772,9 @@ class DeepseekV4AttnBackend(
                 else:
                     from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
+                flashmla_metadata = core_attn_metadata.get_flashmla_metadata(
+                    compress_ratio
+                )
                 if self.is_dsv41:
                     _maybe_precompute_flashmla_sched_meta(
                         flashmla_metadata,
@@ -3771,6 +3797,7 @@ class DeepseekV4AttnBackend(
                         torch.float8_e5m2,
                         torch.float8_e4m3fn,
                         torch.float8_e4m3fnuz,
+                        torch.int8,
                     ),
                     indices=swa_page_indices,
                     topk_length=swa_topk_lengths,

@@ -20,6 +20,9 @@ from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
+    kv_cache_bytes_per_token,
+    kv_cache_page_bytes,
+    kv_cache_scale_bytes_per_token,
 )
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -232,6 +235,8 @@ class DeepSeekV4SingleKVPool(KVCache):
 
         # Paged FlashMLA layout of this pool's pages; see KVLayout.
         self.kv_layout = KVLayout.parse(kv_layout)
+        if self.dtype is torch.int8 and self.kv_layout is not KVLayout.V4:
+            raise ValueError("INT8 main KV requires the V4 packed layout")
         self.scale_pad = 1
         self.quantize_block_size = self.kv_layout.tile_size
         # V4 keeps its 64 RoPE dims in bf16; the V4.1 layouts quantize them too.
@@ -259,6 +264,8 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
+        if self.dtype is torch.int8:
+            return kv_cache_bytes_per_token(self.kv_layout, self.dtype)
         if self.dtype is torch.bfloat16:
             return (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
         if self.kv_layout is not KVLayout.V4:
@@ -282,18 +289,20 @@ class DeepSeekV4SingleKVPool(KVCache):
                 num_pages, self.bytes_per_page_padded // 2,
                 dtype=torch.bfloat16, device=self.device,
             )
-        self.bytes_per_page_padded = self.kv_layout.page_bytes(self.page_size)
+        self.bytes_per_page_padded = kv_cache_page_bytes(
+            self.kv_layout, self.dtype, self.page_size
+        )
 
         if self.kv_layout is KVLayout.V4:
-            assert bytes_per_token == 448 + 64 * 2 + 8, (
-                "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
-                "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+            assert bytes_per_token == 448 + 64 * 2 + kv_cache_scale_bytes_per_token(self.kv_layout, self.dtype), (
+                "DSV4 V4 KV layout requires 448 quantized NOPE bytes, "
+                "64*2 BF16 RoPE bytes, and dtype-specific scales"
             )
             assert (
                 self.bytes_per_page_padded
                 == ceil_div(self.page_size * bytes_per_token, 576) * 576
             )
-        assert self.store_dtype == torch.uint8
+        assert self.store_dtype in (torch.uint8, torch.int8)
 
         return torch.zeros(
             num_pages,
@@ -1874,6 +1883,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if self.uniform_fp8:
             # The trtllm uniform-FP8 pool has no paged FlashMLA layout: 512 B/token.
             return self.swa_kv_pool.kv_cache_total_dim
+        if self.dtype is torch.int8:
+            return kv_cache_bytes_per_token(self.kv_layout, self.dtype)
         if self.dtype is torch.bfloat16:
             return (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
         return self.kv_layout.bytes_per_token

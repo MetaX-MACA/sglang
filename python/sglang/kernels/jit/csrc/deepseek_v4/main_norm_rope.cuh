@@ -49,6 +49,10 @@ SGL_DEVICE char2 pack_int8(float x, float y) {
   return char2{int8_clip(x), int8_clip(y)};
 }
 
+SGL_DEVICE char2 pack_int8_round(float x, float y) {
+  return char2{int8_clip(roundf(x)), int8_clip(roundf(y))};
+}
+
 // 8 warps per block: warp-per-(token, head) work-item dispatch (Q kernel).
 // 256 threads lifts scheduler occupancy (~38% -> ~86%) on the fp8-quant path;
 // math is unchanged, output is bitwise-identical.
@@ -264,7 +268,7 @@ struct FusedKNormRopeFlashMLAParams {
   const float* __restrict__ freqs_cis;  // (max_pos, kRopeDim) fp32
   const void* __restrict__ positions;   // (B,) PosT
   const int32_t* __restrict__ out_loc;  // (B,) int32 -> cache slot id
-  uint8_t* __restrict__ kvcache;        // (npages, kPageBytes) uint8
+  void* __restrict__ kvcache;           // packed KV cache storage
   // Row stride for `kv` in elements. Required because the upstream caller often
   // passes `qkv_a[..., q_lora_rank:]`, a non-contiguous slice whose stride[0]
   // equals `q_lora_rank + kHeadDim` rather than `kHeadDim`.
@@ -281,6 +285,7 @@ struct FusedKNormRopeFlashMLAParams {
 
 template <
     typename DType,
+    typename CacheDType,
     int64_t kHeadDim,
     int64_t kRopeDim,
     typename PosT,
@@ -294,6 +299,12 @@ K_KERNEL void fused_k_norm_rope_flashmla(const FusedKNormRopeFlashMLAParams para
   constexpr int64_t kVecSize = 2;
   constexpr uint32_t kRopeWarp = kFusedKNumWarps - 1;
   using Paged = deepseek_v4::PagedKV<kLayout, kPageBits>;
+  constexpr bool kUseFp8Cache = std::is_same_v<CacheDType, uint8_t>;
+  constexpr bool kUseInt8Cache = std::is_same_v<CacheDType, int8_t>;
+  constexpr int64_t kFp8PageBytes = host::div_ceil(584ll << kPageBits, 576) * 576;
+  constexpr int64_t kInt8PageBytes = host::div_ceil(608ll << kPageBits, 576) * 576;
+  static_assert(kUseFp8Cache || kUseInt8Cache, "CacheDType must be uint8_t or int8_t");
+  static_assert(kLayout == deepseek_v4::KVLayout::V4 || kUseFp8Cache, "V4.1 layouts require uint8_t storage");
   static_assert(kHeadDim == kFusedKBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
@@ -377,9 +388,8 @@ K_KERNEL void fused_k_norm_rope_flashmla(const FusedKNormRopeFlashMLAParams para
   // here, not at the load, so the out_loc prefetch overlaps the norm above.
   if (out_loc < 0) return;
 
-  const auto row = Paged::row(params.kvcache, out_loc);
-
   if constexpr (kLayout != deepseek_v4::KVLayout::V4) {
+    const auto row = Paged::row(static_cast<uint8_t*>(params.kvcache), out_loc);
     // V4.1 layouts: every dim is quantized, one scale per 32 (fp8) or 16 (fp4) values. The
     // reference rotates in bf16, so round the normed values, rotate, round again, then quantize.
     using Packed = packed_t<DType>;
@@ -398,11 +408,15 @@ K_KERNEL void fused_k_norm_rope_flashmla(const FusedKNormRopeFlashMLAParams para
     return deepseek_v4::v41::store_row<kLayout>(row.data, row.scale, tx, v);
   }
 
-  const auto value_ptr = row.data;
+  const int32_t page = out_loc >> kPageBits;
+  const int32_t offset = out_loc & ((1 << kPageBits) - 1);
 
   PDLTriggerSecondary<kUsePDL>();
 
-  // part 2: rope on warp 7 (BF16 store), per-warp UE8M0 quant + store on warps 0..6.
+  // part 2: BF16 RoPE, FP8/INT8 NOPE quantization and packed cache store.
+  constexpr int64_t kPackedPageBytes = kUseFp8Cache ? kFp8PageBytes : kInt8PageBytes;
+  const auto page_ptr = static_cast<uint8_t*>(params.kvcache) + page * kPackedPageBytes;
+  const auto value_ptr = page_ptr + offset * 576;
   if (warp_id == kRopeWarp) {
     const auto x_real = data[0];
     const auto x_imag = data[1];
@@ -413,7 +427,7 @@ K_KERNEL void fused_k_norm_rope_flashmla(const FusedKNormRopeFlashMLAParams para
     const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
     const auto rope_ptr = value_ptr + 448;
     reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
-  } else {
+  } else if constexpr (kUseFp8Cache) {
     const auto x = data[0];
     const auto y = data[1];
     const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
@@ -421,14 +435,24 @@ K_KERNEL void fused_k_norm_rope_flashmla(const FusedKNormRopeFlashMLAParams para
     const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
     const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
     const auto result = pack_fp8(x * inv_scale, y * inv_scale);
-    const auto scale_ptr = row.scale;
+    const auto scale_ptr = page_ptr + (576 << kPageBits) + offset * 8;
     reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = result;
     if (lane_id == 0) static_cast<uint8_t*>(scale_ptr)[warp_id] = scale_ue8m0;
+  } else {
+    const auto x = data[0];
+    const auto y = data[1];
+    const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
+    const auto scale = fmaxf(1e-4f, abs_max) / 127.0f;
+    const auto result = pack_int8_round(x / scale, y / scale);
+    const auto scale_ptr = page_ptr + (576 << kPageBits) + offset * 32;
+    reinterpret_cast<char2*>(value_ptr)[tx] = result;
+    if (lane_id == 0) reinterpret_cast<float*>(scale_ptr)[warp_id] = scale;
   }
 }
 
 template <
     typename DType,
+    typename CacheDType,
     int64_t kHeadDim,
     int64_t kRopeDim,
     uint32_t kPageSize,
@@ -437,6 +461,14 @@ template <
 struct FusedKNormRopeFlashMLAKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
+  static constexpr bool kUseFp8Cache = std::is_same_v<CacheDType, uint8_t>;
+  static constexpr bool kUseInt8Cache = std::is_same_v<CacheDType, int8_t>;
+  static constexpr int64_t kFp8PageBytes = host::div_ceil(584 * kPageSize, 576) * 576;
+  static constexpr int64_t kInt8PageBytes = host::div_ceil(608 * kPageSize, 576) * 576;
+  static constexpr int64_t kPageStride = kLayout == deepseek_v4::KVLayout::V4
+      ? (kUseInt8Cache ? kInt8PageBytes : kFp8PageBytes) : kPageBytes;
+  static_assert(kUseFp8Cache || kUseInt8Cache, "CacheDType must be uint8_t or int8_t");
+  static_assert(kLayout == deepseek_v4::KVLayout::V4 || kUseFp8Cache, "V4.1 layouts require uint8_t storage");
   static_assert(kLayout != deepseek_v4::KVLayout::V4 || kPageBytes == host::div_ceil(584 * kPageSize, 576) * 576);
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogPageSize == kPageSize);
@@ -444,7 +476,7 @@ struct FusedKNormRopeFlashMLAKernel {
 
   template <typename PosT, bool kRopeQ>
   static constexpr auto kernel =
-      fused_k_norm_rope_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL, kRopeQ>;
+      fused_k_norm_rope_flashmla<DType, CacheDType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL, kRopeQ>;
 
   static void forward(
       const tvm::ffi::TensorView kv,
@@ -510,8 +542,8 @@ struct FusedKNormRopeFlashMLAKernel {
         .with_device(device_)
         .verify(out_loc);
     TensorMatcher({-1, -1})  //
-        .with_strides({kPageBytes, 1})
-        .with_dtype<uint8_t>()
+        .with_strides({kPageStride, 1})
+        .with_dtype<CacheDType>()
         .with_device(device_)
         .verify(kvcache);
 
@@ -524,7 +556,7 @@ struct FusedKNormRopeFlashMLAKernel {
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
         .positions = positions.data_ptr(),
         .out_loc = static_cast<const int32_t*>(out_loc.data_ptr()),
-        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .kvcache = kvcache.data_ptr(),
         .kv_stride_batch = kv.stride(0),
         .batch_size = batch_size,
         .eps = eps,
