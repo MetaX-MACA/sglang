@@ -1948,8 +1948,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             shard_id: str,
             num_experts: int,
         ):
-            if name not in params_dict:
-                return False
+            #if name not in params_dict:
+            #    return False
+            if "scale" in name:
+                if"_inv" not in name:
+                    name = name + "_inv"
             param = params_dict[name]
             weight_loader = param.weight_loader
             # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank

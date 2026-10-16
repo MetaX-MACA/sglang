@@ -831,6 +831,17 @@ class LogitsProcessor(nn.Module):
 
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
+            # A bf16/fp16 GEMM result is not a safe all-gather input inside a
+            # CUDA graph. Replay can hand some ranks the previous step's shard
+            # (local matmul is current, gathered peers lag). A fp32 copy is
+            # ordered correctly in the graph. Eager is unchanged;
+            # _copy_logits_to_buffer already promotes to fp32.
+            if (
+                logits.shape[0] != 0
+                and logits.dtype in (torch.bfloat16, torch.float16)
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                logits = logits.float()
             _trace_e2e_logits(
                 "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
             )
