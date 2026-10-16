@@ -305,6 +305,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             shard_id: str,
             num_experts: int,
         ):
+            if "scale" in name:
+                if"_inv" not in name:
+                    name = name + "_inv"
             param = params_dict[name]
             weight_loader = param.weight_loader
             # Let EP MoE layer handle expert_ids that do not belong to local moe rank
