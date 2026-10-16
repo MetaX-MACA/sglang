@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
+from sglang.srt.layers.attention.dsv4.index_cache_kind import dsv4_index_cache_kind
+
 from .full_topk import FullTopKIndexer
 from .types import (
     CandidateMetadata,
@@ -36,6 +38,7 @@ __all__ = [
     "PrefillInputs",
     "Selection",
     "has_dense_fp4_indexer",
+    "has_dense_int8_indexer",
     "is_sm100_or_newer",
     "make_candidate_indexer",
     "make_full_topk_indexer",
@@ -57,6 +60,16 @@ def has_dense_fp4_indexer() -> bool:
     except ImportError:
         return False
     return hasattr(deep_gemm, "fp8_fp4_mqa_logits")
+
+
+@functools.cache
+def has_dense_int8_indexer() -> bool:
+    # The int8 logits come from DeepGEMM's tilelang backends, no CUDA needed.
+    try:
+        import deep_gemm
+    except ImportError:
+        return False
+    return hasattr(deep_gemm, "int8_mqa_logits")
 
 
 @functools.cache

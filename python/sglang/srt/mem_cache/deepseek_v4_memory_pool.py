@@ -728,19 +728,31 @@ class DeepSeekV4IndexerPool(KVCache):
     def get_index_k_fp4(
         self, layer_id: int, slots: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Packed fp4 rows at `slots`: (payload int8 [n, 64], scales int32 [n]),
-        from the page layout [page_size * 64 payload | page_size * 4 scale]."""
-        assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
+        """Packed rows at `slots`. The fp4 layout returns (payload int8 [n, 64],
+        scales int32 [n]) from [page_size * 64 payload | page_size * 4 scale]; the
+        int8 layout returns (payload int8 [n, 128], scales float32 [n]) from
+        [page_size * 128 payload | page_size * 4 scale]."""
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         slots = slots.to(torch.int64)
         p = self.page_size
         page, off = (slots // p).unsqueeze(-1), slots % p
-        payload_cols = (off * 64).unsqueeze(-1) + torch.arange(64, device=buf.device)
-        scale_cols = (p * 64 + off * 4).unsqueeze(-1) + torch.arange(
+        if self.use_fp4_indexer:
+            payload_cols = (off * 64).unsqueeze(-1) + torch.arange(
+                64, device=buf.device
+            )
+            scale_cols = (p * 64 + off * 4).unsqueeze(-1) + torch.arange(
+                4, device=buf.device
+            )
+            payload = buf[page, payload_cols].view(torch.int8)  # [n, 64]
+            scales = buf[page, scale_cols].contiguous().view(torch.int32).squeeze(-1)
+            return payload, scales
+        # int8 layout: the payload rows are plain int8, the scales plain float32.
+        payload_cols = (off * 128).unsqueeze(-1) + torch.arange(128, device=buf.device)
+        scale_cols = (p * 128 + off * 4).unsqueeze(-1) + torch.arange(
             4, device=buf.device
         )
-        payload = buf[page, payload_cols].view(torch.int8)  # [n, 64]
-        scales = buf[page, scale_cols].contiguous().view(torch.int32).squeeze(-1)
+        payload = buf[page, payload_cols]
+        scales = buf[page, scale_cols].view(torch.float32).contiguous().squeeze(-1)
         return payload, scales
 
     def get_index_k_dequant(

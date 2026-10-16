@@ -8,6 +8,7 @@ from typing import Iterator, Tuple
 
 import torch
 
+from sglang.srt.layers.attention.dsv4.index_cache_kind import dsv4_index_cache_kind
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
@@ -15,6 +16,23 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 from sglang.srt.utils.common import ceil_align
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
+
+
+def _align_score_rows(logits: torch.Tensor, align: int) -> torch.Tensor:
+    """Pad the row stride of ``logits`` to a multiple of ``align`` elements.
+
+    The fused top-k kernels load score rows with 16-byte vectorized reads
+    and reject a row stride that is not a multiple of 4 fp32 elements. The
+    tilelang int8 logits backends size the output by the tile's max window
+    (or ``max_seq_len``) instead of the caller's aligned width, so the
+    stride is not guaranteed to be aligned: copy only when it is not.
+    """
+    stride = logits.stride(0)
+    if stride % align == 0:
+        return logits
+    padded = logits.new_empty((logits.shape[0], ceil_align(stride, align)))
+    padded[:, : logits.shape[1]].copy_(logits)
+    return padded
 
 
 def flat_index_logits_rows_per_tile(
@@ -35,7 +53,7 @@ def flat_index_logits_rows_per_tile(
 
 def flat_index_logits_tiles(
     *,
-    q: tuple[torch.Tensor, torch.Tensor],
+    q: tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     starts: torch.Tensor,
@@ -47,35 +65,61 @@ def flat_index_logits_tiles(
     """``(rows, logits)`` per row tile, each fp32 tile within ``budget_bytes``:
     ``logits[i, j]`` scores query row ``rows.start + i`` against ``kv[starts + j]``,
     garbage past the row's ``lengths``; the width is ``max(context_lengths)``
-    aligned to ``width_align``."""
-    from deep_gemm import fp8_fp4_mqa_logits
+    aligned to ``width_align``. ``q`` is the ``(q_fp4, q_sf)`` tuple of the fp4
+    cache kind, the int8 tensor of the int8 kind."""
 
-    rows = q[0].shape[0]
+
+    kind = dsv4_index_cache_kind()
+    if kind.is_fp4:
+        from deep_gemm import fp8_fp4_mqa_logits
+        rows, heads = q[0].shape[0], q[0].shape[1]
+    else:
+        from deep_gemm import int8_mqa_logits
+        rows, heads = q.shape[0], q.shape[1]
     width = ceil_align(max(context_lengths, default=0), width_align)
+    if kind.is_int8 and width % 4:
+        width = ceil_align(width, 4)
     if rows == 0 or width == 0:
         return
     rows_per_chunk = flat_index_logits_rows_per_tile(
-        rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
+        rows, width, heads=heads, budget_bytes=budget_bytes
     )
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))
         tile_starts = starts[tile]
-        yield (
-            tile,
-            fp8_fp4_mqa_logits(
-                (q[0][tile], q[1][tile]),
-                kv,
-                weights[tile],
-                tile_starts,
-                tile_starts + lengths[tile],
-                False,
-                width,
-            ),
+        if kind.is_fp4:
+            yield (
+                tile,
+                fp8_fp4_mqa_logits(
+                    (q[0][tile], q[1][tile]),
+                    kv,
+                    weights[tile],
+                    tile_starts,
+                    tile_starts + lengths[tile],
+                    False,
+                    width,
+                ),
+            )
+            continue
+        if not kind.is_int8:
+            raise ValueError(
+                f"{kind} index cache has no flattened index-K logits kernel; "
+                "the ratio-1/2 indexer stores fp4 or int8 slots"
+            )
+        logits = int8_mqa_logits(
+            q[tile],
+            kv,
+            weights[tile],
+            tile_starts,
+            tile_starts + lengths[tile],
+            False,
+            backend="tilelang",
         )
+        yield tile, _align_score_rows(logits, width_align)
 
 
 def deep_gemm_fp4_paged_mqa_logits(
-    q_fp4: Tuple[torch.Tensor, torch.Tensor],
+    q: Tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
     k_cache: torch.Tensor,
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -83,14 +127,34 @@ def deep_gemm_fp4_paged_mqa_logits(
     deep_gemm_metadata,
     max_seq_len: int,
 ) -> torch.Tensor:
-    """DeepGEMM paged fp4 logits; no hadamard, the reference does not apply one."""
+    """DeepGEMM paged logits; no hadamard, the reference does not apply one. ``q``
+    is the ``(q_fp4, q_sf)`` tuple of the fp4 cache kind, the int8 tensor
+    of the int8 kind."""
     from deep_gemm import fp8_fp4_paged_mqa_logits
+    from deep_gemm import int8_paged_mqa_logits
 
     sl = seq_lens.to(torch.int32)
     if sl.dim() == 1:
         sl = sl.unsqueeze(-1)
-    return fp8_fp4_paged_mqa_logits(
-        q_fp4,
+    kind = dsv4_index_cache_kind()
+    if kind.is_fp4:
+        return fp8_fp4_paged_mqa_logits(
+            q,
+            k_cache,
+            weights,
+            sl,
+            page_table,
+            deep_gemm_metadata,
+            max_seq_len,
+            False,
+        )
+    if not kind.is_int8:
+        raise ValueError(
+            f"{kind} index cache has no paged index-K logits kernel; "
+            "the ratio-1/2 indexer stores fp4 or int8 slots"
+        )
+    return int8_paged_mqa_logits(
+        q,
         k_cache,
         weights,
         sl,
@@ -98,6 +162,7 @@ def deep_gemm_fp4_paged_mqa_logits(
         deep_gemm_metadata,
         max_seq_len,
         False,
+        backend="tilelang",
     )
 
 
