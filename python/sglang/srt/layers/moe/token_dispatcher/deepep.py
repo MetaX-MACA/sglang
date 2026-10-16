@@ -127,7 +127,7 @@ def _deepep_precompile_tp_barrier() -> None:
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
     def __call__(self, dispatcher: BaseDispatcher):
-        for hook_fun in self.hook_dict.values():
+        for hook_fun in list(self.hook_dict.values()):
             hook_fun(dispatcher)
 
 
