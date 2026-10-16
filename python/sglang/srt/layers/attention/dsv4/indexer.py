@@ -699,7 +699,7 @@ class C4IndexerBackendMixin:
 
         positions = core_metadata.positions
         q_lora_linear = q_lora[0] if isinstance(q_lora, tuple) else q_lora
-        num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
+        num_queries = min(x.shape[0], q_lora_linear.shape[0], positions.shape[0])
         if x.shape[0] != num_queries:
             x = x[:num_queries]
         if q_lora_linear.shape[0] != num_queries:

@@ -358,7 +358,12 @@ class DeepseekMLAForwardMixin:
 
             # overlap qk norm
             overlap_qk_norm = envs.OVERLAP_QK_NORM.get()
-            if overlap_qk_norm and self.alt_stream is not None and get_is_capture_mode():
+            if (
+                overlap_qk_norm
+                and self.alt_stream is not None
+                and not envs.MX_DISABLE_INDEXER_ALT_STREAM.get()
+                and get_is_capture_mode()
+            ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -377,6 +382,7 @@ class DeepseekMLAForwardMixin:
             # overlap q_b_proj and indexer during decode
             if (
                 self.alt_stream is not None
+                and not envs.MX_DISABLE_INDEXER_ALT_STREAM.get()
                 and get_is_capture_mode()
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
@@ -406,7 +412,10 @@ class DeepseekMLAForwardMixin:
                 k_nope = k_nope.unsqueeze(1)
                 if q_replicate_active:
                     # full-head Q from the gathered weight (skips Q all-gather)
-                    q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
+                    q = torch.nn.functional.linear(
+                        q[2] if isinstance(q, tuple) and len(q) == 3 else q,
+                        self.q_b_proj_qrep_weight,
+                    ).view(
                         -1,
                         self.num_local_heads * get_parallel().attn_dcp_size,
                         self.qk_head_dim,
@@ -435,6 +444,7 @@ class DeepseekMLAForwardMixin:
                     and _ENABLE_DSA_Q8KV8_BORN_FP8_Q
                     and fusion_plan is None
                     and self.alt_stream is not None
+                    and not envs.MX_DISABLE_INDEXER_ALT_STREAM.get()
                     and q_lora is not None
                     and self.rotary_emb is not None
                 ):
@@ -489,8 +499,8 @@ class DeepseekMLAForwardMixin:
                 )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
-            if not envs.MX_FUSED_MLA_ABSORB_ROPE.get():
-                k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+            # This 0.5.19 path has no legacy fused RMSNorm producer.
+            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
         if q_nope is None:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)

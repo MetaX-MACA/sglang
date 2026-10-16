@@ -86,7 +86,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import RMSNorm, mx_can_use_group_fp8_quant
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
@@ -692,7 +692,7 @@ class MqaAttentionBase(nn.Module):
             self.q_lora_rank,
             eps=self.eps,
             fused_quant=self.fused_quant,
-            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
+            return_quant_tuple=mx_can_use_group_fp8_quant(quant_config),
         )
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
@@ -1838,7 +1838,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_quant=self.fused_quant,
-            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
+            return_quant_tuple=mx_can_use_group_fp8_quant(quant_config),
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
@@ -1861,7 +1861,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         ) = make_hc_mixing_params(hc_mult, config.hidden_size)
         self.rms_norm_eps = config.rms_norm_eps
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.use_fused_mhc_post_pre = is_cross_layer_mhc_fusion_enabled()
+        self.use_fused_mhc_post_pre = (
+            is_cross_layer_mhc_fusion_enabled()
+            and not (
+                envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
+                and mx_can_use_group_fp8_quant(quant_config)
+            )
+        )
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
 
@@ -2129,7 +2135,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                         )
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
-                        x_quant = None
+                        if isinstance(hidden_states, tuple):
+                            x_quant = hidden_states[:2]
+                            hidden_states = hidden_states[2]
+                        else:
+                            x_quant = None
                 else:
                     x_quant = None
             else:
@@ -2153,7 +2163,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                         )
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
-                        x_quant = None
+                        if isinstance(hidden_states, tuple):
+                            x_quant = hidden_states[:2]
+                            hidden_states = hidden_states[2]
+                        else:
+                            x_quant = None
                 else:
                     x_quant = None
         else:
@@ -2460,7 +2474,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
             else:
                 hidden_states = self.input_layernorm(hidden_states)
-                x_quant = None
+                if isinstance(hidden_states, tuple):
+                    x_quant = hidden_states[:2]
+                    hidden_states = hidden_states[2]
+                else:
+                    x_quant = None
         else:
             x_quant = None
 
@@ -2822,7 +2840,13 @@ class DeepseekV4Model(nn.Module):
             ) = make_hc_head_params(hc_mult, config.hidden_size)
 
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.use_fused_mhc_post_pre = is_cross_layer_mhc_fusion_enabled()
+        self.use_fused_mhc_post_pre = (
+            is_cross_layer_mhc_fusion_enabled()
+            and not (
+                envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
+                and mx_can_use_group_fp8_quant(quant_config)
+            )
+        )
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
 
