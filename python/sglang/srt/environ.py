@@ -321,6 +321,8 @@ class Envs:
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
 
+    SGLANG_DSA_TRITON_FLASHMLA_KV = EnvBool(False)
+
     # KV cache
     # Store the MHA (dense) KV cache in HND layout [num_pages, num_kv_heads,
     # page_size, head_dim] instead of the default NHD [num_pages, page_size,

@@ -123,6 +123,29 @@ global_workspace_buffer = None
 _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
 
 
+def _dequantize_selected_kv_cache(
+    kv_cache: torch.Tensor, page_table_1: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize only the sparse KV slots selected for the current batch."""
+    flat_page_table = page_table_1.reshape(-1)
+    kv_token_capacity = kv_cache.numel() // kv_cache.shape[-1]
+    valid_mask = (flat_page_table >= 0) & (flat_page_table < kv_token_capacity)
+    safe_page_table = torch.where(
+        valid_mask, flat_page_table, torch.zeros_like(flat_page_table)
+    )
+    selected_kv_cache = dequantize_k_cache_paged(kv_cache, safe_page_table)
+
+    local_page_table = torch.arange(
+        flat_page_table.numel(),
+        dtype=page_table_1.dtype,
+        device=page_table_1.device,
+    )
+    local_page_table = torch.where(
+        valid_mask, local_page_table, torch.full_like(local_page_table, -1)
+    )
+    return selected_kv_cache, local_page_table.view_as(page_table_1)
+
+
 @dataclass(frozen=True)
 class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -333,6 +356,12 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
+        self.dsa_kv_cache_store_int8 = (
+            model_runner.token_to_kv_pool.dsa_kv_cache_store_int8
+        )
+        self.dsa_kv_cache_is_quantized = (
+            self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8
+        )
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
@@ -342,6 +371,15 @@ class DeepseekSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        if self.dsa_kv_cache_store_int8:
+            assert (
+                self.kv_lora_rank == 512
+                and self.qk_rope_head_dim == 64
+                and self.kv_cache_dim == 656
+            ), (
+                "The basic DSA INT8 cache implementation requires "
+                "kv_lora_rank=512, qk_rope_head_dim=64, and kv_cache_dim=656"
+            )
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -1561,7 +1599,8 @@ class DeepseekSparseAttnBackend(
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        assert kv_cache.dtype == q.dtype
+        if not self.dsa_kv_cache_is_quantized:
+            assert kv_cache.dtype == q.dtype
         
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1807,6 +1846,10 @@ class DeepseekSparseAttnBackend(
             )
 
         if self.dsa_decode_impl == "flashmla_sparse":
+            if self.dsa_kv_cache_store_int8:
+                kv_cache, page_table_1 = _dequantize_selected_kv_cache(
+                    kv_cache, page_table_1
+                )
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
@@ -1982,18 +2025,22 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        from flash_mla import flash_mla_with_kvcache
-
         cache_seqlens = metadata.dsa_cache_seqlens_int32
-        
-        if metadata.flashmla_sched_metadata.tile_scheduler_metadata is None or not envs.MX_ENABLE_FLASH_MLA_METADATA_CACHE.get():
+        use_functional_triton = (
+            self.dsa_kv_cache_is_quantized
+            and envs.SGLANG_DSA_TRITON_FLASHMLA_KV.get()
+        )
+        if (
+            metadata.flashmla_sched_metadata.tile_scheduler_metadata is None
+            or not envs.MX_ENABLE_FLASH_MLA_METADATA_CACHE.get()
+        ):
             sched_meta = _create_flashmla_metadata()
         else:
             sched_meta = metadata.flashmla_sched_metadata
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_fp8 and not use_functional_triton:
             # The xcore1600 FlashMLA FP8 KV sparse-decode path expects only the
             # absorbed NoPE query part (512 dims for DeepSeek V3.2), not q_nope
             # concatenated with the 64-dim RoPE query.
@@ -2011,52 +2058,44 @@ class DeepseekSparseAttnBackend(
 
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
-
-        # if not self.dsa_kv_cache_store_fp8:
-        #     # inefficiently quantize the whole cache
-        #     kv_cache = quantize_k_cache(kv_cache)
-
         indices = page_table_1.unsqueeze(1)
-        assert (
-            indices.shape[-1] == self.dsa_index_topk
-        )  # requirement of FlashMLA decode kernel
+        assert indices.shape[-1] == self.dsa_index_topk
+        block_table = torch.empty(
+            (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
+        )
 
         flashmla_opt = get_bool_env_var("MX_ENABLE_FLASH_MLA_OPT", default="true")
-
+        flashmla_kwargs = {
+            "q": q_input,
+            "k_cache": kv_cache,
+            "cache_seqlens": cache_seqlens,
+            "head_dim_v": v_head_dim,
+            "tile_scheduler_metadata": sched_meta,
+            "num_splits": None,
+            "softmax_scale": sm_scale,
+            "indices": indices,
+            "block_table": block_table,
+            "is_fp8_kvcache": self.dsa_kv_cache_store_fp8,
+        }
         if flashmla_opt:
-            decode_mask = (indices != -1).all(dim=-1, keepdim=True)
-            o, _ = flash_mla_with_kvcache(
-                q=q_input,
-                k_cache=kv_cache,
-                cache_seqlens=cache_seqlens,
-                head_dim_v=v_head_dim,
-                tile_scheduler_metadata=sched_meta,
-                num_splits=None,
-                softmax_scale=sm_scale,
-                indices=indices,
-                indices_all_valid_per_q=decode_mask,
-                # doc says it is not used, but if pass in None then error
-                block_table=torch.empty(
-                    (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
-                ),
-                is_fp8_kvcache=self.dsa_kv_cache_store_fp8,
+            flashmla_kwargs["indices_all_valid_per_q"] = (indices != -1).all(
+                dim=-1, keepdim=True
             )
+
+        # Correctness-first replacement for third-party FlashMLA. It reads both
+        # FP8 and INT8 656-byte rows directly, but receives the exact vendor-call
+        # kwargs above so the saved case can be replayed against the library.
+        if use_functional_triton:
+            from sglang.srt.layers.attention.dsa.triton_flashmla_kv import (
+                flash_mla_with_kvcache_triton,
+            )
+            o, softmax_lse = flash_mla_with_kvcache_triton(**flashmla_kwargs)
         else:
-            o, _ = flash_mla_with_kvcache(
-                q=q_input,
-                k_cache=kv_cache,
-                cache_seqlens=cache_seqlens,
-                head_dim_v=v_head_dim,
-                tile_scheduler_metadata=sched_meta,
-                num_splits=None,
-                softmax_scale=sm_scale,
-                indices=indices,
-                # doc says it is not used, but if pass in None then error
-                block_table=torch.empty(
-                    (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
-                ),
-                is_fp8_kvcache=self.dsa_kv_cache_store_fp8,
-            )
+            if self.dsa_kv_cache_store_int8:
+                flashmla_kwargs["is_fp8_kvcache"] = True
+            from flash_mla import flash_mla_with_kvcache
+
+            o, _ = flash_mla_with_kvcache(**flashmla_kwargs)
         
         if metadata.flashmla_sched_metadata.tile_scheduler_metadata is None:
             metadata.flashmla_sched_metadata.tile_scheduler_metadata = sched_meta.tile_scheduler_metadata
@@ -2522,7 +2561,7 @@ class DeepseekSparseAttnBackend(
 
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
-            if self.dsa_kv_cache_store_fp8:
+            if self.dsa_kv_cache_is_quantized:
                 if (
                     is_blackwell()
                     and forward_batch is not None
@@ -2547,8 +2586,8 @@ class DeepseekSparseAttnBackend(
         This method is used to select the topk transform method which can be fused or unfused.
         """
         if (
-            # disable for MTP
-            self.dsa_kv_cache_store_fp8
+            # Keep speculative modes on the paged path.
+            self.dsa_kv_cache_is_quantized
             and self.dsa_prefill_impl == "flashmla_sparse"
             and forward_mode == ForwardMode.EXTEND
         ):
