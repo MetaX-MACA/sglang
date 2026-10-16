@@ -240,9 +240,18 @@ class DecodeKVCacheOffloadManager:
     def _release_finished_req(self, req: Req):
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
         # so a previously-released request must be skipped here to avoid
-        # non-idempotent side effects (e.g. tree_cache.protected_size_
-        # double-decrement, host pool double-free).
+        # non-idempotent side effects (e.g. double-freeing KV slots).
         if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
+            return
+
+        if not self.tree_cache.disable:
+            # Tree-owned prefix slots must not be freed by the raw path below.
+            # Cache committed KV, free duplicates/tails/overallocation, and
+            # balance the prefix lock acquired during preallocation.
+            from sglang.srt.mem_cache.common import release_kv_cache
+
+            release_kv_cache(req, self.tree_cache, is_insert=True)
+            self.offloaded_state.pop(req, None)
             return
 
         kv_committed_len = req.effective_kv_committed_len()
@@ -267,7 +276,6 @@ class DecodeKVCacheOffloadManager:
 
         self.req_to_token_pool.free(req)
         req.kv.mark_kv_released()
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
         self.offloaded_state.pop(req, None)
 
     def _check_backup_progress(self, finish_count):
