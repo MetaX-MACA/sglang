@@ -6,6 +6,7 @@ from collections import defaultdict
 import torch
 
 from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,7 @@ def alloc_with_pin_memory(
 
 
 ALLOC_MEMORY_FUNCS = defaultdict(
-    lambda: alloc_with_host_register,
+    lambda: alloc_with_pin_memory if envs.SGLANG_HICACHE_USE_PIN_MEMORY.get() else alloc_with_host_register,
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
