@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.environ import get_hicache_write_through_threshold
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -206,8 +207,8 @@ class HiRadixCache(RadixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.work_list: List[torch.distributed.Work] = []
         # todo: dynamically adjust the threshold
-        self.write_through_threshold = (
-            1 if server_args.hicache_write_policy == "write_through" else 2
+        self.write_through_threshold = get_hicache_write_through_threshold(
+            server_args.hicache_write_policy
         )
         self.load_back_threshold = 10
 
@@ -410,7 +411,7 @@ class HiRadixCache(RadixCache):
                 if hicache_write_policy is not None:
                     self.cache_controller.write_policy = hicache_write_policy
                     self.write_through_threshold = (
-                        1 if hicache_write_policy == "write_through" else 2
+                        get_hicache_write_through_threshold(hicache_write_policy)
                     )
                     logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
                 return (
@@ -433,8 +434,8 @@ class HiRadixCache(RadixCache):
 
         if hicache_write_policy is not None:
             self.cache_controller.write_policy = hicache_write_policy
-            self.write_through_threshold = (
-                1 if hicache_write_policy == "write_through" else 2
+            self.write_through_threshold = get_hicache_write_through_threshold(
+                hicache_write_policy
             )
             logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
 

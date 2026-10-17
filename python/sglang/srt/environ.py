@@ -452,6 +452,8 @@ class Envs:
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
 
     # Hi-Cache
+    # Minimum node hit count before write_through_selective backs up KV to host.
+    SGLANG_HICACHE_WRITE_THROUGH_SELECTIVE_THRESHOLD = EnvInt(5)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
@@ -1080,6 +1082,20 @@ class Envs:
 
 envs = Envs()
 EnvField._allow_set_name = False
+
+
+def get_hicache_write_through_threshold(write_policy: str) -> int:
+    if write_policy == "write_through":
+        return 1
+    if write_policy != "write_through_selective":
+        return 2
+
+    threshold = envs.SGLANG_HICACHE_WRITE_THROUGH_SELECTIVE_THRESHOLD.get()
+    if threshold < 1:
+        raise ValueError(
+            "SGLANG_HICACHE_WRITE_THROUGH_SELECTIVE_THRESHOLD must be at least 1"
+        )
+    return threshold
 
 
 def _print_deprecated_env(old_name: str, new_name: Optional[str] = None):

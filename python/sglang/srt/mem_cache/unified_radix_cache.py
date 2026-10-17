@@ -14,7 +14,7 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.distributed.communication_tags import P2PTag
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, get_hicache_write_through_threshold
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -549,8 +549,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         # State initialization
-        self.write_through_threshold = (
-            1 if server_args.hicache_write_policy == "write_through" else 2
+        self.write_through_threshold = get_hicache_write_through_threshold(
+            server_args.hicache_write_policy
         )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
