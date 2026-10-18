@@ -293,6 +293,73 @@ def mark_selected_kv_rows(
     return row_mask, sanitized_topk.view_as(topk_indices)
 
 
+def build_request_shared_dequant_tables(
+    page_table_1: torch.Tensor,
+    queries_per_request: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prep tables to dequantize a query-expanded slot table once per request.
+
+    Target-verify / draft-extend repeat each request's shared top-k physical
+    slots to one row per draft token (index_share_for_mtp_iteration), so
+    ``page_table_1`` [num_q, topk] carries every request's slots
+    ``queries_per_request`` times. Returns ``(safe_req, row_mask, local)``:
+    ``safe_req`` / ``row_mask`` are [num_requests * topk] inputs for
+    ``dequantize_k_cache_paged`` (-1 slots mapped to slot 0 and masked off);
+    ``local`` is [num_q, topk] remapping each query's entries onto its
+    request's dequantized rows, -1 entries kept. ``queries_per_request=1``
+    degrades to masking the -1 padding only, with identity row mapping.
+    """
+    num_q, topk = page_table_1.shape
+    assert queries_per_request >= 1 and num_q % queries_per_request == 0
+    num_req = num_q // queries_per_request
+    flat = page_table_1.reshape(-1)
+    safe_req = torch.empty(num_req * topk, dtype=flat.dtype, device=flat.device)
+    row_mask = torch.empty(num_req * topk, dtype=torch.int8, device=flat.device)
+    local = torch.empty_like(flat)
+    block = 1024
+    _build_request_shared_dequant_tables_kernel[
+        (num_q, triton.cdiv(topk, block))
+    ](
+        flat,
+        safe_req,
+        row_mask,
+        local,
+        topk,
+        queries_per_request,
+        BLOCK=block,
+    )
+    return safe_req, row_mask, local.view_as(page_table_1)
+
+
+@triton.jit
+def _build_request_shared_dequant_tables_kernel(
+    page_table_ptr,
+    safe_req_ptr,
+    row_mask_ptr,
+    local_ptr,
+    topk,
+    queries_per_request,
+    BLOCK: tl.constexpr,
+):
+    q = tl.program_id(0)
+    req = q // queries_per_request
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    in_range = offs < topk
+    slot = tl.load(page_table_ptr + q * topk + offs, mask=in_range, other=-1)
+    ok = in_range & (slot >= 0)
+    tl.store(
+        local_ptr + q * topk + offs,
+        tl.where(ok, req * topk + offs, -1),
+        mask=in_range,
+    )
+    # Row req*qpr of the expanded table is written by exactly one program per
+    # column block; it carries the request's slots (rows within a request are
+    # identical), so it doubles as the per-request dequant input.
+    if q % queries_per_request == 0:
+        tl.store(safe_req_ptr + req * topk + offs, tl.where(ok, slot, 0), mask=in_range)
+        tl.store(row_mask_ptr + req * topk + offs, ok.to(tl.int8), mask=in_range)
+
+
 @triton.jit
 def _mark_selected_kv_rows_kernel(
     topk_ptr,

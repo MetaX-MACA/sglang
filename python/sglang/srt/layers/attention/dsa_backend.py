@@ -27,6 +27,7 @@ from sglang.srt.runtime_context import (
 
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
+    build_request_shared_dequant_tables,
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged,
     gather_dequant_requant_fp8_paged,
@@ -224,6 +225,29 @@ def _dequantize_selected_ragged_kv_cache(
             (1, *selected_kv_cache.shape[1:])
         )
     return selected_kv_cache, page_table_1
+
+
+def _dequantize_request_shared_kv_cache(
+    kv_cache: torch.Tensor,
+    page_table_1: torch.Tensor,
+    queries_per_request: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize a query-expanded decode table once per request.
+
+    ``page_table_1`` [num_q, topk] repeats each request's shared top-k physical
+    slots once per draft token; dequantizing it flat materializes every row
+    ``queries_per_request`` times (x8 at s7d8). The output keeps one row per
+    (request, topk column) and the returned table remaps each query onto its
+    request's rows. ``queries_per_request=1`` degrades to masking the -1
+    padding only, with identity row mapping.
+    """
+    safe_req, row_mask, local = build_request_shared_dequant_tables(
+        page_table_1, queries_per_request
+    )
+    selected_kv_cache = dequantize_k_cache_paged(
+        kv_cache, safe_req, row_mask=row_mask
+    )
+    return selected_kv_cache, local
 
 
 def _dequantize_selected_kv_cache_for_flashmla_kv(
@@ -3209,6 +3233,14 @@ class DeepseekSparseAttnBackend(
                     forward_mode=forward_batch.forward_mode,
                     dcp_enabled=get_parallel().dcp_enabled,
                 ),
+                # Only draft-extend-v2 repeats each request's shared top-k row
+                # exactly (num_q // batch_size) times; any other extend shape
+                # has per-token rows and must keep one dequant row each.
+                queries_per_request=(
+                    q_all.shape[0] // forward_batch.batch_size
+                    if forward_batch.forward_mode.is_draft_extend_v2()
+                    else 1
+                ),
             )
         elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -3533,6 +3565,11 @@ class DeepseekSparseAttnBackend(
                 return_lse=_should_return_dsa_dcp_lse(
                     forward_mode=forward_batch.forward_mode,
                     dcp_enabled=get_parallel().dcp_enabled,
+                ),
+                # Decode and target-verify both repeat each request's shared
+                # top-k row exactly (num_q // batch_size) times.
+                queries_per_request=max(
+                    q_nope.shape[0] // forward_batch.batch_size, 1
                 ),
             )
         elif dsa_impl == "fa3":
@@ -4231,6 +4268,7 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
         return_lse: bool = False,
+        queries_per_request: int = 1,
     ) -> torch.Tensor:
         if envs.MX_ENABLE_MCOPLIB_TILELANG_DSA.get():
             from mcoplib.tilelang_sparse_attention import (
@@ -4249,9 +4287,16 @@ class DeepseekSparseAttnBackend(
             and envs.MX_ENABLE_NSA_FP8_KV_STORE.get()
             and envs.MX_ENABLE_NSA_FP8_DEQUANT_TILELANG.get()
         ):
-            kv_cache, page_table_1 = _dequantize_selected_kv_cache(
-                kv_cache, page_table_1
-            )
+            if envs.MX_ENABLE_NSA_FP8_KV_UNIQUE_SLOTS.get():
+                # Decode/verify repeat each request's shared top-k slots once
+                # per draft token; dedup them to one row per request.
+                kv_cache, page_table_1 = _dequantize_request_shared_kv_cache(
+                    kv_cache, page_table_1, queries_per_request
+                )
+            else:
+                kv_cache, page_table_1 = _dequantize_selected_kv_cache(
+                    kv_cache, page_table_1
+                )
 
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
         # index_topk columns. TileLang processes indices in 64-column blocks,
