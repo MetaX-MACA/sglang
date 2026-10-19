@@ -43,7 +43,20 @@ if ENABLE_JIT_DEEPGEMM:
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
 # MetaX DeepGEMM accepts a backend override; the upstream API does not.
-_deep_gemm_backend_kwargs = {"backend": "torch_bf16"} if is_maca() else {}
+import importlib
+def try_import_with_message(name: str):
+    try:
+        module = importlib.import_module(name)
+        return module
+    except ImportError:
+        print(f"can't import {name}, please use 'pip install {name}'")
+        return None
+
+if try_import_with_message("mctlassEx") != None :
+    backend_name = "mctlassEx"
+else:
+    backend_name = "torch_bf16"
+_deep_gemm_backend_kwargs = {"backend": backend_name} if is_maca() else {}
 
 
 def get_paged_mqa_logits_metadata(

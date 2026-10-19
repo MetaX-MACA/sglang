@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_xpu,
+    is_maca,
     offloader,
 )
 from sglang.srt.utils.common import torch_release
@@ -581,6 +582,10 @@ if get_platform().is_sm90 and is_flashinfer_available():
     # FlashInfer SM90 DeepGEMM with automatic swapAB optimization for small M
     from flashinfer.gemm import fp8_blockscale_gemm_sm90
 
+if _is_maca:
+    SUPPORT_FP8_LINEAR_BLOCK_SIZE = [[32, 32], [128, 128]]
+else:
+    SUPPORT_FP8_LINEAR_BLOCK_SIZE = [[128, 128]]
 
 def dispatch_w8a8_block_fp8_linear(
     weight_block_size: Optional[List[int]] = None,
@@ -595,7 +600,8 @@ def dispatch_w8a8_block_fp8_linear(
     """
     # Only Triton reads the block size at launch; DeepGEMM, the FlashInfer
     # groupwise kernels and CUTLASS take 128-wide K blocks only.
-    if weight_block_size is not None and weight_block_size[1] != 128:
+    if weight_block_size is not None and \
+        weight_block_size not in SUPPORT_FP8_LINEAR_BLOCK_SIZE:
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
 
     backend = get_fp8_gemm_runner_backend()
@@ -1229,7 +1235,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
-    block_supported = list(block_size) == [128, 128]
+    block_supported = list(block_size) in SUPPORT_FP8_LINEAR_BLOCK_SIZE
 
     if not (shape_supported and dtype_supported and block_supported):
         # fall back to triton

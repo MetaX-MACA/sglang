@@ -267,6 +267,10 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_hip(self) -> bool:
         return self.is_rocm()
+    
+    @lru_cache(maxsize=1)
+    def is_maca(self) -> bool:
+        return "metax" in torch.__version__
 
     @classmethod
     @lru_cache(maxsize=1)

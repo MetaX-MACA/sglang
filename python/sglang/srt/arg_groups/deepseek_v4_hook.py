@@ -42,6 +42,13 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
 
+    if get_platform().is_maca:
+        hf_config = model_config_of(server_args).hf_config
+        quant_config = getattr(hf_config, "quantization_config", None)
+        if quant_config and quant_config.get("quant_method") == "fp8":
+            if not envs.SGLANG_ENABLE_JIT_DEEPGEMM.is_set():
+                envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(True)
+
     if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported
 
