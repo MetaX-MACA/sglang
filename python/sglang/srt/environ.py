@@ -1603,7 +1603,6 @@ class Envs:
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(False)
     # Storage format for the DSV4 index cache.
     SGLANG_DSV4_INDEX_CACHE_TYPE = EnvStr("int8")
-    SGLANG_DSA_INDEX_CACHE_TYPE = EnvStr("int8")
 
     # ===================================================================
     # Inkling

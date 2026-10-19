@@ -483,7 +483,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
-        if DSATokenToKVPool.index_k_with_scale_buffer_dtype in [torch.int8, torch.uint8]:
+        if DSATokenToKVPool.index_k_with_scale_buffer_dtype in (
+            torch.int8,
+            torch.uint8,
+        ):
             indexer_size_per_token = (
                 index_head_dim
                 + index_head_dim // DSATokenToKVPool.quant_block_size * 4
