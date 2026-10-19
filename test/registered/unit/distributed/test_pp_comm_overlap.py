@@ -2,7 +2,7 @@ import unittest
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 import torch
 
@@ -33,6 +33,29 @@ def _make_scheduler(**attrs):
 
 
 class TestPPCommOverlap(CustomTestCase):
+    def test_scattered_proxy_send_skips_gather_but_output_keeps_it(self):
+        attn_tp_group = object()
+        pp_group = SimpleNamespace(send_tensor_dict=Mock(return_value=[]))
+        scheduler = _make_scheduler(
+            attn_tp_group=attn_tp_group,
+            pp_comm_stream_ctx=nullcontext(),
+            pp_group=pp_group,
+        )
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+            return_value=SimpleNamespace(enable_attn_tp_input_scattered=True),
+        ):
+            scheduler._pp_send_dict_to_next_stage({}, msg_type="proxy")
+            scheduler._pp_send_dict_to_next_stage({}, msg_type="output")
+
+        self.assertIsNone(
+            pp_group.send_tensor_dict.call_args_list[0].kwargs["all_gather_group"]
+        )
+        self.assertIs(
+            pp_group.send_tensor_dict.call_args_list[1].kwargs["all_gather_group"],
+            attn_tp_group,
+        )
+
     def test_graph_proxy_send_records_forward_reuse_fence(self):
         comm_stream = FakeStream(4)
         work = Mock()
