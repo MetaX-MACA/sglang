@@ -1120,6 +1120,7 @@ class ModelConfig:
                 if (
                     envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get()
                     or is_in_ci()  # FIXME: fix this special case
+                    or is_draft_model  # spec decoding intentionally syncs draft to target
                 ):
                     logger.warning(msg)
                     self.context_len = context_length
