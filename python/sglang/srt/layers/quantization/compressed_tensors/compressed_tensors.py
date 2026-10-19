@@ -914,6 +914,13 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu and self._is_dynamic_token_w4a8(weight_quant, input_quant):
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
+            if (
+                weight_quant.type == QuantizationType.INT
+                and input_quant.type == QuantizationType.INT
+                and self._is_dynamic_token_w4a8(weight_quant, input_quant)
+            ):
+                logger.info_once("Using CompressedTensorsW4A8Int8MoEMethod")
+                return CompressedTensorsW4A8Int8MoEMethod(self)
             logger.info_once("Using CompressedTensorsW4AFP8MoE")
             return CompressedTensorsW4AFP8MoE(self, weight_quant, input_quant)
         elif self._is_dynamic_token_w4a8(weight_quant, input_quant):

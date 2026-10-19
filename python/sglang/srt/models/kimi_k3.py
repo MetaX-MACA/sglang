@@ -180,6 +180,14 @@ def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
     )
 
 
+def _remap_mxfp4_weight_name(name: str, quant_config: QuantizationConfig | None) -> str:
+    """Preserve packed INT4 names; remap MXFP4 weights on non-NPU."""
+    quant_format = getattr(quant_config, "quant_format", None) or ""
+    if not _is_npu and "mxfp4" in quant_format:
+        return name.replace("weight_packed", "weight")
+    return name
+
+
 def _k3_bf16_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1239,16 +1247,17 @@ class KimiK3MoE(nn.Module):
         kernels return from apply() before that quant, and precision="bf16"
         skips it as well, so those keep the bf16 contract even though the
         runner backend is the same."""
-        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
-
         method = self.experts.quant_method
+        # Only this FlashInfer MXFP4 path accepts the non-dense front slice.
+        # Check its capabilities without importing the optional MXFP4 module:
+        # unrelated quant methods may run with a FlashInfer build that lacks
+        # the NVFP4 symbols imported by that module.
         return not (
-            isinstance(method, Mxfp4MoEMethod)
-            and method.use_flashinfer
-            and not method.use_marlin
-            and method._fi_kernel == "trtllm_sm100"
-            and method.flashinfer_mxfp4_moe_precision == "default"
-            and method.hidden_size == self.moe_hidden_size
+            getattr(method, "use_flashinfer", False)
+            and not getattr(method, "use_marlin", False)
+            and getattr(method, "_fi_kernel", None) == "trtllm_sm100"
+            and getattr(method, "flashinfer_mxfp4_moe_precision", None) == "default"
+            and getattr(method, "hidden_size", None) == self.moe_hidden_size
         )
 
     @cached_property
@@ -1256,14 +1265,11 @@ class KimiK3MoE(nn.Module):
         """Whether to stage routed_input for the fused route+pack+quant launch
         (route_quant_handoff). Only the trtllm-gen SiTU runner with mxfp8
         activations consumes the staged quant, so only that runner stages."""
-        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
-
         method = self.experts.quant_method
         return (
-            isinstance(method, Mxfp4MoEMethod)
-            and method.use_flashinfer
-            and not method.use_marlin
-            and method.flashinfer_mxfp4_moe_precision == "default"
+            getattr(method, "use_flashinfer", False)
+            and not getattr(method, "use_marlin", False)
+            and getattr(method, "flashinfer_mxfp4_moe_precision", None) == "default"
             and self.experts.moe_runner_config.activation == "situ"
         )
 
@@ -2635,6 +2641,13 @@ class KimiK3DecoderLayer(nn.Module):
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
 
+        if isinstance(result, tuple):
+            result, topk_indices = result
+            assert topk_indices is None, (
+                "Kimi K3 does not support propagating DSA index top-k values "
+                "between layers"
+            )
+
         return result
 
     def forward(
@@ -3290,10 +3303,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if _lid.isdigit() and int(_lid) >= num_hidden_layers:
                     continue
 
-            # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
-            # (NPU keeps weight_packed for NPUCompressedTensorsW4A8mxfp4MoE).
-            if "weight_packed" in name and not _is_npu:
-                name = name.replace("weight_packed", "weight")
+            name = _remap_mxfp4_weight_name(name, self.quant_config)
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa
             if ".q_a_proj." in name or ".kv_a_proj_with_mqa." in name:
@@ -3529,7 +3539,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_prefix={
-            "language_model.layers.": "language_model.model.layers.",
+            # Normalize both legacy and current wrapper prefixes directly to
+            # the inner language-model namespace. The same mapper is applied
+            # to checkpoint weights and compressed-tensors config entries.
+            "language_model.layers.": "model.layers.",
+            "language_model.": "",
         },
         orig_to_new_substr={
             "block_sparse_moe": "mlp",
@@ -3917,7 +3931,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
                     continue
-                yield name.replace("language_model.", ""), loaded_weight
+                yield name, loaded_weight
 
         if self.language_model is not None:
             self.language_model.load_weights(stream_language_weights())
