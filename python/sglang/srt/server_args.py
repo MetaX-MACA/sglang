@@ -2001,7 +2001,10 @@ class ServerArgs:
     ] = None
     flashinfer_mla_disable_ragged: A[
         bool,
-        "Not using ragged prefill wrapper when running flashinfer mla",
+        Arg(
+            help="Not using ragged prefill wrapper when running flashinfer mla",
+            resolvable=True,
+        ),
         NS("exec.kernel"),
     ] = False
     enable_fused_qk_norm_rope: A[

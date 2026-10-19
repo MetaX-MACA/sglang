@@ -106,12 +106,14 @@ def dequantize_k_cache_paged_int8(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     group_size: int = 128,
+    num_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     dim_quant = quant_k_cache.shape[-1]
     assert dim_quant == 656
     assert quant_k_cache.dtype == torch.int8
     assert group_size == 128
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
+    valid_num_tokens = num_tokens
     num_tokens = page_table_1_flattened.shape[0]
     output = torch.empty(
         (num_tokens, 1, 576),
@@ -130,11 +132,13 @@ def dequantize_k_cache_paged_int8(
         input_nope_s,
         input_rope,
         page_table_1_flattened,
+        valid_num_tokens if valid_num_tokens is not None else page_table_1_flattened,
         output.stride(0),
         input_nope_q.stride(0),
         input_nope_s.stride(0),
         input_rope.stride(0),
         GROUP_SIZE=group_size,
+        USE_NUM_TOKENS_PTR=valid_num_tokens is not None,
     )
     return output
 
@@ -188,24 +192,35 @@ def _dequantize_k_cache_paged_int8_kernel(
     input_nope_s_ptr,
     input_rope_ptr,
     page_table_1_ptr,
+    num_tokens_ptr,
     output_stride_0: int,
     input_nope_q_stride_0: int,
     input_nope_s_stride_0: int,
     input_rope_stride_0: int,
     GROUP_SIZE: tl.constexpr,
+    USE_NUM_TOKENS_PTR: tl.constexpr,
 ):
     token_id = tl.program_id(0)
-    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32)
+    valid = True
+    if USE_NUM_TOKENS_PTR:
+        valid = token_id < tl.load(num_tokens_ptr)
+    token_id_paged = tl.load(page_table_1_ptr + token_id, mask=valid, other=0).to(
+        tl.int32
+    )
     group_id = tl.program_id(1)
     offs = tl.arange(0, GROUP_SIZE)
 
     if group_id < 4:
         dim_offs = group_id * GROUP_SIZE + offs
         quant = tl.load(
-            input_nope_q_ptr + token_id_paged * input_nope_q_stride_0 + dim_offs
+            input_nope_q_ptr + token_id_paged * input_nope_q_stride_0 + dim_offs,
+            mask=valid,
+            other=0,
         ).to(tl.float32)
         scale = tl.load(
-            input_nope_s_ptr + token_id_paged * input_nope_s_stride_0 + group_id
+            input_nope_s_ptr + token_id_paged * input_nope_s_stride_0 + group_id,
+            mask=valid,
+            other=0,
         )
         tl.store(
             output_ptr + token_id * output_stride_0 + dim_offs,
@@ -214,7 +229,8 @@ def _dequantize_k_cache_paged_int8_kernel(
     else:
         rope = tl.load(
             input_rope_ptr + token_id_paged * input_rope_stride_0 + offs,
-            mask=offs < 64,
+            mask=(offs < 64) & valid,
+            other=0,
         )
         tl.store(
             output_ptr + token_id * output_stride_0 + 512 + offs,

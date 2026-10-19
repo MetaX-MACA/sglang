@@ -3716,6 +3716,7 @@ class HybridLinearKVPool(KVCache):
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
         enable_mla_int8: bool = False,
+        enable_mla_int8_workspace: bool = True,
     ):
         self.size = size
         self.dtype = dtype
@@ -3834,6 +3835,11 @@ class HybridLinearKVPool(KVCache):
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
                 **({"enable_mla_int8": True} if enable_mla_int8 else {}),
+                **(
+                    {"enable_mla_int8_workspace": False}
+                    if enable_mla_int8 and not enable_mla_int8_workspace
+                    else {}
+                ),
             )
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
@@ -4301,6 +4307,7 @@ class MLATokenToKVPool(KVCache):
         use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
         enable_mla_int8: bool = False,
+        enable_mla_int8_workspace: bool = True,
     ):
         super().__init__(
             size,
@@ -4333,6 +4340,7 @@ class MLATokenToKVPool(KVCache):
             enable_mla_int8 and dtype == torch.int8 and not use_dsa
         )
         self.mla_int8_dequant_workspace = None
+        self.enable_mla_int8_workspace = enable_mla_int8_workspace
         if self.mla_kv_cache_store_int8:
             if kv_lora_rank != 512 or qk_rope_head_dim != 64:
                 raise ValueError(
@@ -4390,7 +4398,7 @@ class MLATokenToKVPool(KVCache):
                         dtype=torch.bfloat16,
                         device=self.device,
                     )
-                    if self.mla_kv_cache_store_int8
+                    if self.mla_kv_cache_store_int8 and self.enable_mla_int8_workspace
                     else None
                 )
 

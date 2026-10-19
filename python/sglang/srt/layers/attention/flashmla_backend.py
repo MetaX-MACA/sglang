@@ -92,6 +92,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         }
+        self.is_int8_kvcache = self.mla_kv_cache_store_int8
+        if self.is_int8_kvcache:
+            if self.page_size != PAGE_SIZE or self.q_data_type != torch.bfloat16:
+                raise ValueError("FlashMLA INT8 requires BF16 Q and page_size=64")
+            self.kv_cache_dim = 656
 
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
 
@@ -118,6 +123,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         in_capture: bool = False,
     ):
         forward_mode = forward_batch.forward_mode
+        if self.is_int8_kvcache and not forward_mode.is_decode_or_idle():
+            raise ValueError("FlashMLA INT8 requires FlashInfer for prefill and verify")
         if (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
@@ -150,6 +157,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         return buf[:bs, :max_seqlen_pad]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if self.is_int8_kvcache and not forward_batch.forward_mode.is_decode_or_idle():
+            raise ValueError("FlashMLA INT8 requires FlashInfer for prefill and verify")
         bs = forward_batch.batch_size
         # Host max only sizes the block table: CPU mirror when published,
         # else the static bound (kernel reads are capped by seq_lens_k).
@@ -186,6 +195,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.num_q_heads,
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
+                **({"is_int8_kvcache": True} if self.is_int8_kvcache else {}),
             )
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
@@ -371,7 +381,18 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 q_head_mult * self.num_q_heads,
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
+                **({"is_int8_kvcache": True} if self.is_int8_kvcache else {}),
             )
+
+            if self.is_int8_kvcache:
+                # Scheduling is captured inside the first decode layer, not copied
+                # from the legacy tensor metadata on each graph replay.
+                self.forward_metadata = FlashMLADecodeMetadata(
+                    mla_metadata,
+                    num_splits,
+                    self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+                )
+                return
 
             actual_num_sm_parts = mla_metadata.shape[0]
             assert actual_num_sm_parts <= self.cuda_graph_mla_metadata.shape[0], (
@@ -415,6 +436,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        if self.is_int8_kvcache:
+            metadata = self.forward_metadata.flashmla_metadata
+            self.forward_metadata.flashmla_metadata = type(metadata)()
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -439,6 +465,24 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+        if self.is_int8_kvcache:
+            if reshape_q.dtype != torch.bfloat16 or reshape_q.shape[1] != 1:
+                raise ValueError("FlashMLA INT8 decode requires single-token BF16 Q")
+            o, _ = flash_mla_with_kvcache(
+                q=reshape_q,
+                k_cache=k_cache.view(-1, PAGE_SIZE, 1, 656),
+                block_table=self.forward_metadata.block_kv_indices[:bs],
+                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                head_dim_v=self.kv_lora_rank,
+                tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
+                num_splits=self.forward_metadata.num_splits,
+                softmax_scale=layer.scaling,
+                causal=True,
+                is_int8_kvcache=True,
+            )
+            if o.dtype != torch.bfloat16:
+                raise RuntimeError("FlashMLA dense INT8 kernel must return BF16 output")
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         if self.is_fp8_kvcache:
             assert (
                 self.dcp_world_size == 1
@@ -505,6 +549,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
+        if self.is_int8_kvcache:
+            raise ValueError("FlashMLA INT8 requires FlashInfer for prefill and verify")
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
         else:

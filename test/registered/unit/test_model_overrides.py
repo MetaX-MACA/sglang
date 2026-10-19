@@ -96,6 +96,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dsa_decode_backend",
                     "prefill_attention_backend",
                     "decode_attention_backend",
+                    "flashinfer_mla_disable_ragged",
                     "flashinfer_allreduce_fusion_backend",
                     "fp8_gemm_runner_backend",
                     "fp4_gemm_runner_backend",
