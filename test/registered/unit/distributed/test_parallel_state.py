@@ -52,6 +52,44 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
 
 
+@pytest.mark.parametrize(
+    "msg_type,recv_size,gathers", [("proxy", 8, 0), ("output", 4, 1)]
+)
+def test_pp_recv_tensor_dict_selects_gather_from_received_message(
+    msg_type, recv_size, gathers
+):
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = 2
+    coordinator.rank_in_group = 0
+    coordinator.ranks = [0, 1]
+    coordinator.device_group = Mock()
+    coordinator.cpu_group = Mock()
+    coordinator.recv_object = Mock(
+        return_value=[
+            ("value", parallel_state.TensorMetadata("cpu", torch.float32, (8,))),
+            ("__msg_type__", msg_type),
+        ]
+    )
+    attn_tp_group = Mock(world_size=2, rank_in_group=0)
+    attn_tp_group.all_gather.return_value = torch.empty(8)
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.irecv", return_value=Mock()) as irecv,
+    ):
+        result = coordinator.recv_tensor_dict(
+            all_gather_group=attn_tp_group,
+            all_gather_group_by_msg_type={"proxy": None},
+        )
+
+    assert result["__msg_type__"] == msg_type
+    assert result["value"].numel() == 8
+    assert irecv.call_args.args[0].numel() == recv_size
+    assert attn_tp_group.all_gather.call_count == gathers
+
+
 @pytest.mark.parametrize("rank", range(4))
 @pytest.mark.parametrize("inplace_allreduce", [False, True])
 @pytest.mark.parametrize("alias_output", [False, True])
