@@ -55,7 +55,6 @@ elif _is_hip:
     pass
 
 padding_size = get_moe_padding_size(_use_aiter)
-enable_mctlass_fused_moe = _is_maca and (os.getenv("ENABLE_MCTLASS_FUSED_MOE", "0") == "1")
 enable_mctlass_fused_moe_python_api = _is_maca and (os.getenv("ENABLE_MCTLASS_FUSED_MOE_PYTHON_API", "1") == "1")
 
 if enable_mctlass_fused_moe_python_api:
@@ -848,6 +847,9 @@ def invoke_fused_moe_kernel(
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
     is_fp4_experts: bool = False,
+    use_fp4_w4a8: bool = False,
+    scale_b: Optional[torch.Tensor] = None,
+    scale_t: Optional[torch.Tensor] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -874,9 +876,10 @@ def invoke_fused_moe_kernel(
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
     else:
         swap_ab = False
+
     group_size = 0
     padded_size = 0
-    if use_fp8_w8a8:
+    if use_fp8_w8a8 or use_fp4_w4a8:
         assert B_scale is not None
         if block_shape is None:
             # activation tensor-wise fp8 quantization, dynamic or static
@@ -890,26 +893,30 @@ def invoke_fused_moe_kernel(
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
             group_size = block_n
-            if A.dtype == torch.float8_e4m3fn:
+            if not isinstance(A, tuple) and A.dtype == torch.float8_e4m3fn:
                 # Pre-quantized activation (SGLANG_OPT_MOE_QUANT_ONCE): the
                 # caller already ran the per-token-group quant; A_scale holds
                 # the matching scales (row- or column-major, strides are
                 # passed to the kernel below).
                 assert A_scale is not None
             elif _is_cuda:
-                A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+                if isinstance(A, tuple):
+                    A, A_scale = A
+                else:
+                    A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
             else:
                 A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
-            assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
-            assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
+            if not use_fp4_w4a8:
+                assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
+                assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
     elif use_int8_w8a8 or use_int4_w4a8:
         assert B_scale is not None
         if block_shape is None:
-            # Per-token activation quantization with per-channel weight scales.
-            assert per_channel_quant, (
-                "INT8 activation quantization requires per-channel weight scales"
-            )
+            # activation channel-wise int8 quantization
+            assert (
+                per_channel_quant
+            ), "int8 quantization only supports channel-wise quantization except for block-wise quantization"
             A, A_scale = per_token_quant_int8(A)
         else:
             # activation block-wise int8 quantization
@@ -962,218 +969,28 @@ def invoke_fused_moe_kernel(
         )
     # ===== END TO BE REFACTORED ====
 
-    packed_mctlass_supported = (
-        enable_mctlass_fused_moe_python_api
-        and A.dtype in (torch.bfloat16, torch.float16)
-        and C.dtype == A.dtype
-        and C.is_contiguous()
-        and bias is None
-        and not (
-            c_sorted
-            or fuse_add_to_output
-            or mask_output
-            or lora_preserve_base
-            or fuse_sum_all_reduce
-            or fuse_swiglu
-        )
-    )
-    if is_fp4_experts or (
-        _is_maca
-        and envs.ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16.get()
-        and use_int4_w4a16
-        and B_zp is None
-        and block_shape == [0, 32]
-        and packed_mctlass_supported
-    ):
-        assert packed_mctlass_supported, "MXFP4 requires the MACA mctlass Python API"
-        gemm(
-            A.shape[0],
-            B.shape[1],
-            A.shape[1],
-            B.shape[0],
-            sorted_token_ids.shape[0],
-            top_k,
-            A,
-            B.view(dtype=torch.quint4x2),
-            C.view(-1, C.shape[-1]),
-            A_scale,
-            B_scale,
-            None,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            mul_routed_weight,
-            filter_expert=filter_expert,
-            is_blockwise=True,
-            group_size=32,
-            is_scale_a_1d=is_fp4_experts,
-            is_scale_b_1d=is_fp4_experts,
-            scale_b_layout="n-major" if is_fp4_experts else "k-major",
-            is_scale_ue8m0=is_fp4_experts,
-            is_b_e2m1fp4x2=is_fp4_experts,
-        )
-    elif (
-        (use_int8_w8a16 or use_int4_w4a16)
-        and block_shape is not None
-        and block_shape[1] > 0
-    ):
-        assert not fuse_sum_all_reduce, (
-            "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
-        )
-        assert B_scale is not None and B_scale.ndim == 3
-        assert B_zp is None or B_zp.ndim == 3
-        assert bias is None
-        fused_moe_kernel_gptq_awq[grid](
-            A,
-            B,
-            C,
-            B_scale,
-            B_zp,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            B.shape[1],
-            A.shape[1],
-            sorted_token_ids.shape[0],
-            topk_ids.numel(),
-            A.stride(0),
-            A.stride(1),
-            B.stride(0),
-            B.stride(2),
-            B.stride(1),
-            C.stride(-2),
-            C.stride(-1),
-            B_scale.stride(0),
-            B_scale.stride(2),
-            B_scale.stride(1),
-            B_zp.stride(0) if B_zp is not None else 0,
-            B_zp.stride(2) if B_zp is not None else 0,
-            B_zp.stride(1) if B_zp is not None else 0,
-            group_size=block_shape[1],
-            MUL_ROUTED_WEIGHT=mul_routed_weight,
-            top_k=top_k,
-            compute_type=compute_type,
-            has_zp=B_zp is not None,
-            use_int4_w4a16=use_int4_w4a16,
-            use_int8_w8a16=use_int8_w8a16,
-            even_Ks=even_Ks,
-            filter_expert=filter_expert,
-            **config,
-        )
-    elif (
-        use_int8_w8a8
-        and enable_mctlass_fused_moe
-        and enable_mctlass_fused_moe_python_api
-        and mctlass_output_supported
-    ):
-        C1 = C.view(-1, C.size(-1)).contiguous()
-        gemm(
-            A.shape[0], B.shape[1], A.shape[1], B.shape[0],
-            sorted_token_ids.shape[0], top_k, A, B, C1, A_scale, B_scale,
-            None, topk_weights, sorted_token_ids, expert_ids,
-            num_tokens_post_padded, mul_routed_weight,
-            filter_expert=filter_expert,
-        )
-    elif use_fp8_w8a8 and enable_mctlass_fused_moe_python_api:
-        C1 = C.view(-1, C.size(-1)).contiguous()
-        fp8_kwargs = {
-            "filter_expert": filter_expert,
-            "use_fp8": True,
-        }
-        if block_shape is not None:
-            A_scale = A_scale.T.contiguous()
-            B_scale = B_scale.transpose(1, 2).contiguous()
-            fp8_kwargs.update(
-                is_blockwise=True,
-                group_size=group_size,
-                is_scale_a_1d=True,
-                is_scale_b_1d=False,
-                scale_a_layout="m-major",
-                scale_b_layout="n-major",
-            )
-        gemm(
-            A.shape[0],
-            B.shape[1],
-            A.shape[1],
-            B.shape[0],
-            sorted_token_ids.shape[0],
-            top_k,
-            A,
-            B,
-            C1,
-            A_scale,
-            B_scale,
-            None,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            mul_routed_weight,
-            **fp8_kwargs,
-        )
-    elif use_int4_w4a8:
-        assert enable_mctlass_fused_moe_python_api, (
-            "int4_w4a8 only support enable_mctlass_fused_moe_python_api now"
-        )
-        EM = sorted_token_ids.shape[0]
-        B = B.view(dtype=torch.quint4x2)
-        gemm(
-            A.size(0),
-            B.size(1),
-            A.size(1),
-            B.size(0),
-            EM,
-            top_k,
-            A,
-            B,
-            C,
-            A_scale,
-            B_scale,
-            None,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            mul_routed_weight,
-        )
-    else:
-        if a_use_tma or b_use_tma:
-            _set_triton_tma_allocator()
+    if enable_mctlass_fused_moe_python_api:
+        if use_int8_w8a8:
 
-        if a_use_tma:
-            a_desc = TensorDescriptor(
-                A, A.shape, A.stride(), [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]]
-            )
-        else:
-            a_desc = None
-        if b_use_tma:
-            # B is constant weights -> cache descriptor
-            b_desc = _get_b_tma_desc_cached(
-                B,
-                config["BLOCK_SIZE_N"],
-                config["BLOCK_SIZE_K"],
-            )
-        else:
-            b_desc = None
-
-        if (
-            enable_mctlass_fused_moe_python_api
-            and mctlass_output_supported
-            and A.dtype == torch.bfloat16
-            and not any(
-                (use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16)
-            )
-            and bias is None
-            and not c_sorted
-            and not fuse_add_to_output
-            and not mask_output
-            and not lora_preserve_base
-            and not fuse_sum_all_reduce
-            and not fuse_swiglu
-        ):
             C1 = C.view(-1, C.size(-1)).contiguous()
+            gemm(A.shape[0], B.shape[1], A.shape[1], B.shape[0], sorted_token_ids.shape[0], top_k, A, B, C1, A_scale, B_scale, None, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, mul_routed_weight, filter_expert = filter_expert)
+        elif use_fp8_w8a8:
+            C1 = C.view(-1, C.size(-1)).contiguous()
+            fp8_kwargs = {
+                "filter_expert": filter_expert,
+                "use_fp8": True,
+            }
+            if block_shape is not None:
+                A_scale = A_scale.T.contiguous()
+                B_scale = B_scale.transpose(1, 2).contiguous()
+                fp8_kwargs.update(
+                    is_blockwise=True,
+                    group_size=group_size,
+                    is_scale_a_1d=True,
+                    is_scale_b_1d=False,
+                    scale_a_layout="m-major",
+                    scale_b_layout="n-major",
+                )
             gemm(
                 A.shape[0],
                 B.shape[1],
@@ -1192,71 +1009,268 @@ def invoke_fused_moe_kernel(
                 expert_ids,
                 num_tokens_post_padded,
                 mul_routed_weight,
-                filter_expert=filter_expert,
+                **fp8_kwargs,
             )
-            return
+        elif use_int4_w4a8:
+            EM = sorted_token_ids.shape[0]
+            B = B.view(dtype=torch.quint4x2)
+            gemm(
+                A.size(0),
+                B.size(1),
+                A.size(1),
+                B.size(0),
+                EM,
+                top_k,
+                A,
+                B,
+                C,
+                A_scale,
+                B_scale,
+                None,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                mul_routed_weight,
+            )
+        elif use_int4_w4a16: 
+            assert block_shape is not None, "int4_w4a16 need block_shape is not None"
+            assert block_shape[1] > 0, "int4_w4a16 need block_shape[1] > 0"
+            assert B_zp is None, "int4_w4a16 need B_zp is None"
+            C1 = C.view(-1, C.size(-1)).contiguous()
+            gemm(
+                A.shape[0], B.shape[1], A.shape[1], B.shape[0], sorted_token_ids.shape[0], top_k, A, B.view(dtype=torch.quint4x2), C1, A_scale, B_scale, None,
+                topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, mul_routed_weight, filter_expert = filter_expert,  is_blockwise=True, group_size=32, zp_b=B_zp)
+        elif is_fp4_experts and use_fp4_w4a8:
+            C1 = C.view(-1, C.size(-1)).contiguous()
+            A_scale = A_scale.T.contiguous()
 
-        pdl_kwargs = (
-            {"USE_GDC": True, "launch_pdl": True, "GDC_EARLY": A.shape[0] <= 512}
-            if is_arch_support_pdl()
-            else {}
-        )
-        fused_moe_kernel[grid](
-            A,
-            a_desc,
-            B,
-            b_desc,
-            bias,
-            C,
-            A_scale,
-            B_scale,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            add_output_mask,
-            B.shape[1],
-            B.shape[2] - padded_size,
-            sorted_token_ids.shape[0],
-            topk_ids.numel(),
-            A.stride(0),
-            A.stride(1),
-            B.stride(0),
-            B.stride(2),
-            B.stride(1),
-            bias.stride(0) if bias is not None else 0,
-            bias.stride(1) if bias is not None else 0,
-            C.stride(-2),
-            C.stride(-1),
-            A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
-            A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
-            B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
-            B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
-            B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
-            0 if block_shape is None else block_shape[0],
-            0 if block_shape is None else block_shape[1],
-            MUL_ROUTED_WEIGHT=mul_routed_weight,
-            top_k=top_k,
-            compute_type=compute_type,
-            IS_MACA=_is_maca,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            per_channel_quant=per_channel_quant,
-            even_Ks=even_Ks,
-            c_sorted=c_sorted,
-            filter_expert=filter_expert,
-            swap_ab=swap_ab,
-            FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
-            MASK_OUTPUT=mask_output,
-            LORA_PRESERVE_BASE=lora_preserve_base,
-            FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
-            ROUTER_TOPK=router_topk,
-            FUSE_SWIGLU=fuse_swiglu,
-            **pdl_kwargs,
-            **config,
-        )
+            gemm(
+                A.shape[0],
+                B.shape[1],
+                A.shape[1],
+                B.shape[0],
+                sorted_token_ids.shape[0],
+                top_k,
+                A,
+                B.view(dtype=torch.quint4x2),
+                C1,
+                A_scale,
+                scale_b,
+                None,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                mul_routed_weight,
+                is_blockwise=True,
+                group_size=128,
+                filter_expert=filter_expert,
+                use_fp8=True,
+                is_scale_a_1d=True,
+                is_scale_b_1d=False,
+                scale_a_layout="m-major",
+                scale_b_layout="n-major",
+                scale_t=scale_t,
+                is_b_e2m1fp4x2=True,
+                use_hier_scale=True,
+            )
+        elif is_fp4_experts and not use_fp4_w4a8:
+            assert A.dtype == torch.bfloat16, "expected fp4_w4a16" 
+            C1 = C.view(-1, C.size(-1)).contiguous()
+            gemm(
+                A.shape[0],
+                B.shape[1],
+                A.shape[1],
+                B.shape[0],
+                sorted_token_ids.shape[0],
+                top_k,
+                A,
+                B.view(dtype=torch.quint4x2),
+                C1,
+                A_scale,
+                B_scale,
+                None,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                mul_routed_weight,
+                is_blockwise=True,
+                group_size=32,
+                use_fp8=True,
+                is_scale_a_1d=True,
+                is_scale_b_1d=True,
+                scale_b_layout="n-major",
+                is_scale_ue8m0=True,
+                is_b_e2m1fp4x2=True,
+            )
+        else:
+            if (A.dtype == torch.bfloat16
+                and not any(
+                    (use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16, use_int4_w4a16)
+                )
+                and bias is None
+                and not c_sorted
+                and not fuse_add_to_output
+                and not mask_output
+                and not lora_preserve_base
+                and not fuse_sum_all_reduce
+                and not fuse_swiglu
+            ):
+                C1 = C.view(-1, C.size(-1)).contiguous()
+                gemm(
+                    A.shape[0],
+                    B.shape[1],
+                    A.shape[1],
+                    B.shape[0],
+                    sorted_token_ids.shape[0],
+                    top_k,
+                    A,
+                    B,
+                    C1,
+                    A_scale,
+                    B_scale,
+                    None,
+                    topk_weights,
+                    sorted_token_ids,
+                    expert_ids,
+                    num_tokens_post_padded,
+                    mul_routed_weight,
+                    filter_expert=filter_expert,
+                )
+            else:
+                assert False, "current gemm not support"
+    else:
+        if (
+            (use_int8_w8a16 or use_int4_w4a16)
+            and block_shape is not None
+            and block_shape[1] > 0
+        ):
+            assert not fuse_sum_all_reduce, (
+                "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
+            )
+            assert B_scale is not None and B_scale.ndim == 3
+            assert B_zp is None or B_zp.ndim == 3
+            assert bias is None
+            fused_moe_kernel_gptq_awq[grid](
+                A,
+                B,
+                C,
+                B_scale,
+                B_zp,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                B.shape[1],
+                A.shape[1],
+                sorted_token_ids.shape[0],
+                topk_ids.numel(),
+                A.stride(0),
+                A.stride(1),
+                B.stride(0),
+                B.stride(2),
+                B.stride(1),
+                C.stride(-2),
+                C.stride(-1),
+                B_scale.stride(0),
+                B_scale.stride(2),
+                B_scale.stride(1),
+                B_zp.stride(0) if B_zp is not None else 0,
+                B_zp.stride(2) if B_zp is not None else 0,
+                B_zp.stride(1) if B_zp is not None else 0,
+                group_size=block_shape[1],
+                MUL_ROUTED_WEIGHT=mul_routed_weight,
+                top_k=top_k,
+                compute_type=compute_type,
+                has_zp=B_zp is not None,
+                use_int4_w4a16=use_int4_w4a16,
+                use_int8_w8a16=use_int8_w8a16,
+                even_Ks=even_Ks,
+                filter_expert=filter_expert,
+                **config,
+            )
+        else:
+            if a_use_tma or b_use_tma:
+                _set_triton_tma_allocator()
 
+            if a_use_tma:
+                a_desc = TensorDescriptor(
+                    A, A.shape, A.stride(), [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]]
+                )
+            else:
+                a_desc = None
+            if b_use_tma:
+                # B is constant weights -> cache descriptor
+                b_desc = _get_b_tma_desc_cached(
+                    B,
+                    config["BLOCK_SIZE_N"],
+                    config["BLOCK_SIZE_K"],
+                )
+            else:
+                b_desc = None
+
+            pdl_kwargs = (
+                {"USE_GDC": True, "launch_pdl": True, "GDC_EARLY": A.shape[0] <= 512}
+                if is_arch_support_pdl()
+                else {}
+            )
+            fused_moe_kernel[grid](
+                A,
+                a_desc,
+                B,
+                b_desc,
+                bias,
+                C,
+                A_scale,
+                B_scale,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                add_output_mask,
+                B.shape[1],
+                B.shape[2] - padded_size,
+                sorted_token_ids.shape[0],
+                topk_ids.numel(),
+                A.stride(0),
+                A.stride(1),
+                B.stride(0),
+                B.stride(2),
+                B.stride(1),
+                bias.stride(0) if bias is not None else 0,
+                bias.stride(1) if bias is not None else 0,
+                C.stride(-2),
+                C.stride(-1),
+                A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+                A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+                B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+                B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
+                B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+                0 if block_shape is None else block_shape[0],
+                0 if block_shape is None else block_shape[1],
+                MUL_ROUTED_WEIGHT=mul_routed_weight,
+                top_k=top_k,
+                compute_type=compute_type,
+                IS_MACA=_is_maca,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                per_channel_quant=per_channel_quant,
+                even_Ks=even_Ks,
+                c_sorted=c_sorted,
+                filter_expert=filter_expert,
+                swap_ab=swap_ab,
+                FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
+                MASK_OUTPUT=mask_output,
+                LORA_PRESERVE_BASE=lora_preserve_base,
+                FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
+                ROUTER_TOPK=router_topk,
+                FUSE_SWIGLU=fuse_swiglu,
+                **pdl_kwargs,
+                **config,
+            )
 
 @triton.jit
 def tanh(x):
