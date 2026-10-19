@@ -1,3 +1,5 @@
+import re
+
 try:
     from sglang._version import __version__, __version_tuple__
 except ImportError:
@@ -22,3 +24,6 @@ except ImportError:
             # Fallback for development without build
             __version__ = "0.0.0.dev0"
             __version_tuple__ = (0, 0, 0, "dev0")
+
+__version__ = re.sub(r"^\d+\.\d+\.\d+", "0.5.21", __version__, count=1)
+__version_tuple__ = (0, 5, 21, *__version_tuple__[3:])
