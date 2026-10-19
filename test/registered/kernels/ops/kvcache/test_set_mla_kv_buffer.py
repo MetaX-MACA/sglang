@@ -141,6 +141,28 @@ def test_int8_mla_kv_cache_round_trip():
         torch.int32
     )
     num_valid = torch.tensor([order.numel()], dtype=torch.int32, device=DEVICE)
+    padded_compact_indices = padded_indices.clone()
+    padded_compact_indices[order.numel() :] = -1
+    compact = dequantize_k_cache_paged_int8(
+        kv_buffer.view(torch.int8), padded_compact_indices, num_tokens=num_valid
+    )
+    torch.testing.assert_close(compact[: order.numel()], actual, rtol=0, atol=0)
+    assert torch.count_nonzero(compact[order.numel() :]) == 0
+    torch.cuda.synchronize()
+    compact_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(compact_graph):
+        compact = dequantize_k_cache_paged_int8(
+            kv_buffer.view(torch.int8), padded_compact_indices, num_tokens=num_valid
+        )
+    padded_compact_indices.fill_(-1)
+    padded_compact_indices[:2].copy_(loc[:2].to(torch.int32))
+    num_valid.fill_(2)
+    compact_graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(compact[:2, ..., :512], k_nope[:2], atol=0.03, rtol=0)
+    assert torch.equal(compact[:2, ..., 512:], k_rope[:2])
+    assert torch.count_nonzero(compact[2:]) == 0
+    num_valid.fill_(order.numel())
     workspace = torch.full(
         (32, 1, 576), float("nan"), dtype=torch.bfloat16, device=DEVICE
     )

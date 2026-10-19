@@ -70,6 +70,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_context,
     get_disagg,
     get_exec,
@@ -1650,6 +1651,15 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    @property
+    def mla_int8_uses_workspace(self) -> bool:
+        return not (
+            self.kv_cache_dtype == torch.int8
+            and self.model_config.hf_config.architectures[0]
+            == "KimiK3ForConditionalGeneration"
+            and attention_backends() == ("flashinfer", "flashmla")
+        )
+
     def _build_mla_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         token_to_kv_pool = MLATokenToKVPool(
             max_total_num_tokens,
@@ -1666,6 +1676,11 @@ class KVCacheConfigurator:
                 self.kv_cache_dtype == torch.int8
                 and self.model_config.hf_config.architectures[0]
                 == "KimiK3ForConditionalGeneration"
+            ),
+            **(
+                {"enable_mla_int8_workspace": False}
+                if not self.mla_int8_uses_workspace
+                else {}
             ),
         )
         return token_to_kv_pool
@@ -1794,6 +1809,8 @@ class KVCacheConfigurator:
                 == "KimiK3ForConditionalGeneration"
             ):
                 extra_args["enable_mla_int8"] = True
+                if not self.mla_int8_uses_workspace:
+                    extra_args["enable_mla_int8_workspace"] = False
             if is_deepseek_dsa(self.model_config.hf_config):
                 from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 

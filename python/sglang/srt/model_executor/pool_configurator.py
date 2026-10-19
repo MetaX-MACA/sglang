@@ -374,6 +374,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and not is_deepseek_dsa(model_config.hf_config)
                 and model_config.hf_config.architectures[0]
                 == "KimiK3ForConditionalGeneration"
+                and kvc.mla_int8_uses_workspace
             ):
                 cell_size += (
                     model_config.kv_lora_rank + model_config.qk_rope_head_dim

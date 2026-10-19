@@ -53,6 +53,7 @@ def get_mla_metadata(
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
     topk: Optional[int] = None,
+    is_int8_kvcache: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -71,6 +72,10 @@ def get_mla_metadata(
         raise _IMPORT_ERROR from _flashmla_import_error
 
     if _is_maca:
+        if is_int8_kvcache:
+            if is_fp8_kvcache or topk is not None or cache_seqlens is None:
+                raise ValueError("Dense INT8 FlashMLA requires dense sequence metadata")
+            return flash_mla_community.get_mla_metadata()
         if is_fp8_kvcache and topk is None:
             return flash_mla_community.get_mla_metadata_dense_fp8(
                 cache_seqlens,
@@ -85,6 +90,8 @@ def get_mla_metadata(
             is_fp8_kvcache=is_fp8_kvcache,
         )
 
+    if is_int8_kvcache:
+        raise ValueError("Dense INT8 FlashMLA currently requires MACA")
     if cache_seqlens is None:
         return FlashMLASchedMeta(), None
 
@@ -126,6 +133,7 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    is_int8_kvcache: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -151,6 +159,54 @@ def flash_mla_with_kvcache(
         raise _IMPORT_ERROR from _flashmla_import_error
 
     if _is_maca:
+        if is_int8_kvcache:
+            if (
+                q.dtype != torch.bfloat16
+                or k_cache.dtype != torch.int8
+                or q.ndim != 4
+                or q.shape[1] != 1
+                or q.shape[-1] != 576
+                or k_cache.ndim != 4
+                or k_cache.shape[1:] != (64, 1, 656)
+                or not k_cache.is_contiguous()
+                or head_dim_v != 512
+            ):
+                raise ValueError(
+                    "Dense INT8 FlashMLA expects single-token BF16 Q and paged INT8 KV (64, 1, 656)"
+                )
+            if block_table is None or cache_seqlens is None or num_splits is not None:
+                raise ValueError(
+                    "Dense INT8 FlashMLA requires block table, sequence lengths and num_splits=None"
+                )
+            if is_fp8_kvcache or any(
+                x is not None
+                for x in (
+                    indices,
+                    descale_q,
+                    descale_k,
+                    attn_sink,
+                    extra_k_cache,
+                    extra_indices_in_kvcache,
+                    topk_length,
+                    extra_topk_length,
+                )
+            ):
+                raise ValueError(
+                    "Dense INT8 FlashMLA does not accept FP8 or sparse arguments"
+                )
+            return flash_mla_community.flash_mla_with_kvcache(
+                q=q,
+                k_cache=k_cache,
+                block_table=block_table,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=head_dim_v,
+                tile_scheduler_metadata=tile_scheduler_metadata,
+                num_splits=num_splits,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                # MACA's quantized dense mode consumes INT8, despite the API name.
+                is_fp8_kvcache=True,
+            )
         if indices is None and q.element_size() == 1:
             return flash_mla_community.flash_mla_with_kvcache_fp8(
                 q=q,
@@ -185,6 +241,8 @@ def flash_mla_with_kvcache(
                 extra_topk_length=extra_topk_length,
             )
     else:
+        if is_int8_kvcache:
+            raise ValueError("Dense INT8 FlashMLA currently requires MACA")
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
