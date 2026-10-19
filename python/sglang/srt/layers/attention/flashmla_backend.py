@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
 import torch
 import triton
-from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
 from sglang.kernels.ops.attention.utils import (
     create_flashmla_kv_indices_triton,

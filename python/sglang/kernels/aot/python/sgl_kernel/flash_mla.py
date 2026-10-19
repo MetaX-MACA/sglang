@@ -2,16 +2,24 @@ import dataclasses
 from typing import Optional, Tuple
 
 import torch
+from sgl_kernel.platform import is_maca
+
+_is_maca = is_maca()
 
 try:
-    from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
+    if _is_maca:
+        import flash_mla as flash_mla_community
+    else:
+        from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
 except Exception as _e:
     _flashmla_import_error = _e
 else:
     _flashmla_import_error = None
 
 _IMPORT_ERROR = ImportError(
-    "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4"
+    "Failed to load the MACA flash_mla package"
+    if _is_maca
+    else "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4"
 )
 
 # 512 fp8 values + 4 fp32 scales; FlashMLA's V4.1 format has the same size.
@@ -64,6 +72,22 @@ def get_mla_metadata(
     """
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error
+
+    if _is_maca:
+        if is_fp8_kvcache and topk is None and cache_seqlens is not None:
+            assert num_q_tokens_per_head_k is not None
+            assert num_heads_k is not None
+            return flash_mla_community.get_mla_metadata_dense_fp8(
+                cache_seqlens, num_q_tokens_per_head_k, num_heads_k
+            )
+        return flash_mla_community.get_mla_metadata(
+            cache_seqlens,
+            num_q_tokens_per_head_k,
+            num_heads_k,
+            num_heads_q=num_heads_q,
+            is_fp8_kvcache=is_fp8_kvcache,
+            topk=topk,
+        )
 
     if cache_seqlens is None:
         return FlashMLASchedMeta(), None
@@ -134,6 +158,40 @@ def flash_mla_with_kvcache(
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+    if _is_maca:
+        if kv_format is not None:
+            raise NotImplementedError(
+                "The MACA flash_mla API does not accept an explicit kv_format"
+            )
+        kwargs = dict(
+            q=q,
+            k_cache=k_cache,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=head_dim_v,
+            tile_scheduler_metadata=tile_scheduler_metadata,
+            num_splits=num_splits,
+            softmax_scale=softmax_scale,
+            causal=causal,
+        )
+        if indices is None and q.element_size() == 1:
+            assert (descale_q is None) == (descale_k is None), (
+                "descale_q and descale_k should be both None or both not None"
+            )
+            return flash_mla_community.flash_mla_with_kvcache_fp8(
+                **kwargs, descale_q=descale_q, descale_k=descale_k
+            )
+        return flash_mla_community.flash_mla_with_kvcache(
+            **kwargs,
+            is_fp8_kvcache=is_fp8_kvcache,
+            indices=indices,
+            attn_sink=attn_sink,
+            extra_k_cache=extra_k_cache,
+            extra_indices_in_kvcache=extra_indices_in_kvcache,
+            topk_length=topk_length,
+            extra_topk_length=extra_topk_length,
+        )
+
     if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
         return _flash_mla_with_kvcache_sched_meta(
             q=q,
