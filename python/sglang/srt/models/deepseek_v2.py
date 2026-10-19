@@ -943,37 +943,37 @@ class DeepseekV2MoE(nn.Module):
             else None
         )
         if not self._enable_a2a_moe:
-            if self._can_dual_stream_graph(hidden_states):
-                fwd = get_forward()
-                return dsv2_flashinfer_moe_dual_stream_graph(
-                    hidden_states,
-                    self.layer_id,
-                    fwd.fuse_mlp_allreduce,
-                    fwd.mlp_reduce_scatter,
-                )
-            elif (
-                self.alt_stream is not None
-                and self.num_fused_shared_experts == 0
-                and hidden_states.shape[0] > 0
-                and get_is_capture_mode()
-                and not is_in_breakable_cuda_graph()
-            ):
-                return self.forward_normal_dual_stream(
-                    hidden_states,
-                    gemm_output_zero_allocator,
-                    input_ids,
-                    input_ids_global=input_ids_global,
-                    num_token_non_padded=num_token_non_padded,
-                )
-            else:
-                return self.forward_normal(
-                    hidden_states,
-                    gemm_output_zero_allocator,
-                    input_ids,
-                    input_ids_global=input_ids_global,
-                    skip_shared_experts=skip_shared_experts,
-                    num_token_non_padded=num_token_non_padded,
-                )
+            # if self._can_dual_stream_graph(hidden_states):
+            #     fwd = get_forward()
+            #     return dsv2_flashinfer_moe_dual_stream_graph(
+            #         hidden_states,
+            #         self.layer_id,
+            #         fwd.fuse_mlp_allreduce,
+            #         fwd.mlp_reduce_scatter,
+            #     )
+            # elif (
+            #     self.alt_stream is not None
+            #     and self.num_fused_shared_experts == 0
+            #     and hidden_states.shape[0] > 0
+            #     and get_is_capture_mode()
+            #     and not is_in_breakable_cuda_graph()
+            # ):
+            #     return self.forward_normal_dual_stream(
+            #         hidden_states,
+            #         gemm_output_zero_allocator,
+            #         input_ids,
+            #         input_ids_global=input_ids_global,
+            #         num_token_non_padded=num_token_non_padded,
+            #     )
+            # else:
+            return self.forward_normal(
+                hidden_states,
+                gemm_output_zero_allocator,
+                input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=skip_shared_experts,
+                num_token_non_padded=num_token_non_padded,
+            )
         else:
             return self.forward_deepep(
                 hidden_states, forward_batch, input_ids_global=input_ids_global
