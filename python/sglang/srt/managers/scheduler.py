@@ -1188,7 +1188,8 @@ class Scheduler(
             # TODO: max_running_requests_under_SLO has no setter — dead chain.
             max_running_requests_under_SLO=None,
             page_size=self.page_size,
-            num_pages=self.max_total_num_tokens // self.page_size,
+            num_pages=self.max_total_num_tokens
+            // self.token_to_kv_pool_allocator.page_size,
             context_len=self.model_config.context_len,
             startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
         )
@@ -2265,8 +2266,7 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens
-            * get_parallel().attn_dcp_size,
+            max_total_num_tokens=self.max_total_num_tokens,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2431,16 +2431,16 @@ class Scheduler(
 
         # Keep this bound consistent with PrefillAdder's admission budget:
         # ceil_page(input_len) + max_new_tokens + page_size must be strictly
-        # smaller than max_total_num_tokens. Otherwise a request can be accepted
-        # into the waiting queue but can never be scheduled, blocking the queue
-        # and eventually making health checks fail.
+        # smaller than the logical max_total_num_tokens. Otherwise a request can
+        # be accepted into the waiting queue but never scheduled, blocking the
+        # queue and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
         req.sampling_params.max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * get_parallel().attn_dcp_size
+                self.max_total_num_tokens
                 - paged_input_len
                 - self.page_size
                 - 1,
