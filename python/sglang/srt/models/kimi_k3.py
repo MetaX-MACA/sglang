@@ -92,6 +92,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -732,7 +733,10 @@ class KimiK3MoE(nn.Module):
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
         self.experts = get_moe_impl_class(moe_quant_config)(
-            num_experts=getattr(config, "n_routed_experts", config.num_experts),
+            num_experts=(
+                getattr(config, "n_routed_experts", config.num_experts)
+                + get_exec().moe.ep_num_redundant_experts
+            ),
             top_k=config.num_experts_per_token,
             hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -2530,6 +2534,12 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
         )
+        # K3 checkpoints may leave q_b_proj unquantized.
+        # Its input must remain a Tensor rather than the fused INT8 tuple.
+        if self.q_lora_rank is not None and isinstance(
+            self.q_b_proj.quant_method, UnquantizedLinearMethod
+        ):
+            self.q_a_layernorm.fused_quant = False
         if split_gguf_kv_b:
             del self.fused_qkv_a_proj_with_mqa
             del self.kv_b_proj
