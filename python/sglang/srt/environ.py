@@ -950,6 +950,8 @@ class Envs:
     # Use mcoplib for MACA sgl_kernel, FP8 quantization, and AWQ dequantization.
     SGLANG_USE_MCOPLIB = EnvBool(True)
     ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16 = EnvBool(False)
+
+    SGLANG_ENABLE_SHARED_EXPERTS_MULTI_STREAM = EnvBool(False)
     # Route Kimi-K3-style h12 + fp8 MLA decode through aiter Triton Gluon when
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).

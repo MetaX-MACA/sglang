@@ -256,6 +256,7 @@ _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
 )
 
+sglang_enable_shared_experts_multi_stream = envs.SGLANG_ENABLE_SHARED_EXPERTS_MULTI_STREAM.get()
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -943,37 +944,38 @@ class DeepseekV2MoE(nn.Module):
             else None
         )
         if not self._enable_a2a_moe:
-            # if self._can_dual_stream_graph(hidden_states):
-            #     fwd = get_forward()
-            #     return dsv2_flashinfer_moe_dual_stream_graph(
-            #         hidden_states,
-            #         self.layer_id,
-            #         fwd.fuse_mlp_allreduce,
-            #         fwd.mlp_reduce_scatter,
-            #     )
-            # elif (
-            #     self.alt_stream is not None
-            #     and self.num_fused_shared_experts == 0
-            #     and hidden_states.shape[0] > 0
-            #     and get_is_capture_mode()
-            #     and not is_in_breakable_cuda_graph()
-            # ):
-            #     return self.forward_normal_dual_stream(
-            #         hidden_states,
-            #         gemm_output_zero_allocator,
-            #         input_ids,
-            #         input_ids_global=input_ids_global,
-            #         num_token_non_padded=num_token_non_padded,
-            #     )
-            # else:
-            return self.forward_normal(
-                hidden_states,
-                gemm_output_zero_allocator,
-                input_ids,
-                input_ids_global=input_ids_global,
-                skip_shared_experts=skip_shared_experts,
-                num_token_non_padded=num_token_non_padded,
-            )
+            if self._can_dual_stream_graph(hidden_states):
+                fwd = get_forward()
+                return dsv2_flashinfer_moe_dual_stream_graph(
+                    hidden_states,
+                    self.layer_id,
+                    fwd.fuse_mlp_allreduce,
+                    fwd.mlp_reduce_scatter,
+                )
+            elif (
+                self.alt_stream is not None
+                and self.num_fused_shared_experts == 0
+                and hidden_states.shape[0] > 0
+                and get_is_capture_mode()
+                and not is_in_breakable_cuda_graph()
+                and sglang_enable_shared_experts_multi_stream
+            ):
+                return self.forward_normal_dual_stream(
+                    hidden_states,
+                    gemm_output_zero_allocator,
+                    input_ids,
+                    input_ids_global=input_ids_global,
+                    num_token_non_padded=num_token_non_padded,
+                )
+            else:
+                return self.forward_normal(
+                    hidden_states,
+                    gemm_output_zero_allocator,
+                    input_ids,
+                    input_ids_global=input_ids_global,
+                    skip_shared_experts=skip_shared_experts,
+                    num_token_non_padded=num_token_non_padded,
+                )
         else:
             return self.forward_deepep(
                 hidden_states, forward_batch, input_ids_global=input_ids_global
@@ -1471,7 +1473,9 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
-                if self.alt_stream is not None:
+                if (self.alt_stream is not None 
+                    and sglang_enable_shared_experts_multi_stream
+                ):
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
@@ -1665,6 +1669,7 @@ class DeepseekV2MoE(nn.Module):
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
             and not is_in_breakable_cuda_graph()
+            and sglang_enable_shared_experts_multi_stream
         ):
             torch.cuda.current_stream().wait_event(shared_event)
 

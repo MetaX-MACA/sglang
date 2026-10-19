@@ -86,9 +86,11 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     round_up,
+    is_maca,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
+_is_maca=is_maca()
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -557,6 +559,9 @@ class FusedMoE(torch.nn.Module):
         ):
             self.moe_runner_config.inplace = False
 
+        if _is_maca:
+            # shared expert and routed expert use same input, so routed expert can't exec inplace when multi-stream on
+            self.moe_runner_config.inplace = not envs.SGLANG_ENABLE_SHARED_EXPERTS_MULTI_STREAM.get()
         self.should_fuse_routed_scaling_factor_in_topk = (
             _fuses_routed_scaling_factor_in_topk(self.quant_method)
         )
