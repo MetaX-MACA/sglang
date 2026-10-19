@@ -332,6 +332,7 @@ class Envs:
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
+    SGLANG_LOAD_MODEL_WORKERS = EnvInt(4)
 
     # ===================================================================
     # HTTP server and health
