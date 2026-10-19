@@ -1,7 +1,7 @@
 import inspect
 import logging
 from contextlib import contextmanager
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 
 import torch
 
@@ -133,6 +133,24 @@ def grouped_gemm_nt_fp4bf16_masked(
         masked_m,
         expected_m,
     )
+
+def grouped_gemm_nt_int8int8bf16_masked(
+    lhs: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+):
+    if not isinstance(lhs, tuple):
+        lhs = (lhs.view(torch.int8), None)
+    deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(
+        lhs,
+        rhs,
+        out,
+        masked_m,
+        expected_m,
+    )
+
 
 def _ensure_cuda(
     pair: Tuple[torch.Tensor, torch.Tensor],
