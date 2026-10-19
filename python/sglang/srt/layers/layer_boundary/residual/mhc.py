@@ -15,7 +15,6 @@
 
 from dataclasses import dataclass
 from typing import Callable, Optional
-from sglang.srt.utils import is_maca
 
 import torch
 
@@ -53,10 +52,7 @@ class MHCState:
 
     def attn_split(self, hidden_states, out_norm: Optional[torch.nn.Module] = None):
         residual = hidden_states
-        if not is_maca():
-            out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
-        else:
-            out_norm_weight, out_norm_eps = None, None
+        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
         hidden_states, self.h_res, self.h_post, norm_fused = self.hc_attn_pre(
             hidden_states, out_norm_weight, out_norm_eps
         )
@@ -67,10 +63,7 @@ class MHCState:
     def attn_to_mlp(
         self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
     ):
-        if not is_maca():
-            out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
-        else:
-            out_norm_weight, out_norm_eps = None, None
+        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
         if self.hc_ffn_post_pre is not None and hidden_states.shape[0] != 0:
             # Returns None when it declines -- no fused kernel for this platform
             # or shape, or a shape the fusion is slower at -- and the chain runs.

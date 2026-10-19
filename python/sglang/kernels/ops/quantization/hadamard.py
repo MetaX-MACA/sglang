@@ -26,7 +26,7 @@ def _jit_hadamard_module(dtype: torch.dtype) -> Module:
             ("hadamard_transform_28n", f"Hadamard28NKernel<{args}>::run"),
             ("hadamard_transform_40n", f"Hadamard40NKernel<{args}>::run"),
         ],
-        extra_include_paths=[str(hadamard_include_dir), "/opt/maca/tools/cu-bridge/include/"],
+        extra_include_paths=[str(hadamard_include_dir)],
     )
 
 

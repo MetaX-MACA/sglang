@@ -94,7 +94,7 @@ def load_jit(
             else ["-Xptxas=-v"]
         )
 
-    includes = list(DEFAULT_INCLUDE) + (extra_include_paths or ["/opt/maca/tools/cu-bridge/include/"])
+    includes = list(DEFAULT_INCLUDE) + (extra_include_paths or [])
     for dep in sorted(set(extra_dependencies or [])):
         if dep not in REGISTERED_DEPENDENCIES:
             raise ValueError(f"Dependency {dep} is not registered.")
