@@ -51,7 +51,7 @@ __device__ __forceinline__ int ceil_to_i(int a, int b) {
   return (a + b - 1) / b * b;
 }
 
-__global__ void __launch_bounds__(kBlockSize) flashmla_sched_meta_kernel(__grid_constant__ const Params p) {
+__global__ void __launch_bounds__(kBlockSize) flashmla_sched_meta_kernel(const Params p) {
   extern __shared__ int smem[];
   const int b = p.b;
   int* num_blocks_shared = smem;                   // [b]

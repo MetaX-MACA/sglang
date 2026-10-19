@@ -540,14 +540,14 @@ def dsv41_index_page_size() -> int:
 
 DSV41_INDEX_PAGE_SIZE = dsv41_index_page_size()
 
-
+CSA_INDEX_CACHE_TYPE_MAP = {
+    "fp8":  torch.uint8,
+    "fp4":  torch.uint8,
+    "int8":  torch.int8,
+    }
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128
-    index_k_with_scale_buffer_dtype = (
-        torch.int8
-        if is_maca() and envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "int8"
-        else torch.uint8
-    )
+    index_k_with_scale_buffer_dtype =  CSA_INDEX_CACHE_TYPE_MAP[envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get()]
 
     def __init__(
         self,
@@ -1523,7 +1523,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 len(sources),
                 device,
                 enable_memory_saver,
-                force_fp4=True,
+                force_fp4=envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get()=="fp4",
             )
 
         # HiCache and hardware backends still read these per-ratio attributes.

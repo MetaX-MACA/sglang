@@ -266,7 +266,7 @@ public:
 
 template<typename Kernel>
 __launch_bounds__(Kernel::NUM_THREADS, Kernel::TARGET_OCCUPANCY, Kernel::CLUSTER_SIZE)
-__global__ void topk_kernel(__grid_constant__ const TopkSelectArgs args, __grid_constant__ const typename Kernel::TmaParams tma_params) {
+__global__ void topk_kernel(const TopkSelectArgs args, const typename Kernel::TmaParams tma_params) {
     Kernel::topk_select_kernel_devfunc(args, tma_params);
 }
 

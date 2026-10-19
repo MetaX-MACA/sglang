@@ -151,7 +151,7 @@ SGL_DEVICE void copy_row(const bf16_t* __restrict__ src, bf16_t* __restrict__ ds
 
 /// Work list: Q rows, K rows, prefix-K copies, prefix-V copies, then (kCopyV) V copies. One warp per row.
 template <bool kFuseRealSin, bool kCopyV>
-__global__ void kernel(const Params __grid_constant__ params) {
+__global__ void kernel(const Params params) {
   const int lane = threadIdx.x & (device::kWarpThreads - 1);
   const uint32_t warp = threadIdx.x >> 5;
   const int64_t heads = params.heads;

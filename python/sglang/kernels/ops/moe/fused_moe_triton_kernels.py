@@ -1104,6 +1104,7 @@ def invoke_fused_moe_kernel(
                 scale_b_layout="n-major",
                 is_scale_ue8m0=True,
                 is_b_e2m1fp4x2=True,
+                filter_expert=filter_expert,
             )
         else:
             if (A.dtype == torch.bfloat16

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
+    _deepseek_v4_index_cache_dtype,
     declare_resolution,
     model_config_of,
     resolving_view,
@@ -41,6 +42,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # its legacy slot.
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
+    run_post_process_pass(server_args, _deepseek_v4_index_cache_dtype)
 
     if get_platform().is_maca:
         hf_config = model_config_of(server_args).hf_config

@@ -355,7 +355,7 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
-        is_fp4_experts=is_fp4_experts,
+            is_fp4_experts=is_fp4_experts,
         )
         return hidden_states
     else:
@@ -392,7 +392,7 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
-        is_fp4_experts=is_fp4_experts,
+            is_fp4_experts=is_fp4_experts,
         )
 
 

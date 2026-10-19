@@ -376,7 +376,7 @@ SGL_HICACHE_KERNEL void hicache_transfer_all_layer(const  HicacheKernelParams pa
  */
 template <typename T, int64_t kElementSize, uint32_t kBlockSize, bool kIsMLA = false>
 SGL_HICACHE_KERNEL void
-hicache_transfer_per_layer_page_unified(const __grid_constant__ HicachePageUnifiedKernelParams params) {
+hicache_transfer_per_layer_page_unified(const HicachePageUnifiedKernelParams params) {
   using namespace device;
   static_assert(kElementSize > 0 && kElementSize % 16 == 0);
   constexpr int64_t kGroupVecs = kElementSize / 16;

@@ -2,11 +2,11 @@ import logging
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_maca
 from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
     is_musa,
+    is_maca,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,19 +32,20 @@ def _sm120_deep_gemm_apis_available() -> bool:
 
 
 def _compute_enable_deep_gemm():
-    if not (_is_cuda or _is_maca or _is_musa):
+    if not (_is_cuda or _is_musa or _is_maca):
         return False
     if not envs.SGLANG_ENABLE_JIT_DEEPGEMM.get():
         return False
 
-    sm_version = get_device_sm()
-    if (_is_cuda and not _is_maca and sm_version < 90) or (_is_musa and sm_version < 31):
-        return False
-    # SM120/SM121 support (mma.sync block-scale, no TMEM) landed in DeepGEMM#324;
-    # probe every API used by the SM120 DSV4 paths since installed builds may
-    # expose fp8_einsum but still predate the SM120 kernels.
-    if sm_version in (120, 121) and not _sm120_deep_gemm_apis_available():
-        return False
+    if not _is_maca:
+        sm_version = get_device_sm()
+        if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
+            return False
+        # SM120/SM121 support (mma.sync block-scale, no TMEM) landed in DeepGEMM#324;
+        # probe every API used by the SM120 DSV4 paths since installed builds may
+        # expose fp8_einsum but still predate the SM120 kernels.
+        if sm_version in (120, 121) and not _sm120_deep_gemm_apis_available():
+            return False
 
     try:
         import deep_gemm  # noqa: F401

@@ -918,6 +918,30 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
 
 
 @register_post_process
+def _deepseek_v4_index_cache_dtype(view: Any) -> dict:
+    """Set dsa index cache by default according to model quantization method."""
+    hf_config = model_config_of(view).hf_config
+    model_arch = hf_config.architectures[0]
+    if model_arch != "DeepseekV4ForCausalLM":
+        return {}
+
+    if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.is_set():
+        return {}
+    
+    quant_config = getattr(hf_config, "quantization_config", None)
+    if quant_config and quant_config.get("quant_method") == "fp8":
+        if getattr(hf_config, "model_type", None) == "deepseek_v41":
+            envs.SGLANG_DSV4_INDEX_CACHE_TYPE.set("fp4")
+            logger.warning(f"Setting Index cache dtype to fp4 for deepseek_v41.")
+        elif getattr(hf_config, "model_type", None) == "deepseek_v4":
+            envs.SGLANG_DSV4_INDEX_CACHE_TYPE.set("fp8")
+            logger.warning(f"Setting Index cache dtype to fp8 for deepseek_v4.")
+        else:
+            raise NotImplementedError
+    return {}
+
+
+@register_post_process
 def _sparse_head_overlap_disable(view: Any) -> dict:
 
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():

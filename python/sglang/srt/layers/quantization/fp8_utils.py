@@ -48,6 +48,7 @@ from sglang.srt.utils import (
     is_gfx1250_supported,
     is_hip,
     is_musa,
+    is_maca,
     is_xpu,
     is_maca,
     offloader,
@@ -64,6 +65,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
+_is_maca = is_maca()
 
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
@@ -2343,6 +2345,8 @@ def apply_fp8_linear(
 
 
 def can_auto_enable_marlin_fp8() -> bool:
+    if _is_maca:
+        return False
     try:
         major, minor = get_device_capability()
         sm = major * 10 + minor
