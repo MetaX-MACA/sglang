@@ -49,7 +49,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
-
+from sglang.srt.utils.common import is_maca
 logger = logging.getLogger(__name__)
 
 
@@ -572,37 +572,40 @@ class _HostTable:
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
-        if layout == "shared":
-            self.fd = self._open_shared_fd(nbytes, name)
-            self.mm = mmap.mmap(
-                self.fd,
-                nbytes,
-                flags=mmap.MAP_SHARED,
-                prot=mmap.PROT_READ | mmap.PROT_WRITE,
-            )
+        if not is_maca():
+            if layout == "shared":
+                self.fd = self._open_shared_fd(nbytes, name)
+                self.mm = mmap.mmap(
+                    self.fd,
+                    nbytes,
+                    flags=mmap.MAP_SHARED,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                )
+            else:
+                self.fd = None
+                self.mm = mmap.mmap(
+                    -1,
+                    nbytes,
+                    flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                )
+            # Advisory before the first touch: pages are allocated huge at fault time.
+            self.mm.madvise(mmap.MADV_HUGEPAGE)
+            self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
+            if layout == "per_rank":
+                # Cached checkpoint pages, left by a previous server or by the loader,
+                # make the 512 MiB huge-page faults fall back, so empty them first.
+                _drop_page_cache_once("before pre-faulting the per-rank shard")
+                np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+            if layout == "shared":
+                # Every rank holds the fd before rank 0 continues; the /proc path only
+                # resolves while rank 0 keeps its descriptor.
+                group.barrier()
+            err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
+            if int(err) != 0:
+                raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
         else:
-            self.fd = None
-            self.mm = mmap.mmap(
-                -1,
-                nbytes,
-                flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
-                prot=mmap.PROT_READ | mmap.PROT_WRITE,
-            )
-        # Advisory before the first touch: pages are allocated huge at fault time.
-        self.mm.madvise(mmap.MADV_HUGEPAGE)
-        self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
-        if layout == "per_rank":
-            # Cached checkpoint pages, left by a previous server or by the loader,
-            # make the 512 MiB huge-page faults fall back, so empty them first.
-            _drop_page_cache_once("before pre-faulting the per-rank shard")
-            np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
-        if layout == "shared":
-            # Every rank holds the fd before rank 0 continues; the /proc path only
-            # resolves while rank 0 keeps its descriptor.
-            group.barrier()
-        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
-        if int(err) != 0:
-            raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+            self.bytes = torch.empty(nbytes, dtype=torch.uint8, device="cpu", pin_memory=True)
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
