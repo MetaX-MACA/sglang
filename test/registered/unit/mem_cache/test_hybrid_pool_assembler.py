@@ -19,11 +19,11 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _DsaStrategy,
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
+    _MambaStrategy,
     _split_hicache_size,
     _SwaStrategy,
     build_full_draft_pools,
     build_host_pool_group,
-    build_hybrid_swa_group,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
@@ -155,12 +155,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         """The separate-draft DSA branch must build its indexer mirror from a
         DRAFT_INDEXER decl. A constructor change that skips this call site
         breaks only here, not on the target path."""
-        draft_kv_pool = object.__new__(DSATokenToKVPool)
-        draft_kv_pool.layer_num = 1
-        draft_kv_pool.size = 800
-        draft_kv_pool.index_head_dim = 128
-        draft_kv_pool.skip_topk_layers = [False]
-        draft_kv_pool.index_key_cache = SimpleNamespace(buffer=[object()])
+        draft_kv_pool = _dsa_pool_stub(layer_num=1, size=800)
         draft_host_pool = SimpleNamespace(layer_num=1)
         tree_cache = SimpleNamespace(
             cache_controller=SimpleNamespace(
@@ -231,7 +226,9 @@ def _dsa_pool_stub(*, layer_num: int, size: int = 4096, shard: tuple | None = No
         buffer=[torch.empty((1, 64 * 132), dtype=torch.uint8) for _ in range(layer_num)]
     )
     pool.kv_buffer = [torch.empty(0) for _ in range(layer_num)]
-    pool.data_ptrs = torch.tensor([b.data_ptr() for b in pool.kv_buffer], dtype=torch.uint64)
+    pool.data_ptrs = torch.tensor(
+        [b.data_ptr() for b in pool.kv_buffer], dtype=torch.uint64
+    )
     pool.layer_shard_enabled = shard is not None
     if shard is not None:
         from sglang.srt.layers.cp.utils import get_layer_shard_range
@@ -260,7 +257,9 @@ def _kv_pool_stub(*, layer_num: int, size: int = 4096):
     pool.layer_shard_enabled = False
     pool.device = "cpu"
     pool.kv_buffer = [torch.empty(0) for _ in range(layer_num)]
-    pool.data_ptrs = torch.tensor([b.data_ptr() for b in pool.kv_buffer], dtype=torch.uint64)
+    pool.data_ptrs = torch.tensor(
+        [b.data_ptr() for b in pool.kv_buffer], dtype=torch.uint64
+    )
     return pool
 
 
@@ -337,12 +336,29 @@ class TestDeclaredStackStructure(CustomTestCase):
     order, anchor, device owners, layer mapper over every transfer layer,
     packed drafts, mirror geometry, controller arguments, sidecars."""
 
+    def test_direct_linker_uses_current_builder_signature(self):
+        pool = _dsa_pool_stub(layer_num=3)
+        expected = object()
+        with patch(
+            "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler."
+            "_build_dsa_device_pool_group",
+            autospec=True,
+            return_value=expected,
+        ) as build:
+            result = _DsaStrategy().build_direct_linker_pool_group(
+                kvcache=pool,
+                params=_target_params(),
+                page_size=64,
+            )
+        self.assertIs(result, expected)
+        build.assert_called_once_with(pool, 64)
+
     def _run(self, *, pool, drafts, full_layer_mapping, page_size=64):
         from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
         real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
 
-        def dummy_kv_host(**kwargs):
+        def cpu_kv_host(**kwargs):
             return MLATokenToKVPoolHost(
                 kwargs["kv_pool"],
                 host_to_device_ratio=2,
@@ -354,7 +370,7 @@ class TestDeclaredStackStructure(CustomTestCase):
                 mtp_draft_device_pools=kwargs["mtp_draft_device_pools"],
             )
 
-        def dummy_indexer_host(
+        def cpu_indexer_host(
             decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
         ):
             return real_indexer_host(
@@ -366,8 +382,8 @@ class TestDeclaredStackStructure(CustomTestCase):
             )
 
         with (
-            patch.object(hybrid_pool_assembler, "build_kv_host_pool", dummy_kv_host),
-            patch.object(pool_host_dsa, "DSAIndexerPoolHost", dummy_indexer_host),
+            patch.object(hybrid_pool_assembler, "build_kv_host_pool", cpu_kv_host),
+            patch.object(pool_host_dsa, "DSAIndexerPoolHost", cpu_indexer_host),
             patch.object(
                 hybrid_pool_assembler, "_get_allocator_type", return_value="default"
             ),
@@ -629,6 +645,161 @@ class TestKvHostPoolRow(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "KV row"):
             self._build(pool, (draft,))
         self._build(pool, (_dsa_pool_stub(layer_num=1),))
+
+
+class TestHybridMambaDeclaredIndexer(CustomTestCase):
+    """hybrid Mamba + DSA reuses the target's indexer declaration: the KV/Mamba
+    stack gains an INDEXER entry whose mirror and layer mapping cover only the
+    DSA layers that own index buffers."""
+
+    def test_strategy_registers_indexer_and_checks_missing_pool(self):
+        kv_pool = _dsa_pool_stub(layer_num=3)
+        decls = kv_pool.host_pool_decls()
+        full_mapping = {0: 0, 2: 1, 4: 2}
+        config = prepare_host_pool_config(
+            decls=decls,
+            full_layer_mapping=full_mapping,
+            transfer_layer_id_max=5,
+            transfer_page_size=64,
+        )
+        kvcache = SimpleNamespace(
+            start_layer=8,
+            full_attention_layer_id_mapping={8: 0, 10: 1, 12: 2},
+            host_pool_decls=lambda: decls,
+            use_mla=True,
+        )
+        params = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                mamba_map={9: 0, 11: 1}, mamba_pool=object()
+            )
+        )
+        group = MagicMock()
+        group.entry_map = {
+            name: object() for name in (PoolName.KV, PoolName.INDEXER, PoolName.MAMBA)
+        }
+        strategy = _MambaStrategy()
+        with patch.object(
+            hybrid_pool_assembler,
+            "build_hybrid_mamba_stack",
+            return_value=(group, SimpleNamespace(layer_num=5), config),
+        ) as build:
+            result = strategy.build(
+                cache=None,
+                kvcache=kvcache,
+                params=params,
+                server_args=None,
+                load_cache_event=None,
+            )
+        self.assertEqual(build.call_args.kwargs["full_layer_mapping"], full_mapping)
+        self.assertEqual(build.call_args.kwargs["mamba_layer_mapping"], {1: 0, 3: 1})
+        self.assertEqual(result.sidecars, [decls[1].sidecar_spec()])
+        self.assertEqual(result.pools_desc, "KV + INDEXER + MAMBA")
+        self.assertEqual(result.transfer_layer_num, 5)
+        _check_declared_pools_present(kvcache=kvcache, result=result, strategy=strategy)
+        del group.entry_map[PoolName.INDEXER]
+        with self.assertRaisesRegex(ValueError, "indexer"):
+            _check_declared_pools_present(
+                kvcache=kvcache, result=result, strategy=strategy
+            )
+
+    def test_stack_declares_indexer_and_skips_empty_layers(self):
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        kv_pool = _dsa_pool_stub(layer_num=3)
+        kv_pool.skip_topk_layers = [False, True, False]  # device layer 1: no buffer
+        mamba_pool = SimpleNamespace(layer_num=2, size=8)
+        # transfer layers 0,2,4 are DSA (device 0,1,2), 1,3 are Mamba
+        full_mapping = {0: 0, 2: 1, 4: 2}
+        mamba_mapping = {1: 0, 3: 1}
+        params = SimpleNamespace(
+            page_size=64,
+            mtp_draft_device_pools=(),
+            token_to_kv_pool_allocator=None,
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+            req_to_token_pool=SimpleNamespace(
+                mamba_allocator=SimpleNamespace(
+                    alloc=lambda n: None, free=lambda x: None
+                )
+            ),
+        )
+        real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
+
+        def cpu_kv_host(**kwargs):
+            return MLATokenToKVPoolHost(
+                kwargs["kv_pool"],
+                host_to_device_ratio=2,
+                host_size=0,
+                page_size=kwargs["page_size"],
+                layout="page_first",
+                pin_memory=False,
+                override_kv_cache_dim=None,
+                mtp_draft_device_pools=kwargs["mtp_draft_device_pools"],
+            )
+
+        def cpu_indexer_host(
+            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+        ):
+            return real_indexer_host(
+                decl=decl,
+                anchor_host=anchor_host,
+                packed_draft_device_pools=packed_draft_device_pools,
+                allocator_type=allocator_type,
+                pin_memory=False,
+            )
+
+        with (
+            patch.object(hybrid_pool_assembler, "build_kv_host_pool", cpu_kv_host),
+            patch.object(pool_host_dsa, "DSAIndexerPoolHost", cpu_indexer_host),
+            patch.object(
+                hybrid_pool_assembler,
+                "MambaPoolHost",
+                return_value=SimpleNamespace(layer_num=2, can_use_write_back_jit=False),
+            ),
+            patch.object(hybrid_pool_assembler, "HybridCacheController", MagicMock()),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(
+                    hicache_size=0,
+                    hicache_ratio=2,
+                    hicache_mem_layout="page_first",
+                    hicache_write_policy="write_through",
+                    hicache_io_backend="kernel",
+                    hicache_host_memory_mode="cache",
+                ),
+            ),
+        ):
+            group, _, config = hybrid_pool_assembler.build_hybrid_mamba_stack(
+                params=params,
+                decls=kv_pool.host_pool_decls(),
+                mamba_pool=mamba_pool,
+                full_layer_mapping=full_mapping,
+                mamba_layer_mapping=mamba_mapping,
+                load_cache_event=None,
+                storage_backend=None,
+                use_mla=True,
+            )
+
+        names = [e.name for e in group.entries]
+        self.assertEqual(names, [PoolName.KV, PoolName.INDEXER, PoolName.MAMBA])
+        indexer = group.entry_map[PoolName.INDEXER]
+        kv = group.entry_map[PoolName.KV]
+        # KV still maps every DSA transfer layer. The indexer drops device layer 1.
+        self.assertEqual([kv.layer_mapper(t) for t in range(5)], [0, None, 1, None, 2])
+        self.assertEqual(
+            [indexer.layer_mapper(t) for t in range(5)], [0, None, None, None, 2]
+        )
+        self.assertEqual(indexer.host_pool.layer_num, 2)
+        self.assertEqual(indexer.host_pool._host_layer_index(2), 1)
+        self.assertEqual(
+            [c.decl.pool_name for c in config.pools], [PoolName.KV, PoolName.INDEXER]
+        )
 
 
 class TestDeclaredPoolPlanning(CustomTestCase):
