@@ -707,16 +707,19 @@ class Gemma3ForConditionalGeneration(
         self.quant_config = quant_config
         self.text_config = config.text_config
 
-        # Vision Tower
-        self.vision_tower = SiglipVisionModel(
-            config=config.vision_config,
-            qkv_backend="sdpa",
-            quant_config=quant_config,
-            prefix=add_prefix("vision_tower", prefix),
+        # Diffusion uses Gemma3 as a text encoder. Avoid constructing the
+        # unused vision tower unless image understanding is requested.
+        self.enable_image_understanding = getattr(
+            config, "enable_image_understanding", True
         )
-
-        # Projector
-        self.multi_modal_projector = Gemma3MultiModalProjector(config)
+        if self.enable_image_understanding:
+            self.vision_tower = SiglipVisionModel(
+                config=config.vision_config,
+                qkv_backend="sdpa",
+                quant_config=quant_config,
+                prefix=add_prefix("vision_tower", prefix),
+            )
+            self.multi_modal_projector = Gemma3MultiModalProjector(config)
 
         # Text Model
         self.language_model = Gemma3TextModel(config)
@@ -761,6 +764,11 @@ class Gemma3ForConditionalGeneration(
         inputs_embeds = self.language_model.get_input_embeddings(llm_input_ids)
 
         if pixel_values is not None:
+            if not self.enable_image_understanding:
+                raise ValueError(
+                    "pixel_values were provided, but Gemma3 vision tower is disabled. "
+                    "Set enable_image_understanding=True for multimodal Gemma3 usage."
+                )
             if pixel_values.dim() == 5:
                 pixel_values = pixel_values.reshape(
                     -1,

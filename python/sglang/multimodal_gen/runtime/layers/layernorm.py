@@ -49,7 +49,11 @@ _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
 _has_attentions = False
 
 if _is_cuda or _is_xpu:
-    from sgl_kernel import fused_add_rmsnorm, rmsnorm
+    from sgl_kernel import fused_add_rmsnorm
+    try:
+        from flashinfer import rmsnorm
+    except ImportError:
+        from sgl_kernel import rmsnorm
 
 if _is_npu:
     import torch_npu
@@ -616,36 +620,9 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual.numel() == 0 or x.numel() == 0:
-            return self.forward_native(residual, x, gate, shift, scale)
-
-        if x.shape[-1] % 256 != 0 or x.shape[-1] > 8192:
-            import warnings
-
-            warnings.warn(
-                "FusedScaleResidualNormScaleShift cuda not available, using native fallback",
-                stacklevel=2,
-            )
-            return self.forward_native(residual, x, gate, shift, scale)
-
-        from sglang.kernels.ops.diffusion import fused_scale_residual_norm_scale_shift
-
-        if isinstance(gate, int) and gate != 1:
-            raise ValueError(
-                f"Only gate value of 1 is supported for int type, but got {gate}"
-            )
-
-        return fused_scale_residual_norm_scale_shift(
-            residual.contiguous(),
-            x.contiguous(),
-            gate.contiguous() if isinstance(gate, torch.Tensor) else None,
-            _ensure_contiguous(getattr(self.norm, "weight", None)),
-            _ensure_contiguous(getattr(self.norm, "bias", None)),
-            scale.contiguous(),
-            shift.contiguous(),
-            self.norm_type,
-            self.eps,
-        )
+        # The fused CuTe kernel is unavailable on several CUDA-compatible
+        # runtimes (including MetaX). Native execution keeps the path portable.
+        return self.forward_native(residual, x, gate, shift, scale)
 
     def forward_hip(
         self,
@@ -858,26 +835,7 @@ class _NormScaleShift(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        if x.shape[-1] % 256 != 0 or x.shape[-1] > 8192:
-            import warnings
-
-            warnings.warn(
-                "FusedNormScaleShift cuda not available, using native fallback",
-                stacklevel=2,
-            )
-            return self.forward_native(x, shift, scale)
-
-        from sglang.kernels.ops.diffusion import fused_norm_scale_shift
-
-        return fused_norm_scale_shift(
-            x.contiguous(),
-            _ensure_contiguous(getattr(self.norm, "weight", None)),
-            _ensure_contiguous(getattr(self.norm, "bias", None)),
-            scale.contiguous(),
-            shift.contiguous(),
-            self.norm_type,
-            self.eps,
-        )
+        return self.forward_native(x, shift, scale)
 
     def forward_hip(
         self,

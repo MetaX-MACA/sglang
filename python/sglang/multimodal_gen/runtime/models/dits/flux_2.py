@@ -90,10 +90,12 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import is_maca
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 _get_qkv_projections = get_qkv_projections
+_IS_MACA = is_maca()
 
 _FLUX2_LN_MOD = BitExactFusionGate("FLUX.2 fused LN+modulate", per_signature=True)
 _FLUX2_LN_MOD_SIGS = _FLUX2_LN_MOD.verified_sigs
@@ -373,6 +375,7 @@ def _flux2_norm_modulate(
     shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift
     if (
         _FLUX2_LN_MOD.disabled
+        or _IS_MACA
         or not is_plain_layer_norm(norm, x.shape[-1])
         or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
     ):
@@ -428,6 +431,7 @@ def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
     verified = sig in _FLUX2_SWIGLU_SIGS
     can_fuse = (
         not _FLUX2_SWIGLU.disabled
+        and not _IS_MACA
         and x.is_cuda
         and x.dtype is torch.bfloat16
         and x.dim() == 3

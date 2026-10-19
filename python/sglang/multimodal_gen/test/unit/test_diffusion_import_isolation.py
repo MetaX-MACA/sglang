@@ -7,6 +7,28 @@ import unittest
 
 
 class TestDiffusionImportIsolation(unittest.TestCase):
+    def test_multimodal_package_import_is_lazy(self):
+        """Top-level package discovery must not load the generation runtime."""
+        script = """
+import sys
+import sglang.multimodal_gen
+assert "sglang.multimodal_gen.runtime.entrypoints.diffusion_generator" not in sys.modules
+"""
+        env = os.environ.copy()
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
+        )
+
     def test_disabled_backend_does_not_import_mlx(self):
         """Diffusion modules must remain usable without the optional MLX path."""
         script = """

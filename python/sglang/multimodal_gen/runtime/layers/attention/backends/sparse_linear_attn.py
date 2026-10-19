@@ -253,7 +253,9 @@ class _attention(torch.autograd.Function):
             BLOCK_M,
             BLOCK_N,
             num_warps=4 if q.shape[-1] == 64 else 8,
-            num_stages=3,
+            # MetaX devices expose a 64 KiB per-block shared-memory limit.
+            # Three pipeline stages require 114688 bytes for this kernel.
+            num_stages=1,
         )
 
         ctx.save_for_backward(q, k, v, k_block_id, lut, lse, o_s)
@@ -438,6 +440,9 @@ class SageSparseLinearAttentionImpl(AttentionImpl, nn.Module):
         else:
             BLKQ = 128
             BLKK = 64
+        # MetaX sparse kernels only support 64x64 tiles.
+        BLKQ = 64
+        BLKK = 64
         # Compute block-sparse attention pattern
         sparse_map, lut, real_topk = get_block_map(
             q, k, topk_ratio=self.topk_ratio, BLKQ=BLKQ, BLKK=BLKK

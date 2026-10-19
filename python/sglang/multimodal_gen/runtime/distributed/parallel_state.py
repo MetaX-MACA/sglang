@@ -202,7 +202,9 @@ def init_parallel_group_coordinator(
             local_rank=local_rank,
             torch_distributed_backend=backend,
             use_device_communicator=parallel_mode != "tensor",
-            use_srt_custom_allreduce=parallel_mode == "tensor",
+            # CUDA-compatible runtimes such as MetaX do not ship SGLang's
+            # custom all-reduce extension.
+            use_srt_custom_allreduce=False,
             group_name=group_name,
         )
 
