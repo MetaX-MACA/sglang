@@ -4645,8 +4645,16 @@ class MLATokenToKVPool(KVCache):
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
+    def _cpu_copy_local_indices(self, indices):
+        parallel = get_parallel()
+        if parallel.dcp_enabled:
+            indices = indices[indices % parallel.attn_dcp_size == parallel.attn_dcp_rank]
+            indices = indices // parallel.attn_dcp_size
+        return indices
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         current_platform.synchronize()
+        indices = self._cpu_copy_local_indices(indices)
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -4666,6 +4674,7 @@ class MLATokenToKVPool(KVCache):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         current_platform.synchronize()
+        indices = self._cpu_copy_local_indices(indices)
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             if self.kv_buffer[layer_id].shape[0] == 0:

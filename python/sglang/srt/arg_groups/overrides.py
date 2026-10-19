@@ -82,6 +82,7 @@ from sglang.srt.utils.common import (
     get_quantization_config,
     is_cpu,
     is_gfx95_supported,
+    is_maca,
     is_mnnvl_fabric_device,
     is_mps,
     is_triton_kernels_available,
@@ -544,7 +545,9 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["speculative_attention_mode"] = "decode"
 
         prefill_backend, decode_backend = attention_backends_of(cfg)
-        if decode_backend == "cutedsl_mla" or decode_backend is None:
+        if decode_backend == "cutedsl_mla" or (
+            decode_backend is None and not is_maca()
+        ):
             _require_kimi_k3_cutedsl_dcp_support()
             logger.info(
                 "Kimi-K3 DCP keeps decode attention backend 'cutedsl_mla' "
@@ -569,9 +572,27 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 decode_attention_backend="tokenspeed_mla",
                 kv_cache_dtype="fp8_e4m3",
             )
+        elif (decode_backend == "flashinfer" or decode_backend is None) and is_maca():
+            if cfg.speculative_algorithm == "DSPARK":
+                raise ValueError(
+                    "Kimi-K3 DCP + DSPARK is not supported with the MetaX "
+                    "FlashInfer MLA backend."
+                )
+            logger.info(
+                "Kimi-K3 DCP on MetaX uses FlashInfer MLA for prefill and "
+                "decode (prefill=%r, decode=%r).",
+                prefill_backend,
+                decode_backend,
+            )
+            overrides.update(
+                prefill_attention_backend="flashinfer",
+                decode_attention_backend="flashinfer",
+            )
         else:
             raise AssertionError(
-                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'tokenspeed_mla', got {decode_backend!r}."
+                "Decode attention backend for Kimi-K3 DCP must be "
+                "'cutedsl_mla', 'tokenspeed_mla', or 'flashinfer' on MetaX; "
+                f"got {decode_backend!r}."
             )
 
         if cfg.dcp_replicate_q_proj is None:
