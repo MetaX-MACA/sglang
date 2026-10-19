@@ -30,6 +30,10 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.kernels.ops.attention.dsv4.kv_layout import (
+    INT8_SCALE_BYTES_PER_TOKEN,
+    kv_cache_page_bytes,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -1009,6 +1013,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.kv_bytes = self._unified_row_bytes
         elif get_exec().kernel.dsv4_attn_backend == "trtllm":
             self.kv_bytes = self.attn_head_dim
+        elif kvc.kv_cache_dtype is torch.int8:
+            # 448 INT8 NOPE + 64 BF16 RoPE + 7 FP32 scales and padding.
+            self.kv_bytes = (
+                self.qk_nope_head_dim + self.qk_rope_head_dim * 2
+                + INT8_SCALE_BYTES_PER_TOKEN
+            )
         else:
             # One FlashMLA-layout latent slot, in bytes.
             self.kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
@@ -1260,6 +1270,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 layout, compress_ratio, compressed_option
             )
             page_size = self.page_size // compress_ratio
+        if self.kv_cache_dtype is torch.int8:
+            if layout.value != "v4":
+                raise ValueError("INT8 main KV requires V4 packed pages")
+            return kv_cache_page_bytes(layout, self.kv_cache_dtype, page_size) / page_size
         return layout.page_bytes(page_size) / page_size
 
     def _get_bytes_per_swa_token(self) -> float:

@@ -53,6 +53,7 @@ def _jit_main_q_norm_rope_module(
 @cache_once
 def _jit_main_k_norm_rope_flashmla_module(
     dtype: torch.dtype,
+    cache_dtype: torch.dtype,
     head_dim: int,
     rope_dim: int,
     page_size: int,
@@ -60,7 +61,7 @@ def _jit_main_k_norm_rope_flashmla_module(
 ):
     """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache."""
     args = make_cpp_args(
-        dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl()
+        dtype, cache_dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl()
     )
     return load_jit(
         make_name("main_k_norm_rope_flashmla"),
@@ -75,6 +76,7 @@ def _jit_main_k_norm_rope_flashmla_module(
 @cache_once
 def _jit_main_k_norm_rope_q_flashmla_module(
     dtype: torch.dtype,
+    cache_dtype: torch.dtype,
     head_dim: int,
     rope_dim: int,
     page_size: int,
@@ -82,7 +84,7 @@ def _jit_main_k_norm_rope_q_flashmla_module(
 ):
     """ROCm only: the K kernel above with the in-place query rope in the same launch."""
     args = make_cpp_args(
-        dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl()
+        dtype, cache_dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl()
     )
     return load_jit(
         make_name("main_k_norm_rope_q_flashmla"),
@@ -330,13 +332,13 @@ def fused_k_norm_rope_flashmla(
     elif q is not None:
         assert _is_hip, "only the ROCm K launch ropes q"
         module = _jit_main_k_norm_rope_q_flashmla_module(
-            kv.dtype, head_dim, rope_dim, page_size, layout
+            kv.dtype, kvcache.dtype, head_dim, rope_dim, page_size, layout
         )
         module.forward_with_q(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, q
         )
     else:
         module = _jit_main_k_norm_rope_flashmla_module(
-            kv.dtype, head_dim, rope_dim, page_size, layout
+            kv.dtype, kvcache.dtype, head_dim, rope_dim, page_size, layout
         )
         module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)

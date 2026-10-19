@@ -13,6 +13,7 @@ separate region at the end of each page.
 
 import logging
 import math
+import os
 from functools import lru_cache
 from typing import FrozenSet, Optional, Tuple
 
@@ -21,6 +22,17 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.kernels.ops.attention.dsv4.kv_layout import (
+    DSV4KVCacheFormat,
+    FP8_SCALE_BYTES_PER_TOKEN,
+    INT8_SCALE_BYTES_PER_TOKEN,
+    NOPE_DIM,
+    NUM_QUANT_GROUPS,
+    QUANT_GROUP_SIZE,
+    ROPE_DIM,
+    VALUE_BYTES_PER_TOKEN,
+    get_kv_cache_format,
+)
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -38,12 +50,12 @@ _GLM_DSA_MODEL_ARCHS = (
 #   bytes_per_token = 448 + 128 + 8 = 584
 #   page_bytes = ceil_div(page_size * 584, 576) * 576
 
-_NOPE_DIM = 448
-_ROPE_DIM = 64
-_NOPE_ROPE_STRIDE = _NOPE_DIM + _ROPE_DIM * 2  # 576
-_TILE_SIZE = 64
-_NUM_TILES = _NOPE_DIM // _TILE_SIZE  # 7
-_SCALE_STRIDE = _NUM_TILES + 1  # 8 (7 scales + 1 pad)
+_NOPE_DIM = NOPE_DIM
+_ROPE_DIM = ROPE_DIM
+_NOPE_ROPE_STRIDE = VALUE_BYTES_PER_TOKEN
+_TILE_SIZE = QUANT_GROUP_SIZE
+_NUM_TILES = NUM_QUANT_GROUPS
+_SCALE_STRIDE = FP8_SCALE_BYTES_PER_TOKEN
 _D = _NOPE_DIM + _ROPE_DIM  # 512
 
 
@@ -63,6 +75,9 @@ def _gather_and_dequant(k_cache, indices, page_size):
     flat_idx = indices.reshape(-1)  # (N,)
     N = flat_idx.shape[0]
     device = k_cache.device
+    cache_format = get_kv_cache_format(k_cache.dtype)
+    if cache_format == DSV4KVCacheFormat.BF16:
+        raise ValueError("Packed gather only accepts an FP8 or INT8 KV cache")
 
     # Page-level addressing
     page_bytes = k_cache.stride(0)  # actual byte stride between pages
@@ -97,10 +112,16 @@ def _gather_and_dequant(k_cache, indices, page_size):
     )  # (N, 128)
 
     scale_section_offset = page_size * _NOPE_ROPE_STRIDE  # 147456
-    scale_base = scale_section_offset + safe_offsets * _SCALE_STRIDE  # (N,)
+    scale_stride = (
+        FP8_SCALE_BYTES_PER_TOKEN
+        if cache_format == DSV4KVCacheFormat.FP8
+        else INT8_SCALE_BYTES_PER_TOKEN
+    )
+    scale_base = scale_section_offset + safe_offsets * scale_stride
+    scale_count = _NUM_TILES if cache_format == DSV4KVCacheFormat.FP8 else _NUM_TILES * 4
     scale_offsets = scale_base.unsqueeze(-1) + torch.arange(
-        _NUM_TILES, device=device, dtype=torch.long
-    )  # (N, 7)
+        scale_count, device=device, dtype=torch.long
+    )
 
     # Gather bytes per page — use advanced indexing
     # raw_pages[safe_pages, nope_offsets] → (N, 448)
@@ -111,19 +132,23 @@ def _gather_and_dequant(k_cache, indices, page_size):
     rope_bytes = raw_pages[page_idx_rope, rope_offsets]  # (N, 128) uint8
 
     page_idx_scale = safe_pages.unsqueeze(-1).expand_as(scale_offsets)
-    scale_bytes = raw_pages[page_idx_scale, scale_offsets]  # (N, 7) uint8
+    scale_bytes = raw_pages[page_idx_scale, scale_offsets]
 
     # Reinterpret dtypes
-    nope_fp8 = nope_bytes.view(torch.float8_e4m3fn)  # (N, 448)
     rope_bf16 = rope_bytes.contiguous().view(torch.bfloat16)  # (N, 64)
-    scale_e8m0 = scale_bytes.view(torch.float8_e8m0fnu)  # (N, 7)
+    if cache_format == DSV4KVCacheFormat.FP8:
+        nope_quant = nope_bytes.view(torch.float8_e4m3fn).float()
+        scales = scale_bytes.view(torch.float8_e8m0fnu).float()
+    else:
+        nope_quant = nope_bytes.view(torch.int8).float()
+        scales = scale_bytes.contiguous().view(torch.float32)
 
     # Dequantize: nope_tile * scale_tile → bf16 (vectorized)
     result = torch.empty(N, _D, dtype=torch.bfloat16, device=device)
     result[:, :_NOPE_DIM] = (
         (
-            nope_fp8.view(N, _NUM_TILES, _TILE_SIZE).float()
-            * scale_e8m0.view(N, _NUM_TILES, 1).float()
+            nope_quant.view(N, _NUM_TILES, _TILE_SIZE)
+            * scales.view(N, _NUM_TILES, 1)
         )
         .view(N, _NOPE_DIM)
         .to(torch.bfloat16)
@@ -207,6 +232,9 @@ def _sm120_sparse_decode_fwd(
 # SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
 # Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
 _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
+_dsv4_int8_backend = (
+    "triton" if os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "1") == "1" else "torch"
+)
 
 
 SM120_DECODE_MAX_TOKENS = 64
@@ -313,7 +341,13 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_indices = kwargs.get("extra_indices_in_kvcache")
     extra_topk_length = kwargs.get("extra_topk_length")
 
-    if _sm120_default_backend == "flashinfer":
+    # INT8 retains the 0.5.14 SM120 selection; the 0.5.19 FlashInfer default
+    # consumes the FP8 scale layout.
+    backend = (
+        _dsv4_int8_backend if k_cache.dtype is torch.int8 else _sm120_default_backend
+    )
+
+    if backend == "flashinfer":
         if q.shape[0] > SM120_DECODE_MAX_TOKENS:
             return _flash_mla_sm120_prefill(
                 q,
@@ -340,7 +374,7 @@ def flash_mla_with_kvcache_sm120(**kwargs):
             extra_topk_length,
         )
 
-    if _sm120_default_backend == "triton":
+    if backend == "triton":
         from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
             flash_mla_sparse_decode_triton,
         )

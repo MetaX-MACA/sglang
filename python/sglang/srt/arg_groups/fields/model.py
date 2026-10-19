@@ -202,6 +202,7 @@ class Model(msgspec.Struct):
                 "auto",
                 "fp8_e5m2",
                 "fp8_e4m3",
+                "int8",
                 "mxfp8",
                 "bf16",
                 "bfloat16",
