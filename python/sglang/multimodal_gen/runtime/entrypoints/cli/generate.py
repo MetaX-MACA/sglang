@@ -203,10 +203,17 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
         model_path=server_args.model_path, server_args=server_args, local_mode=True
     )
 
-    results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
+    try:
+        results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
+        if results is None:
+            raise RuntimeError(
+                "Generation failed; see the generation error log for details"
+            )
 
-    prompt = sampling_params_kwargs.get("prompt")
-    maybe_dump_performance(args, server_args, prompt, results)
+        prompt = sampling_params_kwargs.get("prompt")
+        maybe_dump_performance(args, server_args, prompt, results)
+    finally:
+        generator.shutdown()
 
 
 class GenerateSubcommand(CLISubcommand):

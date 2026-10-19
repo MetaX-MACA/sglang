@@ -67,10 +67,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.utils import is_maca
 
 logger = init_logger(__name__)
 
-_is_cuda = current_platform.is_cuda()
+_use_cuda_fusions = current_platform.is_cuda() and not is_maca()
 
 _GLM_LN_MOD = BitExactFusionGate("GLM fused LN+modulate")
 _GLM_QK_LN = BitExactFusionGate("GLM fused qk-LayerNorm")
@@ -102,7 +103,7 @@ def _glm_ln_modulate(
     verified = _GLM_LN_MOD.verified
     if (
         not _GLM_LN_MOD.disabled
-        and _is_cuda
+        and _use_cuda_fusions
         and dtype is x.dtype
         and is_plain_layer_norm(norm, x.shape[-1])
         and can_use_fused_layernorm_modulate(x, scale, shift)
@@ -143,7 +144,7 @@ def _glm_qk_layernorm(
     verified = _GLM_QK_LN.verified
     if (
         not _GLM_QK_LN.disabled
-        and _is_cuda
+        and _use_cuda_fusions
         and dtype is query.dtype
         and dtype is key.dtype
         and is_plain_layer_norm(norm_q, query.shape[-1])
@@ -649,8 +650,10 @@ class GlmImageAttention(torch.nn.Module):
                 cos=cos,
                 sin=sin,
             )
-            query[:, text_seq_length:, :, :] = q_img
-            key[:, text_seq_length:, :, :] = k_img
+            # In-place RoPE may return aliases with different size-one strides.
+            # Rebuild the streams instead of copying between overlapping views.
+            query = torch.cat([query[:, :text_seq_length], q_img], dim=1)
+            key = torch.cat([key[:, :text_seq_length], k_img], dim=1)
 
         if kv_cache is not None:
             if kv_cache.mode == "write":

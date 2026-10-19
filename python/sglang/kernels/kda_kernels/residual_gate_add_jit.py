@@ -9,6 +9,7 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kda_kernels import _cuda_source
+from sglang.srt.utils import is_maca
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _BIT_EXACT_DTYPES = (torch.float16, torch.bfloat16)
+_IS_MACA = is_maca()
 _TRANSPOSE_TILE = 32
 _MAX_GRID_DIM = 65535
 _FAILED_RUNTIME_KEYS: set[tuple[int | None, torch.dtype]] = set()
@@ -466,6 +468,9 @@ def _is_transposed_dense_residual(
 def can_use_residual_gate_add_cuda(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
+    # Bit-exact 16-bit rounding uses CUDA inline assembly unsupported by MetaX.
+    if _IS_MACA and residual.dtype in _BIT_EXACT_DTYPES:
+        return False
     return (
         residual.dtype in _SUPPORTED_DTYPES
         and residual.dtype == update.dtype

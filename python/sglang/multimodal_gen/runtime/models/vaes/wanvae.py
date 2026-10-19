@@ -54,6 +54,9 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     should_run_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.utils import is_maca
+
+_IS_MACA = is_maca()
 
 if current_platform.is_cuda() or current_platform.is_xpu():
     try:
@@ -74,10 +77,14 @@ first_chunk = contextvars.ContextVar("first_chunk", default=None)
 
 
 def _channels_last_3d_supported_by_platform() -> bool:
-    return hasattr(torch, "channels_last_3d") and (
-        current_platform.is_cuda()
-        or current_platform.is_rocm()
-        or current_platform.is_xpu()
+    return (
+        not _IS_MACA
+        and hasattr(torch, "channels_last_3d")
+        and (
+            current_platform.is_cuda()
+            or current_platform.is_rocm()
+            or current_platform.is_xpu()
+        )
     )
 
 
@@ -90,6 +97,10 @@ def _conv3d_weight_is_channels_last_3d(weight: torch.Tensor) -> bool:
 
 
 def match_conv3d_input_format(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    # MCDNN's packed NDHWC conversion can fault on Wan 2.2 decoder shapes.
+    # Keep MetaX inputs dense NCDHW, including strided temporal-cache views.
+    if _IS_MACA and x.dim() == 5:
+        return x.contiguous()
     if x.dim() == 5 and _conv3d_weight_is_channels_last_3d(weight):
         return x.contiguous(memory_format=torch.channels_last_3d)
     return x

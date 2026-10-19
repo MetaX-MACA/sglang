@@ -94,10 +94,12 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import is_maca
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 _get_qkv_projections = get_qkv_projections
+_IS_MACA = is_maca()
 
 _FLUX_LN_MOD = BitExactFusionGate("FLUX fused LN+modulate", per_signature=True)
 # Keep the pre-refactor direct set lookup in this launch-sensitive hot path.
@@ -122,6 +124,7 @@ def _flux_fused_ln_modulate(
     """
     if (
         _FLUX_LN_MOD.disabled
+        or _IS_MACA
         or not is_plain_layer_norm(norm, x.shape[-1])
         or not can_use_fused_layernorm_modulate(x, scale, shift)
     ):

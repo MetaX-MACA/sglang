@@ -226,6 +226,7 @@ killall_sglang = "sglang.cli.killall:main"
 exclude = [
   "assets*",
   "benchmark*",
+  "build*",
   "docs*",
   "dist*",
   "playground*",
