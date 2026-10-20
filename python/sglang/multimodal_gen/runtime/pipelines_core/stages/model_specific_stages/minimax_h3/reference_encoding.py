@@ -445,13 +445,13 @@ def _decode_reference_video_local(command: list[str]) -> tuple[Any, int]:
     # anonymous file descriptor. Mapping that output avoids communicate()'s
     # chunk list and final bytes join for a several-hundred-MiB reference.
     output_fd = -1
-    if sys.platform.startswith("linux"):
+    if sys.platform.startswith("linux") and hasattr(os, "memfd_create"):
         try:
             output_fd = os.memfd_create(
                 "sglang-h3-reference-video",
-                flags=os.MFD_CLOEXEC,
+                flags=getattr(os, "MFD_CLOEXEC", 0),
             )
-        except OSError:
+        except (AttributeError, OSError):
             output_fd = -1
 
     payload: Any = b""
@@ -519,6 +519,7 @@ def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
         group.world_size <= 1
         or not sys.platform.startswith("linux")
         or not os.path.isdir("/proc/self/fd")
+        or not hasattr(os, "memfd_create")
     ):
         return _decode_reference_video_local(command)
 
@@ -534,9 +535,9 @@ def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
             try:
                 leader_fd = os.memfd_create(
                     "sglang-h3-reference-video-shared",
-                    flags=os.MFD_CLOEXEC,
+                    flags=getattr(os, "MFD_CLOEXEC", 0),
                 )
-            except OSError:
+            except (AttributeError, OSError):
                 # Anonymous file descriptors can be disabled by a container's
                 # seccomp policy. Tell every host to use the unchanged local
                 # decode path instead of failing a valid request.

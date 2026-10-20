@@ -190,9 +190,10 @@ builtin_platform_plugins = {
     "mps": mps_platform_plugin,
     "xpu": xpu_platform_plugin,
     "rocm": rocm_platform_plugin,
+    # MUSA can expose CUDA-compatible APIs; detect it before the CUDA fallback.
+    "musa": musa_platform_plugin,
     "cuda": cuda_platform_plugin,
     "npu": npu_platform_plugin,
-    "musa": musa_platform_plugin,
     "cpu": cpu_platform_plugin,
 }
 

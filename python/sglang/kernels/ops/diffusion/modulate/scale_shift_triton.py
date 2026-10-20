@@ -1,3 +1,5 @@
+import logging
+
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
@@ -6,10 +8,15 @@ from sglang.kernels.ops.diffusion.common.numerics import mul_rn_f32
 from sglang.kernels.ops.diffusion.common.platform import (
     is_cuda,
     is_hip,
+    is_maca,
+    is_musa,
     is_xpu,
     lazy_fallback,
     select_impl,
 )
+
+logger = logging.getLogger(__name__)
+_FAILED_RUNTIME_KEYS: set[tuple[int | None, torch.dtype]] = set()
 
 
 @triton.jit
@@ -38,8 +45,14 @@ def try_fused_scaled_residual_add_exact(
     scale: torch.Tensor,
 ) -> torch.Tensor | None:
     """Fuse ``residual + x * scale`` without changing eager FP32 rounding."""
+    # The kernel uses CUDA PTX inline assembly; torch-musa and MetaX can expose
+    # CUDA-like tensor flags, so both vendor markers and the concrete device
+    # type matter.
     if (
-        not is_cuda()
+        is_maca()
+        or is_musa()
+        or not is_cuda()
+        or getattr(residual.device, "type", None) != "cuda"
         or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
         or residual.dtype != torch.float32
@@ -57,17 +70,33 @@ def try_fused_scaled_residual_add_exact(
     ):
         return None
 
+    runtime_key = (residual.device.index, x.dtype)
+    if runtime_key in _FAILED_RUNTIME_KEYS:
+        return None
+
     output = torch.empty_like(residual)
     block_size = 1024
-    _fused_scaled_residual_add_exact_kernel[(triton.cdiv(x.numel(), block_size),)](
-        output,
-        residual,
-        x,
-        scale,
-        numel=x.numel(),
-        width=x.shape[-1],
-        BLOCK_SIZE=block_size,
-    )
+    try:
+        _fused_scaled_residual_add_exact_kernel[(triton.cdiv(x.numel(), block_size),)](
+            output,
+            residual,
+            x,
+            scale,
+            numel=x.numel(),
+            width=x.shape[-1],
+            BLOCK_SIZE=block_size,
+        )
+    except Exception as exc:
+        if torch.compiler.is_compiling():
+            raise
+        _FAILED_RUNTIME_KEYS.add(runtime_key)
+        logger.warning(
+            "Disabling diffusion scaled residual-add fast path on %s/%s: %s",
+            residual.device,
+            x.dtype,
+            exc,
+        )
+        return None
     return output
 
 
