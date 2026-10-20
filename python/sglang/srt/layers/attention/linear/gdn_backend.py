@@ -893,6 +893,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                requires_state_tracking=forward_metadata.has_mamba_track_mask,
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
                 ),
