@@ -4,6 +4,15 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsa.kv_cache_layout import validate_int8_kv_cache
+
+
+def _check_packed_kv_dtype(dtype, dim_nope: int, dim_rope: int) -> None:
+    if dtype is torch.int8:
+        validate_int8_kv_cache(dim_nope, dim_rope)
+    elif dtype is not torch.float8_e4m3fn:
+        raise TypeError(f"Packed DSA KV cache must be FP8 or INT8, got {dtype}")
+
 
 def _infer_dsa_dims(dim_quant: int, tile_size: int = 128) -> tuple[int, int]:
     """Recover the NoPE and RoPE widths from a packed DSA cache row."""
@@ -55,7 +64,7 @@ def _dequantize_k_cache_fast(
 ):
     num_tokens, dim_quant = quant_k_cache.shape
 
-    assert quant_k_cache.dtype == torch.float8_e4m3fn
+    _check_packed_kv_dtype(quant_k_cache.dtype, dim_nope, dim_rope)
     num_tiles = dim_nope // group_size
     assert dim_quant == dim_nope + num_tiles * 4 + dim_rope * 2
 
@@ -161,7 +170,7 @@ def dequantize_k_cache_paged(
     # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)
     # Index bounds validated in dsa_backend.init_forward_metadata
     num_tokens = page_table_1_flattened.shape[0]
-    assert quant_k_cache.dtype == torch.float8_e4m3fn
+    _check_packed_kv_dtype(quant_k_cache.dtype, dim_nope, dim_rope)
     num_tiles = dim_nope // group_size
 
     output = torch.empty(
@@ -199,6 +208,28 @@ def dequantize_k_cache_paged(
     )
 
     return output
+
+
+def dequantize_k_cache_paged_ref(
+    quant_k_cache: torch.Tensor, page_table_1_flattened: torch.Tensor
+) -> torch.Tensor:
+    """Torch oracle for packed rows, preserving the dynamic FP8 dimensions."""
+    dim_quant = quant_k_cache.shape[-1]
+    dim_nope, dim_rope = _infer_dsa_dims(dim_quant)
+    _check_packed_kv_dtype(quant_k_cache.dtype, dim_nope, dim_rope)
+    indices = page_table_1_flattened.reshape(-1).long()
+    rows = quant_k_cache.reshape(-1, dim_quant)[indices]
+    raw = rows.contiguous().view(torch.uint8)
+    num_groups = dim_nope // 128
+    values = raw[:, :dim_nope].contiguous().view(quant_k_cache.dtype).float()
+    scales = raw[:, dim_nope : dim_nope + num_groups * 4].contiguous().view(
+        torch.float32
+    )
+    nope = (values.reshape(-1, num_groups, 128) * scales.unsqueeze(-1)).reshape(
+        -1, dim_nope
+    )
+    rope = raw[:, dim_nope + num_groups * 4 :].contiguous().view(torch.bfloat16)
+    return torch.cat((nope.to(torch.bfloat16), rope), dim=-1).unsqueeze(1)
 
 
 @triton.jit

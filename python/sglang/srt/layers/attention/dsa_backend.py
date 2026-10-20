@@ -108,6 +108,24 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
+def _dequantize_selected_kv_cache(
+    kv_cache: torch.Tensor, page_table_1: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gather packed rows into BF16 and retain invalid sparse-index sentinels."""
+    indices = page_table_1.reshape(-1)
+    capacity = kv_cache.numel() // kv_cache.shape[-1]
+    valid = (indices >= 0) & (indices < capacity)
+    safe_indices = torch.where(valid, indices, torch.zeros_like(indices))
+    selected = dequantize_k_cache_paged(kv_cache, safe_indices)
+    local_indices = torch.arange(
+        indices.numel(), dtype=indices.dtype, device=indices.device
+    )
+    local_indices = torch.where(
+        valid, local_indices, torch.full_like(local_indices, -1)
+    )
+    return selected, local_indices.view_as(page_table_1)
+
+
 def prepare_kv_for_attention(
     attn_mla,
     forward_batch: ForwardBatch,
@@ -380,8 +398,16 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
+        self.dsa_kv_cache_store_int8 = getattr(
+            model_runner.token_to_kv_pool, "dsa_kv_cache_store_int8", False
+        )
+        self.dsa_kv_cache_is_quantized = (
+            self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8
+        )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
+        if self.dsa_kv_cache_store_int8 and self.dsa_index_kpool != 1:
+            raise ValueError("DSA INT8 main KV cache currently requires index_kpool=1")
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
         self._init_kpool_metadata_fusion()
         self.max_context_len = model_runner.model_config.context_len
@@ -396,6 +422,12 @@ class DeepseekSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        if self.dsa_kv_cache_store_int8:
+            from sglang.kernels.ops.attention.dsa.kv_cache_layout import (
+                validate_int8_kv_cache,
+            )
+
+            validate_int8_kv_cache(self.kv_lora_rank, self.qk_rope_head_dim)
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -1170,7 +1202,10 @@ class DeepseekSparseAttnBackend(
                     cache_seqlens=dsa_cache_seqlens_int32,
                     seq_len_q=1,
                 )
-                if use_flashmla_kv and not _is_xpu and not is_maca()
+                if use_flashmla_kv
+                and not _is_xpu
+                and not is_maca()
+                and not self._use_triton_flashmla_kv
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
@@ -1440,7 +1475,11 @@ class DeepseekSparseAttnBackend(
 
             seqlens_expanded = cache_seqlens_int32
             dsa_extend_seq_lens_list = [1] * bs
-            if self.dsa_decode_impl == "flashmla_kv" and not is_maca():
+            if (
+                self.dsa_decode_impl == "flashmla_kv"
+                and not is_maca()
+                and not self._use_triton_flashmla_kv
+            ):
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
                 ].slice(slice(0, bs + 1))
@@ -1504,7 +1543,11 @@ class DeepseekSparseAttnBackend(
             )
             dsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
-            if self.dsa_decode_impl == "flashmla_kv" and not is_maca():
+            if (
+                self.dsa_decode_impl == "flashmla_kv"
+                and not is_maca()
+                and not self._use_triton_flashmla_kv
+            ):
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
                 ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
@@ -1874,7 +1917,11 @@ class DeepseekSparseAttnBackend(
             effective_n_per_batch=effective_n_per_batch,
         )
 
-        if self.dsa_decode_impl == "flashmla_kv" and not is_maca():
+        if (
+            self.dsa_decode_impl == "flashmla_kv"
+            and not is_maca()
+            and not self._use_triton_flashmla_kv
+        ):
             flashmla_metadata = metadata.flashmla_metadata.slice(
                 slice(0, seqlens_expanded_size + 1)
             )
@@ -2524,6 +2571,10 @@ class DeepseekSparseAttnBackend(
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if kv_cache.dtype is torch.int8:
+            kv_cache, page_table_1 = _dequantize_selected_kv_cache(
+                kv_cache, page_table_1
+            )
         if is_maca():
             from flash_mla import flash_mla_sparse_fwd
         else:
@@ -2932,6 +2983,15 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
+    @property
+    def _use_triton_flashmla_kv(self) -> bool:
+        # The upstream FP8 FlashMLA ABI does not interpret INT8 packed values.
+        # MACA keeps its vendor path unless the correctness fallback is enabled.
+        return (self.dsa_kv_cache_store_int8 and not is_maca()) or (
+            self.dsa_kv_cache_is_quantized
+            and envs.SGLANG_DSA_TRITON_FLASHMLA_KV.get()
+        )
+
     def _forward_flashmla_kv_maca(
         self,
         q_all: torch.Tensor,
@@ -2995,7 +3055,7 @@ class DeepseekSparseAttnBackend(
                 block_table=torch.empty(
                     (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
                 ),
-                is_fp8_kvcache=self.dsa_kv_cache_store_fp8,
+                is_fp8_kvcache=self.dsa_kv_cache_is_quantized,
             )
         else:
             o, _ = flash_mla_with_kvcache(
@@ -3011,7 +3071,7 @@ class DeepseekSparseAttnBackend(
                 block_table=torch.empty(
                     (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
                 ),
-                is_fp8_kvcache=self.dsa_kv_cache_store_fp8,
+                is_fp8_kvcache=self.dsa_kv_cache_is_quantized,
             )
 
         if target_q_heads != num_q_heads:
@@ -3030,6 +3090,21 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
+        if self._use_triton_flashmla_kv:
+            from sglang.kernels.ops.attention.dsa.triton_flashmla_kv import (
+                flash_mla_with_kvcache_triton,
+            )
+
+            output, _ = flash_mla_with_kvcache_triton(
+                q=q_all.reshape(-1, 1, layer.tp_q_head_num, layer.head_dim),
+                k_cache=kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim),
+                block_table=None,
+                cache_seqlens=None,
+                head_dim_v=v_head_dim,
+                softmax_scale=sm_scale,
+                indices=page_table_1.unsqueeze(1),
+            )
+            return output
         if is_maca():
             return self._forward_flashmla_kv_maca(
                 q_all, kv_cache, v_head_dim, sm_scale, layer, metadata, page_table_1
@@ -3759,7 +3834,7 @@ class DeepseekSparseAttnBackend(
         """
         if (
             # disable for MTP
-            self.dsa_kv_cache_store_fp8
+            self.dsa_kv_cache_is_quantized
             # flashmla_sparse_q8 shares flashmla_sparse's RAGGED prefill routing — the q8
             # dispatch lives inside the RAGGED branch of forward_extend; without this the
             # transform is PAGED, the q8 path is skipped, and the bf16 kernel crashes on
@@ -3795,7 +3870,7 @@ class DeepseekSparseAttnBackend(
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
-        if is_maca():
+        if is_maca() or self._use_triton_flashmla_kv:
             return None
         from sgl_kernel.flash_mla import get_mla_metadata
 

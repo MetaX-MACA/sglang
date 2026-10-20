@@ -512,11 +512,13 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         )
     if kv_cache_dtype == "bf16":
         kv_cache_dtype = "bfloat16"
+    if kv_cache_dtype == "int8" and get_platform().is_hip:
+        raise ValueError("DSA INT8 main KV cache is not supported on HIP")
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
         "int8",
-    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+    ], "DeepSeek DSA only supports bf16/bfloat16, fp8_e4m3 or int8 kv_cache_dtype"
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
     return {}
@@ -552,6 +554,16 @@ def _check_dsa_backend_constraints(
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
+
+    if kv_cache_dtype == "int8":
+        if hip:
+            raise ValueError("DSA INT8 main KV cache is not supported on HIP")
+        unsupported = chosen - {"flashmla_sparse", "flashmla_kv"}
+        if unsupported:
+            raise ValueError(
+                "DSA INT8 main KV cache requires flashmla_sparse or flashmla_kv; "
+                f"got prefill={prefill_backend}, decode={decode_backend}"
+            )
 
     rocm_only = {"triton"} & chosen
     if not hip and rocm_only:
@@ -693,6 +705,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_prefill_backend"] = "triton"
         if not user_set_decode:
             declared["dsa_decode_backend"] = "triton"
+    elif kv_cache_dtype == "int8":
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "flashmla_sparse"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "flashmla_kv"
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"

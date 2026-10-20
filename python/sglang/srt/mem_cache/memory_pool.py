@@ -40,11 +40,16 @@ from sglang.srt.utils.common import is_maca
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.attention.dsa.kv_cache_layout import (
+    PACKED_BYTES_PER_TOKEN,
+    validate_int8_kv_cache,
+)
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
+    quantize_k_cache_int8_separate,
     quantize_k_cache_separate,
 )
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
@@ -4037,6 +4042,14 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "dsa_kv_cache_store_fp8", False)
 
     @property
+    def dsa_kv_cache_store_int8(self) -> bool:
+        return getattr(self.full_kv_pool, "dsa_kv_cache_store_int8", False)
+
+    @property
+    def dsa_kv_cache_is_quantized(self) -> bool:
+        return self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8
+
+    @property
     def kv_cache_dim(self):
         return getattr(self.full_kv_pool, "kv_cache_dim", None)
 
@@ -4434,11 +4447,23 @@ class MLATokenToKVPool(KVCache):
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
+        self.dsa_kv_cache_store_int8 = use_dsa and dtype is torch.int8
+        self.dsa_kv_cache_is_quantized = (
+            self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8
+        )
+        if self.dsa_kv_cache_store_int8:
+            validate_int8_kv_cache(kv_lora_rank, qk_rope_head_dim)
+            if override_kv_cache_dim != PACKED_BYTES_PER_TOKEN:
+                raise ValueError(
+                    f"DSA INT8 KV cache requires {PACKED_BYTES_PER_TOKEN} bytes per row, "
+                    f"got override_kv_cache_dim={override_kv_cache_dim}"
+                )
+            self.store_dtype = torch.uint8
         # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.dsa_kv_cache_store_fp8
+            if self.dsa_kv_cache_is_quantized
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -4554,7 +4579,7 @@ class MLATokenToKVPool(KVCache):
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
-        assert not self.dsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_is_quantized
         # No DCP-aware variant is possible: the two backends reaching this door
         # disagree on the loc space (flashinfer-MLA widened, Triton collapsed).
         assert self.write_loc_is_dcp_resolved or not get_parallel().dcp_enabled, (
@@ -4596,6 +4621,11 @@ class MLATokenToKVPool(KVCache):
                 cache_k_rope,
                 fp8_dtype,
             )
+        elif self.dsa_kv_cache_store_int8:
+            nope_bytes, rope_bytes = quantize_k_cache_int8_separate(
+                cache_k_nope, cache_k_rope
+            )
+            self._scatter_mla_rows(dst_buffer, loc, nope_bytes, rope_bytes)
         elif self.dsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
@@ -4657,6 +4687,15 @@ class MLATokenToKVPool(KVCache):
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
         layer_id = layer.layer_id
         kv_buffer = self.get_key_buffer(layer_id)
+        if self.dsa_kv_cache_is_quantized:
+            from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
+                dequantize_k_cache_paged,
+            )
+
+            kv = dequantize_k_cache_paged(kv_buffer, loc.reshape(-1))
+            kv = kv.to(dst_dtype or torch.bfloat16)
+            rope = kv[..., self.kv_lora_rank :] if self.qk_rope_head_dim else None
+            return kv[..., : self.kv_lora_rank], rope
         dst_dtype = dst_dtype or self.dtype
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),
