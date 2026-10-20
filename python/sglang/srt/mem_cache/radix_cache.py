@@ -168,10 +168,18 @@ class RadixKey:
 
     def match(self, other: RadixKey, page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
+        return self._match_from(other, 0, page_size)
+
+    def _match_from(self, other: RadixKey, offset: int, page_size: int = 1) -> int:
+        """Match ``other[offset:]`` without copying the remaining token sequence.
+
+        ``offset`` counts logical units, including in bigram mode. Compare
+        bounded windows within the effective raw lengths to honor ``limit``.
+        """
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
         assert type(t0) is type(t1), (type(t0), type(t1))
-        n = min(len(t0), len(t1))
+        n = min(self._raw_len(), other._raw_len() - offset)
 
         # Exponential search for the first diverging token: gallop in doubling
         # windows (one C-level slice compare each), then binary-search the window
@@ -181,10 +189,10 @@ class RadixKey:
         step = 1
         while lo < n:
             hi = lo + step if lo + step < n else n
-            if t0[lo:hi] != t1[lo:hi]:
+            if t0[lo:hi] != t1[offset + lo : offset + hi]:
                 while hi - lo > 1:
                     mid = (lo + hi) // 2
-                    if t0[lo:mid] == t1[lo:mid]:
+                    if t0[lo:mid] == t1[offset + lo : offset + mid]:
                         lo = mid
                     else:
                         hi = mid
@@ -194,10 +202,10 @@ class RadixKey:
             step *= 2
 
         if self.is_bigram:
-            matched = max(0, min(matched_tokens - 1, len(self), len(other)))
+            matched = max(0, min(matched_tokens - 1, len(self), len(other) - offset))
             return (matched // page_size) * page_size if page_size > 1 else matched
 
-        matched_tokens = min(matched_tokens, len(self), len(other))
+        matched_tokens = min(matched_tokens, len(self), len(other) - offset)
         if page_size == 1:
             return matched_tokens
         return (matched_tokens // page_size) * page_size
@@ -212,6 +220,24 @@ class RadixKey:
                 plain = tuple((t[j], t[j + 1]) for j in range(page_size))
         else:
             plain = t[0] if page_size == 1 else tuple(t[:page_size])
+        return plain if self.extra_key is None else (self.extra_key, plain)
+
+    def _child_key_from(self, offset: int, page_size: int = 1):
+        """Return the child lookup key at a logical offset without tail slicing."""
+        if offset == 0:
+            return self.child_key(page_size)
+        t = self.token_ids
+        if self.is_bigram:
+            if page_size == 1:
+                plain = (t[offset], t[offset + 1])
+            else:
+                plain = tuple(
+                    (t[j], t[j + 1]) for j in range(offset, offset + page_size)
+                )
+        else:
+            plain = (
+                t[offset] if page_size == 1 else tuple(t[offset : offset + page_size])
+            )
         return plain if self.extra_key is None else (self.extra_key, plain)
 
     def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
@@ -667,12 +693,14 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         node.last_access_time = access_time
 
         child_key = key.child_key(self.page_size)
+        key_len = len(key)
+        offset = 0
 
         value = []
-        while len(key) > 0 and child_key in node.children.keys():
+        while offset < key_len and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key._match_from(key, offset, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -681,10 +709,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             else:
                 value.append(child.value)
                 node = child
-                key = key[prefix_len:]
+                offset += prefix_len
 
-                if len(key):
-                    child_key = key.child_key(self.page_size)
+                if offset < key_len:
+                    child_key = key._child_key_from(offset, self.page_size)
 
         return value, node
 
@@ -733,19 +761,20 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         node.last_access_time = access_time
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
-        if len(key) == 0:
+        key_len = len(key)
+        if key_len == 0:
             return 0, node
 
         child_key = key.child_key(self.page_size)
 
         total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        while total_prefix_length < key_len and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = access_time
-            prefix_len = node.key.match(key, page_size=self.page_size)
+            prefix_len = node.key._match_from(
+                key, total_prefix_length, page_size=self.page_size
+            )
             total_prefix_length += prefix_len
-            key = key[prefix_len:]
-            value = value[prefix_len:]
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -755,17 +784,23 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             else:
                 node.priority = max(node.priority, priority)
                 self._inc_hit_count(node, chunked)
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            if total_prefix_length < key_len:
+                child_key = key._child_key_from(total_prefix_length, self.page_size)
 
-        if len(key):
+        if total_prefix_length < key_len:
             new_node = TreeNode(priority=priority)
             new_node.parent = node
-            new_node.key = key
-            new_node.value = value.clone()
+            # Only materialize the suffix owned by the persistent node, rather
+            # than retaining the full request's token sequence through a view.
+            new_node.key = key[total_prefix_length:] if total_prefix_length else key
+            new_node.value = (
+                value[total_prefix_length:].clone()
+                if total_prefix_length
+                else value.clone()
+            )
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
-            self.evictable_size_ += len(key)
+            self.evictable_size_ += len(new_node.key)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
