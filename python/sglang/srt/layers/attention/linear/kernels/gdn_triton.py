@@ -1,9 +1,11 @@
+import os
+
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_maca, is_npu, is_xpu
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
@@ -36,6 +38,17 @@ elif is_xpu():
     from sglang.srt.hardware_backend.xpu.kernels.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
+
+
+_use_external_fla = is_maca() and os.getenv("MACA_SGLANG_USE_EXTERNAL_FLA", "0") == "1"
+_use_external_fla_decode = is_maca() and (
+    _use_external_fla
+    or os.getenv("MACA_SGLANG_USE_EXTERNAL_FLA_GDN_DECODE", "0") == "1"
+)
+_use_external_fla_prefill = is_maca() and (
+    _use_external_fla
+    or os.getenv("MACA_SGLANG_USE_EXTERNAL_FLA_GDN_PREFILL", "0") == "1"
+)
 
 
 class TritonGDNKernel(LinearAttnKernelBase):
@@ -77,6 +90,23 @@ class TritonGDNKernel(LinearAttnKernelBase):
             output tensor of shape [1, B, HV, V] matching the existing
             decode kernel output layout.
         """
+        if _use_external_fla_decode and not any(
+            kwargs.get(name) is not None
+            for name in (
+                "replayssm_d", "replayssm_k", "replayssm_g",
+                "replayssm_write_pos", "replayssm_force_flush",
+            )
+        ):
+            from sglang.srt.layers.attention.linear.kernels.gdn_external_fla import (
+                packed_decode_external_fla,
+            )
+
+            return packed_decode_external_fla(
+                mixed_qkv, a, b, A_log=A_log, dt_bias=dt_bias, scale=scale,
+                ssm_states=ssm_states, cache_indices=cache_indices,
+                num_v_heads=num_v_heads, head_v_dim=head_v_dim, **kwargs,
+            )
+
         B = mixed_qkv.shape[0]
         # Packed kernel expects output shape [B, 1, HV, V]
         out = mixed_qkv.new_empty(B, 1, num_v_heads, head_v_dim)
@@ -179,6 +209,22 @@ class TritonGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
+        if (
+            _use_external_fla_prefill
+            and not kwargs.get("requires_state_tracking", False)
+            and not kwargs.get("num_state_checkpoints", 0)
+            and kwargs.get("state_checkpoint_cu_starts") is None
+        ):
+            from sglang.srt.layers.attention.linear.kernels.gdn_external_fla import (
+                extend_external_fla,
+            )
+
+            return extend_external_fla(
+                q, k, v, g, beta, ssm_states=ssm_states,
+                cache_indices=cache_indices, query_start_loc=query_start_loc,
+                **kwargs,
+            )
+
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         if is_npu():
