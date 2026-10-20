@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.metadata import (
     draft_extend_set_metadata,
