@@ -119,6 +119,27 @@ class TestDSV41CPPDPolicy(CustomTestCase):
                 disaggregation_mode="decode", tp_size=8, dp_size=dp,
             )
 
+    def test_fake_transfer_backend_allowed_for_decode_test(self):
+        self.validate(
+            enable_prefill_cp=False,
+            enable_dp_attention=True,
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="fake",
+            tp_size=8,
+            dp_size=8,
+        )
+
+    def test_unvalidated_transfer_backend_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Mooncake or the fake"):
+            self.validate(
+                enable_prefill_cp=False,
+                enable_dp_attention=True,
+                disaggregation_mode="decode",
+                disaggregation_transfer_backend="mooncake_tcp",
+                tp_size=8,
+                dp_size=8,
+            )
+
     def test_prefill_cp_resolution(self):
         for cp in (1, 8):
             self.validate(

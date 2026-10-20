@@ -254,7 +254,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend != "mooncake"
+            or cfg.disaggregation_transfer_backend not in ("mooncake", "fake")
             or (
                 (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
                 and not supported_prefill_cp
@@ -263,6 +263,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
+                "fake test backend, "
                 "DCP=1, and CP=1 on decode. Prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "
