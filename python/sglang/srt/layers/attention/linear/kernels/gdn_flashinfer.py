@@ -489,8 +489,18 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
 
-        q_fi = l2norm_fwd(q[0].contiguous())
-        k_fi = l2norm_fwd(k[0].contiguous())
+        # MetaX FlashInfer can normalize Q/K inside the prefill kernel.
+        # Preserve other backends and allow an explicit fallback on MACA.
+        inline_l2norm = (
+            is_maca()
+            and os.getenv("MACA_SGLANG_FLASHINFER_PREFILL_INLINE_L2NORM", "1") == "1"
+        )
+        if inline_l2norm:
+            q_fi = q[0].contiguous()
+            k_fi = k[0].contiguous()
+        else:
+            q_fi = l2norm_fwd(q[0].contiguous())
+            k_fi = l2norm_fwd(k[0].contiguous())
         v_fi = v[0].contiguous()
 
         output = kwargs.get("output")
@@ -562,7 +572,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             initial_state=initial_state_fi,
             output_final_state=True,
             cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=False,
+            use_qk_l2norm_in_kernel=inline_l2norm,
             output=output_fi,
             output_state=output_state_fi,
             state_checkpoints=state_checkpoints,
