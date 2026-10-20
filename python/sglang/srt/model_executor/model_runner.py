@@ -686,7 +686,12 @@ class ModelRunner:
             self.remote_instance_weight_transporter.init_engine()
 
     def maybe_init_expert_location_metadata(self):
-        if self.is_draft_worker:
+        enable_dspark_redundant_experts = (
+            self.is_draft_worker
+            and self.spec_algorithm.is_dspark()
+            and envs.SGLANG_DSPARK_NUM_PHYSICAL_EXPERTS.get() > 0
+        )
+        if self.is_draft_worker and not enable_dspark_redundant_experts:
             return
         expert_rank = get_parallel().moe_ep_rank + (
             get_parallel().ep_join_rank_offset
@@ -710,6 +715,13 @@ class ModelRunner:
                 rank=expert_rank,
             )
         )
+        if enable_dspark_redundant_experts and self.ps.tp_rank == 0:
+            metadata = get_global_expert_location_metadata()
+            logger.info(
+                "Initialized DSpark draft expert replicas: logical=%s, physical=%s.",
+                metadata.num_logical_experts,
+                metadata.num_physical_experts,
+            )
 
     def maybe_init_lplb_solvers(self):
         if get_exec().moe.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:

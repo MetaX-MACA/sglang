@@ -233,6 +233,16 @@ class DeepEPBuffer:
         if state.buffer is not None:
             return state.buffer
 
+        configured_max_num_experts = envs.SGLANG_DEEPEP_MAX_NUM_EXPERTS.get()
+        if configured_max_num_experts > 0:
+            if configured_max_num_experts < num_experts:
+                raise ValueError(
+                    "SGLANG_DEEPEP_MAX_NUM_EXPERTS must be greater than or "
+                    f"equal to the model's num_experts ({num_experts}), got "
+                    f"{configured_max_num_experts}."
+                )
+            num_experts = configured_max_num_experts
+
         state.hidden_size = hidden_size
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts

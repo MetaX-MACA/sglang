@@ -48,6 +48,61 @@ def draft_is_deepseek_v4() -> bool:
     return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
 
 
+def get_dspark_draft_num_logical_experts() -> int:
+    """Read the routed-expert count from the DSpark draft checkpoint."""
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    draft_model_path = get_spec().speculative_draft_model_path
+    if not draft_model_path:
+        raise ValueError(
+            "SGLANG_DSPARK_NUM_PHYSICAL_EXPERTS requires a DSpark draft model."
+        )
+    draft_hf_config = get_config(
+        draft_model_path,
+        trust_remote_code=get_model().trust_remote_code,
+        revision=get_spec().speculative_draft_model_revision,
+        model_override_args=json.loads(get_model().json_model_override_args),
+        model_config_parser=get_model().model_config_parser,
+    )
+    return resolve_dspark_num_logical_experts(draft_hf_config)
+
+
+def resolve_dspark_num_logical_experts(draft_hf_config: Any) -> int:
+    text_config = _get_text_config(draft_hf_config)
+    # A bundled DSV4.1 checkpoint keeps the target count in
+    # n_routed_experts and the smaller draft count in the prefixed field.
+    num_experts = _cfg_get(text_config, "dspark_n_routed_experts", None)
+    if num_experts is None:
+        num_experts = _cfg_get(text_config, "n_routed_experts", None)
+    if num_experts is None:
+        num_experts = _cfg_get(text_config, "num_experts", None)
+    if num_experts is None:
+        raise ValueError(
+            "Cannot resolve the DSpark draft routed-expert count from its config."
+        )
+    return int(num_experts)
+
+
+def resolve_dspark_num_redundant_experts(
+    *, num_logical_experts: int, num_physical_experts: int, ep_size: int
+) -> int:
+    """Validate a DSpark physical-expert target and return its replica count."""
+    if num_physical_experts <= 0:
+        return 0
+    if num_physical_experts < num_logical_experts:
+        raise ValueError(
+            "SGLANG_DSPARK_NUM_PHYSICAL_EXPERTS must be greater than or equal "
+            f"to the draft logical expert count ({num_logical_experts}), got "
+            f"{num_physical_experts}."
+        )
+    if num_physical_experts % ep_size != 0:
+        raise ValueError(
+            "SGLANG_DSPARK_NUM_PHYSICAL_EXPERTS must be divisible by the draft "
+            f"EP size ({ep_size}), got {num_physical_experts}."
+        )
+    return num_physical_experts - num_logical_experts
+
+
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
     gamma = int(num_draft_tokens) - 1
     if gamma < 1:
