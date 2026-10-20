@@ -14,6 +14,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import inspect
 import logging
 import os
 from dataclasses import dataclass
@@ -1838,6 +1839,15 @@ class FlashInferIndicesUpdaterPrefill:
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
+        # CPU mirrors for regular eager/PCG paged prefill planning.
+        max_bs = model_runner.req_to_token_pool.size
+        self.paged_plan_qo_indptr_host = torch.empty(
+            max_bs + 1, dtype=torch.int32, device="cpu"
+        )
+        self.paged_plan_kv_indptr_host = torch.empty(
+            max_bs + 1, dtype=torch.int32, device="cpu"
+        )
+
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
             self.update = self.update_sliding_window
@@ -1868,6 +1878,15 @@ class FlashInferIndicesUpdaterPrefill:
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
+
+    def _build_paged_plan_host_indptrs(self, bs, paged_kernel_lens_cpu, qo_lens_cpu):
+        """Mirror device cumsums using CPU-only scheduler metadata."""
+        qo = self.paged_plan_qo_indptr_host[: bs + 1]
+        kv = self.paged_plan_kv_indptr_host[: bs + 1]
+        qo[0] = kv[0] = 0
+        qo[1:] = torch.cumsum(torch.as_tensor(qo_lens_cpu), dim=0)
+        kv[1:] = torch.cumsum(torch.as_tensor(paged_kernel_lens_cpu), dim=0)
+        return qo, kv
 
     def update_single_wrapper(
         self,
@@ -1900,6 +1919,35 @@ class FlashInferIndicesUpdaterPrefill:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
 
+        qo_indptr_host = paged_kv_indptr_host = None
+        if (
+            envs.SGLANG_FLASHINFER_FAST_PREFILL_PLAN.get()
+            and spec_info is None
+            and custom_kv_indices is None
+            and not prefill_wrappers[0].is_cuda_graph_enabled
+            and seq_lens_cpu is not None
+            and extend_prefix_lens_cpu is not None
+            and (
+                not isinstance(seq_lens_cpu, torch.Tensor)
+                or seq_lens_cpu.device.type == "cpu"
+            )
+            and (
+                not isinstance(extend_prefix_lens_cpu, torch.Tensor)
+                or extend_prefix_lens_cpu.device.type == "cpu"
+            )
+            and len(seq_lens_cpu) == len(seq_lens)
+            and len(extend_prefix_lens_cpu) == len(seq_lens)
+        ):
+            seq_host = torch.as_tensor(seq_lens_cpu, dtype=torch.int32, device="cpu")
+            prefix_host = torch.as_tensor(
+                extend_prefix_lens_cpu, dtype=torch.int32, device="cpu"
+            )
+            qo_indptr_host, paged_kv_indptr_host = self._build_paged_plan_host_indptrs(
+                len(seq_lens),
+                prefix_host if use_ragged else seq_host,
+                seq_host - prefix_host,
+            )
+
         self.call_begin_forward(
             self.prefill_wrapper_ragged,
             prefill_wrappers[0],
@@ -1916,6 +1964,8 @@ class FlashInferIndicesUpdaterPrefill:
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
             seq_lens_cpu=seq_lens_cpu,
+            qo_indptr_host=qo_indptr_host,
+            paged_kv_indptr_host=paged_kv_indptr_host,
             custom_kv_indices=custom_kv_indices,
             kv_view=kv_view,
         )
@@ -2134,6 +2184,8 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
         window_left: int = -1,
+        qo_indptr_host: Optional[torch.Tensor] = None,
+        paged_kv_indptr_host: Optional[torch.Tensor] = None,
         *,
         kv_view: KVIndexTable,
     ):
@@ -2309,6 +2361,34 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
 
+        elif (
+            qo_indptr_host is not None
+            and paged_kv_indptr_host is not None
+            and spec_info is None
+            and use_custom_mask is None
+            and not (multi_item_params is not None and multi_item_params.is_enabled())
+            and custom_kv_indices is None
+            and kv_start_idx is None
+            and window_left == -1
+            and not use_sliding_window_kv_pool
+            and not wrapper_paged.is_cuda_graph_enabled
+        ):
+            fast_eager_prefill_plan(
+                wrapper_paged,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+                non_blocking=True,
+                qo_indptr_host=qo_indptr_host,
+                paged_kv_indptr_host=paged_kv_indptr_host,
+            )
         else:
             wrapper_paged.begin_forward(
                 qo_indptr,
@@ -2715,3 +2795,172 @@ def fast_decode_plan(
     self._sm_scale = sm_scale
     self._rope_scale = rope_scale
     self._rope_theta = rope_theta
+
+
+def fast_eager_prefill_plan(
+    wrapper: BatchPrefillWithPagedKVCacheWrapper,
+    qo_indptr: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    page_size: int,
+    q_data_type: Union[str, torch.dtype],
+    kv_data_type: Union[str, torch.dtype],
+    non_blocking: bool = True,
+    *,
+    qo_indptr_host: torch.Tensor,
+    paged_kv_indptr_host: torch.Tensor,
+) -> None:
+    """
+    A sync-free version of BatchPrefillWithPagedKVCacheWrapper::plan for the
+    eager-wrapper prefill path, including piecewise graph metadata setup.
+
+    FlashInfer's ``plan`` converts ``qo_indptr``, ``paged_kv_indptr`` and
+    ``paged_kv_last_page_len`` to CPU with blocking ``.to("cpu")`` reads to
+    build its scheduling metadata. Every prefill batch (including every
+    Piecewise CUDA Graph replay, which re-runs ``init_forward_metadata``
+    outside the captured pieces) pays three device-to-host copies that drain
+    the GPU queue and break CPU/GPU overlap. The caller already knows the same
+    layout on the host - SGLang derives ``seq_lens`` / ``extend_prefix_lens``
+    on CPU - so here we call the underlying ``_cached_module.plan`` directly
+    with host-side indptrs and never read back from the device.
+
+    The produced ``_plan_info``, wrapper buffers and workspace state are
+    identical to what ``plan`` would have computed; only the three D2H copies
+    are skipped.
+
+    Notes on the supported configuration (checked below, otherwise this falls
+    back to the regular ``plan``):
+      * fa2 backend, non-cuda-graph wrapper, page_size == 1
+      * no custom mask / multi-item scoring (the caller gates on these too)
+      * ``_cached_module`` already exists from a previous regular ``plan``
+        call (the first call per wrapper always goes through ``plan`` so the
+        JIT module and the workspace setup stay owned by FlashInfer)
+      * the module plan's trailing optional arguments are detected from
+        FlashInfer's own ``plan`` signature on that first call: older builds
+        (e.g. 0.2.6) end at ``causal``; newer builds append
+        ``fixed_split_size`` / ``disable_split_kv`` which are filled with
+        their defaults here
+      * enabled by default; set ``SGLANG_FLASHINFER_FAST_PREFILL_PLAN=0`` to
+        disable and use FlashInfer's regular plan path
+    """
+    cached_module = getattr(wrapper, "_cached_module", None)
+    if kv_data_type is None:
+        kv_data_type = q_data_type
+    plan_key = (
+        q_data_type,
+        kv_data_type,
+        head_dim_qk,
+        page_size,
+        num_qo_heads,
+        num_kv_heads,
+        paged_kv_indptr.dtype,
+    )
+    if (
+        not envs.SGLANG_FLASHINFER_FAST_PREFILL_PLAN.get()
+        or cached_module is None
+        or wrapper.is_cuda_graph_enabled
+        or wrapper._backend != "fa2"
+        or page_size != 1
+        or getattr(wrapper, "_jit_module", None) is not None
+        or q_data_type not in (torch.float16, torch.bfloat16)
+        or kv_data_type not in (torch.float16, torch.bfloat16)
+        or not isinstance(q_data_type, torch.dtype)
+        or not isinstance(kv_data_type, torch.dtype)
+        or getattr(wrapper, "_fast_prefill_plan_key", None) != plan_key
+    ):
+        # First call (or an unexpected configuration change): let FlashInfer's
+        # own plan() build/rebuild the module and the initial plan info. This
+        # is a one-time cost per wrapper and keeps this fast path independent
+        # of FlashInfer's module construction internals.
+        BatchPrefillWithPagedKVCacheWrapper.plan(
+            wrapper,
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk,
+            page_size,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            non_blocking=non_blocking,
+        )
+        # Detect the underlying module plan's trailing optional arguments once,
+        # after FlashInfer's own plan() has bound the module. Older versions
+        # (15 args, e.g. 0.2.6) end at ``causal``; newer ones (17 args) append
+        # ``fixed_split_size`` and ``disable_split_kv``.
+        plan_params = inspect.signature(
+            BatchPrefillWithPagedKVCacheWrapper.plan
+        ).parameters
+        wrapper._fast_prefill_plan_extra_args = (
+            (-1, False) if "fixed_split_size" in plan_params else ()
+        )
+        wrapper._fast_prefill_plan_key = plan_key
+        return
+
+    batch_size = len(qo_indptr_host) - 1
+
+    # Device-side buffers: same tensors ``plan`` would have bound and exactly
+    # the ones the caller produced with the async device cumsums, so no
+    # host-to-device round trip is needed for them either.
+    wrapper._qo_indptr_buf = qo_indptr
+    wrapper._paged_kv_indptr_buf = paged_kv_indptr
+    wrapper._paged_kv_indices_buf = paged_kv_indices
+    wrapper._paged_kv_last_page_len_buf = paged_kv_last_page_len
+    wrapper._custom_mask_buf = None
+    wrapper._custom_mask_active = False
+    wrapper._mask_indptr_buf = None
+
+    wrapper._cached_q_data_type = q_data_type
+    wrapper._cached_kv_data_type = kv_data_type
+    wrapper._cached_o_data_type = q_data_type
+
+    # page_size == 1: every page is full, so last_page_len is all ones. This
+    # is what FlashInfer would have read back from the device buffer.
+    paged_kv_last_page_len_host = torch.ones(batch_size, dtype=torch.int32)
+    kv_lens_arr_host = get_seq_lens(
+        paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
+    )
+    # FA2 consumes the host KV lengths directly (they are passed to the module
+    # plan below); the GPU-side kv-lens buffer was only used by the FA3 path
+    # and no longer exists in newer FlashInfer versions.
+
+    total_num_rows = int(qo_indptr_host[-1])
+    wrapper._qo_indptr_last = total_num_rows
+    wrapper._plan_info = cached_module.plan(
+        wrapper._float_workspace_buffer,
+        wrapper._int_workspace_buffer,
+        wrapper._pin_memory_int_workspace_buffer,
+        qo_indptr_host,
+        paged_kv_indptr_host,
+        kv_lens_arr_host,
+        wrapper._max_total_num_rows or total_num_rows,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        page_size,
+        wrapper.is_cuda_graph_enabled,
+        head_dim_qk,
+        head_dim_qk,
+        False,  # causal; forward() supplies the real flag at call time
+        *wrapper._fast_prefill_plan_extra_args,
+    )
+
+    # Mirror the cached state tail of plan(). forward() overwrites the
+    # per-call fields (causal / window_left / ...) before ``run``.
+    wrapper._causal = False
+    wrapper._pos_encoding_mode = "NONE"
+    wrapper._use_fp16_qk_reduction = False
+    wrapper._window_left = -1
+    wrapper._logits_soft_cap = 0.0
+    wrapper._sm_scale = None
+    wrapper._rope_scale = None
+    wrapper._rope_theta = None
+    # The current MetaX FlashInfer run() also reads these optional fields.
+    wrapper._seq_lens_kv = None
+    wrapper._seq_lens_q = None
