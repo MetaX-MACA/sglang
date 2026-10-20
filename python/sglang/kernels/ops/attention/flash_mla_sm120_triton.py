@@ -33,6 +33,7 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
     FP8_SCALE_BYTES_PER_TOKEN,
     INT8_SCALE_BYTES_PER_TOKEN,
     NOPE_DIM,
+    QUANT_GROUP_SIZE,
     ROPE_DIM,
     VALUE_BYTES_PER_TOKEN,
     get_kv_cache_format,
@@ -350,6 +351,196 @@ def _apply_attn_sink(
     return (out.float() * w.unsqueeze(-1)).to(torch.bfloat16), combined_lse
 
 
+@triton.jit
+def _int8_sparse_decode_partial_kernel(
+    Q, KV, ROPE, SCALE, INDICES, LENGTH, OUT, LSE,
+    sm_scale: tl.float32,
+    H: tl.constexpr, TOPK: tl.constexpr, PAGE_SIZE: tl.constexpr,
+    PAGE_BYTES: tl.constexpr, STRIDE_QB: tl.constexpr, STRIDE_QH: tl.constexpr,
+    STRIDE_IB: tl.constexpr, HAS_LENGTH: tl.constexpr,
+    SPLITS: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_T: tl.constexpr,
+    DATA_BYTES: tl.constexpr, SCALE_BYTES: tl.constexpr,
+    NOPE_DIM: tl.constexpr, GROUP_SIZE: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    split = tl.program_id(2) // 4
+    value_block = tl.program_id(2) % 4
+    d = tl.arange(0, GROUP_SIZE)
+    vd = value_block * 128 + tl.arange(0, 128)
+    t = tl.arange(0, BLOCK_T)
+    valid_length = TOPK
+    if HAS_LENGTH:
+        valid_length = tl.minimum(tl.load(LENGTH + batch), TOPK)
+    tiles = tl.cdiv(TOPK, SPLITS * BLOCK_T)
+    start = split * tiles * BLOCK_T
+    end = tl.minimum(start + tiles * BLOCK_T, valid_length)
+    maximum = tl.full((BLOCK_H,), -1.0e30, tl.float32)
+    denominator = tl.zeros((BLOCK_H,), tl.float32)
+    accumulator = tl.zeros((BLOCK_H, 128), tl.float32)
+    for offset in range(start, end, BLOCK_T):
+        token = offset + t
+        index = tl.load(INDICES + batch * STRIDE_IB + token, token < TOPK, -1)
+        valid = (token < valid_length) & (index >= 0)
+        index = tl.where(valid, index, 0)
+        page = (index // PAGE_SIZE).to(tl.int64)
+        slot = index % PAGE_SIZE
+        base = page * PAGE_BYTES + slot * DATA_BYTES
+        scale_base = (page * PAGE_BYTES + PAGE_SIZE * DATA_BYTES + slot * SCALE_BYTES) // 4
+        score = tl.zeros((BLOCK_H, BLOCK_T), tl.float32)
+        # Limit live operands to one 64-value quantization group.
+        for group in range(0, NOPE_DIM // GROUP_SIZE):
+            query = tl.load(
+                Q + batch * STRIDE_QB + heads[:, None] * STRIDE_QH + group * GROUP_SIZE + d[None, :],
+                heads[:, None] < H, 0.0,
+            )
+            quantized = tl.load(
+                KV + base[:, None] + group * GROUP_SIZE + d[None, :], valid[:, None], 0,
+            ).to(tl.float32)
+            scale = tl.load(SCALE + scale_base + group, valid, 1.0)
+            value = quantized * scale[:, None]
+            high = value.to(tl.bfloat16)
+            low = (value - high.to(tl.float32)).to(tl.bfloat16)
+            score = tl.dot(query, tl.trans(high), score)
+            score = tl.dot(query, tl.trans(low), score)
+        query_rope = tl.load(
+            Q + batch * STRIDE_QB + heads[:, None] * STRIDE_QH + NOPE_DIM + d[None, :],
+            heads[:, None] < H, 0.0,
+        )
+        key_rope = tl.load(
+            ROPE + base[:, None] // 2 + (NOPE_DIM // 2) + d[None, :], valid[:, None], 0.0,
+        )
+        score = tl.dot(query_rope, tl.trans(key_rope), score) * sm_scale * LOG2E
+        score = tl.where(valid[None, :], score, -1.0e30)
+        new_maximum = tl.maximum(maximum, tl.max(score, 1))
+        alpha = tl.exp2(maximum - new_maximum)
+        probability = tl.where(valid[None, :], tl.exp2(score - new_maximum[:, None]), 0.0)
+        denominator = denominator * alpha + tl.sum(probability, 1)
+        quantized_v = tl.load(
+            KV + base[:, None] + vd[None, :],
+            valid[:, None] & (vd[None, :] < NOPE_DIM), 0,
+        ).to(tl.float32)
+        v_scale = tl.load(
+            SCALE + scale_base[:, None] + vd[None, :] // GROUP_SIZE,
+            valid[:, None] & (vd[None, :] < NOPE_DIM), 1.0,
+        )
+        v_rope = tl.load(
+            ROPE + base[:, None] // 2 + (NOPE_DIM // 2) + vd[None, :] - NOPE_DIM,
+            valid[:, None] & (vd[None, :] >= NOPE_DIM), 0.0,
+        ).to(tl.float32)
+        value_v = tl.where(vd[None, :] < NOPE_DIM, quantized_v * v_scale, v_rope)
+        v_high = value_v.to(tl.bfloat16)
+        v_low = (value_v - v_high.to(tl.float32)).to(tl.bfloat16)
+        p_high = probability.to(tl.bfloat16)
+        p_low = (probability - p_high.to(tl.float32)).to(tl.bfloat16)
+        accumulator = accumulator * alpha[:, None]
+        accumulator = tl.dot(p_high, v_high, accumulator)
+        accumulator = tl.dot(p_low, v_high, accumulator)
+        accumulator = tl.dot(p_high, v_low, accumulator)
+        accumulator = tl.dot(p_low, v_low, accumulator)
+        maximum = new_maximum
+    safe_denominator = tl.where(denominator > 0.0, denominator, 1.0)
+    out_base = ((batch * H + heads) * SPLITS + split) * 512
+    tl.store(OUT + out_base[:, None] + vd[None, :],
+             accumulator / safe_denominator[:, None], heads[:, None] < H)
+    if value_block == 0:
+        lse = tl.where(denominator > 0.0, maximum / LOG2E + tl.log(safe_denominator), float("-inf"))
+        tl.store(LSE + (batch * H + heads) * SPLITS + split, lse, heads < H)
+
+
+@triton.jit
+def _reduce_int8_sparse_decode_kernel(
+    partial_ptr, lse_ptr, extra_partial_ptr, extra_lse_ptr, sink_ptr,
+    out_ptr, out_lse_ptr,
+    H: tl.constexpr, SPLITS: tl.constexpr, EXTRA_SPLITS: tl.constexpr,
+    HAS_EXTRA: tl.constexpr, HAS_SINK: tl.constexpr,
+    BLOCK_S: tl.constexpr, BLOCK_EXTRA_S: tl.constexpr,
+):
+    row = tl.program_id(0)
+    d = tl.arange(0, 512)
+    s = tl.arange(0, BLOCK_S)
+    ls = tl.load(lse_ptr + row * SPLITS + s, s < SPLITS, float("-inf"))
+    maximum = tl.max(ls, 0)
+    if HAS_EXTRA:
+        es = tl.arange(0, BLOCK_EXTRA_S)
+        els = tl.load(extra_lse_ptr + row * EXTRA_SPLITS + es, es < EXTRA_SPLITS, float("-inf"))
+        maximum = tl.maximum(maximum, tl.max(els, 0))
+    if HAS_SINK:
+        sink = tl.load(sink_ptr + row % H).to(tl.float32)
+        maximum = tl.maximum(maximum, sink)
+    maximum = tl.where(maximum == float("-inf"), 0.0, maximum)
+    weights = tl.exp(ls - maximum)
+    values = tl.load(
+        partial_ptr + (row * SPLITS + s[:, None]) * 512 + d[None, :],
+        s[:, None] < SPLITS, 0.0,
+    )
+    numerator = tl.sum(weights[:, None] * values, 0)
+    denominator = tl.sum(weights, 0)
+    if HAS_EXTRA:
+        eweights = tl.exp(els - maximum)
+        evalues = tl.load(
+            extra_partial_ptr + (row * EXTRA_SPLITS + es[:, None]) * 512 + d[None, :],
+            es[:, None] < EXTRA_SPLITS, 0.0,
+        )
+        numerator += tl.sum(eweights[:, None] * evalues, 0)
+        denominator += tl.sum(eweights, 0)
+    if HAS_SINK:
+        denominator += tl.exp(sink - maximum)
+    safe_denominator = tl.where(denominator > 0.0, denominator, 1.0)
+    tl.store(out_ptr + row * 512 + d, numerator / safe_denominator)
+    tl.store(out_lse_ptr + row, tl.where(
+        denominator > 0.0, maximum + tl.log(safe_denominator), float("-inf")
+    ))
+
+
+def _run_int8_sparse_decode(q, k_cache, indices, topk_length, attn_sink,
+                           softmax_scale, extra_k_cache, extra_indices,
+                           extra_topk_length):
+    B, _, H, D = q.shape
+    query = q.squeeze(1).contiguous()
+
+    def partial(cache, cache_indices, length):
+        flat_indices = cache_indices.reshape(B, -1).contiguous()
+        topk = flat_indices.shape[1]
+        splits = min(8, max(1, triton.cdiv(topk, 32)))
+        page_size, page_bytes = cache.shape[1], cache.stride(0)
+        raw = cache.as_strided((cache.shape[0] * page_bytes,), (1,)).view(torch.uint8)
+        values = torch.empty((B, H, splits, D), device=q.device, dtype=torch.float32)
+        lse = torch.empty((B, H, splits), device=q.device, dtype=torch.float32)
+        _int8_sparse_decode_partial_kernel[(B, triton.cdiv(H, 32), splits * 4)](
+            query, raw.view(torch.int8), raw.view(torch.bfloat16), raw.view(torch.float32),
+            flat_indices, length if length is not None else flat_indices,
+            values, lse, softmax_scale,
+            H=H, TOPK=topk, PAGE_SIZE=page_size, PAGE_BYTES=page_bytes,
+            STRIDE_QB=query.stride(0), STRIDE_QH=query.stride(1),
+            STRIDE_IB=flat_indices.stride(0), HAS_LENGTH=length is not None,
+            SPLITS=splits, BLOCK_H=32, BLOCK_T=32, num_warps=4, num_stages=1,
+            DATA_BYTES=VALUE_BYTES_PER_TOKEN, SCALE_BYTES=INT8_SCALE_BYTES_PER_TOKEN,
+            NOPE_DIM=_NOPE_DIM, GROUP_SIZE=QUANT_GROUP_SIZE,
+        )
+        return values, lse
+
+    values, lse = partial(k_cache, indices, topk_length)
+    has_extra = extra_k_cache is not None and extra_indices is not None
+    if has_extra:
+        extra_values, extra_lse = partial(extra_k_cache, extra_indices, extra_topk_length)
+    else:
+        extra_values, extra_lse = values, lse
+    splits, extra_splits = lse.shape[-1], extra_lse.shape[-1]
+    out = torch.empty((B, 1, H, D), device=q.device, dtype=q.dtype)
+    out_lse = torch.empty((B, H, 1), device=q.device, dtype=torch.float32)
+    _reduce_int8_sparse_decode_kernel[(B * H,)](
+        values, lse, extra_values, extra_lse,
+        attn_sink if attn_sink is not None else lse,
+        out, out_lse, H=H, SPLITS=splits, EXTRA_SPLITS=extra_splits,
+        HAS_EXTRA=has_extra, HAS_SINK=attn_sink is not None,
+        BLOCK_S=triton.next_power_of_2(splits),
+        BLOCK_EXTRA_S=triton.next_power_of_2(extra_splits),
+        num_warps=4,
+    )
+    return out, out_lse
+
+
 def flash_mla_sparse_decode_triton(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -369,6 +560,14 @@ def flash_mla_sparse_decode_triton(
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+
+    if k_cache.dtype is torch.int8 and (
+        extra_k_cache is None or extra_k_cache.dtype is torch.int8
+    ):
+        return _run_int8_sparse_decode(
+            q, k_cache, indices, topk_length, attn_sink, softmax_scale,
+            extra_k_cache, extra_indices, extra_topk_length,
+        )
 
     # Process main cache (SWA)
     out, lse = _run_triton_sparse_decode(
