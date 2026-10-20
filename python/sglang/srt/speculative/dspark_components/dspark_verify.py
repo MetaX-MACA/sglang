@@ -44,6 +44,8 @@ from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
+    record_stream_each,
+    record_stream_for_v2_verify,
     sample_simulated_acc_len,
 )
 from sglang.srt.utils import is_npu
@@ -76,6 +78,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    verify_forward_batch: object
 
 
 def candidate_request_length_bound(
@@ -334,9 +337,12 @@ class TargetVerifyExecutor:
             verify_input.candidate_max_seq_len_upper_bound = (
                 candidate_request_length_bound(batch.reqs, self.verify_num_draft_tokens)
             )
+        fwd_stream = torch.get_device_module(self.target_worker.device).current_stream()
+        record_stream_for_v2_verify(batch, verify_input, fwd_stream)
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
@@ -349,6 +355,7 @@ class TargetVerifyExecutor:
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            verify_forward_batch=verify_forward_batch,
         )
 
     def commit_hidden(
