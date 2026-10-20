@@ -159,6 +159,25 @@ class Qwen3Attention(nn.Module):
         )
         self.alt_stream = alt_stream
 
+        self.use_fused_qk_norm_rope = False
+        if (
+            get_exec().kernel.enable_fused_qk_norm_rope
+            and get_exec().deterministic.rl_on_policy_target is None
+            and _is_cuda
+            and not isinstance(self.rotary_emb, MRotaryEmbedding)
+        ):
+            from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
+                can_use_fused_inplace_qknorm_rope,
+            )
+
+            self.use_fused_qk_norm_rope = can_use_fused_inplace_qknorm_rope(
+                self.head_dim,
+                self.head_dim,
+                self.rotary_emb.is_neox_style,
+                torch.bfloat16,
+                cache_dtype=self.rotary_emb.cos_sin_cache.dtype,
+            )
+
         self.use_fused_qk_norm_mrope = (
             _has_fused_qk_norm_mrope
             and isinstance(self.rotary_emb, MRotaryEmbedding)
@@ -175,15 +194,33 @@ class Qwen3Attention(nn.Module):
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = apply_qk_norm(
-            q=q,
-            k=k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
-            alt_stream=self.alt_stream,
-        )
-        q, k = self.rotary_emb(positions, q, k)
+        if self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
+            from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
+                fused_inplace_qknorm_rope,
+            )
+
+            fused_inplace_qknorm_rope(
+                q.view(-1, self.num_heads, self.head_dim),
+                k.view(-1, self.num_kv_heads, self.head_dim),
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                is_neox=self.rotary_emb.is_neox_style,
+                eps=self.q_norm.variance_epsilon,
+                head_dim=self.head_dim,
+                rope_dim=self.head_dim,
+            )
+        else:
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
+            q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
