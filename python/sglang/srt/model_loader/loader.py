@@ -220,6 +220,8 @@ def _get_quantization_config(
             from sglang.srt.configs.model_config import is_deepseek_v4
 
             quant_config.is_dsv4_fp4_experts = is_deepseek_v4(model_config.hf_config)
+            if hasattr(model_config.hf_text_config,"expert_dtype"):
+                quant_config.is_fp4_experts = (model_config.hf_text_config.expert_dtype == 'fp4')
             quant_config.dequant_fp4_to_fp8 = envs.SGLANG_DSV4_FP4_DEQUANT.get()
             # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
             nvfp4_meta = model_config.nvfp4_moe_meta

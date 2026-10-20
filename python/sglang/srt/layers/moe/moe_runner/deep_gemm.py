@@ -402,22 +402,26 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                         runner_input, quant_info, running_state
                     )
             else:
-                if weight_dtype == torch.int8:
-                    hidden_states = self._run_masked_gemm_mx(
-                        runner_input, quant_info, running_state
-                    )
-                elif weight_dtype == torch.bfloat16:
+                if weight_dtype == torch.bfloat16:
                     hidden_states = self._run_masked_bf16_gemm(
                         runner_input, quant_info, running_state
                     )
-                elif quant_info.is_fp4_experts:
-                    hidden_states = self._run_masked_gemm_mx_fp4(
-                        runner_input, quant_info, running_state
-                    )
-                else:
+                elif weight_dtype == torch.float8_e4m3fn:
                     hidden_states = self._run_masked_gemm(
                         runner_input, quant_info, running_state
                     )
+                else:
+                    # Packed FP4 and quantized INT8 both use int8 storage.
+                    # Select the expert format before inspecting storage dtype.
+                    if getattr(quant_info, "is_fp4_experts", False) and quant_info.is_fp4_experts:
+                        hidden_states = self._run_masked_gemm_mx_fp4(
+                            runner_input, quant_info, running_state
+                        )
+                    else:
+                        assert weight_dtype == torch.int8, "weight_dtype expected torch.int8"
+                        hidden_states = self._run_masked_gemm_mx(
+                            runner_input, quant_info, running_state
+                        )
         return DeepGemmRunnerOutput(hidden_states=hidden_states)
 
     def _run_contiguous_gemm(
