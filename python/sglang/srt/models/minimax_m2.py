@@ -851,7 +851,7 @@ class MiniMaxM2Attention(nn.Module):
         # QK Normalization layers
         if self.use_qk_norm:
             if self.qk_norm_type == "per_layer":
-                if is_dp_attention_enabled():
+                if is_dp_attention_enabled() and attn_tp_size == 1:
                     self.q_norm = RMSNorm(
                         self.total_num_heads * self.head_dim,
                         eps=config.rms_norm_eps,
