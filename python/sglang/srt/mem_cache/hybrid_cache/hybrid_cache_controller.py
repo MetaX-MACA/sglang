@@ -231,6 +231,7 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
+        dp_rank: int = 0,
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
@@ -252,6 +253,7 @@ class HybridCacheController(BaseHiCacheController):
             pp_size=pp_size,
             pp_group=pp_group,
             enable_storage_metrics=enable_storage_metrics,
+            dp_rank=dp_rank,
         )
         self._init_extra_host_mem_release_queues()
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),

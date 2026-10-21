@@ -36,6 +36,8 @@ class HiCacheStorageConfig:
     model_name: Optional[str]
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
+    # With DP attention, tp_rank is attention-group-local.
+    dp_rank: int = 0
     extra_config: Optional[dict] = None
 
 

@@ -477,6 +477,7 @@ class Scheduler(
             and self.server_args.disaggregation_decode_enable_offload_kvcache
         ):
             self.decode_offload_manager = DecodeKVCacheOffloadManager(
+                dp_rank=self.ps.dp_rank if self.ps.dp_rank is not None else 0,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tp_group=(

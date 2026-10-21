@@ -55,3 +55,5 @@ class CacheInitParams:
     )
 
     mtp_draft_device_pools: tuple[object, ...] = ()
+    # Independent DP replica identity (distinct from attention DP rank).
+    dp_rank: int = 0

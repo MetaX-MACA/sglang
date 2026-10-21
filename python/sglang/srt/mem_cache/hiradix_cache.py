@@ -182,6 +182,7 @@ class HiRadixCache(RadixCache):
                 storage_backend_extra_config=extra_config,
                 pp_rank=self.pp_rank,
                 pp_size=self.pp_size,
+                dp_rank=params.dp_rank,
                 pp_group=self.pp_group,
                 enable_storage_metrics=self.enable_storage_metrics,
             )

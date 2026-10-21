@@ -284,6 +284,7 @@ class HiCacheController:
         pp_rank: int = 0,
         pp_size: int = 1,
         enable_storage_metrics: bool = False,
+        dp_rank: int = 0,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
@@ -308,6 +309,7 @@ class HiCacheController:
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.enable_storage_metrics = enable_storage_metrics
+        self._replica_dp_rank = dp_rank
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
@@ -680,7 +682,7 @@ class HiCacheController:
         else:
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
-            self.dp_rank = 0
+            self.dp_rank = self._replica_dp_rank
 
         self.pp_rank = get_pipeline_model_parallel_rank()
         self.pp_size = get_pipeline_model_parallel_world_size()
@@ -725,6 +727,7 @@ class HiCacheController:
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
+            dp_rank=self.dp_rank,
             extra_config=storage_backend_extra_config,
         )
 

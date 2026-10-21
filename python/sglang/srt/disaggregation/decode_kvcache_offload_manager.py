@@ -41,6 +41,7 @@ class DecodeKVCacheOffloadManager:
         tp_group: torch.distributed.ProcessGroup,
         tree_cache: BasePrefixCache,
         server_args: ServerArgs,
+        dp_rank: int = 0,
     ) -> None:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -99,6 +100,7 @@ class DecodeKVCacheOffloadManager:
             storage_backend=server_args.hicache_storage_backend,
             model_name=server_args.served_model_name,
             storage_backend_extra_config=hicache_storage_backend_extra_config,
+            dp_rank=dp_rank,
         )
 
         self.ongoing_offload = {}
