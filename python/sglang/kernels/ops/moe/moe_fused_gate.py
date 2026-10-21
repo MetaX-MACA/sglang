@@ -10,7 +10,6 @@ import triton.language as tl
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.moe import moe_route_radix
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -258,80 +257,6 @@ def _router_triton_kernel(
 
 
 @debug_kernel_api
-def moe_fused_gate_triton(
-    scores: torch.Tensor,
-    bias: torch.Tensor,
-    topk: int,
-    scoring_func: str = "sigmoid",
-    num_fused_shared_experts: int = 0,
-    renormalize: bool = True,
-    routed_scaling_factor: float = 1.0,
-    apply_routed_scaling_factor_on_output: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
-
-    Mirrors the semantics of :func:`moe_fused_gate_jit` (the CUDA JIT kernel)
-    for the ungrouped case (``num_expert_group == 1``). The first argument is
-    named ``scores`` (raw GEMM logits) to match the existing call sites.
-    """
-    scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
-    assert (
-        scoring_func_int is not None
-    ), f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
-    assert scores.dtype == torch.float32, "scores must be float32"
-    assert bias.dtype == torch.float32, "bias must be float32"
-    assert scores.ndim == 2, "scores must be 2D"
-    assert bias.ndim == 1, "bias must be 1D"
-    assert scores.size(1) == bias.size(0), "scores and bias must have same num_experts"
-    assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
-
-    M, N = scores.shape
-    K = topk
-    K_routed = topk - num_fused_shared_experts
-
-    weights = torch.empty((M, K), dtype=torch.float32, device=scores.device)
-    indices = torch.empty((M, K), dtype=torch.int32, device=scores.device)
-
-    BLOCK_N = triton.next_power_of_2(N)  # 256 -> 256, 384 -> 512
-    BLOCK_K = triton.next_power_of_2(K)  # 6 -> 8, 8 -> 8
-    grid = (M,)
-    use_pdl = is_arch_support_pdl()
-    extra = {"launch_pdl": True} if use_pdl else {}
-    # A single warp keeps the per-row reductions cheap to synchronize.
-    _router_triton_kernel[grid](
-        scores,
-        bias,
-        weights,
-        indices,
-        M,
-        float(routed_scaling_factor),
-        0.0,                          
-        N=N,
-        K=K,
-        K_ROUTED=K_routed,
-        BLOCK_M=1,                    
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        N_GROUP=1,                   
-        TOPK_GROUP=1,                 
-        EXPERTS_PER_GROUP=N,          
-        BLOCK_G=1,                   
-        SCORING_FUNC=scoring_func_int,
-        HAS_SOFTCAP=False,            
-        RENORMALIZE=bool(renormalize),
-        APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
-        USE_PDL=use_pdl,
-        stride_sm=scores.stride(0),
-        stride_sn=scores.stride(1),
-        stride_wm=weights.stride(0),
-        stride_wk=weights.stride(1),
-        stride_im=indices.stride(0),
-        stride_ik=indices.stride(1),
-        num_warps=1,
-        **extra,
-    )
-    return weights, indices
-
 def moe_fused_gate(
     scores: torch.Tensor,
     bias: torch.Tensor,
@@ -341,17 +266,120 @@ def moe_fused_gate(
     renormalize: bool = True,
     routed_scaling_factor: float = 1.0,
     apply_routed_scaling_factor_on_output: bool = False,
+    moe_softcapping: float = 0.0,
+    num_expert_group: int = 1,
+    topk_group: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
-    moe_fused_gate_impl = moe_fused_gate_triton if envs.MX_MOE_FUSED_GATE_BACKEND.get() == 'triton' else moe_fused_gate_jit
+    Mirrors the semantics of :func:`moe_fused_gate_jit` (the CUDA JIT kernel).
+    With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
+    (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
+    within). The first argument is named ``scores`` (raw GEMM logits) to match
+    the existing call sites.
+    """
+    from mcoplib.triton_sglang_moe_fused_gate import _router_triton_kernel
 
-    return moe_fused_gate_impl(
+    scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
+    assert (
+        scoring_func_int is not None
+    ), f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
+    assert scores.dtype in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ), "scores must be float32/float16/bfloat16"
+    # The kernel loads the bias and upcasts it to fp32 in-register (see
+    # _router_triton_kernel), so a non-fp32 bias (DeepSeek-V4 stores the
+    # correction bias in bf16) needs no host-side cast/copy.
+    assert bias.dtype in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ), "bias must be float32/float16/bfloat16"
+    assert scores.ndim == 2, "scores must be 2D"
+    assert bias.ndim == 1, "bias must be 1D"
+    assert scores.size(1) == bias.size(0), "scores and bias must have same num_experts"
+    assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
+
+    # K3 radix-select fast path: native-CUDA radix-select replaces the 16
+    # dependent argmax rounds (single CTA per token; ids bit-identical to this
+    # triton kernel incl. ties).
+    # The radix kernel keeps keys register-resident and returns winners in
+    # expert-id order (skipping the biased-descending sort; downstream MoE
+    # kernels are order-insensitive). It is 3.1-3.5x faster than the Triton
+    # kernel at [1..8192, 896] top-16 on B200.
+    if (
+        scoring_func.lower() == "sigmoid"
+        and num_fused_shared_experts == 0
+        and num_expert_group <= 1
+        and moe_softcapping == 0.0
+    ):
+        radix_args = (
+            scores,
+            bias,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+        )
+        # if moe_route_radix.covered(scores, bias, topk):
+        if False:
+            return moe_route_radix.route_radix(*radix_args, sorted=False)
+
+    M, N = scores.shape
+    K = topk
+    K_routed = topk - num_fused_shared_experts
+    if num_expert_group > 1:
+        assert N % num_expert_group == 0, "num_experts must be divisible by group count"
+        assert 1 <= topk_group <= num_expert_group, "invalid topk_group"
+    experts_per_group = N // num_expert_group
+    BLOCK_G = triton.next_power_of_2(num_expert_group)
+
+    weights = torch.empty((M, K), dtype=torch.float32, device=scores.device)
+    indices = torch.empty((M, K), dtype=torch.int32, device=scores.device)
+
+    BLOCK_N = triton.next_power_of_2(N)  # 256 -> 256, 384 -> 512
+    BLOCK_K = triton.next_power_of_2(K)  # 6 -> 8, 8 -> 8
+    # BLOCK_M / num_warps / num_stages are picked by the mcoplib kernel's
+    # @triton.autotune (keyed on N/K/SCORING_FUNC/N_GROUP), so they must not be
+    # passed explicitly; the grid reads BLOCK_M back from the chosen config.
+    log_n = BLOCK_N.bit_length() - 1
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
+    use_pdl = is_arch_support_pdl()
+    extra = {"launch_pdl": True} if use_pdl else {}
+    _router_triton_kernel[grid](
         scores,
         bias,
-        topk,
-        scoring_func,
-        num_fused_shared_experts,
-        renormalize,
-        routed_scaling_factor,
-        apply_routed_scaling_factor_on_output,
+        weights,
+        indices,
+        M,
+        float(routed_scaling_factor),
+        float(moe_softcapping),
+        N=N,
+        K=K,
+        K_ROUTED=K_routed,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        N_GROUP=num_expert_group,
+        TOPK_GROUP=topk_group,
+        EXPERTS_PER_GROUP=experts_per_group,
+        BLOCK_G=BLOCK_G,
+        SCORING_FUNC=scoring_func_int,
+        HAS_SOFTCAP=bool(moe_softcapping != 0.0),
+        RENORMALIZE=bool(renormalize),
+        APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
+        USE_PDL=use_pdl,
+        USE_BITONIC=False,
+        LOGN=log_n,
+        stride_sm=scores.stride(0),
+        stride_sn=scores.stride(1),
+        stride_wm=weights.stride(0),
+        stride_wk=weights.stride(1),
+        stride_im=indices.stride(0),
+        stride_ik=indices.stride(1),
+        **extra,
     )
+    return weights, indices
