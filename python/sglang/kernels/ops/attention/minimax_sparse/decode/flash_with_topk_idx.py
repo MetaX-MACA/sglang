@@ -22,7 +22,6 @@ from sglang.srt.environ import envs
 
 from ..common.utils import (
     _bitonic_merge,
-    _sort_ids_ascending,
     check_sparse_kv_fp8,
     robust_allocator,
     sparse_out_dtype,
@@ -821,11 +820,6 @@ def _topk_index_merge_kernel(
         + pid_h * stride_tif_h
         + pid_b * stride_tif_b
         + off_t * stride_tif_t
-    )
-    # Ascending by block id, -1 tail: the MSA fmha_sm100 consumer requires
-    # sorted kv_block_indexes (the bitonic pass above orders by score).
-    topk_idx_final = _sort_ids_ascending(
-        topk_idx_final, tl.minimum(topk, num_blocks), BLOCK_SIZE_T
     )
     tl.store(
         tif_ptrs, topk_idx_final.to(ti_final_ptr.dtype.element_ty), mask=off_t < topk
