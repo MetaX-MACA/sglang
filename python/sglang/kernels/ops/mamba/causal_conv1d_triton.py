@@ -13,7 +13,7 @@ import triton.language as tl
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
 # C500/MetaX-C550 optimized fast path (self-contained; default off).
-from sglang.kernels.ops.attention.fla.kda_opt_c500 import _c500_kda_opt_enabled
+from sglang.kernels.ops.attention.fla.kda_opt_config import _c500_kda_opt_enabled
 
 PAD_SLOT_ID = -1
 

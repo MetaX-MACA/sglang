@@ -20,7 +20,7 @@ from sglang.kernels.ops.attention.fla.utils import (
 )
 
 # C500/MetaX-C550 optimized fast path (self-contained; default off).
-from .kda_opt_c500 import _c500_kda_opt_enabled
+from .kda_opt_config import _c500_kda_opt_enabled
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
