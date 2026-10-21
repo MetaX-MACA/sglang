@@ -7,7 +7,7 @@ import triton.language as tl
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
 # C500/MetaX-C550 optimized fast path (self-contained; default off).
-from .kda_opt_c500 import _c500_kda_opt_enabled
+from .kda_opt_config import _c500_kda_opt_enabled
 
 
 @triton.jit(do_not_specialize=["T"])

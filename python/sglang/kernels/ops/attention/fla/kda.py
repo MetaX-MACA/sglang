@@ -40,7 +40,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_maca
 
 # C500/MetaX-C550 optimized fast paths (self-contained; default off).
-from .kda_opt_c500 import _c500_kda_opt_enabled
+from .kda_opt_config import _c500_kda_opt_enabled
 
 _USE_MCOPLIB_KDA_CHUNK_H = is_maca() and envs.MX_USE_MCOPLIB_KDA.get()
 if _USE_MCOPLIB_KDA_CHUNK_H:

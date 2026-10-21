@@ -19,7 +19,7 @@ from sglang.kernels.ops.attention.fla.utils import (
 )
 
 # C500/MetaX-C550 optimized fast path (self-contained; default off).
-from .kda_opt_c500 import _c500_kda_opt_enabled
+from .kda_opt_config import _c500_kda_opt_enabled
 
 if is_tf32_supported:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
