@@ -561,6 +561,45 @@ def _dsv4_run_bf16_sparse_prefill_attention(
         topk_length=topk_length_unified,
     )[0]
 
+
+def _dsv4_run_bf16_sparse_prefill_attention_v2(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_kv: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    import flash_mla
+
+    q = q.squeeze(1).contiguous()
+    assert q.ndim == 3
+
+    kv = kv.flatten(0, 1).contiguous()
+    assert kv.ndim == 3
+
+    if extra_kv is not None:
+        extra_kv = extra_kv.flatten(0, 1).contiguous()
+        assert extra_kv.ndim == 3
+
+    return flash_mla.flash_mla_sparse_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        extra_kv=extra_kv,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_topk_length,
+    )[0]
+
+
 @dataclass
 class DSV4AttnMetadata:
     page_size: int
@@ -2103,6 +2142,20 @@ class DeepseekV4AttnBackend(
                 or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
             ):
                 if swa_k_cache.dtype == torch.bfloat16:
+                    if envs.MX_OPT_DSV4_PREFILL_ATTN.get():
+                        return _dsv4_run_bf16_sparse_prefill_attention_v2(
+                            q=q,
+                            kv=swa_k_cache,
+                            indices=swa_page_indices,
+                            sm_scale=self.softmax_scale,
+                            d_v=self.head_dim_v,
+                            attn_sink=attn_sink,
+                            topk_length=swa_topk_lengths,
+                            extra_kv=extra_k_cache,
+                            extra_indices=extra_indices,
+                            extra_topk_length=extra_topk_lengths,
+                        )
+
                     prefill_inputs = _dsv4_build_unified_prefill_inputs_from_real_decode(
                         q=q,
                         swa_k_cache=swa_k_cache,

@@ -696,6 +696,7 @@ class Envs:
     MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE = EnvInt(256)
     MX_MOE_FUSED_GATE_BACKEND = EnvStr("triton")
     MX_DSV4_HISPARSE_CACHE_DTYPE = EnvStr("fp8")
+    MX_OPT_DSV4_PREFILL_ATTN = EnvBool(True)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
