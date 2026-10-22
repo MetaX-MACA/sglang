@@ -19,7 +19,6 @@ import triton.language as tl
 
 from ..common.utils import (
     _bitonic_merge,
-    _sort_ids_ascending,
     check_sparse_kv_fp8,
     get_cu_seqblocks,
     sparse_out_dtype,
@@ -431,9 +430,6 @@ def _topk_index_kernel(
         * tl.reshape(topk_idx - 1, [BLOCK_SIZE_K // BLOCK_SIZE_T, BLOCK_SIZE_T]),
         axis=0,
     )
-    # Ascending by block id, -1 tail: the MSA fmha_sm100 consumer requires
-    # sorted kv_block_indexes (the bitonic pass above orders by score).
-    topk_idx = _sort_ids_ascending(topk_idx, min(topk, valid_blocks), BLOCK_SIZE_T)
     # save topk
     ti_ptrs = (
         ti_ptr

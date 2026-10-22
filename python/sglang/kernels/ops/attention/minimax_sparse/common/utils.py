@@ -349,26 +349,3 @@ def _bitonic_merge(
     for i in tl.static_range(stage):
         x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
     return x, ids
-
-
-@triton.jit
-def _sort_ids_ascending(ids, valid_n, BLOCK_SIZE_T: tl.constexpr):
-    """Sort a top-k id row ascending, invalids packed as -1 at the tail.
-
-    ``ids``: int32 [BLOCK_SIZE_T] block ids (0-indexed, -1 = invalid); entries at
-    positions >= ``valid_n`` are also treated as invalid. Valid ids must be
-    distinct and < 2**30 (block ids always are). The MSA fmha_sm100 consumer
-    requires kv_block_indexes strictly ascending with -1 tail padding — its
-    sorted-order early-exit otherwise mis-masks the partial last block.
-
-    O(T^2) rank sort (T = BLOCK_SIZE_T <= 64): invalid entries get unique keys
-    above every valid id so ranks form a permutation.
-    """
-    off = tl.arange(0, BLOCK_SIZE_T)
-    invalid = (off >= valid_n) | (ids < 0)
-    key = tl.where(invalid, 0x40000000 + off, ids)
-    rank = tl.sum(tl.where(key[None, :] < key[:, None], 1, 0), axis=1)
-    sorted_key = tl.sum(
-        tl.where(rank[None, :] == off[:, None], key[None, :], 0), axis=1
-    )
-    return tl.where(sorted_key >= 0x40000000, -1, sorted_key)
