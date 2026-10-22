@@ -2681,9 +2681,8 @@ def fast_decode_plan(
                     head_dim,
                     head_dim,
                     False,  # causal
-                    # window_left,
-                    # fixed_split_size,
-                    # disable_split_kv,
+                    *((fixed_split_size, disable_split_kv)
+                      if self._backend == "fa2" else ()),
                 )
             except Exception as e:
                 raise RuntimeError(f"Error in standard plan: {e}")

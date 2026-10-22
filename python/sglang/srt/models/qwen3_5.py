@@ -137,6 +137,10 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
+_qwen35_use_fused_qk_rope = (
+    _is_cuda and not envs.SGLANG_DISABLE_QWEN35_FUSED_QK_ROPE.get()
+)
+
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
@@ -1337,7 +1341,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_cuda and self.attn_output_gate:
+        if _qwen35_use_fused_qk_rope and self.attn_output_gate:
             q, k, v, gate = self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
