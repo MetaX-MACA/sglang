@@ -280,6 +280,11 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         b: [num_v_heads]
         a: [num_v_heads]
     """
+    # The single-GEMM input projection returns row-strided QKVZ/BA views.
+    # This legacy unpack kernel uses compact row offsets; normalize only here.
+    # The fused unpack/Conv1D path accepts the original strides without copies.
+    mixed_qkvz = mixed_qkvz.contiguous()
+    mixed_ba = mixed_ba.contiguous()
     batch, seq_len = mixed_qkvz.shape[0], 1
     qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v
     mixed_qkv = torch.empty(

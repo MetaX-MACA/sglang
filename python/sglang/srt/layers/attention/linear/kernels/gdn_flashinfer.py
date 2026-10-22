@@ -129,7 +129,8 @@ def _get_flashinfer_gdn_kernels():
             _flashinfer_gated_delta_rule_mtp_bf16 = None
             _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode_pretranspose
             _flashinfer_gdn_available = (
-                (is_cuda() and torch.cuda.get_device_capability()[0] >= 9) or (is_maca())
+                (is_cuda() and torch.cuda.get_device_capability()[0] >= 9)
+                or (is_maca() and os.getenv("MACA_SGLANG_FLASHINFER_GDN", "1") == "1")
             )
             if _flashinfer_gdn_available:
                 logger.info("FlashInfer GDN kernels loaded successfully")
@@ -161,7 +162,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     """FlashInfer kernel for GDN with K-last SSM state layout.
 
     SM90 (Hopper): decode uses gather/scatter; prefill and MTP verify supported.
-    SM100 (Blackwell): decode uses gather/scatter; prefill and MTP verify supported.
+    SM100 (Blackwell) and MACA: indexed pool decode; MACA supports an opt-out.
+    Prefill retains pool gather/writeback and checkpoint support.
 
     Requires flashinfer >= 0.6.14.
     """
@@ -186,10 +188,17 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             raise RuntimeError("FlashInfer GDN decode kernel is unavailable.")
 
         sm_major = torch.cuda.get_device_capability()[0]
-        self.use_state_pool = sm_major >= 10
-        # The SM120 chunked-prefill kernel only accepts float32 initial
-        # states; SM100 accepts the state-pool dtype directly.
-        self._prefill_needs_fp32_state = sm_major >= 12
+        # MACA/C600-U reports capability major 8, but its FlashInfer build
+        # supports indexed pool decode. Preserve the upstream CUDA defaults.
+        maca_backend = is_maca()
+        self.use_state_pool = (
+            os.getenv("MACA_SGLANG_FLASHINFER_GDN_USE_STATE_POOL", "1") == "1"
+            if maca_backend
+            else sm_major >= 10
+        )
+        # MetaX and SM120 prefill require float32 initial state.
+        self._prefill_needs_fp32_state = maca_backend or sm_major >= 12
+        logger.info("FlashInfer GDN state pool enabled: %s", self.use_state_pool)
         self.supports_target_verify = sm_major in (9, 10)
         self._aligned_input_buffers: dict[tuple, torch.Tensor] = {}
         self._aligned_parameter_cache: dict[
@@ -480,8 +489,18 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
 
-        q_fi = l2norm_fwd(q[0].contiguous())
-        k_fi = l2norm_fwd(k[0].contiguous())
+        # MetaX FlashInfer can normalize Q/K inside the prefill kernel.
+        # Preserve other backends and allow an explicit fallback on MACA.
+        inline_l2norm = (
+            is_maca()
+            and os.getenv("MACA_SGLANG_FLASHINFER_PREFILL_INLINE_L2NORM", "1") == "1"
+        )
+        if inline_l2norm:
+            q_fi = q[0].contiguous()
+            k_fi = k[0].contiguous()
+        else:
+            q_fi = l2norm_fwd(q[0].contiguous())
+            k_fi = l2norm_fwd(k[0].contiguous())
         v_fi = v[0].contiguous()
 
         output = kwargs.get("output")
@@ -553,7 +572,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             initial_state=initial_state_fi,
             output_final_state=True,
             cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=False,
+            use_qk_l2norm_in_kernel=inline_l2norm,
             output=output_fi,
             output_state=output_state_fi,
             state_checkpoints=state_checkpoints,
