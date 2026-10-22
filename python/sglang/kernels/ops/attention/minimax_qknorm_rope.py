@@ -71,7 +71,8 @@ def _fused_gemma_qknorm_rope(
     # graph can trace past the otherwise-opaque FFI call. The launch is
     # graph-capturable (host-side constant offsets/counts), so it stays inside
     # the captured region.
-    torch.ops.sgl_kernel.fused_gemma_qknorm_rope(
+    module = _jit_module(positions.dtype, 128, 64)
+    module.fused_gemma_qknorm_rope(
         qkv,
         w0,
         w1,

@@ -1221,7 +1221,7 @@ class Envs:
 
     # Metax
     SGLANG_DSA_DISABLE_FUSED_KERNEL = EnvBool(False)
-    MX_MOE_FUSED_GATE_BACKEND = EnvStr("triton")
+
     # Backend for INT8 paged MQA logits on MetaX.
     # Supported values: "maca_c", "tilelang", "triton".
     MX_ENABLE_TILELANG_INT8_MQA_LOGITS = EnvStr("triton")
