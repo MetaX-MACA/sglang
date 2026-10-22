@@ -1087,6 +1087,7 @@ def invoke_fused_moe_kernel(
             expert_ids,
             num_tokens_post_padded,
             mul_routed_weight,
+            filter_expert=filter_expert,
         )
     elif is_fp4_experts and use_fp4_w4a8 and enable_mctlass_fused_moe_python_api:
         C1 = C.view(-1, C.size(-1)).contiguous()
