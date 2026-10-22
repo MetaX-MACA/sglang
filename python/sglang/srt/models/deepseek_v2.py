@@ -479,16 +479,21 @@ class DeepseekV2MLP(nn.Module):
                 device=gate_up.device,
                 dtype=torch.float8_e4m3fn,
             )
+            column_major_scales = envs.MX_TRANS_FP8_SCALE_LAYOUT.get()
+            groups = (N // 2) // quant_group_size
             x_scale = torch.empty(
-                (M, (N // 2) // quant_group_size),
+                (groups, M) if column_major_scales else (M, groups),
                 device=gate_up.device,
                 dtype=torch.float32,
             )
+            if column_major_scales:
+                x_scale = x_scale.transpose(-1, -2)
             torch.ops.sgl_kernel.fused_silu_mul_per_group_quant(
                 x_quant,
                 x_scale,
                 gate_up,
                 self.swiglu_limit,
+                *([True] if column_major_scales else []),
             )
             x = (x_quant, x_scale)
         elif self.use_fused_clamp_act_mul and self.swiglu_limit is not None:

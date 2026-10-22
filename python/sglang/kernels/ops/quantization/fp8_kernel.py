@@ -89,11 +89,9 @@ if _is_cuda or _is_maca:
 
     if _is_maca:
         try:
-            # mcoplib.op is a standalone pybind extension; unlike
-            # mcoplib.sgl_kernel it does not register torch operators.
-            from mcoplib.op import (
-                per_token_cast_to_fp8 as _mcoplib_per_token_cast_to_fp8,
-            )
+            # NOTE: per_token_cast_to_fp8 from mcoplib.sgl_kernel achieves the best perf, so we use it here.
+            import mcoplib.sgl_kernel 
+            _mcoplib_per_token_cast_to_fp8 = (torch.ops.sgl_kernel.per_token_cast_to_fp8.default)
         except (ImportError, ModuleNotFoundError, OSError, AttributeError):
             pass
 
@@ -783,21 +781,29 @@ def sglang_per_token_group_quant_fp8(
 
     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
 
-    shape_supported_mcoplib = (
+    shape_supported_aot = (
         x.dim() == 2
         and group_size == 128
-        and not column_major_scales
-        and not scale_tma_aligned
         and not scale_ue8m0
         and not fuse_silu_and_mul
         and masked_m is None
     )
-    # Column-major scale layout for the mcoplib cast op (opt-in): allocate
-    # the transposed scale up front and let the op fill it directly.
+    shape_supported_mcoplib = (
+        shape_supported_aot
+        and not column_major_scales
+        and not scale_tma_aligned
+    )
+    # The AOT cast supports both row-major and transposed scales.
     trans_scale_layout = (
-        shape_supported_mcoplib
+        shape_supported_aot
         and _mcoplib_per_token_cast_to_fp8 is not None
-        and envs.MX_TRANS_FP8_SCALE_LAYOUT.get()
+        and (
+            column_major_scales
+            or envs.MX_TRANS_FP8_SCALE_LAYOUT.get()
+        )
+    )
+    use_transposed_layout = (
+        column_major_scales  or trans_scale_layout
     )
 
     x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
@@ -805,39 +811,39 @@ def sglang_per_token_group_quant_fp8(
         x_shape=out_shape,
         device=x.device,
         group_size=group_size,
-        column_major_scales=column_major_scales or trans_scale_layout,
+        column_major_scales=use_transposed_layout,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
     )
 
-    can_use_mcoplib = (
-        (
-            _mcoplib_per_token_cast_to_fp8 is not None
-            or _mcoplib_per_token_group_quant_fp8 is not None
-        )
-        and shape_supported_mcoplib
+    can_use_aot_cast = (
+        shape_supported_aot and _mcoplib_per_token_cast_to_fp8 is not None
+    )
+    can_use_group_quant = (
+        shape_supported_mcoplib
+        and _mcoplib_per_token_group_quant_fp8 is not None
     )
     if x.shape[0] > 0:
-        if can_use_mcoplib:
-            if trans_scale_layout:
-                import mcoplib.sgl_kernel  # noqa: F401
-
-                torch.ops.sgl_kernel.per_token_cast_to_fp8.default(x_q, x_s, x, True)
-            elif _mcoplib_per_token_cast_to_fp8 is not None:
-                _mcoplib_per_token_cast_to_fp8(x_q, x_s, x)
-            else:
-                _mcoplib_per_token_group_quant_fp8(
-                    x,
-                    x_q,
-                    x_s,
-                    group_size,
-                    eps,
-                    fp8_min,
-                    fp8_max,
-                    False,
-                    False,
-                    False,
-                )
+        if can_use_aot_cast:
+            _mcoplib_per_token_cast_to_fp8(
+                x_q, 
+                x_s, 
+                x,
+                *([True] if trans_scale_layout else []),
+            )
+        elif can_use_group_quant:
+            _mcoplib_per_token_group_quant_fp8(
+                x,
+                x_q,
+                x_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                False,
+                False,
+                False,
+            )
         else:
             _run_per_token_group_quant_8bit_kernel(
                 x,
