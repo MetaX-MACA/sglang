@@ -11,6 +11,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
+from sglang.srt.layers.attention.dsv4.index_cache_kind import DSV4IndexCacheKind
 
 from .types import (
     DecodeInputs,
@@ -28,10 +29,36 @@ _DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
-    q_fp4: torch.Tensor  # [rows, 1, heads, 64] int8, packed fp4
-    q_sf: torch.Tensor  # [rows, 1, heads] int32, packed ue8m0
+    q_fp4: Optional[torch.Tensor]  # [rows, 1, heads, 64] int8, packed fp4 (fp4 kind)
+    q_sf: Optional[torch.Tensor]  # [rows, 1, heads] int32, packed ue8m0 (fp4 kind)
     weights: torch.Tensor  # [rows, heads] bf16/fp32 head weights
-    k_cache: torch.Tensor  # [pages, page_size, 1, 68] uint8, the layer's index-K pool
+    k_cache: torch.Tensor  # [pages, page_size, 1, slot_bytes], the layer's index-K pool
+    q_int8: Optional[torch.Tensor] = None  # [rows, 1, heads, 128] int8 (int8 kind)
+    kind: DSV4IndexCacheKind = DSV4IndexCacheKind.FP4
+
+    def query_rows(
+        self, rows: Optional[slice | torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, ...] | torch.Tensor:
+        """The q operands of `rows`: the fp4 ``(q_fp4, q_sf)`` pair, or the int8
+        tensor."""
+        if self.kind.is_fp4:
+            return (
+                self.q_fp4 if rows is None else self.q_fp4[rows],
+                self.q_sf if rows is None else self.q_sf[rows],
+            )
+        return self.q_int8 if rows is None else self.q_int8[rows]
+
+    @property
+    def num_rows(self) -> int:
+        return self.query_rows()[0].shape[0] if self.kind.is_fp4 else self.q_int8.shape[0]
+
+    @property
+    def q_dtype(self) -> torch.dtype:
+        return self.q_fp4.dtype if self.kind.is_fp4 else self.q_int8.dtype
+
+    @property
+    def q_device(self) -> torch.device:
+        return self.q_fp4.device if self.kind.is_fp4 else self.q_int8.device
 
 
 class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
@@ -43,13 +70,39 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
     lens_per_request: List[int]  # compressed positions at each request's newest token
     rows_per_request: List[int]  # query rows of each request
     compress_lens: torch.Tensor  # [rows] int32, compressed positions the row sees
-    q_fp4: torch.Tensor  # [rows, heads, 64] int8, packed fp4
-    q_sf: torch.Tensor  # [rows, heads] int32, packed ue8m0
+    q_fp4: Optional[torch.Tensor]  # [rows, heads, 64] int8, packed fp4 (fp4 kind)
+    q_sf: Optional[torch.Tensor]  # [rows, heads] int32, packed ue8m0 (fp4 kind)
     weights: torch.Tensor  # [rows, heads] fp32 head weights
+    q_int8: Optional[torch.Tensor] = None  # [rows, heads, 128] int8 (int8 kind)
+    kind: DSV4IndexCacheKind = DSV4IndexCacheKind.FP4
+
+    def query_rows(
+        self, rows: Optional[slice | torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, ...] | torch.Tensor:
+        """The q operands of `rows`: the fp4 ``(q_fp4, q_sf)`` pair, or the int8
+        tensor."""
+        if self.kind.is_fp4:
+            return (
+                self.q_fp4 if rows is None else self.q_fp4[rows],
+                self.q_sf if rows is None else self.q_sf[rows],
+            )
+        return self.q_int8 if rows is None else self.q_int8[rows]
 
     @property
     def num_rows(self) -> int:
-        return self.q_fp4.shape[0]
+        return self.q_fp4.shape[0] if self.kind.is_fp4 else self.q_int8.shape[0]
+
+    @property
+    def num_heads(self) -> int:
+        return self.q_fp4.shape[1] if self.kind.is_fp4 else self.q_int8.shape[1]
+
+    @property
+    def q_dtype(self) -> torch.dtype:
+        return self.q_fp4.dtype if self.kind.is_fp4 else self.q_int8.dtype
+
+    @property
+    def q_device(self) -> torch.device:
+        return self.q_fp4.device if self.kind.is_fp4 else self.q_int8.device
 
     def empty_selection(self, topk: int) -> torch.Tensor:
         return self.request_starts.new_full(
