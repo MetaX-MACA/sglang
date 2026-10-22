@@ -917,27 +917,35 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
     return {}
 
 
+# The default dsa index cache dtype per DeepSeek-V4 model family.
+_DSV4_INDEX_CACHE_DTYPES = {"deepseek_v41": "fp4", "deepseek_v4": "fp8"}
+
+
 @register_post_process
 def _deepseek_v4_index_cache_dtype(view: Any) -> dict:
     """Set dsa index cache by default according to model quantization method."""
     hf_config = model_config_of(view).hf_config
-    model_arch = hf_config.architectures[0]
-    if model_arch != "DeepseekV4ForCausalLM":
+    if hf_config.architectures[0] != "DeepseekV4ForCausalLM":
         return {}
 
-    if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.is_set():
-        return {}
-    
-    quant_config = getattr(hf_config, "quantization_config", None)
-    if quant_config and quant_config.get("quant_method") == "fp8":
-        if getattr(hf_config, "model_type", None) == "deepseek_v41":
-            envs.SGLANG_DSV4_INDEX_CACHE_TYPE.set("fp4")
-            logger.warning(f"Setting Index cache dtype to fp4 for deepseek_v41.")
-        elif getattr(hf_config, "model_type", None) == "deepseek_v4":
-            envs.SGLANG_DSV4_INDEX_CACHE_TYPE.set("fp8")
-            logger.warning(f"Setting Index cache dtype to fp8 for deepseek_v4.")
-        else:
-            raise NotImplementedError
+    index_cache = envs.SGLANG_DSV4_INDEX_CACHE_TYPE
+    if not index_cache.is_set():
+        quant_config = getattr(hf_config, "quantization_config", None)
+        model_type = getattr(hf_config, "model_type", None)
+        if quant_config is None:
+            compression_config = getattr(hf_config, "compression_config", None)
+            if (
+                compression_config
+                and compression_config.get("format") == "int-quantized"
+            ):
+                index_cache.set("int8")
+                logger.warning(f"Setting Index cache dtype to int8 for {model_type}.")
+        elif quant_config.get("quant_method") == "fp8":
+            inferred = _DSV4_INDEX_CACHE_DTYPES.get(model_type)
+            if inferred is None:
+                raise NotImplementedError
+            index_cache.set(inferred)
+            logger.warning(f"Setting Index cache dtype to {inferred} for {model_type}.")
     return {}
 
 
