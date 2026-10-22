@@ -702,6 +702,13 @@ class Envs:
     MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL = EnvBool(False)
     MX_ENABLE_FUSE_SILUMUL_QUANT = EnvBool(False)
     MX_ENABLE_FUSE_ACT_FP8_QUANT = EnvBool(False)
+    # Triton MoE (standard dispatch) FP8 prefill for plain-SiLU models (no
+    # swiglu clamp): fuse act_and_mul with the per-block FP8 quant of the
+    # down-proj input. Complements MX_ENABLE_FUSE_ACT_FP8_QUANT, which covers
+    # the clamped (DeepSeek-V4) MoE branch and the dense MLP. Requires a
+    # mcoplib build that registers _C.swiglu_step_and_mul_per_block_quant;
+    # otherwise the flag is a no-op.
+    MX_ENABLE_MOE_FUSE_ACT_QUANT = EnvBool(False)
     # FP8 weight/activation scale layout switched to column-major so a later
     # scale.T.contiguous() becomes a no-op. Affects all FP8 models when on;
     # PD decode with this on is known to trap, keep off by default.

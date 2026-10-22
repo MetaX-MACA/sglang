@@ -131,6 +131,37 @@ enable_mctlass_fused_moe_python_api = (
 )
 enable_maca_sglang_fused_moe_mctlass_w4a16 = envs.ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16.get()
 
+# Opt-in: run the MoE down-input activation and its fp8 quantization through
+# mcoplib's fused kernel (`_C.swiglu_step_and_mul_per_block_quant`) instead of
+# the separate act_and_mul + quantization kernels, so the bf16 activation never
+# round-trips through HBM. Default off (MX_ENABLE_MOE_FUSE_ACT_QUANT); see
+# `_should_fuse_moe_act_quant` for the
+# exact preconditions -- every other shape keeps the two-kernel sequence.
+enable_fused_moe_act_quant = envs.MX_ENABLE_MOE_FUSE_ACT_QUANT.get()
+
+# The fused op is registered in the vllm-compatible `_C` namespace by
+# `mcoplib._C`, which sglang already imports for the per-token quantizer.
+# Older mcoplib builds may not register it -> the feature simply stays off.
+try:
+    _MCOPLIB_FUSED_ACT_QUANT = torch.ops._C.swiglu_step_and_mul_per_block_quant
+except AttributeError:  # pragma: no cover - depends on the mcoplib build
+    _MCOPLIB_FUSED_ACT_QUANT = None
+
+# The op evaluates min(silu(alpha*gate), limit) * (clamp(up, -limit, limit) + beta)
+# before quantizing, so a huge finite limit with beta=0 degenerates to plain
+# silu(gate) * up (i.e. "no clamp").
+_MCOPLIB_NO_CLAMP_LIMIT = 1e30
+
+if enable_fused_moe_act_quant and _MCOPLIB_FUSED_ACT_QUANT is None:
+    # Loud instead of silent: the switch is on but this mcoplib build does not
+    # register the fused op, so the two-kernel path will be used.
+    logger.warning(
+        "MX_ENABLE_MOE_FUSE_ACT_QUANT is set but "
+        "torch.ops._C.swiglu_step_and_mul_per_block_quant is not registered "
+        "(mcoplib build lacks the fused op?); falling back to "
+        "act_and_mul + quantize."
+    )
+
 if enable_mctlass_fused_moe_python_api:
     from mctlassEx import FusedMoeGEMM
 
@@ -642,6 +673,66 @@ def _prepare_fused_moe_run(
     )
 
 
+def _should_fuse_moe_act_quant(
+    *,
+    activation: str,
+    is_gated: bool,
+    use_fp8_w8a8: bool,
+    use_fp4_w4a8: bool,
+    is_fp4_experts: bool,
+    block_shape: Optional[List[int]],
+    input_dtype: torch.dtype,
+    total_tokens: int,
+    gemm1_alpha: Optional[float],
+    gemm1_limit: Optional[float],
+    swiglu_limit: Optional[float],
+    hooks: Optional[Any],
+    filter_expert: bool,
+    fuse_swiglu_interleaved: bool,
+    two_i: int,
+) -> bool:
+    """Can act_and_mul + fp8 quant run as one fused kernel on this call?
+
+    All of the following must hold:
+
+    * ``MX_ENABLE_MOE_FUSE_ACT_QUANT=1`` (opt-in, read once at import);
+    * CUDA/HIP target and an mcoplib build that registers
+      ``_C.swiglu_step_and_mul_per_block_quant``;
+    * plain gated SiLU: no gemm1_alpha/limit, no swiglu clamp, no LoRA hooks,
+      no expert-filtered (EP masked) rows, and the up-GEMM epilogue must not
+      have applied silu itself (``fuse_swiglu_interleaved``);
+    * fp8 W8A8 whose weight block is one of the group sizes the fused kernel
+      supports (64/128) and divides the *local* MoE intermediate width. The
+      kernel then emits ``[T, two_i // 2 // group]`` fp32 scales, the same
+      row-major layout the per-group quantizer produces on the legacy path
+      (``group == two_i // 2`` degenerates to one scale per row, i.e.
+      per-token), so the down GEMM sees an unchanged contract.
+    """
+    return (
+        enable_fused_moe_act_quant
+        and _MCOPLIB_FUSED_ACT_QUANT is not None
+        and (_is_cuda or _is_hip)
+        and use_fp8_w8a8
+        and not use_fp4_w4a8
+        and not is_fp4_experts
+        and block_shape is not None
+        and len(block_shape) == 2
+        and block_shape[1] in (64, 128)
+        and two_i % 2 == 0
+        and (two_i // 2) % block_shape[1] == 0
+        and activation == "silu"
+        and is_gated
+        and input_dtype == torch.bfloat16
+        and gemm1_alpha is None
+        and gemm1_limit is None
+        and swiglu_limit is None
+        and hooks is None
+        and not filter_expert
+        and not fuse_swiglu_interleaved
+        and total_tokens > 0
+    )
+
+
 def _fused_moe_kernel_sequence(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1026,10 +1117,69 @@ def _fused_moe_kernel_sequence(
             dtype=hidden_states.dtype,
         )
 
+    use_fused_act_quant = _should_fuse_moe_act_quant(
+        activation=activation,
+        is_gated=is_gated,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_fp4_w4a8=use_fp4_w4a8,
+        is_fp4_experts=is_fp4_experts,
+        block_shape=block_shape,
+        input_dtype=hidden_states.dtype,
+        total_tokens=total_tokens,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        swiglu_limit=swiglu_limit,
+        hooks=hooks,
+        filter_expert=filter_expert,
+        fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        two_i=N,
+    )
+
     # Activation function with multiplication
     if fuse_swiglu_interleaved:
         # silu(gate) * up was already applied by the up-GEMM epilogue.
         pass
+    elif use_fused_act_quant:
+        # MX_ENABLE_MOE_FUSE_ACT_QUANT: mcoplib's fused silu-and-mul + fp8
+        # per-block quantization turns gate_up ([total_tokens, 2I] bf16) into the
+        # fp8 down-input plus its fp32 scales in one pass, so the bf16 activation
+        # is never written out and read back. Pass the fp8 activation and its
+        # scales separately so `invoke_fused_moe_kernel` takes its existing
+        # pre-quantized branch (works on older wheels without tuple support).
+        a2_group = int(block_shape[1])
+        a2_inter = N // 2
+        a2_groups = a2_inter // a2_group
+        a2_fused_q = torch.empty(
+            (total_tokens, a2_inter),
+            device=hidden_states.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        a2_fused_scale = torch.empty(
+            (total_tokens, a2_groups),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+        _MCOPLIB_FUSED_ACT_QUANT(
+            a2_fused_q,
+            intermediate_cache1.view(-1, N),
+            _MCOPLIB_NO_CLAMP_LIMIT,
+            a2_fused_scale,
+            a2_group,
+            None,  # scale_ub
+            False,  # is_scale_transposed -> row-major [T, groups]
+            1.0,  # alpha
+            0.0,  # beta
+        )
+        intermediate_cache2 = a2_fused_q
+        a2_scale = a2_fused_scale
+        logger.warning_once(
+            "MX_ENABLE_MOE_FUSE_ACT_QUANT: mcoplib fused act+quant "
+            "(tokens=%d, inter=%d, group=%d, groups/row=%d)",
+            total_tokens,
+            a2_inter,
+            a2_group,
+            a2_groups,
+        )
     elif activation == "silu" and is_gated:
         # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
