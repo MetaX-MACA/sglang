@@ -31,7 +31,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache, get_tensor_size_bytes
-from sglang.srt.runtime_context import get_exec, get_platform, get_spec
+from sglang.srt.runtime_context import get_exec, get_memory, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
@@ -182,6 +182,21 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     family pool; the V4.1 layouts exist only in SM100 / SM103 FlashMLA."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
+    if get_memory().enable_hisparse:
+        # HiSparse's host/device transfer policy addresses the packed V4 page.
+        # Keep auto compatible on SM100, which otherwise selects V4.1 pages.
+        if mode not in ("auto", "v4") or option not in ("auto", "fp8"):
+            raise ValueError(
+                "DeepSeek V4 HiSparse requires the V4 KV layout: use "
+                "SGLANG_DSV4_KV_LAYOUT=auto or v4 and "
+                "SGLANG_DSV4_COMPRESSED_KV_LAYOUT=auto or fp8."
+            )
+        if get_exec().kernel.dsv4_attn_backend in ("trtllm", "flashmla_mega"):
+            raise ValueError(
+                "DeepSeek V4 HiSparse requires packed V4 KV pages; use "
+                "--dsv4-attn-backend flashmla instead of trtllm or flashmla_mega."
+            )
+        return KVLayout.V4, None if option == "auto" else option
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
     assert mode in ("v41", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
