@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_rows_per_chunk,
 )
 from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import is_maca
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 
@@ -101,21 +102,17 @@ def flat_index_logits_tiles(
                 ),
             )
             continue
-        if not kind.is_int8:
-            raise ValueError(
-                f"{kind} index cache has no flattened index-K logits kernel; "
-                "the ratio-1/2 indexer stores fp4 or int8 slots"
+        elif kind.is_int8 and is_maca():
+            logits = int8_mqa_logits(
+                q[tile],
+                kv,
+                weights[tile],
+                tile_starts,
+                tile_starts + lengths[tile],
+                False,
+                backend="maca_c",
             )
-        logits = int8_mqa_logits(
-            q[tile],
-            kv,
-            weights[tile],
-            tile_starts,
-            tile_starts + lengths[tile],
-            False,
-            backend="tilelang",
-        )
-        yield tile, _align_score_rows(logits, width_align)
+            yield tile, _align_score_rows(logits, width_align)
 
 
 def deep_gemm_fp4_paged_mqa_logits(
@@ -148,22 +145,18 @@ def deep_gemm_fp4_paged_mqa_logits(
             max_seq_len,
             False,
         )
-    if not kind.is_int8:
-        raise ValueError(
-            f"{kind} index cache has no paged index-K logits kernel; "
-            "the ratio-1/2 indexer stores fp4 or int8 slots"
+    elif kind.is_int8 and is_maca():
+        return int8_paged_mqa_logits(
+            q,
+            k_cache,
+            weights,
+            sl,
+            page_table,
+            deep_gemm_metadata,
+            max_seq_len,
+            False,
+            backend="maca_c",
         )
-    return int8_paged_mqa_logits(
-        q,
-        k_cache,
-        weights,
-        sl,
-        page_table,
-        deep_gemm_metadata,
-        max_seq_len,
-        False,
-        backend="tilelang",
-    )
 
 
 def sparse_logits(

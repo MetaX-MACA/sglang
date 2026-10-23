@@ -7,7 +7,6 @@ from enum import Enum
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_maca
 
 
 class DSV4IndexCacheKind(Enum):
@@ -52,6 +51,6 @@ def dsv4_index_cache_kind() -> DSV4IndexCacheKind:
     cache_type = envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get()
     if cache_type == "fp8":
         return DSV4IndexCacheKind.FP8
-    if is_maca() and cache_type == "int8":
+    if cache_type == "int8":
         return DSV4IndexCacheKind.INT8
     return DSV4IndexCacheKind.FP4
