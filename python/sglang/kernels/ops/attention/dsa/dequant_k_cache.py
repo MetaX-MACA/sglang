@@ -6,13 +6,14 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.dsa.kv_cache_layout import (
     DSAKVCacheFormat,
-    HEAD_DIM,
     NOPE_DIM,
     NUM_QUANT_GROUPS,
     PACKED_BYTES_PER_TOKEN,
     QUANT_GROUP_SIZE,
     ROPE_DIM,
+    SCALE_BYTES_PER_TOKEN,
     get_kv_cache_format,
+    rope_dim_from_packed_row,
 )
 
 
@@ -198,14 +199,7 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
-    # 528-byte rows are NoPE MLA (rope dim 0, e.g. GLM-5.3); 656-byte rows
-    # carry 64 bf16 rope values. Derive the rope width from the row size.
-    _nope_scale_bytes = NOPE_DIM + NUM_QUANT_GROUPS * 4
-    dim_rope = (dim_quant - _nope_scale_bytes) // 2
-    assert dim_rope in (0, ROPE_DIM) and dim_quant == _nope_scale_bytes + dim_rope * 2, (
-        f"dim_quant: {dim_quant} (derived rope {dim_rope}) not a valid DSA "
-        "quantized row width"
-    )
+    dim_rope = rope_dim_from_packed_row(dim_quant)
     assert group_size == QUANT_GROUP_SIZE
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
@@ -232,12 +226,12 @@ def dequantize_k_cache_paged(
     assert dim_nope % group_size == 0
 
     input_nope_q = quant_k_cache[:, :dim_nope]
-    # [:, 512:512+4*4] = [:, 512:528]
-    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
+    # Four FP32 group scales immediately follow the 512 quantized values.
+    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + SCALE_BYTES_PER_TOKEN].view(
         torch.float32
     )
-    # [:, 528:]
-    input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+    # The remaining bytes are the optional BF16 RoPE tail.
+    input_rope = quant_k_cache[:, dim_nope + SCALE_BYTES_PER_TOKEN :].view(torch.bfloat16)
 
     _dequantize_k_cache_paged_kernel[(num_tokens, num_blocks_per_token)](
         output,
@@ -389,16 +383,13 @@ def dequantize_k_cache_paged_ref(
     cache_format = get_kv_cache_format(quant_k_cache.dtype)
     if cache_format not in (DSAKVCacheFormat.FP8, DSAKVCacheFormat.INT8):
         raise ValueError("The packed DSA dequantizer only accepts FP8 or INT8 cache")
-    if quant_k_cache.shape[-1] != PACKED_BYTES_PER_TOKEN:
-        raise ValueError(
-            f"Expected {PACKED_BYTES_PER_TOKEN} bytes per packed row, got "
-            f"{quant_k_cache.shape[-1]}"
-        )
+    row_bytes = quant_k_cache.shape[-1]
+    rope_dim = rope_dim_from_packed_row(row_bytes)
     if page_table_1_flattened.dtype not in (torch.int32, torch.int64):
         raise TypeError("page_table_1_flattened must contain int32/int64 token IDs")
 
     cache_u8 = quant_k_cache.contiguous().view(torch.uint8).reshape(
-        -1, PACKED_BYTES_PER_TOKEN
+        -1, row_bytes
     )
     loc = page_table_1_flattened.reshape(-1).to(torch.int64)
     rows = cache_u8[loc]
@@ -407,24 +398,25 @@ def dequantize_k_cache_paged_ref(
     else:
         nope_q = rows[:, :NOPE_DIM].contiguous().view(torch.int8).float()
     scales = (
-        rows[:, NOPE_DIM : NOPE_DIM + NUM_QUANT_GROUPS * 4]
+        rows[:, NOPE_DIM : NOPE_DIM + SCALE_BYTES_PER_TOKEN]
         .contiguous()
         .view(torch.float32)
-    )
-    rope = rows[:, NOPE_DIM + NUM_QUANT_GROUPS * 4 :].contiguous().view(
-        torch.bfloat16
     )
     nope = (
         nope_q.reshape(-1, NUM_QUANT_GROUPS, QUANT_GROUP_SIZE)
         * scales.reshape(-1, NUM_QUANT_GROUPS, 1)
     ).reshape(-1, NOPE_DIM)
     output = torch.empty(
-        (loc.numel(), 1, HEAD_DIM),
+        (loc.numel(), 1, NOPE_DIM + rope_dim),
         dtype=torch.bfloat16,
         device=quant_k_cache.device,
     )
     output[:, 0, :NOPE_DIM] = nope.to(torch.bfloat16)
-    output[:, 0, NOPE_DIM:] = rope.reshape(-1, ROPE_DIM)
+    if rope_dim:
+        rope = rows[:, NOPE_DIM + SCALE_BYTES_PER_TOKEN :].contiguous().view(
+            torch.bfloat16
+        )
+        output[:, 0, NOPE_DIM:] = rope.reshape(-1, rope_dim)
     return output
 
 

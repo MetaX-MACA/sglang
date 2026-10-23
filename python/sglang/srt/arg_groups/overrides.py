@@ -1848,6 +1848,12 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         )
 
     kv_cache_dtype = view.kv_cache_dtype
+    if (
+        kv_cache_dtype == "int8"
+        and hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        and envs.MX_ENABLE_NSA_FP8_KV_STORE.get()
+    ):
+        raise ValueError("GLM-5.3-Flash INT8 KV conflicts with FP8 KV store override")
     if envs.MX_ENABLE_NSA_FP8_KV_STORE.get():
         if kv_cache_dtype not in ("auto", "fp8_e4m3"):
             logger.warning(
@@ -2483,6 +2489,19 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
     handler: the TRT-LLM and tokenspeed MLA backends constrain the resolved
     kv-cache dtype (declarations never reach the field, so the checks read
     the view)."""
+    if (
+        view.kv_cache_dtype == "int8"
+        and model_config_of(view).hf_config.architectures[0]
+        == "Glm5NextForConditionalGeneration"
+    ):
+        if (view.dsa_prefill_backend, view.dsa_decode_backend) != (
+            "tilelang",
+            "tilelang",
+        ):
+            raise ValueError(
+                "GLM-5.3-Flash INT8 KV requires TileLang prefill and decode"
+            )
+
     if (
         view.kv_cache_dtype == "int8"
         and model_config_of(view).hf_config.architectures[0]

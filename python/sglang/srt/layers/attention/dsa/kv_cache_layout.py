@@ -1,12 +1,13 @@
 """Layout contract for the quantized GLM/DeepSeek-DSA MLA KV cache.
 
-FP8 and INT8 share the same 656-byte row ABI:
+FP8 and INT8 share the same packed row prefix:
 
     [0:512]   quantized c_kv (four groups of 128 values)
     [512:528] four FP32 dequantization scales
-    [528:656] 64 BF16 RoPE values
+    [528:656] optional 64 BF16 RoPE values
 
 Only the interpretation of the first 512 bytes differs between FP8 and INT8.
+GLM-5.3-Flash has no RoPE tail, so its packed row is 528 bytes.
 """
 
 from enum import IntEnum
@@ -32,10 +33,24 @@ ROPE_BYTES_PER_TOKEN = ROPE_DIM * torch.bfloat16.itemsize
 PACKED_BYTES_PER_TOKEN = (
     QUANT_VALUE_BYTES + SCALE_BYTES_PER_TOKEN + ROPE_BYTES_PER_TOKEN
 )
+GLM53_FLASH_PACKED_BYTES_PER_TOKEN = QUANT_VALUE_BYTES + SCALE_BYTES_PER_TOKEN
 BF16_BYTES_PER_TOKEN = HEAD_DIM * torch.bfloat16.itemsize
 
 INT8_SCALE_EPS = 1.0e-4
 INT8_QMAX = 127.0
+
+
+def packed_kv_row_bytes(rope_dim: int) -> int:
+    if rope_dim not in (0, ROPE_DIM):
+        raise ValueError(f"Unsupported DSA RoPE dimension: {rope_dim}")
+    return GLM53_FLASH_PACKED_BYTES_PER_TOKEN + rope_dim * torch.bfloat16.itemsize
+
+
+def rope_dim_from_packed_row(row_bytes: int) -> int:
+    for rope_dim in (0, ROPE_DIM):
+        if row_bytes == packed_kv_row_bytes(rope_dim):
+            return rope_dim
+    raise ValueError(f"Unsupported DSA packed row width: {row_bytes}")
 
 
 def is_fp8_dtype(dtype: torch.dtype) -> bool:
