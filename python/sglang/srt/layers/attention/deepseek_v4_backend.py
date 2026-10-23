@@ -1225,6 +1225,10 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     local_lens_cpu: Optional[List[int]] = None
     req_global: Optional[torch.Tensor] = None
     pos_global: Optional[torch.Tensor] = None
+    # prefill CP: the tail rows indexed into the FULL extend, and the row count of
+    # the CP all-gather the late layers' MoE runs on (one max_local chunk per rank).
+    cp_extend_indices: Optional[torch.Tensor] = None
+    cp_packed_rows: int = 0
 
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
@@ -1236,6 +1240,14 @@ class LateLayerTail(msgspec.Struct, frozen=True):
         return _tail_rows(
             t, token_indices=self.token_indices, contiguous_start=self.contiguous_start
         )
+
+    def global_rows(self, t: torch.Tensor) -> torch.Tensor:
+        assert self.cp_extend_indices is not None and self.cp_packed_rows, (
+            "global_rows is the CP-only tail selector"
+        )
+        rows = t.new_zeros((self.cp_packed_rows, *t.shape[1:]))
+        rows[self.cp_metadata.gather_index] = t[self.cp_extend_indices]
+        return rows
 
 
 def _tail_rows(
@@ -1956,6 +1968,8 @@ class DeepseekV4AttnBackend(
                 local_lens_cpu=cp_tail["local_lens_cpu"],
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
+                cp_extend_indices=cp_tail["extend_token_indices"],
+                cp_packed_rows=cp_tail["packed_rows"],
             )
         return metadata
 
@@ -2022,6 +2036,10 @@ class DeepseekV4AttnBackend(
                 tail_request_ids[local_tail_rows], minlength=forward_batch.batch_size
             ).tolist(),
             pad_rows=pad_rows,
+            # A per-token tensor the late MoE reads must follow the all-gather
+            # layout: one max_local-row chunk per rank, indexed this way.
+            extend_token_indices=token_indices,
+            packed_rows=cp_size * max_local,
         )
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:

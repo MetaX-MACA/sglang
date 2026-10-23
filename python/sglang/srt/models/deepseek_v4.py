@@ -4495,11 +4495,17 @@ class DeepseekV4Model(nn.Module):
                 normalized_attn = None
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
-                hidden_states, prev_pre, input_ids, input_ids_global = (
+                hidden_states, prev_pre, input_ids = (
                     tail.rows(hidden_states),
                     tail.rows(prev_pre),
                     tail.rows(input_ids),
-                    tail.rows(input_ids_global),
+                )
+                # CP gathers the MoE input across ranks, so its per-token ids
+                # cannot be selected with this rank's local tail indices.
+                input_ids_global = (
+                    tail.global_rows(forward_batch.input_ids)
+                    if tail.cp_metadata is not None
+                    else tail.rows(input_ids_global)
                 )
                 positions = tail.positions
                 if hash_ids is not None:
