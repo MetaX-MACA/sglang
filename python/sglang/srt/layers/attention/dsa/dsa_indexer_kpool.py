@@ -1284,7 +1284,7 @@ class IndexerKPool(MultiPlatformOp):
         assert page_table_all is None or page_table_row_index_all is not None
 
         return self._kpool_topk_by_row_chunks(
-            q_fp8=q_fp8,
+            q_fp8=q_fp8_or_i8,
             weights=weights,
             kv_fp8=kv_fp8,
             logits_starts=ks_per_q,
