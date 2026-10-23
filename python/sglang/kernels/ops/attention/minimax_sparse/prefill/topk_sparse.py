@@ -25,6 +25,17 @@ from ..common.utils import (
     unit_scale,
 )
 
+
+def _prune_subtile_configs(configs, nargs, **kwargs):
+    """Keep K/V sub-tiles within each selected logical sparse block."""
+    block_size = kwargs["block_size"]
+    return [
+        config
+        for config in configs
+        if block_size % config.kwargs["BLOCK_SIZE_K"] == 0
+    ]
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"]),
@@ -52,7 +63,9 @@ from ..common.utils import (
         "qk_head_dim",
         "v_head_dim",
         "gqa_group_size",
+        "block_size",
     ],
+    prune_configs_by={"early_config_prune": _prune_subtile_configs},
 )
 @triton.jit
 def _gqa_share_sparse_fwd_kernel(
@@ -115,6 +128,7 @@ def _gqa_share_sparse_fwd_kernel(
     HAS_SINK: tl.constexpr,
     IS_FP8: tl.constexpr,
 ):
+    tl.static_assert(block_size % BLOCK_SIZE_K == 0)
     sm_scale_log2e = sm_scale * 1.4426950409
     # get batch id and head id
     pid_q = tl.program_id(0)
