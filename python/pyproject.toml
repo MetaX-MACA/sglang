@@ -22,7 +22,9 @@ dependencies = [
   "build",
   "arctic-inference==0.1.1",
   "compressed-tensors==0.15.0.1",
+  "datasets==5.1.0",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
+  "dill==0.4.1",
   "distro",
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "einops",
@@ -37,6 +39,7 @@ dependencies = [
   "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
+  "multiprocess==0.70.19",
   "ninja",
   "numba==0.65.1",
   "numpy==1.26.4",
@@ -49,6 +52,7 @@ dependencies = [
   "prometheus-client>=0.20.0",
   "psutil",
   "py-spy",
+  "pyarrow==25.0.1",  # PyArrow 26 requires NumPy >=2; this branch pins NumPy 1.26.4.
   "pybase64",
   "pydantic",
   "python-multipart",
