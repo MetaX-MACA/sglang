@@ -21,6 +21,7 @@ from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import triton
 
 # Layers - Attention
@@ -67,6 +68,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -137,6 +139,10 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
+_qwen35_use_fused_qk_rope = (
+    _is_cuda and not envs.SGLANG_DISABLE_QWEN35_FUSED_QK_ROPE.get()
+)
+
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
@@ -405,6 +411,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         )
 
+        # Decode-only Qwen3.6-27B TP2/TP4 specialization. The model owner binds all
+        # eligible layers to slices of one large allocation after construction;
+        # using one allocation avoids per-layer large-block allocator rounding.
+        self.register_buffer("_fused_in_proj_weight", None, persistent=False)
+        self._fused_in_proj_qkvz_width = 0
+        self._fused_in_proj_decode_max_tokens = 0
+        self._init_qwen36_tp2_fused_in_proj()
+
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -623,6 +637,66 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=tp_size,
         )
 
+    def _init_qwen36_tp2_fused_in_proj(self) -> None:
+        """Enable the shape-specialized decode path when it is supported.
+
+        Keep the legacy TP2 environment names for both TP2 and TP4.
+        """
+        enabled = os.environ.get(
+            "SGLANG_QWEN36_TP2_FUSED_IN_PROJ", "1"
+        ).strip().lower() not in ("0", "false", "off", "no")
+        if not enabled:
+            return
+
+        try:
+            decode_max_tokens = int(
+                os.environ.get(
+                    "SGLANG_QWEN36_TP2_FUSED_IN_PROJ_DECODE_MAX_TOKENS", "256"
+                )
+            )
+        except ValueError:
+            logger.warning(
+                "Invalid Qwen3.6 TP2 fused projection decode limit; "
+                "disabling the fused projection"
+            )
+            return
+
+        qkvz = self.in_proj_qkvz
+        ba = self.in_proj_ba
+        # Local (per-rank) reference shapes: TP2 -> (8192, 5120) / (48, 5120),
+        # TP4 -> (4096, 5120) / (24, 5120).
+        qkvz_rows = (2 * self.key_dim + 2 * self.value_dim) // self.attn_tp_size
+        ba_rows = (2 * self.num_v_heads) // self.attn_tp_size
+        if not (
+            _is_cuda
+            and decode_max_tokens > 0
+            and self.attn_tp_size in (2, 4)
+            and self.hidden_size == 5120
+            and isinstance(qkvz.quant_method, UnquantizedLinearMethod)
+            and isinstance(ba.quant_method, UnquantizedLinearMethod)
+            and qkvz.bias is None
+            and ba.bias is None
+            and qkvz.weight.dtype == torch.bfloat16
+            and ba.weight.dtype == torch.bfloat16
+            and tuple(qkvz.weight.shape) == (qkvz_rows, 5120)
+            and tuple(ba.weight.shape) == (ba_rows, 5120)
+            and qkvz.weight.device == ba.weight.device
+        ):
+            return
+
+        self._fused_in_proj_qkvz_width = qkvz.weight.shape[0]
+        self._fused_in_proj_decode_max_tokens = decode_max_tokens
+
+    def bind_qwen36_tp2_fused_in_proj_storage(self, fused: torch.Tensor) -> None:
+        """Bind original projection Parameters to one layer's storage slice."""
+        split = self._fused_in_proj_qkvz_width
+        expected_shape = (split + self.in_proj_ba.weight.shape[0], self.hidden_size)
+        assert tuple(fused.shape) == expected_shape
+        assert fused.is_contiguous()
+        self.in_proj_qkvz.weight.data = fused[:split]
+        self.in_proj_ba.weight.data = fused[split:]
+        self._fused_in_proj_weight = fused
+
     def fix_query_key_value_ordering(
         self,
         mixed_qkvz: torch.Tensor,
@@ -645,7 +719,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
-    def _forward_input_proj(self, hidden_states: torch.Tensor):
+    def _forward_input_proj(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
         # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
         # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
         # consume ``(fp8, scale)`` (skipping its internal quant) while the
@@ -654,6 +732,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if _use_aiter and isinstance(hidden_states, tuple):
             return self._forward_input_proj_fused_quant_amd(hidden_states)
 
+        seq_len, hidden_dim = hidden_states.shape
+        is_pure_decode = (
+            forward_batch.forward_mode.is_decode()
+            and not forward_batch.is_extend_in_batch
+        )
+        if (
+            is_pure_decode
+            and self._fused_in_proj_weight is not None
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_dim == self.hidden_size
+            and 0 < seq_len <= self._fused_in_proj_decode_max_tokens
+        ):
+            # The mode check above is the primary guard. The token limit only
+            # selects supported decode batches and must never infer the phase.
+            fused_out = F.linear(hidden_states, self._fused_in_proj_weight)
+            split = self._fused_in_proj_qkvz_width
+            return fused_out[:, :split], fused_out[:, split:]
+
+        # Keep the original fallback byte-for-byte in behavior. In particular,
+        # short EXTEND/prefill inputs must still execute the original 8192 and
+        # 48-wide projections rather than the 8240-wide decode projection.
         if (
             _is_cpu
             or _is_npu
@@ -663,7 +762,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
-        seq_len, _ = hidden_states.shape
         if (
             self.alt_stream is not None
             and get_is_capture_mode()
@@ -769,7 +867,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         3. Output projection
         """
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
+            hidden_states, forward_batch
         )
 
         if _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu":
@@ -1337,7 +1435,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_cuda and self.attn_output_gate:
+        if _qwen35_use_fused_qk_rope and self.attn_output_gate:
             q, k, v, gate = self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1597,6 +1695,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
+        self.register_buffer(
+            "_qwen36_tp2_fused_in_proj_storage", None, persistent=False
+        )
+        self._bind_qwen36_tp2_fused_in_proj_storage()
         self.flashinfer_mnnvl_cutedsl_fusion = None
         if _use_mnnvl_cutedsl_fusion(config, is_nextn):
             if self.pp_group.world_size != 1:
@@ -1646,6 +1748,32 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = PPMissingLayer()
 
         self.layers_to_capture = []
+
+    def _bind_qwen36_tp2_fused_in_proj_storage(self) -> None:
+        """Use one allocation for all local decode-only fused projections."""
+        eligible = []
+        for layer in self.layers:
+            if not isinstance(layer, Qwen3_5LinearDecoderLayer):
+                continue
+            gdn = layer.linear_attn
+            if gdn._fused_in_proj_decode_max_tokens > 0:
+                eligible.append(gdn)
+
+        if not eligible:
+            return
+
+        rows = (
+            eligible[0]._fused_in_proj_qkvz_width
+            + eligible[0].in_proj_ba.weight.shape[0]
+        )
+        storage = torch.empty(
+            (len(eligible), rows, self.hidden_size),
+            dtype=eligible[0].in_proj_qkvz.weight.dtype,
+            device=eligible[0].in_proj_qkvz.weight.device,
+        )
+        for index, gdn in enumerate(eligible):
+            gdn.bind_qwen36_tp2_fused_in_proj_storage(storage[index])
+        self._qwen36_tp2_fused_in_proj_storage = storage
 
     def get_input_embeddings(self):
         return self.embed_tokens

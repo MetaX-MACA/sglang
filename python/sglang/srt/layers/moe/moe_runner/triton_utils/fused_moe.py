@@ -47,7 +47,6 @@ from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .moe_align_block_size import moe_align_block_size
-from mcoplib.triton_situ_and_mul import situ_and_mul
 from sgl_kernel import cutlass_moe_mm_gemm_kernel_m_w8a8
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -1293,7 +1292,10 @@ def _fused_moe_kernel_sequence(
                 d = x.shape[-1] // 2
                 intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
     elif activation == "situ" and is_gated:
-        situ_and_mul(
+        # SiTU is optional for SiLU/GLM models; require it only when selected.
+        from mcoplib.triton_situ_and_mul import situ_and_mul as _mcoplib_situ_and_mul
+
+        _mcoplib_situ_and_mul(
             intermediate_cache1.view(-1, N),
             situ_beta=(gemm1_alpha if gemm1_alpha is not None else 4.0),
             situ_linear_beta=gemm1_limit,

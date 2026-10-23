@@ -98,13 +98,23 @@ class PrefillDelayer:
             self._max_delay_ms = 5000.0
         self._queue_trigger_enabled = self._queue_min_ratio is not None
         self._prefill_max_requests = get_schedule().prefill_max_requests
+        # Token-threshold trigger is opt-in: activates only when min_tokens > 0.
+        self._min_prefill_tokens = get_schedule().prefill_delayer_min_tokens
+        if self._min_prefill_tokens > get_schedule().max_prefill_tokens:
+            logger.warning(
+                f"prefill_delayer_min_tokens={self._min_prefill_tokens} exceeds "
+                f"max_prefill_tokens={get_schedule().max_prefill_tokens}; clamping so a "
+                f"single prefill batch can still reach the threshold."
+            )
+            self._min_prefill_tokens = get_schedule().max_prefill_tokens
         logger.info(
             f"PrefillDelayer initialized with "
             f"max_delay_passes={self._max_delay_passes} "
             f"token_usage_low_watermark={self._token_usage_low_watermark} "
             f"queue_min_ratio={self._queue_min_ratio} "
             f"max_delay_ms={self._max_delay_ms} "
-            f"queue_trigger_enabled={self._queue_trigger_enabled}"
+            f"queue_trigger_enabled={self._queue_trigger_enabled} "
+            f"min_tokens={self._min_prefill_tokens}"
         )
         self.dp_size = dp_size
         self.enable_dp_attention = get_parallel().enable_dp_attention
@@ -129,9 +139,9 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len.
+        # waiting_queue_len, pending_tokens, timeout_expired.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, 5),
+            (dp_size_dim, attn_tp_size, 7),
             dtype=torch.int64,
             device=self._gather_device,
         )
@@ -153,6 +163,7 @@ class PrefillDelayer:
         max_prefill_bs: int = 0,
         max_running_requests: int = 0,
         waiting_queue_len: int = 0,
+        pending_tokens: int = 0,
     ) -> _NegotiateOutput:
         out = self._negotiate_should_allow_prefill_pure(
             prev_state=self._curr_state,
@@ -162,6 +173,7 @@ class PrefillDelayer:
             max_prefill_bs=max_prefill_bs,
             max_running_requests=max_running_requests,
             waiting_queue_len=waiting_queue_len,
+            pending_tokens=pending_tokens,
         )
         self._curr_state = out.next_state
         return out
@@ -176,12 +188,20 @@ class PrefillDelayer:
         max_prefill_bs: int = 0,
         max_running_requests: int = 0,
         waiting_queue_len: int = 0,
+        pending_tokens: int = 0,
     ) -> _NegotiateOutput:
         # Compute local states
         local_token_watermark_force_allow = (
             local_prefillable
             and ((x := self._token_usage_low_watermark) is not None)
             and (token_usage < x)
+        )
+
+        # Synchronize timeout decisions: rank-local clocks can straddle the cap.
+        local_timeout_expired = (
+            prev_state is not None
+            and (time.perf_counter() - prev_state.start_time) * 1000.0
+            >= self._max_delay_ms
         )
 
         # Gather global states
@@ -191,12 +211,17 @@ class PrefillDelayer:
             running_batch=running_batch,
             max_prefill_bs=max_prefill_bs,
             waiting_queue_len=waiting_queue_len,
+            pending_tokens=pending_tokens,
+            timeout_expired=local_timeout_expired,
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
         global_running_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
         global_waiting_queue_len = tp0_info[:, 4]
+        global_pending_tokens = tp0_info[:, 5]
+        # Include every TP rank, not only the TP0 slices used for scheduler state.
+        global_timeout_expired = self._global_info_buffer[:, :, 6].max().item() > 0
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -223,6 +248,75 @@ class PrefillDelayer:
                 (time.perf_counter() - prev_state.start_time) if prev_state else 0.0
             ),
         )
+
+        # Token-threshold trigger (opt-in via --prefill-delayer-min-tokens):
+        # while decode is running, hold prefill until enough pending tokens
+        # accumulate. Release on the token threshold, on the wall-clock cap,
+        # on the max-delay-passes cap, or when no decode is running.
+        # When the option is unset (0), use the slot/queue logic below.
+        if self._min_prefill_tokens > 0 and prefillable_status != "none":
+            if global_exists_token_watermark_force_allow:
+                return _NegotiateOutput(
+                    next_state=None,
+                    output_allow=True,
+                    output_reason="token_watermark",
+                    **debug_info,
+                    **wait_info,
+                )
+
+            if self.skip_first_delayer:
+                self.skip_first_delayer = False
+                return _NegotiateOutput(
+                    next_state=None,
+                    output_allow=True,
+                    output_reason=(
+                        "wait_success" if prev_state is not None else "no_wait"
+                    ),
+                    **debug_info,
+                    **wait_info,
+                )
+
+            global_running_batch_max = int(global_running_batch.max().item())
+            prev_delayed_count = prev_state.delayed_count if prev_state else 0
+            if int(global_pending_tokens.max().item()) >= self._min_prefill_tokens:
+                return _NegotiateOutput(
+                    next_state=None,
+                    output_allow=True,
+                    output_reason="token_threshold",
+                    **debug_info,
+                    **wait_info,
+                )
+            if (
+                global_timeout_expired
+                or prev_delayed_count >= self._max_delay_passes - 1
+            ):
+                # Match the mixed branch: release on the Nth negotiation.
+                return _NegotiateOutput(
+                    next_state=None,
+                    output_allow=True,
+                    output_reason="wait_timeout",
+                    **debug_info,
+                    **wait_info,
+                )
+            if global_running_batch_max == 0:
+                # Device idle: there is no decode to batch with, do not delay.
+                return _NegotiateOutput(
+                    next_state=None,
+                    output_allow=True,
+                    output_reason=(
+                        "wait_success" if prev_state is not None else "no_wait"
+                    ),
+                    **debug_info,
+                    **wait_info,
+                )
+
+            next_state = (prev_state or _State()).bump_delayed_count()
+            return _NegotiateOutput(
+                next_state=next_state,
+                output_allow=False,
+                output_reason="delay",
+                **debug_info,
+            )
 
         # Compute outputs
         if prefillable_status == "all":
@@ -266,10 +360,8 @@ class PrefillDelayer:
                     queue_min_effective > 0
                     and global_waiting_queue_max < queue_min_effective
                 )
-                if queue_condition and prev_state is not None:
-                    elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
-                    if elapsed_ms >= self._max_delay_ms:
-                        queue_condition = False
+                if queue_condition and global_timeout_expired:
+                    queue_condition = False
 
             slot_condition = (
                 max_running_requests - global_running_batch_max
@@ -358,6 +450,8 @@ class PrefillDelayer:
         running_batch: int = 0,
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
+        pending_tokens: int = 0,
+        timeout_expired: bool = False,
     ):
         local_info = torch.tensor(
             [
@@ -366,6 +460,8 @@ class PrefillDelayer:
                 running_batch,
                 max_prefill_bs,
                 waiting_queue_len,
+                pending_tokens,
+                int(timeout_expired),
             ],
             device=self._gather_device,
             dtype=torch.int64,
@@ -380,9 +476,15 @@ class PrefillDelayer:
 
 
 class PrefillDelayerSinglePassExecutor:
-    def __init__(self, prefill_delayer: PrefillDelayer, token_usage: float):
+    def __init__(
+        self,
+        prefill_delayer: PrefillDelayer,
+        token_usage: float,
+        pending_tokens: int = 0,
+    ):
         self._prefill_delayer = prefill_delayer
         self._token_usage = token_usage
+        self._pending_tokens = pending_tokens
         self._result: Optional[_NegotiateOutput] = None
         self._attempted_prefill_bs = 0
 
@@ -449,6 +551,7 @@ class PrefillDelayerSinglePassExecutor:
                 max_prefill_bs=max_prefill_bs,
                 max_running_requests=max_running_requests,
                 waiting_queue_len=waiting_queue_len,
+                pending_tokens=self._pending_tokens,
             )
         return self._result.output_allow
 
@@ -464,6 +567,12 @@ def _record_single_pass_result(
         if output.output_allow and (output.output_reason == "wait_timeout"):
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill "
+                f"(num_prefillable={output.num_prefillable}, "
+                f"actual_execution={actual_execution})"
+            )
+        elif output.output_allow and (output.output_reason == "token_threshold"):
+            logger.info(
+                f"PrefillDelayer token threshold reached thus not forbid prefill "
                 f"(num_prefillable={output.num_prefillable}, "
                 f"actual_execution={actual_execution})"
             )

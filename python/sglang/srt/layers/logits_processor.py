@@ -59,6 +59,7 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.common import (
     is_cpu,
+    is_maca,
     is_npu,
     is_pin_memory_available,
     use_intel_amx_backend,
@@ -432,6 +433,9 @@ class LogitsProcessor(nn.Module):
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         self.empty_hiddens = None
+        self.use_bf16_logits_gather = (
+            is_maca() and envs.SGLANG_LOGITS_GATHER_BF16.get()
+        )
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -836,14 +840,27 @@ class LogitsProcessor(nn.Module):
             # (local matmul is current, gathered peers lag). A fp32 copy is
             # ordered correctly in the graph. Eager is unchanged;
             # _copy_logits_to_buffer already promotes to fp32.
+            # SGLANG_LOGITS_GATHER_BF16 explicitly opts out for MACA ordinary
+            # TP decode; FP16 and specialized/DP paths retain the workaround.
             if (
                 logits.shape[0] != 0
                 and logits.dtype in (torch.bfloat16, torch.float16)
                 and torch.cuda.is_current_stream_capturing()
+                and not (
+                    self.use_bf16_logits_gather
+                    and logits.dtype == torch.bfloat16
+                    and logits_metadata.forward_mode.is_decode()
+                    and not self.use_lm_head_tp_group
+                    and not self.use_attn_tp_group
+                    and not self.use_tp_lm_head_all_to_all
+                    and not self.do_tensor_parallel_all_gather_dp_attn
+                )
             ):
                 logits = logits.float()
             _trace_e2e_logits(
-                "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
+                "tp_logits_gather_enter",
+                logits_shape=tuple(logits.shape),
+                logits_dtype=logits.dtype,
             )
             if self.use_lm_head_tp_group:
                 logits = get_lm_head_tp_group().all_gather(logits, -1)

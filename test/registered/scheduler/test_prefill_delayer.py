@@ -50,6 +50,8 @@ class NegotiateCall:
     max_prefill_bs: Optional[List[int]] = None
     waiting_queue_len: Optional[List[int]] = None
     max_running_requests: Optional[int] = None
+    # Pending prefill tokens for the token-threshold trigger.
+    pending_tokens: Optional[List[int]] = None
     # Inter-call sleep (seconds). Used to exercise the queue-trigger
     # wall-clock timeout.
     sleep_before_s: float = 0.0
@@ -71,6 +73,9 @@ class NegotiateTestCase:
     # Expected accumulated wait surfaced on the final (release) outcome. When
     # set, asserts the wait histograms would observe this value instead of 0.
     expected_wait_forward_passes: Optional[int] = None
+    # Token-threshold trigger knob (--prefill-delayer-min-tokens).
+    min_tokens: int = 0
+    max_prefill_tokens: int = 8192
 
 
 def _run_negotiate_test(rank, test_cases):
@@ -84,6 +89,8 @@ def _run_negotiate_test(rank, test_cases):
             prefill_delayer_queue_min_ratio=case.queue_min_ratio,
             prefill_delayer_max_delay_ms=case.max_delay_ms,
             prefill_max_requests=case.prefill_max_requests,
+            prefill_delayer_min_tokens=case.min_tokens,
+            max_prefill_tokens=case.max_prefill_tokens,
         )
         override.install()
         delayer = PrefillDelayer(
@@ -105,6 +112,8 @@ def _run_negotiate_test(rank, test_cases):
                 extra_kwargs["max_prefill_bs"] = call.max_prefill_bs[rank]
             if call.waiting_queue_len is not None:
                 extra_kwargs["waiting_queue_len"] = call.waiting_queue_len[rank]
+            if call.pending_tokens is not None:
+                extra_kwargs["pending_tokens"] = call.pending_tokens[rank]
             if call.max_running_requests is not None:
                 extra_kwargs["max_running_requests"] = call.max_running_requests
 
@@ -451,16 +460,250 @@ _NEGOTIATE_TEST_CASES = [
         # Two slot-condition delays accumulated after the skip-first pass.
         expected_wait_forward_passes=2,
     ),
+    # ---- Token-threshold trigger (--prefill-delayer-min-tokens) ----
+    # The "all" branch must honor max_delay_passes too (liveness): with a
+    # persistently-true slot condition, prefill is released on the Nth
+    # negotiation instead of being delayed forever.
+    NegotiateTestCase(
+        name="all_slot_condition_timeout",
+        max_delay_passes=3,
+        token_usage_low_watermark=None,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[1000, 1000, 1000, 1000],
+                max_prefill_bs=[80, 80, 80, 80],
+                max_running_requests=1024,
+            )
+            for _ in range(4)
+        ],
+        expected_allow=True,
+        expected_reason="wait_timeout",
+    ),
+    # While decode is running, prefill is held until the pending tokens reach
+    # the threshold; the threshold release reports "token_threshold".
+    # Call 1 is consumed by skip_first_delayer, call 2 delays (below
+    # threshold), call 3 releases because 5000 >= 4096.
+    NegotiateTestCase(
+        name="token_threshold_release",
+        max_delay_passes=100,
+        token_usage_low_watermark=None,
+        min_tokens=4096,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[8, 8, 8, 8],
+                pending_tokens=[1000, 1000, 1000, 1000],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[8, 8, 8, 8],
+                pending_tokens=[1000, 1000, 1000, 1000],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[8, 8, 8, 8],
+                pending_tokens=[5000, 5000, 5000, 5000],
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="token_threshold",
+        expected_wait_forward_passes=1,
+    ),
+    # Below threshold and still decoding: the wall-clock cap releases prefill.
+    NegotiateTestCase(
+        name="token_threshold_timeout_release",
+        max_delay_passes=100,
+        token_usage_low_watermark=None,
+        min_tokens=8192,
+        max_delay_ms=50,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[8, 8, 8, 8],
+                pending_tokens=[1000, 1000, 1000, 1000],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[8, 8, 8, 8],
+                pending_tokens=[1000, 1000, 1000, 1000],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[8, 8, 8, 8],
+                pending_tokens=[1000, 1000, 1000, 1000],
+                sleep_before_s=0.2,  # > max_delay_ms (50ms)
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="wait_timeout",
+    ),
+    # No running decode: never delay, prefill immediately (call 3 releases
+    # although the threshold is not reached and the timeout has not elapsed).
+    NegotiateTestCase(
+        name="token_threshold_idle_release",
+        max_delay_passes=100,
+        token_usage_low_watermark=None,
+        min_tokens=8192,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[8, 8, 8, 8],
+                pending_tokens=[100, 100, 100, 100],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[8, 8, 8, 8],
+                pending_tokens=[100, 100, 100, 100],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[0, 0, 0, 0],
+                pending_tokens=[100, 100, 100, 100],
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="wait_success",
+    ),
+    # Threshold above the batch budget is clamped to max_prefill_tokens, so a
+    # full batch's worth of pending tokens still releases immediately.
+    NegotiateTestCase(
+        name="token_threshold_clamped_to_batch_budget",
+        max_delay_passes=100,
+        token_usage_low_watermark=None,
+        min_tokens=100000,
+        max_prefill_tokens=8192,
+        max_delay_ms=5000,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[8, 8, 8, 8],
+                pending_tokens=[100, 100, 100, 100],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[8, 8, 8, 8],
+                pending_tokens=[5000, 5000, 5000, 5000],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[8, 8, 8, 8],
+                pending_tokens=[8192, 8192, 8192, 8192],
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="token_threshold",
+    ),
+    NegotiateTestCase(
+        name="token_threshold_pass_cap",
+        max_delay_passes=3,
+        token_usage_low_watermark=None,
+        min_tokens=4096,
+        max_delay_ms=50000,
+        calls=[
+            NegotiateCall(
+                prefillable=[True] * 4,
+                token_usage=[0.9] * 4,
+                running_batch=[8] * 4,
+                pending_tokens=[100] * 4,
+            )
+            for _ in range(4)
+        ],
+        expected_allow=True,
+        expected_reason="wait_timeout",
+        expected_wait_forward_passes=2,
+    ),
+
 ]
 
 
+def _run_tp_timeout_sync_test(rank):
+    from sglang.srt.managers.prefill_delayer import _State
+
+    cpu_group = torch.distributed.new_group(backend="gloo")
+    # Four ranks form two DP groups with two TP ranks each. Only rank 1
+    # times out, so examining TP0 alone would miss the release vote.
+    for min_tokens in (0, 4096):
+        override = get_context().override_server_args(
+            enable_dp_attention=True,
+            disable_overlap_schedule=False,
+            prefill_delayer_queue_min_ratio=2.0,
+            prefill_delayer_max_delay_ms=50000,
+            prefill_delayer_min_tokens=min_tokens,
+            max_prefill_tokens=8192,
+        )
+        override.install()
+        try:
+            delayer = PrefillDelayer(
+                dp_size=2,
+                attn_tp_size=2,
+                cpu_group=cpu_group,
+                max_delay_passes=100,
+                token_usage_low_watermark=None,
+            )
+            delayer.skip_first_delayer = False
+            delayer._curr_state = _State(
+                delayed_count=1,
+                start_time=time.perf_counter() - (100.0 if rank == 1 else 0.0),
+            )
+            result = delayer._negotiate_should_allow_prefill(
+                local_prefillable=True,
+                token_usage=0.9,
+                running_batch=8,
+                max_prefill_bs=80,
+                max_running_requests=1024,
+                waiting_queue_len=1,
+                pending_tokens=100,
+            )
+            assert result.output_allow, (rank, min_tokens, result)
+            expected_reason = "wait_timeout" if min_tokens else "wait_success"
+            assert result.output_reason == expected_reason, (rank, result)
+            assert result.wait_forward_passes == 1
+        finally:
+            override.restore()
+
+
 class TestPrefillDelayerNegotiate(unittest.TestCase):
+    def test_token_threshold_cli(self):
+        import argparse
+        from sglang.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            ["--model-path", "dummy", "--prefill-delayer-min-tokens", "4096"]
+        )
+        self.assertEqual(args.prefill_delayer_min_tokens, 4096)
+        defaults = parser.parse_args(["--model-path", "dummy"])
+        self.assertEqual(defaults.prefill_delayer_min_tokens, 0)
+
     def test_negotiate(self):
         run_distributed_test(
             _run_negotiate_test,
             world_size=4,
             backend="gloo",
             test_cases=_NEGOTIATE_TEST_CASES,
+        )
+
+
+    def test_tp_timeout_sync(self):
+        run_distributed_test(
+            _run_tp_timeout_sync_test,
+            world_size=4,
+            backend="gloo",
         )
 
 

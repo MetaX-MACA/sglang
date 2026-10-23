@@ -10,6 +10,9 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import input_guard
+from sglang.srt.utils import is_maca
+
+_is_maca = is_maca()
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -140,7 +143,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
-    num_warps = 1
+    num_warps = 4 if _is_maca else 1
 
     o = q.new_empty(NK, *v.shape)
     if output_final_state:
@@ -360,7 +363,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         )
     BV = min(triton.next_power_of_2(V), 32)
     num_stages = 3
-    num_warps = 1
+    num_warps = 4 if _is_maca else 1
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
     stride_a_tok = a.stride(0)
