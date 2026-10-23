@@ -52,6 +52,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -195,7 +196,8 @@ class DeepEPMoE(FusedMoE):
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             if (isinstance(quant_config, Fp8Config) or \
             isinstance(quant_config, CompressedTensorsConfig) or \
-            isinstance(quant_config, W8A8Int8Config)):
+            isinstance(quant_config, W8A8Int8Config)) or \
+            isinstance(quant_config, Mxfp4Config):
                 self.deprecate_flag = True
             else:
                 self.deprecate_flag = False

@@ -78,6 +78,9 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
+import logging
+logger = logging.getLogger(__name__)
+import os
 
 if not (_is_npu or _is_hip) and _is_cuda:
     from sglang.kernels.ops.activation.activation import (
@@ -1113,11 +1116,19 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             swiglu_limit_arg = self.swiglu_limit
 
         # Act
-        down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant_bf16(
-            gateup_output,
-            masked_m,
-            swiglu_limit_arg,
-        )
+        if self.config.activation == "situ":
+            down_input, down_input_scale = _varlen_deep_gemm_situ_mul_w4a16(
+                gateup_output=gateup_output,
+                masked_m=masked_m,
+                beta=self.config.gemm1_alpha,
+                linear_beta=self.config.gemm1_clamp_limit,
+            )
+        else:
+            down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant_bf16(
+                gateup_output,
+                masked_m,
+                swiglu_limit_arg,
+            )
         del gateup_output
 
         # GroupGemm-1
@@ -1974,6 +1985,30 @@ def _situ_mul_quant_contig_kernel(
     srow = tl.arange(0, KG_POW2)
     tl.store(s_ptr + row * KG + srow, amax / 448.0, mask=srow < KG)
 
+def _varlen_deep_gemm_situ_mul_w4a16(
+    gateup_output: torch.Tensor,
+    masked_m: Optional[torch.Tensor],
+    beta: float,
+    linear_beta: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    assert masked_m is not None
+    hidden_states_device = gateup_output.device
+    E, N, D_2 = gateup_output.shape
+    down_input = torch.empty(
+        (E, N, D_2 // 2),
+        device=hidden_states_device,
+        dtype=torch.bfloat16,
+    )
+    torch.ops._C.masked_situ_and_mul(
+        down_input,
+        gateup_output,
+        masked_m,
+        beta,
+        linear_beta,
+    )
+
+    return down_input, None
 
 def _apply_swiglu_limit(
     gateup_output: torch.Tensor, swiglu_limit: float
