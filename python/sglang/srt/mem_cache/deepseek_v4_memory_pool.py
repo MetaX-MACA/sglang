@@ -2203,7 +2203,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id)),
             )
             return
-        if self.swa_kv_pool.dtype == torch.bfloat16:
+        window = self.request_window
+        kv_dtype = window.state.dtype if window is not None else self.swa_kv_pool.dtype
+        if kv_dtype == torch.bfloat16:
             # The FlashMLA fused writer requires the packed FP8/uint8 layout.
             # BF16 pages hold plain KV rows; normalize/rotate first, then use
             # the dtype-aware store. Fused QKV projection slices need a copy
