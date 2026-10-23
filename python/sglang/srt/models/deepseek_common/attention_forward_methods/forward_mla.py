@@ -798,7 +798,13 @@ class DeepseekMLAForwardMixin:
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
 
-            attn_output = self.attn_mqa(
+            flashmla_dcp_decode = (
+                self.current_attention_backend == "flashmla"
+                and self.kv_cache_dtype == "int8"
+                and is_dcp_mla_decode_phase(forward_batch)
+            )
+            attn = self.attn_mqa_for_dcp_decode if flashmla_dcp_decode else self.attn_mqa
+            attn_output = attn(
                 q,
                 k,
                 k_nope,
@@ -806,6 +812,8 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+            if flashmla_dcp_decode:
+                attn_output, lse = attn_output
 
         # correct attn_output with respect to lse from other ranks
         if is_dcp_mla_decode_phase(forward_batch):

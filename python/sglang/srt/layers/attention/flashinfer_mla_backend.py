@@ -881,7 +881,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 )
             o = q.new_empty(q.shape)
             fp8_run_kwargs = {}
-            if self.mla_kv_cache_store_int8:
+            if self.mla_kv_cache_store_int8 and k_buf.dtype != torch.bfloat16:
                 from sglang.kernels.ops.kimi_k3.int8_kv_cache import (
                     dequantize_k_cache_paged_int8,
                 )
@@ -1359,7 +1359,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
             )
 
         self.attn_backend.extend_bf16_kv_indices = kv_indices
-        if self.attn_backend.mla_kv_cache_store_int8 and not use_ragged:
+        if (
+            self.attn_backend.mla_kv_cache_store_int8
+            and not use_ragged
+            and attn_dcp_metadata is None
+        ):
             kv_indices = self.attn_backend._prepare_int8_prefill_indices(
                 wrapper_paged, kv_indices, kv_indptr
             )

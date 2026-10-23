@@ -506,14 +506,19 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if cfg.kv_cache_dtype == "int8":
         if cfg.dcp_size > 1:
-            raise ValueError("Kimi-K3 INT8 KV cache does not support DCP.")
-        if attention_backends_of(cfg) == (None, None):
+            if not is_maca() or attention_backends_of(cfg) != ("flashinfer", "flashmla"):
+                raise ValueError(
+                    "Kimi-K3 INT8 DCP requires MACA, FlashInfer prefill and FlashMLA decode."
+                )
+            if cfg.speculative_algorithm is not None:
+                raise ValueError("Kimi-K3 INT8 DCP does not support speculative decoding.")
+        elif attention_backends_of(cfg) == (None, None):
             logger.info("Kimi-K3 INT8 KV cache selects the Triton attention backend.")
             return {
                 "prefill_attention_backend": "triton",
                 "decode_attention_backend": "triton",
             }
-        if attention_backends_of(cfg) == ("flashinfer", "flashmla"):
+        if cfg.dcp_size == 1 and attention_backends_of(cfg) == ("flashinfer", "flashmla"):
             return {"flashinfer_mla_disable_ragged": True}
 
     if cfg.dcp_size > 1:
@@ -547,7 +552,13 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["speculative_attention_mode"] = "decode"
 
         prefill_backend, decode_backend = attention_backends_of(cfg)
-        if decode_backend == "cutedsl_mla" or (
+        if cfg.kv_cache_dtype == "int8":
+            overrides.update(
+                prefill_attention_backend="flashinfer",
+                decode_attention_backend="flashmla",
+                flashinfer_mla_disable_ragged=True,
+            )
+        elif decode_backend == "cutedsl_mla" or (
             decode_backend is None and not is_maca()
         ):
             _require_kimi_k3_cutedsl_dcp_support()

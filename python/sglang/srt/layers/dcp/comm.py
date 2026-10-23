@@ -279,15 +279,22 @@ def all_gather_kv_cache_for_mla_extend(
         attn_mqa,
         dcp_local_prefix_kv_indices,
     )
-    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-    # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
-    gathered_kv = all_gather_kv_cache_for_dcp(
-        cache_k_nope,
-        cache_k_rope,
-        extend_prefix_lens_cpu,
-        prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
-    )
-    dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
+    mla_pool = getattr(token_to_kv_pool, "full_kv_pool", token_to_kv_pool)
+    # INT8 absorbed prefill reaches this path even without a prefix. MCCL FC
+    # rejects the zero-count gather. The global sum is identical on all ranks;
+    # ranks with no local KV must still participate when the global sum is > 0.
+    if dcp_extend_prefix_lens_sum > 0 or not getattr(
+        mla_pool, "mla_kv_cache_store_int8", False
+    ):
+        extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
+        # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+        gathered_kv = all_gather_kv_cache_for_dcp(
+            cache_k_nope,
+            cache_k_rope,
+            extend_prefix_lens_cpu,
+            prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
+        )
+        dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
     # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
     dcp_kv_buffer[
