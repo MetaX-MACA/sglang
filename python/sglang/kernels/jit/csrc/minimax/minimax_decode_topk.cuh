@@ -272,7 +272,7 @@ struct TopKTrait {
 // -------------------------------------------------------------------------
 
 // Block-id output: topk_idx[h, b, 0:k_eff) = selected block ids (front-packed,
-// unordered), [k_eff:topk) = -1.
+// ascending), [k_eff:topk) = -1.
 template <typename SeqLenT, bool kUsePDL>
 __global__ void minimax_decode_topk_block_kernel(
     const float* __restrict__ score,
@@ -304,7 +304,20 @@ __global__ void minimax_decode_topk_block_kernel(
 
   const float* __restrict__ row = score + (static_cast<int64_t>(h) * batch + b) * max_seqblock;
   __shared__ TopKTrait::Smem smem;
-  TopKTrait::forward(row, static_cast<uint32_t>(num_blocks), out, static_cast<uint32_t>(topk), &smem);
+  __shared__ int32_t s_topk[TopKTrait::kMaxTopK];
+  TopKTrait::forward(row, static_cast<uint32_t>(num_blocks), s_topk, static_cast<uint32_t>(topk), &smem);
+  __syncthreads();  // s_topk fully written before the sort reads it
+
+  // Shared-memory rank avoids CUDA warp-ballot assumptions on MACA wave64.
+  // The selected ids are distinct; each thread writes exactly one sorted slot.
+  if (tx < topk) {
+    const int32_t target = s_topk[tx];
+    int rank = 0;
+    for (int i = 0; i < topk; ++i) {
+      rank += (s_topk[i] < target);
+    }
+    out[rank] = target;
+  }
 }
 
 // Page-table output: for each (batch b, kv-head h) pseudo-request emit the
