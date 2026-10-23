@@ -10,6 +10,8 @@ from sglang.srt.layers.attention.dsa.kv_cache_layout import (
     PACKED_BYTES_PER_TOKEN,
     QUANT_GROUP_SIZE,
     ROPE_DIM,
+    SCALE_BYTES_PER_TOKEN,
+    packed_kv_row_bytes,
 )
 
 
@@ -126,19 +128,21 @@ def quantize_k_cache_separate(
 
 def quantize_k_cache_int8_separate(
     k_nope: torch.Tensor,
-    k_rope: torch.Tensor,
+    k_rope: torch.Tensor | None = None,
     group_size: int = QUANT_GROUP_SIZE,
 ):
-    """Pack BF16 MLA KV into the DSA INT8 656-byte row format."""
+    """Pack BF16 latent KV and an optional BF16 RoPE tail into DSA INT8 rows."""
     k_nope_2d = k_nope.squeeze(1) if k_nope.ndim == 3 else k_nope
+    if k_rope is None:
+        k_rope = k_nope.new_empty((k_nope_2d.shape[0], 0))
     k_rope_2d = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
     if k_nope_2d.ndim != 2 or k_nope_2d.shape[1] != NOPE_DIM:
         raise ValueError(
             f"Expected k_nope shape (num_tokens, {NOPE_DIM}), got {k_nope.shape}"
         )
-    if k_rope_2d.ndim != 2 or k_rope_2d.shape[1] != ROPE_DIM:
+    if k_rope_2d.ndim != 2 or k_rope_2d.shape[1] not in (0, ROPE_DIM):
         raise ValueError(
-            f"Expected k_rope shape (num_tokens, {ROPE_DIM}), got {k_rope.shape}"
+            f"Expected k_rope shape (num_tokens, 0/{ROPE_DIM}), got {k_rope.shape}"
         )
     if k_nope_2d.shape[0] != k_rope_2d.shape[0]:
         raise ValueError("k_nope and k_rope must have the same number of tokens")
@@ -153,11 +157,15 @@ def quantize_k_cache_int8_separate(
     )
 
 
-def quantize_k_cache_int8_ref(k_nope: torch.Tensor, k_rope: torch.Tensor):
+def quantize_k_cache_int8_ref(
+    k_nope: torch.Tensor, k_rope: torch.Tensor | None = None
+):
     """Pure-Torch reference for the INT8 packer, usable on CPU or CUDA."""
     k_nope_2d = k_nope.squeeze(1) if k_nope.ndim == 3 else k_nope
+    if k_rope is None:
+        k_rope = k_nope.new_empty((k_nope_2d.shape[0], 0))
     k_rope_2d = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
-    if k_nope_2d.shape[-1] != NOPE_DIM or k_rope_2d.shape[-1] != ROPE_DIM:
+    if k_nope_2d.shape[-1] != NOPE_DIM or k_rope_2d.shape[-1] not in (0, ROPE_DIM):
         raise ValueError(
             f"Expected DSA dimensions {NOPE_DIM}+{ROPE_DIM}, got "
             f"{k_nope_2d.shape[-1]}+{k_rope_2d.shape[-1]}"
@@ -169,43 +177,49 @@ def quantize_k_cache_int8_ref(k_nope: torch.Tensor, k_rope: torch.Tensor):
     grouped = k_nope_2d.float().reshape(
         num_tokens, NUM_QUANT_GROUPS, QUANT_GROUP_SIZE
     )
-    scales = grouped.abs().amax(dim=-1).clamp(min=INT8_SCALE_EPS) / INT8_QMAX
+    scales = (
+        grouped.abs().amax(dim=-1).clamp(min=INT8_SCALE_EPS).double() / INT8_QMAX
+    ).float()
+    scaled = (grouped.double() / scales.double().unsqueeze(-1)).float()
     quant = (
-        torch.round(grouped / scales.unsqueeze(-1))
+        (torch.sign(scaled) * torch.floor(scaled.abs() + 0.5))
         .clamp(-INT8_QMAX, INT8_QMAX)
         .to(torch.int8)
         .reshape(num_tokens, NOPE_DIM)
     )
     nope_part = torch.empty(
-        (num_tokens, NOPE_DIM + NUM_QUANT_GROUPS * torch.float32.itemsize),
+        (num_tokens, NOPE_DIM + SCALE_BYTES_PER_TOKEN),
         dtype=torch.uint8,
         device=k_nope.device,
     )
     nope_part[:, :NOPE_DIM] = quant.contiguous().view(torch.uint8)
     nope_part[:, NOPE_DIM:] = scales.contiguous().view(torch.uint8)
-    rope_part = k_rope_2d.contiguous().view(torch.uint8)
-    assert nope_part.shape[-1] + rope_part.shape[-1] == PACKED_BYTES_PER_TOKEN
-    return nope_part.unsqueeze(1), rope_part.unsqueeze(1)
+    rope_dim = k_rope_2d.shape[-1]
+    rope_part = k_rope_2d.contiguous().view(torch.uint8) if rope_dim else None
+    rope_bytes = rope_part.shape[-1] if rope_part is not None else 0
+    assert nope_part.shape[-1] + rope_bytes == packed_kv_row_bytes(rope_dim)
+    return nope_part.unsqueeze(1), (
+        rope_part.unsqueeze(1) if rope_part is not None else None
+    )
 
 
 def _quantize_k_cache_int8_fast_separate(
     k_nope: torch.Tensor, k_rope: torch.Tensor
 ):
     num_tokens = k_nope.shape[0]
+    rope_dim = k_rope.shape[-1]
     nope_part = torch.empty(
-        (num_tokens, NOPE_DIM + NUM_QUANT_GROUPS * torch.float32.itemsize),
+        (num_tokens, NOPE_DIM + SCALE_BYTES_PER_TOKEN),
         dtype=torch.uint8,
         device=k_nope.device,
     )
-    rope_part = torch.empty(
-        (num_tokens, ROPE_DIM * torch.bfloat16.itemsize),
-        dtype=torch.uint8,
-        device=k_rope.device,
-    )
+    rope_bf16 = torch.empty_like(k_rope) if rope_dim else k_rope
     nope_q = nope_part[:, :NOPE_DIM].view(torch.int8)
     nope_s = nope_part[:, NOPE_DIM:].view(torch.float32)
-    rope_bf16 = rope_part.view(torch.bfloat16)
-    _quantize_k_cache_int8_kernel[(num_tokens, NUM_QUANT_GROUPS + 1)](
+    if num_tokens == 0:
+        rope_part = rope_bf16.view(torch.uint8).unsqueeze(1) if rope_dim else None
+        return nope_part.unsqueeze(1), rope_part
+    _quantize_k_cache_int8_kernel[(num_tokens, NUM_QUANT_GROUPS + (rope_dim > 0))](
         nope_q,
         nope_s,
         rope_bf16,
@@ -219,11 +233,12 @@ def _quantize_k_cache_int8_fast_separate(
         GROUP_SIZE=QUANT_GROUP_SIZE,
         NUM_GROUPS=NUM_QUANT_GROUPS,
         NOPE_DIM=NOPE_DIM,
-        ROPE_DIM=ROPE_DIM,
+        ROPE_DIM=rope_dim,
         SCALE_EPS=INT8_SCALE_EPS,
         QMAX=INT8_QMAX,
     )
-    return nope_part.unsqueeze(1), rope_part.unsqueeze(1)
+    rope_part = rope_bf16.view(torch.uint8).unsqueeze(1) if rope_dim else None
+    return nope_part.unsqueeze(1), rope_part
 
 
 @triton.jit
@@ -256,8 +271,8 @@ def _quantize_k_cache_int8_kernel(
             other=0.0,
         ).to(tl.float32)
         abs_max = tl.max(tl.abs(values))
-        scale = tl.maximum(abs_max, SCALE_EPS) / QMAX
-        quant = tl.extra.cuda.libdevice.round(values / scale)
+        scale = tl.div_rn(tl.maximum(abs_max, SCALE_EPS), QMAX)
+        quant = tl.extra.cuda.libdevice.round(tl.div_rn(values, scale))
         quant = tl.maximum(tl.minimum(quant, QMAX), -QMAX).to(tl.int8)
         tl.store(
             output_nope_q_ptr + token_id * output_nope_q_stride_0 + dim_offs,
