@@ -159,6 +159,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if self.is_int8_kvcache and not forward_batch.forward_mode.is_decode_or_idle():
             raise ValueError("FlashMLA INT8 requires FlashInfer for prefill and verify")
+        if self.is_int8_kvcache and self.dcp_world_size > 1:
+            self._init_int8_dcp_metadata(
+                forward_batch.batch_size,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+            )
+            return
         bs = forward_batch.batch_size
         # Host max only sizes the block table: CPU mirror when published,
         # else the static bound (kernel reads are capped by seq_lens_k).
@@ -298,6 +305,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_mla_metadata_view = None
         self.cuda_graph_num_splits_view = None
 
+        if self.is_int8_kvcache and self.dcp_world_size > 1:
+            self.cuda_graph_dcp_seq_lens = torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
+            )
+
         if self.num_draft_tokens:
             self.cuda_graph_draft_extend_seq_lens_k = torch.ones(
                 max_bs, dtype=torch.int32, device="cuda"
@@ -328,6 +340,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         forward_mode: ForwardMode,
     ):
         """Shared decode/target-verify/draft-extend capture+replay body."""
+        if self.is_int8_kvcache and self.dcp_world_size > 1:
+            self._init_int8_dcp_metadata(
+                bs, req_pool_indices, seq_lens, self.cuda_graph_kv_indices[:bs]
+            )
+            return
         if True:
             seq_lens = seq_lens[:bs]
             seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
@@ -433,6 +450,46 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 seq_lens_k,
             )
 
+    def _init_int8_dcp_metadata(self, bs, req_pool_indices, seq_lens, block_table=None):
+        from sglang.srt.layers.dcp.layout import get_dcp_lens
+
+        # INT8 DCP is limited to the static pool (unified memory is rejected
+        # by argument validation). Both the scheduler and kernel need local lengths.
+        local_lens = get_dcp_lens(
+            seq_lens[:bs], self.dcp_world_size, self.dcp_rank
+        ).to(torch.int32)
+        if block_table is None:
+            width = triton.cdiv(
+                triton.cdiv(self.max_context_len, self.dcp_world_size), PAGE_SIZE
+            )
+            block_table = self._eager_block_kv_indices(bs, max(1, width))
+        else:
+            # Replay updates the same storage that the decode graph captured.
+            self.cuda_graph_dcp_seq_lens[:bs].copy_(local_lens)
+            local_lens = self.cuda_graph_dcp_seq_lens[:bs]
+        create_flashmla_kv_indices_triton[
+            (bs, get_num_kv_index_blocks_flashmla(block_table.shape[1], PAGE_SIZE))
+        ](
+            self.req_to_token,
+            req_pool_indices[:bs],
+            local_lens,
+            None,
+            block_table,
+            self.req_to_token.stride(0),
+            block_table.stride(0),
+            DCP_WORLD_SIZE=self.dcp_world_size,
+            DCP_RANK=self.dcp_rank,
+        )
+        metadata, splits = get_mla_metadata(
+            local_lens,
+            self.num_q_heads * self.dcp_world_size,
+            1,
+            is_int8_kvcache=True,
+        )
+        self.forward_metadata = FlashMLADecodeMetadata(
+            metadata, splits, block_table, local_lens
+        )
+
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
@@ -455,12 +512,22 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    cache_loc,
-                    k,
-                    v,
-                )
+                if self.is_int8_kvcache and self.dcp_world_size > 1:
+                    # The split writer masks owners and translates locations on
+                    # device, unlike set_kv_buffer's host-side valid_mask.all().
+                    self.token_to_kv_pool.set_mla_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k[..., : self.kv_lora_rank],
+                        k[..., self.kv_lora_rank :],
+                    )
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                    )
         bs = forward_batch.batch_size
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
@@ -468,11 +535,16 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if self.is_int8_kvcache:
             if reshape_q.dtype != torch.bfloat16 or reshape_q.shape[1] != 1:
                 raise ValueError("FlashMLA INT8 decode requires single-token BF16 Q")
-            o, _ = flash_mla_with_kvcache(
+            local_lens = (
+                self.forward_metadata.seq_lens_k
+                if self.dcp_world_size > 1
+                else forward_batch.seq_lens.to(torch.int32)
+            )
+            o, lse = flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, 656),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
-                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                cache_seqlens=local_lens,
                 head_dim_v=self.kv_lora_rank,
                 tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
                 num_splits=self.forward_metadata.num_splits,
@@ -482,6 +554,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             if o.dtype != torch.bfloat16:
                 raise RuntimeError("FlashMLA dense INT8 kernel must return BF16 output")
+            if self.dcp_world_size > 1:
+                # Empty shards can return uninitialized data, including NaNs.
+                # Selection, rather than multiplication by zero, is required.
+                empty = local_lens == 0
+                o = torch.where(empty[:, None, None, None], 0.0, o)
+                lse = torch.where(empty[:, None, None], -torch.inf, lse)
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), lse
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         if self.is_fp8_kvcache:
             assert (

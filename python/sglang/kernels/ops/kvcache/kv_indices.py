@@ -129,6 +129,8 @@ def create_flashmla_kv_indices_triton(
     req_to_token_ptr_stride: tl.constexpr,
     kv_indices_ptr_stride: tl.constexpr,
     PAGED_SIZE: tl.constexpr = 64,
+    DCP_WORLD_SIZE: tl.constexpr = 1,
+    DCP_RANK: tl.constexpr = 0,
 ):
     # Static-pool builder only: token ids here are physical, entry = token//ps.
     # The unified pool's block table is filled by KVIndexTranslator instead.
@@ -168,11 +170,12 @@ def create_flashmla_kv_indices_triton(
             req_to_token_ptr
             + req_pool_index * req_to_token_ptr_stride
             + kv_start
-            + paged_offset,
+            + paged_offset * DCP_WORLD_SIZE
+            + DCP_RANK,
             mask=mask,
         )
         tl.store(
             kv_indices_ptr + pid * kv_indices_ptr_stride + paged_offset_out,
-            data // PAGED_SIZE,
+            data // DCP_WORLD_SIZE // PAGED_SIZE,
             mask=mask_out,
         )
