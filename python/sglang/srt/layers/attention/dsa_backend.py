@@ -190,16 +190,27 @@ def _dequantize_selected_kv_cache(
     )
     return selected_kv_cache, local_page_table.view_as(page_table_1)
 
-
 @lru_cache(maxsize=None)
 def _support_fp8_mma(device_index: int = 0) -> bool:
     major, minor = torch.cuda.get_device_capability(device_index)
+    # from 蓝区：sw-wiki/bin/view/1.%20Projects/1.%20Internal/C500/1.%20Product/Cross%20Team%20Design%20Doc/SKU%20and%20DID%20decouple%20solution/chip%20ISA%20version%20table/
+    # MACA3.10 以后改了 C600U 的 computation capacity
+    # from deepgemm:
+    # 80) C500
+    # 86) C600
+    # 87|88|89) C600U  # 87/88: renumbered-SDK xcore1600 spellings
+    # 90) H200
+
     arch = major * 10 + minor
-    if arch not in (80, 86, 89):
+    known_sms = (80, 86, 87, 88, 89)    
+    fp8_mma_sms = (87, 88, 89)             # 仅 C600U 支持 FP8 MMA
+
+    if arch not in known_sms:
+        supported = ", ".join(f"sm_{cc}" for cc in known_sms)
         raise RuntimeError(
-            f"Unsupported GPU architecture: sm_{arch}, supported: sm_80, sm_86, sm_89"
+            f"Unsupported GPU architecture: sm_{arch}, supported: {supported}"
         )
-    return arch == 89
+    return arch in fp8_mma_sms
 
 
 def _dequantize_selected_ragged_kv_cache(
