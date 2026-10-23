@@ -422,7 +422,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _draft_context(self):
         with ExitStack() as stack:
             if self._draft_dp_context_enabled:
-                stack.enter_context(draft_tp_context(get_parallel().attn_tp_group))
+                stack.enter_context(draft_tp_context(get_parallel().attn_tp_group, owns_attention=True))
             stack.enter_context(speculative_moe_backend_context())
             stack.enter_context(speculative_moe_a2a_backend_context())
             yield

@@ -44,7 +44,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
-
+from mcoplib.triton_situ_and_mul import situ_and_mul
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .moe_align_block_size import moe_align_block_size
 
@@ -977,16 +977,12 @@ def _fused_moe_kernel_sequence(
                 d = x.shape[-1] // 2
                 intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
     elif activation == "situ" and is_gated:
-        d = N // 2
-        x = intermediate_cache1.view(-1, N)
-        gate = x[..., :d].float()
-        up = x[..., d:].float()
-        situ_beta = gemm1_alpha if gemm1_alpha is not None else 4.0
-        gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
-        situ_linear_beta = gemm1_limit
-        if situ_linear_beta is not None:
-            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
-        intermediate_cache2.copy_((gate * up).to(intermediate_cache1.dtype))
+        situ_and_mul(
+            intermediate_cache1.view(-1, N),
+            situ_beta=(gemm1_alpha if gemm1_alpha is not None else 4.0),
+            situ_linear_beta=gemm1_limit,
+            out=intermediate_cache2.view(-1, N // 2),
+        )
     elif activation in ("gelu", "gelu_tanh") and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
