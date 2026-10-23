@@ -1,7 +1,9 @@
+import os
 from functools import lru_cache
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from diffusers.models.activations import get_activation
 from diffusers.models.autoencoders.vae import (
@@ -14,8 +16,10 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_decode_parallel_group_coordinator,
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelConv3d,
@@ -28,6 +32,9 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     can_install_spatial_shard_parallel_decode,
     should_run_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 @lru_cache(maxsize=128)
@@ -1796,6 +1803,219 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             and should_run_spatial_shard_parallel_decode(self.config, z)
         )
 
+    def _should_use_tile_parallel_decode(self) -> bool:
+        r"""
+        Whether to distribute the LTX-2 spatial decode tiles across the decode
+        parallel group: tile-level parallelism in the spirit of WanVAE's
+        ParallelTiledVAE, but using LTX-2's own spatial tile scheme.
+
+        Env-gated by SGLANG_LTX2_TILE_PARALLEL_DECODE, default off.
+        """
+        return (
+            os.environ.get("SGLANG_LTX2_TILE_PARALLEL_DECODE", "0") == "1"
+            and self.use_parallel_decode
+            and model_parallel_is_initialized()
+            and get_decode_parallel_world_size() > 1
+        )
+
+    def parallel_tiled_decode(
+        self,
+        z: torch.Tensor,
+        temb: Optional[torch.Tensor] = None,
+        causal: Optional[bool] = None,
+        return_dict: bool = True,
+    ) -> Union[DecoderOutput, torch.Tensor]:
+        r"""
+        Decode by distributing the spatial tiles of ``tiled_decode`` across the
+        decode parallel group (WanVAE ParallelTiledVAE-style tile ownership).
+
+        Unlike the generic implementation in ``ParallelTiledVAE`` (which re-tiles
+        temporally and spatially into a fine grid), this keeps LTX-2's native
+        scheme: full temporal extent per tile and a 2D spatial grid with overlap
+        blending. Per-tile work and CUDNN workspace demand stay identical to
+        the serial ``tiled_decode`` -- only tile ownership changes -- so this
+        path avoids the driver-level workspace wall that kills the conv-level
+        spatial-shard decode next to the resident DiT stack. Every rank decodes
+        a subset of tiles, the flattened results are all-gathered, and each
+        rank stitches the full video exactly like ``tiled_decode``.
+        """
+        if not self._should_use_tile_parallel_decode():
+            return self.tiled_decode(z, temb, causal=causal, return_dict=return_dict)
+        world_size = get_decode_parallel_world_size()
+        rank = get_decode_parallel_rank()
+        group = get_decode_parallel_group_coordinator().device_group
+
+        (
+            batch_size,
+            num_channels,
+            num_frames,
+            height,
+            width,
+        ) = z.shape
+        sample_height = height * self.spatial_compression_ratio
+        sample_width = width * self.spatial_compression_ratio
+
+        tile_latent_min_height = (
+            self.tile_sample_min_height // self.spatial_compression_ratio
+        )
+        tile_latent_min_width = (
+            self.tile_sample_min_width // self.spatial_compression_ratio
+        )
+        tile_latent_stride_height = (
+            self.tile_sample_stride_height // self.spatial_compression_ratio
+        )
+        tile_latent_stride_width = (
+            self.tile_sample_stride_width // self.spatial_compression_ratio
+        )
+
+        blend_height = self.tile_sample_min_height - self.tile_sample_stride_height
+        blend_width = self.tile_sample_min_width - self.tile_sample_stride_width
+
+        # Same tile enumeration as tiled_decode (i outer loop, j inner loop).
+        tile_coords = [
+            (i, j)
+            for i in range(0, height, tile_latent_stride_height)
+            for j in range(0, width, tile_latent_stride_width)
+        ]
+        num_tiles = len(tile_coords)
+        if world_size > num_tiles:
+            # More ranks than tiles: fall back to the serial tiled path.
+            return self.tiled_decode(z, temb, causal=causal, return_dict=return_dict)
+
+        # Round-robin tile ownership. For the default 2x3 grid on 2 ranks this
+        # splits the total tile area 640 vs 556 latent cells -- near balanced.
+        owned = [gi for gi in range(num_tiles) if gi % world_size == rank]
+        logger.info(
+            "LTX-2 tile-parallel decode: rank=%d world_size=%d tiles=%d local_tiles=%d",
+            rank,
+            world_size,
+            num_tiles,
+            len(owned),
+        )
+
+        local_shapes = {}
+        local_flat = []
+        for gi in owned:
+            i, j = tile_coords[gi]
+            # A tile belongs to one rank; spatial-convolution collectives must
+            # remain disabled even if wrappers were installed at model load.
+            with disable_spatial_parallel_decode():
+                tile = self.decoder(
+                    z[
+                        :,
+                        :,
+                        :,
+                        i : i + tile_latent_min_height,
+                        j : j + tile_latent_min_width,
+                    ],
+                    temb,
+                    causal=causal,
+                )
+            local_shapes[gi] = tuple(tile.shape)
+            local_flat.append(tile.reshape(-1))
+        local_flat = torch.cat(local_flat, dim=0)
+
+        # All-gather the flattened tile results with padding.
+        device = local_flat.device
+        dtype = local_flat.dtype
+        local_numel = torch.tensor(
+            [local_flat.numel()], device=device, dtype=torch.int64
+        )
+        all_numels = [
+            torch.zeros(1, device=device, dtype=torch.int64) for _ in range(world_size)
+        ]
+        dist.all_gather(all_numels, local_numel, group=group)
+        max_numel = max(int(n.item()) for n in all_numels)
+
+        padded = torch.zeros(max_numel, device=device, dtype=dtype)
+        padded[: local_flat.numel()] = local_flat
+        del local_flat
+        gathered = [
+            torch.zeros(max_numel, device=device, dtype=dtype)
+            for _ in range(world_size)
+        ]
+        dist.all_gather(gathered, padded, group=group)
+        del padded
+
+        # Rebuild every tile on this rank. Remote tile shapes are derived
+        # locally: batch/channel/temporal dims are shared by all tiles (the
+        # decoder varies spatially only) and spatial dims follow from the tile
+        # coordinates. The offset asserts below cross-check the derivation
+        # against the gathered buffer sizes, so no object collective is needed.
+        ref_shape = local_shapes[owned[0]]
+        b_out, c_out, t_out = ref_shape[0], ref_shape[1], ref_shape[2]
+
+        def _tile_shape(i: int, j: int) -> Tuple[int, ...]:
+            out_h = (
+                min(tile_latent_min_height, height - i) * self.spatial_compression_ratio
+            )
+            out_w = (
+                min(tile_latent_min_width, width - j) * self.spatial_compression_ratio
+            )
+            return (b_out, c_out, t_out, out_h, out_w)
+
+        tiles = {}
+        for r in range(world_size):
+            offset = 0
+            for gi in range(num_tiles):
+                if gi % world_size != r:
+                    continue
+                i, j = tile_coords[gi]
+                shape = _tile_shape(i, j)
+                if gi in local_shapes:
+                    assert local_shapes[gi] == shape, (
+                        f"tile {gi} derived shape {shape} != decoded shape "
+                        f"{local_shapes[gi]}"
+                    )
+                numel = shape[0] * shape[1] * shape[2] * shape[3] * shape[4]
+                tiles[gi] = gathered[r][offset : offset + numel].reshape(shape)
+                offset += numel
+            assert offset == int(all_numels[r].item()), (
+                f"rank {r} derived flat size {offset} != gathered "
+                f"{int(all_numels[r].item())}"
+            )
+
+        num_tile_rows = (
+            height + tile_latent_stride_height - 1
+        ) // tile_latent_stride_height
+        num_tile_cols = (
+            width + tile_latent_stride_width - 1
+        ) // tile_latent_stride_width
+
+        rows = []
+        gi = 0
+        for _ in range(num_tile_rows):
+            rows.append([tiles[gi + jj] for jj in range(num_tile_cols)])
+            gi += num_tile_cols
+
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                # blend the above tile and the left tile
+                # to the current tile and add the current tile to the result row
+                if i > 0:
+                    tile = self.blend_v(rows[i - 1][j], tile, blend_height)
+                if j > 0:
+                    tile = self.blend_h(row[j - 1], tile, blend_width)
+                result_row.append(
+                    tile[
+                        :,
+                        :,
+                        :,
+                        : self.tile_sample_stride_height,
+                        : self.tile_sample_stride_width,
+                    ]
+                )
+            result_rows.append(torch.cat(result_row, dim=4))
+
+        dec = torch.cat(result_rows, dim=3)[:, :, :, :sample_height, :sample_width]
+
+        if not return_dict:
+            return (dec,)
+
+        return DecoderOutput(sample=dec)
+
     def enable_tiling(
         self,
         tile_sample_min_height: Optional[int] = None,
@@ -1925,6 +2145,10 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         if self.use_tiling and (
             width > tile_latent_min_width or height > tile_latent_min_height
         ):
+            if self._should_use_tile_parallel_decode():
+                return self.parallel_tiled_decode(
+                    z, temb, causal=causal, return_dict=return_dict
+                )
             return self.tiled_decode(z, temb, causal=causal, return_dict=return_dict)
 
         if self._should_use_spatial_parallel_decode(z):
