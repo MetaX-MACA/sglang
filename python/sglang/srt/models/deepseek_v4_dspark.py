@@ -1225,6 +1225,33 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 f"or disable env SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD "
             )
 
+    def _remap_dspark_vocab_weight_name(
+        self, stage_idx: int, rest: str
+    ) -> Optional[str]:
+        vocab_prefixes = (
+            ("emb.tok_emb.", "embed_tokens.", 0),
+            ("embed.", "embed_tokens.", 0),
+            ("embed_tokens.", "embed_tokens.", 0),
+            ("head.", "lm_head.", self.num_stages - 1),
+            ("lm_head.", "lm_head.", self.num_stages - 1),
+        )
+        for source, target, owner_stage in vocab_prefixes:
+            if not rest.startswith(source):
+                continue
+            if stage_idx != owner_stage:
+                return None
+            if not self.uses_own_vocab_modules:
+                raise ValueError(
+                    "DSpark V4 checkpoint contains separate embedding/LM head "
+                    "weights; set SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD=True "
+                    "to load them instead of sharing target vocabulary weights."
+                )
+            suffix = rest.removeprefix(source)
+            if suffix == "scale":
+                suffix = "weight_scale_inv"
+            return target + suffix
+        return None
+
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
         if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
             return None
@@ -1251,6 +1278,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if len(parts) < 3:
             return None
         stage_id, rest = parts[1], parts[2]
+        if not stage_id.isdigit():
+            return None
+        if rest.startswith(
+            ("emb.tok_emb.", "embed.", "embed_tokens.", "head.", "lm_head.")
+        ):
+            return self._remap_dspark_vocab_weight_name(int(stage_id), rest)
 
         if rest.startswith("markov_head."):
             rest = rest.replace("markov_head.embed.", "markov_head.markov_w1.", 1)
