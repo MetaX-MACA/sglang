@@ -1219,6 +1219,54 @@ def _mla_backend_page_constraints(view: Any) -> dict:
 def _mla_kv_cache_dtype_checks(view: Any) -> dict:
     """Validate resolved KV-cache dtype for TRTLLM and tokenspeed MLA backends."""
     if (
+        view.kv_cache_dtype == "int8"
+        and model_config_of(view).hf_config.architectures[0]
+        == "KimiK3ForConditionalGeneration"
+    ):
+        prefill_backend, decode_backend = attention_backends_of(view)
+        triton_path = prefill_backend == decode_backend == "triton"
+        flashmla_path = prefill_backend == "flashinfer" and decode_backend == "flashmla"
+        if not (triton_path or flashmla_path):
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache requires Triton prefill/decode, or "
+                "FlashInfer prefill with FlashMLA decode."
+            )
+        if flashmla_path:
+            if not get_platform().is_maca:
+                raise ValueError("Kimi-K3 FlashMLA INT8 KV cache requires MACA.")
+            if view.speculative_algorithm is not None:
+                if view.speculative_attention_mode != "prefill":
+                    raise ValueError(
+                        "FlashMLA INT8 target verify must use prefill attention."
+                    )
+                if view.speculative_draft_kv_cache_dtype not in ("bf16", "bfloat16"):
+                    raise ValueError(
+                        "FlashMLA INT8 speculative decoding requires --speculative-draft-kv-cache-dtype bfloat16."
+                    )
+                if (
+                    view.speculative_algorithm == "DSPARK"
+                    and view.speculative_draft_attention_backend
+                    not in (None, "triton", "flashinfer")
+                ):
+                    raise ValueError(
+                        "DSpark draft must use a BF16 MHA backend, not FlashMLA."
+                    )
+        if view.dtype not in ("auto", "bfloat16", "bf16"):
+            raise ValueError("Kimi-K3 INT8 KV cache requires BF16 model inputs.")
+        if view.enable_deterministic_inference:
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache does not support deterministic attention."
+            )
+        if view.enable_unified_memory:
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache does not support --enable-unified-memory."
+            )
+        if view.enable_hierarchical_cache or view.enable_lmcache:
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache does not support host-tiered KV cache."
+            )
+
+    if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"
     ):

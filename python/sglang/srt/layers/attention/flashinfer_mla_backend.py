@@ -236,12 +236,30 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        mla_pool = getattr(self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool)
+        self.mla_kv_cache_store_int8 = getattr(
+            mla_pool, "mla_kv_cache_store_int8", False
+        )
+        if self.mla_kv_cache_store_int8:
+            from sglang.srt.runtime_context import attention_backends
+
+            if not (
+                model_runner.model_config.hf_config.architectures[0]
+                == "KimiK3ForConditionalGeneration"
+                and attention_backends() == ("flashinfer", "flashmla")
+            ):
+                raise ValueError(
+                    "FlashInfer MLA INT8 KV cache only supports Kimi-K3 "
+                    "prefill paired with FlashMLA decode; "
+                    "other INT8 backend combinations are not supported."
+                )
         self.kv_index_translator = model_runner.kv_index_translator
         self.enable_chunk_kv = (
             not skip_prefill
             and get_disagg().disaggregation_mode != "decode"
             and not get_schedule().disable_chunked_prefix_cache
             and not get_exec().kernel.flashinfer_mla_disable_ragged
+            and not self.mla_kv_cache_store_int8
         )
         self.page_size = model_runner.page_size
 
@@ -288,6 +306,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             self.workspace_buffer, "NHD", backend=self.fmha_backend
         )
 
+        self.extend_bf16_kv_indices = None
+        self.extend_int8_kv_num_tokens = None
         if not self.skip_prefill:
             self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
@@ -745,7 +765,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             ):
                 k_buf = forward_batch.attn_dcp_metadata.dcp_kv_buffer.to(q.dtype)
             else:
-                k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+                k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                if not self.mla_kv_cache_store_int8:
+                    k_buf = k_buf.to(q.dtype)
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -753,6 +775,18 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     qall[:, :, layer.v_head_dim :],
                 )
             o = q.new_empty(q.shape)
+            if self.mla_kv_cache_store_int8:
+                from sglang.kernels.ops.kvcache.kimi_k3_int8 import (
+                    dequantize_k_cache_paged_int8,
+                )
+
+                if self.extend_bf16_kv_indices is None:
+                    raise RuntimeError("INT8 prefill requires referenced KV indices")
+                k_buf = dequantize_k_cache_paged_int8(
+                    k_buf,
+                    self.extend_bf16_kv_indices,
+                    num_tokens=self.extend_int8_kv_num_tokens,
+                )
             o = prefill_wrapper_paged.run(
                 q,
                 q_rope,
@@ -762,6 +796,23 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _prepare_int8_prefill_indices(self, wrapper, kv_indices, kv_indptr):
+        physical = getattr(wrapper, "_mla_int8_physical_indices", None)
+        if physical is None or physical.numel() != kv_indices.numel():
+            with torch.inference_mode(False):
+                physical = torch.empty_like(kv_indices)
+                wrapper._mla_int8_num_tokens = torch.empty(
+                    (1,), dtype=kv_indptr.dtype, device=kv_indptr.device
+                )
+            wrapper._mla_int8_physical_indices = physical
+        physical.copy_(kv_indices)
+        self.extend_bf16_kv_indices = physical
+        wrapper._mla_int8_num_tokens.copy_(kv_indptr[-1:])
+        self.extend_int8_kv_num_tokens = wrapper._mla_int8_num_tokens
+        return torch.arange(
+            kv_indices.numel(), dtype=kv_indices.dtype, device=kv_indices.device
+        )
 
     def forward_decode(
         self,
@@ -1097,6 +1148,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 )
             )
 
+        self.attn_backend.extend_bf16_kv_indices = kv_indices
+        if self.attn_backend.mla_kv_cache_store_int8 and not use_ragged:
+            kv_indices = self.attn_backend._prepare_int8_prefill_indices(
+                wrapper_paged, kv_indices, kv_indptr
+            )
         if use_ragged:
             # ragged prefill
             wrapper_ragged.begin_forward(
