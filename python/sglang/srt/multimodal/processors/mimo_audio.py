@@ -17,10 +17,13 @@ from sglang.utils import logger
 
 try:
     from torchcodec.decoders import AudioDecoder
-except ImportError:
+except (ImportError, OSError, RuntimeError):
     logger.warning(
-        "torchcodec is not installed; audio inputs will fail at request time"
+        "TorchCodec is unavailable (not installed or native dependencies could "
+        "not be loaded). Text-only inference can continue; "
+        "TorchCodec-dependent audio decoding is unavailable."
     )
+    logger.debug("TorchCodec import failed", exc_info=True)
     AudioDecoder = None
 
 try:
@@ -205,7 +208,8 @@ class MiMoAudioPipeline:
                     file = audio
             if AudioDecoder is None:
                 raise RuntimeError(
-                    "torchcodec is required for audio decoding; install with `pip install torchcodec`."
+                    "TorchCodec is unavailable for this audio request. A build compatible "
+                    "with the current PyTorch runtime and its native dependencies is required."
                 )
             try:
                 samples = AudioDecoder(file).get_all_samples()

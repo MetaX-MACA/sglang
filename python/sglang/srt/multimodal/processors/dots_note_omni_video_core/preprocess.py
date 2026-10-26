@@ -2,13 +2,13 @@
 
 import base64
 import io
+import logging
 import math
 import re
 import wave
 
 import numpy as np
 from PIL import Image
-from torchcodec.decoders import VideoDecoder
 
 from .v2core import (
     ALIGN,
@@ -22,6 +22,19 @@ from .v2core import (
     v2_solve_degrade,
     v2_split_visual_budget,
 )
+
+logger = logging.getLogger(__name__)
+
+try:
+    from torchcodec.decoders import VideoDecoder
+except (ImportError, OSError, RuntimeError):
+    VideoDecoder = None
+    logger.warning(
+        "TorchCodec is unavailable (not installed or native dependencies could "
+        "not be loaded). Text-only inference can continue; "
+        "TorchCodec-dependent video decoding is unavailable."
+    )
+    logger.debug("TorchCodec import failed", exc_info=True)
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 DEFAULT_AUDIO_SAMPLE_RATE = 16000
@@ -88,6 +101,8 @@ def conversation_tokens(conversations, tokenizer=None):
 
 
 def _make_video_decoder(video_bytes):
+    if VideoDecoder is None:
+        raise RuntimeError("TorchCodec is unavailable for this video request.")
     try:
         return VideoDecoder(
             video_bytes,
@@ -197,7 +212,12 @@ def extract_audio_wav(
     video_bytes, sample_rate=DEFAULT_AUDIO_SAMPLE_RATE, max_duration_sec=None
 ):
     """Extract mono 16-bit WAV audio; return ``(None, 0.0)`` when unavailable."""
-    from torchcodec.decoders import AudioDecoder
+    try:
+        from torchcodec.decoders import AudioDecoder
+    except (ImportError, OSError, RuntimeError):
+        logger.warning("TorchCodec is unavailable for audio extraction.")
+        logger.debug("TorchCodec import failed", exc_info=True)
+        raise RuntimeError("TorchCodec is unavailable for this audio request.") from None
 
     try:
         samples = AudioDecoder(

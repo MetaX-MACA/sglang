@@ -11,8 +11,14 @@ try:
     from torchcodec.decoders import VideoDecoder
 
     _BACKEND = "torchcodec"
-except (ImportError, RuntimeError):
+except (ImportError, OSError, RuntimeError):
     _BACKEND = "decord"
+    logger.warning(
+        "TorchCodec is unavailable (not installed or native dependencies could "
+        "not be loaded). Text-only inference can continue; "
+        "video decoding will use decord if available."
+    )
+    logger.debug("TorchCodec import failed", exc_info=True)
 
 
 _cuda_backend_enabled: bool | None = None

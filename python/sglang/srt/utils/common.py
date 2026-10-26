@@ -1787,24 +1787,32 @@ def load_audio(
         )
 
     if _BACKEND == "torchcodec":
-        from torchcodec.decoders import AudioDecoder
-
         try:
-            decoder = AudioDecoder(
-                source,
-                sample_rate=sr,
-                num_channels=1 if mono else None,
-            )
-            samples = decoder.get_all_samples()
-            if mono:
-                return samples.data.squeeze(0).numpy()
-            return samples.data.T.numpy()
-        except Exception as e:
-            # torchcodec's bytes-buffer IO can fail on WAV files that carry
-            # large trailing metadata chunks. Fall back to soundfile, which reads the PCM payload directly.
+            from torchcodec.decoders import AudioDecoder
+        except (ImportError, OSError, RuntimeError):
+            AudioDecoder = None
             logger.warning(
-                f"torchcodec AudioDecoder failed ({e}); falling back to soundfile + torchaudio."
+                "TorchCodec is unavailable; falling back to soundfile + torchaudio."
             )
+            logger.debug("TorchCodec import failed", exc_info=True)
+
+        if AudioDecoder is not None:
+            try:
+                decoder = AudioDecoder(
+                    source,
+                    sample_rate=sr,
+                    num_channels=1 if mono else None,
+                )
+                samples = decoder.get_all_samples()
+                if mono:
+                    return samples.data.squeeze(0).numpy()
+                return samples.data.T.numpy()
+            except Exception as e:
+                # torchcodec's bytes-buffer IO can fail on WAV files that carry
+                # large trailing metadata chunks. Fall back to soundfile, which reads the PCM payload directly.
+                logger.warning(
+                    f"torchcodec AudioDecoder failed ({e}); falling back to soundfile + torchaudio."
+                )
 
     # Fallback: soundfile + torchaudio (ARM / no FFmpeg / torchcodec failure)
     import soundfile as sf
