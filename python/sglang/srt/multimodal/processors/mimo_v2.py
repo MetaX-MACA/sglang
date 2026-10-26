@@ -18,7 +18,6 @@ import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
 from PIL import Image
-from torchcodec.decoders import AudioDecoder
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
@@ -43,6 +42,17 @@ from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.common import download_remote_media
 from sglang.utils import logger
+
+try:
+    from torchcodec.decoders import AudioDecoder
+except (ImportError, OSError, RuntimeError):
+    AudioDecoder = None
+    logger.warning(
+        "TorchCodec is unavailable (not installed or native dependencies could "
+        "not be loaded). Text-only inference can continue; "
+        "TorchCodec-dependent audio decoding is unavailable."
+    )
+    logger.debug("TorchCodec import failed", exc_info=True)
 
 
 @dataclass
@@ -506,6 +516,10 @@ class MiMoProcessor:
             source = BytesIO(base64.b64decode(path_or_data.split(";base64,")[1]))
         else:
             source = path_or_data  # local path or file://
+        if AudioDecoder is None:
+            raise RuntimeError(
+                "TorchCodec is unavailable; cannot determine whether the video has audio."
+            )
         try:
             AudioDecoder(source)
             return True
