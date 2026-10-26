@@ -1158,6 +1158,7 @@ def invoke_fused_moe_kernel(
             expert_ids,
             num_tokens_post_padded,
             mul_routed_weight,
+            filter_expert=filter_expert,
         )
     else:
         if a_use_tma or b_use_tma:
