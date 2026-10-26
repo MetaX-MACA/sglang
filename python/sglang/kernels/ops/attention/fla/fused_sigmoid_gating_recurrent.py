@@ -5,6 +5,12 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.utils import enable_specific_device_opt
+
+# MACA C600 decode shapes favor BV=16 / 1 warp / no software pipelining
+# (see fused_sigmoid_gating_delta_rule_update below). Overridable via
+# SGLANG_ENABLE_SPECIFIC_DEVICE_OPT.
+_C600_DEVICE_OPT = enable_specific_device_opt()
 
 # C500/MetaX-C550 optimized fast path (self-contained; default off).
 from .kda_opt_config import _c500_kda_opt_enabled
@@ -418,10 +424,19 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[1] if a.ndim == 4 else a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    BK = triton.next_power_of_2(K)
+    # MACA C600: swept BV x num_warps x num_stages at N=1..9, T=1 and T=4 --
+    # BV=16 with a single warp and no pipelining wins every decode shape
+    # (1.5-2.9x over the upstream 32/1/3, which is tuned for NVIDIA
+    # async-copy pipelining). (Gerrit CL 225790)
+    if _C600_DEVICE_OPT:
+        BV = min(triton.next_power_of_2(V), 16)
+        num_stages = 1
+    else:
+        BV = min(triton.next_power_of_2(V), 32)
+        num_stages = 3
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
     num_warps = 1
 
     if scale is None:

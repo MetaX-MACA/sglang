@@ -115,6 +115,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
+    is_maca,
     is_npu,
     is_xpu,
     make_layers,
@@ -275,6 +276,35 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
         getattr(quant_method, "block_quant", False)
         or getattr(quant_method, "use_mxfp8", False)
     )
+
+
+def _install_qwen_gdn_mcoplib_rmsnorm(layer: nn.Module) -> None:
+    # GDN input_layernorm and post_attention_layernorm. mcoplib does not add 1,
+    # so pass gemma_weight. Set SGLANG_QWEN_MCOPLIB_ADD_RMSNORM=0 to opt out.
+    if not is_maca():
+        return
+    if os.getenv("SGLANG_QWEN_MCOPLIB_ADD_RMSNORM", "1").lower() in ("0", "false"):
+        return
+    op = torch.ops.sgl_kernel.fused_add_rmsnorm
+
+    def _bind(norm: GemmaRMSNorm) -> None:
+        def _forward(x, residual=None, post_residual_addition=None):
+            if (
+                residual is None
+                or post_residual_addition is not None
+                or not x.is_contiguous()
+                or not residual.is_contiguous()
+            ):
+                return norm.forward_cuda(x, residual, post_residual_addition)
+            op(x, residual, norm.gemma_weight, norm.variance_epsilon, False)
+            return x, residual
+
+        norm._forward_method = _forward
+
+    for name in ("input_layernorm", "post_attention_layernorm"):
+        norm = getattr(layer, name, None)
+        if isinstance(norm, GemmaRMSNorm):
+            _bind(norm)
 
 
 def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
@@ -1044,6 +1074,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=enable_fused_ar_quant,
         )
+        _install_qwen_gdn_mcoplib_rmsnorm(self)
 
     def forward(
         self,
@@ -1264,7 +1295,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # MACA: fuse input_layernorm + FP8 per-128-group quant so qkv_proj's
+        # FP8 blockwise GEMM consumes the pre-quantized (fp8, scales) tuple
+        # directly, saving one full-hidden quant kernel per layer. Only wired
+        # when qkv_proj can actually consume the tuple (Fp8LinearMethod with
+        # block/mxfp8 quant); MX_ENABLE_FUSE_ACT_FP8_QUANT is the runtime
+        # kill-switch.
+        self.input_layernorm = GemmaRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            return_quant_tuple=_linear_accepts_fp8_tuple(self.qkv_proj),
+        )
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -1326,6 +1367,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_cuda_fused(self, positions, hidden_states):
         """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
+        # FP8-fused layernorm hands down a (fp8, scales, bf16) tuple: qkv_proj
+        # consumes (fp8, scales) for the FP8 gemm, bf16 keeps the token count.
+        hs = hidden_states[-1] if isinstance(hidden_states, tuple) else hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -1348,7 +1392,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             has_gate=self.attn_output_gate,
             mrope_axis_map=(self.rotary_emb.axis_map if positions.dim() == 2 else None),
         )
-        seq_len = hidden_states.shape[0]
+        seq_len = hs.shape[0]
         q = q_out.view(seq_len, -1)
         k = k_out.view(seq_len, -1)
         gate = gate_out.view(seq_len, -1) if gate_out is not None else None
@@ -1499,6 +1543,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        elif isinstance(hidden_states, tuple):
+            # On an idle (0-token) batch self_attention is skipped above, so
+            # unwrap the FP8-fused (fp8, scales, bf16_unquant) tuple to the
+            # plain bf16 tensor for the downstream MLP/residual path
+            # (prepare_mlp expects a Tensor).
+            hidden_states = hidden_states[-1]
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(

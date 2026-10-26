@@ -10,6 +10,9 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import input_guard
+from sglang.srt.utils import enable_specific_device_opt
+
+_C600_DEVICE_OPT = enable_specific_device_opt()
 from sglang.srt.utils import is_maca
 
 _is_maca = is_maca()
@@ -361,8 +364,17 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
-    BV = min(triton.next_power_of_2(V), 32)
-    num_stages = 3
+
+    # MACA C600: swept BV x num_warps x num_stages at N=1..9, T=1 and T=4 --
+    # BV=16 with a single warp and no pipelining wins every decode shape
+    # (1.5-2.9x over the upstream 32/1/3, which is tuned for NVIDIA
+    # async-copy pipelining). (Gerrit CL 225790)
+    if _C600_DEVICE_OPT:
+        BV = min(triton.next_power_of_2(V), 16)
+        num_stages = 1
+    else:
+        BV = min(triton.next_power_of_2(V), 32)
+        num_stages = 3
     num_warps = 4 if _is_maca else 1
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
