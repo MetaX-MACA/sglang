@@ -1,3 +1,6 @@
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
