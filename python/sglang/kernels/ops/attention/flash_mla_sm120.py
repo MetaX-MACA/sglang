@@ -24,13 +24,9 @@ import triton.language as tl
 from sglang.srt.environ import envs
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     DSV4KVCacheFormat,
-    FP8_SCALE_BYTES_PER_TOKEN,
-    INT8_SCALE_BYTES_PER_TOKEN,
+    KVLayout,
     NOPE_DIM,
-    NUM_QUANT_GROUPS,
-    QUANT_GROUP_SIZE,
     ROPE_DIM,
-    VALUE_BYTES_PER_TOKEN,
     get_kv_cache_format,
 )
 from sglang.srt.utils import is_hip
@@ -52,10 +48,10 @@ _GLM_DSA_MODEL_ARCHS = (
 
 _NOPE_DIM = NOPE_DIM
 _ROPE_DIM = ROPE_DIM
-_NOPE_ROPE_STRIDE = VALUE_BYTES_PER_TOKEN
-_TILE_SIZE = QUANT_GROUP_SIZE
-_NUM_TILES = NUM_QUANT_GROUPS
-_SCALE_STRIDE = FP8_SCALE_BYTES_PER_TOKEN
+_NOPE_ROPE_STRIDE = KVLayout.V4.data_bytes
+_TILE_SIZE = KVLayout.V4.tile_size
+_NUM_TILES = NOPE_DIM // _TILE_SIZE
+_SCALE_STRIDE = KVLayout.V4.scale_bytes
 _D = _NOPE_DIM + _ROPE_DIM  # 512
 
 
@@ -113,9 +109,9 @@ def _gather_and_dequant(k_cache, indices, page_size):
 
     scale_section_offset = page_size * _NOPE_ROPE_STRIDE  # 147456
     scale_stride = (
-        FP8_SCALE_BYTES_PER_TOKEN
+        KVLayout.V4.scale_bytes
         if cache_format == DSV4KVCacheFormat.FP8
-        else INT8_SCALE_BYTES_PER_TOKEN
+        else KVLayout.V4.int8_scale_bytes
     )
     scale_base = scale_section_offset + safe_offsets * scale_stride
     scale_count = _NUM_TILES if cache_format == DSV4KVCacheFormat.FP8 else _NUM_TILES * 4
@@ -423,7 +419,6 @@ _BYTES_PER_DST_PAGE = (
 # Padded to 576 alignment
 
 _BYTES_PER_DST_PAGE_PADDED = math.ceil(_BYTES_PER_DST_PAGE / 576) * 576  # 37440
-
 
 @triton.jit
 def _page_split_kernel(

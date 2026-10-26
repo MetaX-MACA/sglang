@@ -69,6 +69,27 @@ class KVLayout(str, enum.Enum):
             return value
         return cls(str(value).lower())
 
+    @property
+    def int8_scale_bytes(self) -> int:
+        try:
+            return {
+                KVLayout.V4: 32,
+            }[self]
+        except KeyError:
+            raise ValueError(f"{self.value} has no INT8 form") from None
+
+    @property
+    def int8_bytes_per_token(self) -> int:
+        return self.data_bytes + self.int8_scale_bytes
+
+    @property
+    def bf16_bytes_per_token(self) -> int:
+        """The whole latent at 2 B per element. V4 is the only layout that keeps
+        RoPE in bf16 and the nope values unquantized."""
+        if self is not KVLayout.V4:
+            raise ValueError(f"{self.value} has no bf16 form")
+        return HEAD_DIM * 2
+
 
 def is_valid_kv_layout_pair(kv: KVLayout, extra_kv: KVLayout) -> bool:
     """The (main, extra) cache pairs the decode kernel accepts: identical layouts,
@@ -83,22 +104,14 @@ class DSV4KVCacheFormat(enum.IntEnum):
     INT8 = 2
 
 
+# Latent dimensions. Layout-independent: every layout covers the same 512
+# values, they only differ in how those values are packed.
 NOPE_DIM = 448
 ROPE_DIM = 64
 HEAD_DIM = NOPE_DIM + ROPE_DIM
-QUANT_GROUP_SIZE = KVLayout.V4.tile_size
-NUM_QUANT_GROUPS = NOPE_DIM // QUANT_GROUP_SIZE
 
-# Per-token bytes in the page-wide value section.
-VALUE_BYTES_PER_TOKEN = KVLayout.V4.data_bytes  # 448 quantized + 64 BF16
-
-# FP8 stores 7 UE8M0 bytes plus one padding byte. INT8 stores 7 FP32 scales
-# plus four padding bytes, preserving a 32-byte scale record per token.
 FP8_SCALE_BYTES_PER_TOKEN = KVLayout.V4.scale_bytes
-INT8_SCALE_BYTES_PER_TOKEN = 32
-FP8_BYTES_PER_TOKEN = KVLayout.V4.bytes_per_token  # 584
-INT8_BYTES_PER_TOKEN = VALUE_BYTES_PER_TOKEN + INT8_SCALE_BYTES_PER_TOKEN  # 608
-BF16_BYTES_PER_TOKEN = HEAD_DIM * 2  # 1024
+INT8_SCALE_BYTES_PER_TOKEN = KVLayout.V4.int8_scale_bytes  # 32
 
 INT8_SCALE_EPS = 1.0e-4
 INT8_QMAX = 127.0
@@ -127,25 +140,36 @@ def get_kv_cache_format(dtype: torch.dtype) -> DSV4KVCacheFormat:
 
 def kv_cache_bytes_per_token(layout: Union[str, KVLayout], dtype: torch.dtype) -> int:
     layout = KVLayout.parse(layout)
-    if dtype is torch.int8 or dtype is torch.bfloat16:
+    if dtype is torch.int8:
         if layout is not KVLayout.V4:
-            raise ValueError("INT8/BF16 main KV requires the V4 layout")
-        return INT8_BYTES_PER_TOKEN if dtype is torch.int8 else BF16_BYTES_PER_TOKEN
+            raise ValueError(
+                f"INT8 main KV requires the V4 layout, "
+                f"got {layout.value}"
+            )
+        return layout.int8_bytes_per_token
+    elif dtype is torch.bfloat16:
+        if layout is not KVLayout.V4:
+            raise ValueError("BF16 main KV requires the V4 layout")
+        return layout.bf16_bytes_per_token
     get_kv_cache_format(dtype)
     return layout.bytes_per_token
 
 
-def kv_cache_scale_bytes_per_token(layout: Union[str, KVLayout], dtype: torch.dtype) -> int:
+def kv_cache_scale_bytes_per_token(
+    layout: Union[str, KVLayout], dtype: torch.dtype
+) -> int:
     layout = KVLayout.parse(layout)
     kv_cache_bytes_per_token(layout, dtype)
     if dtype is torch.bfloat16:
         return 0
     if dtype is torch.int8:
-        return INT8_SCALE_BYTES_PER_TOKEN
+        return layout.int8_scale_bytes
     return layout.scale_bytes
 
 
-def kv_cache_page_bytes(layout: Union[str, KVLayout], dtype: torch.dtype, page_size: int) -> int:
+def kv_cache_page_bytes(
+    layout: Union[str, KVLayout], dtype: torch.dtype, page_size: int
+) -> int:
     layout = KVLayout.parse(layout)
     raw = page_size * kv_cache_bytes_per_token(layout, dtype)
     if dtype is torch.bfloat16:

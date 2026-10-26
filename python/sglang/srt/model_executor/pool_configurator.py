@@ -33,8 +33,8 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.layers.attention.dsv4.index_cache_kind import dsv4_index_cache_kind
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseSpecLayout
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
-    INT8_SCALE_BYTES_PER_TOKEN,
     kv_cache_page_bytes,
+    kv_cache_bytes_per_token,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
@@ -1039,11 +1039,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         elif get_exec().kernel.dsv4_attn_backend == "trtllm":
             self.kv_bytes = self.attn_head_dim
         elif kvc.kv_cache_dtype is torch.int8:
-            # 448 INT8 NOPE + 64 BF16 RoPE + 7 FP32 scales and padding.
-            self.kv_bytes = (
-                self.qk_nope_head_dim + self.qk_rope_head_dim * 2
-                + INT8_SCALE_BYTES_PER_TOKEN
-            )
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import select_dsv4_kv_layout
+            kv_layout, _ = select_dsv4_kv_layout()
+            # Raises ValueError for any layout without an INT8 form.
+            self.kv_bytes = kv_cache_bytes_per_token(kv_layout, kvc.kv_cache_dtype)
         else:
             # One FlashMLA-layout latent slot, in bytes.
             self.kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8

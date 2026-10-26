@@ -9,8 +9,8 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     DSV4KVCacheFormat,
     KVLayout,
-    FP8_SCALE_BYTES_PER_TOKEN,
-    INT8_SCALE_BYTES_PER_TOKEN,
+    NOPE_DIM,
+    ROPE_DIM,
     get_kv_cache_format,
 )
 from sglang.srt.utils import is_gfx95_supported
@@ -103,9 +103,11 @@ def dequantize_k_cache_paged(
         NUM_SCALE_TILES=NUM_SCALE_TILES,
         NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
         SCALE_BYTES_PER_TOKEN=(
-            FP8_SCALE_BYTES_PER_TOKEN
+            # V4 is hard-wired to this row: 7 ue8m0 scale bytes for FP8, 7 fp32
+            # scales padded to a 32-byte record for INT8.
+            KVLayout.V4.scale_bytes
             if cache_format == DSV4KVCacheFormat.FP8
-            else INT8_SCALE_BYTES_PER_TOKEN
+            else KVLayout.V4.int8_scale_bytes
         ),
         S_OFFSET_BYTES=s_offset_bytes,
         CACHE_FORMAT=int(cache_format),
@@ -566,9 +568,9 @@ def dequantize_k_cache_paged_ref(
     page_byte_base = page_idx * bytes_per_page
     token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
     scale_stride = (
-        FP8_SCALE_BYTES_PER_TOKEN
+        KVLayout.V4.scale_bytes
         if cache_format == DSV4KVCacheFormat.FP8
-        else INT8_SCALE_BYTES_PER_TOKEN
+        else KVLayout.V4.int8_scale_bytes
     )
     token_scale_base = page_byte_base + s_offset_bytes + in_page * scale_stride
 

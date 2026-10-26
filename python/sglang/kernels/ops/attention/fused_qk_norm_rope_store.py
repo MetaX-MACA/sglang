@@ -21,10 +21,8 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.layout import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
-    INT8_SCALE_BYTES_PER_TOKEN,
+    KVLayout,
     NOPE_DIM,
-    NUM_QUANT_GROUPS,
-    QUANT_GROUP_SIZE,
     ROPE_DIM,
 )
 from sglang.srt.utils import is_gfx95_supported
@@ -551,13 +549,12 @@ def fused_qk_norm_rope_swa_store(
 
     dim_nope = NOPE_DIM
     dim_rope = ROPE_DIM
-    tile_size = QUANT_GROUP_SIZE
-    num_nope_tiles = NUM_QUANT_GROUPS
-    scale_pad = 1
+    tile_size = KVLayout.V4.tile_size
+    num_nope_tiles = dim_nope // tile_size
     scale_bytes = (
-        INT8_SCALE_BYTES_PER_TOKEN if int8_store else num_nope_tiles + scale_pad
+        KVLayout.V4.int8_scale_bytes if int8_store else KVLayout.V4.scale_bytes
     )
-    bytes_per_token = dim_nope + dim_rope * 2 + scale_bytes
+    bytes_per_token = KVLayout.V4.data_bytes + scale_bytes
 
     if _fp8_fnuz:
         fp8_info = torch.finfo(torch.float8_e4m3fnuz)
