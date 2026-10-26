@@ -1319,6 +1319,7 @@ class GemmaRMSNorm(BaseFusedOp):
         fused_quant: bool = False,
         packed_quant: bool = False,
         packed_size: int = 3840,
+        return_quant_tuple: bool = False,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
@@ -1326,6 +1327,7 @@ class GemmaRMSNorm(BaseFusedOp):
         self.fused_quant = fused_quant
         self.packed_quant = packed_quant
         self.packed_size = packed_size
+        self.return_quant_tuple = return_quant_tuple
         self.register_buffer(
             "gemma_weight", torch.ones_like(self.weight), persistent=False
         )
@@ -1388,6 +1390,68 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # MACA: fused GemmaRMSNorm(+residual) + FP8 per-128-group quant into a
+        # single sgl_kernel call producing (fp8_out, scales, bf16_out). The
+        # fp8/scales feed an FP8 blockwise GEMM (e.g. qkv_proj); the bf16
+        # element (tuple[-1]) serves the unquantized consumers. Mirrors the
+        # RMSNorm.forward_cuda return_quant_tuple branch above.
+        if self.return_quant_tuple and envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get():
+            if x.numel() == 0:
+                return self._forward_impl(x, residual, post_residual_addition)
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                if not residual.is_contiguous():
+                    residual = residual.contiguous()
+            original_shape = x.shape
+            hidden_size = x.shape[-1]
+            tokens = x.numel() // hidden_size
+            quant_group_size = 128
+            groups = (hidden_size + quant_group_size - 1) // quant_group_size
+            quant_input = x.contiguous().reshape(tokens, hidden_size)
+            quant_residual = (
+                residual.reshape(tokens, hidden_size)
+                if residual is not None
+                else None
+            )
+            if envs.MX_TRANS_FP8_SCALE_LAYOUT.get():
+                # Column-major scales: allocate (groups, tokens) storage and
+                # pass the transposed view; the trailing True asks the op to
+                # write scales in that layout, so a later scale.T.contiguous()
+                # inside the GEMM path becomes a no-op.
+                bf16_out = torch.empty_like(quant_input)
+                fp8_out = torch.empty_like(quant_input, dtype=torch.float8_e4m3fn)
+                scales = torch.empty(
+                    (groups, tokens), device=x.device, dtype=torch.float32
+                ).transpose(-1, -2)
+                torch.ops.sgl_kernel.rms_norm_dynamic_per_group_quant(
+                    fp8_out,
+                    bf16_out,
+                    quant_input,
+                    self.gemma_weight,
+                    scales,
+                    quant_group_size,
+                    self.variance_epsilon,
+                    None,
+                    quant_residual,
+                    True,
+                )
+            else:
+                fp8_out, bf16_out, scales = rms_norm_dynamic_per_group_quant_custom(
+                    quant_input,
+                    self.gemma_weight,
+                    self.variance_epsilon,
+                    torch.float8_e4m3fn,
+                    quant_group_size,
+                    residual=quant_residual,
+                )
+            fp8_out = fp8_out.reshape(original_shape)
+            bf16_out = bf16_out.reshape(original_shape)
+            quant_tuple = (fp8_out, scales, bf16_out)
+            if residual is not None:
+                return quant_tuple, residual
+            return quant_tuple
+
         if self.fused_quant:
             assert x.shape[0] > 0
             if post_residual_addition is not None and residual is not None:

@@ -102,6 +102,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
+    get_lora,
     get_parallel,
     get_stream,
 )
@@ -112,6 +113,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_maca,
     is_npu,
     make_layers,
     use_intel_amx_backend,
@@ -218,6 +220,10 @@ class Qwen2MoeMLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
+        # Same switch as DeepseekV2MLP. There it selects SiluAndMul's INT8
+        # fused_silu_mul_dq path. Shared-expert down_proj here is FP8 block-128,
+        # so the flag instead selects fused_silu_mul_per_group_quant.
+        self.fused_quant = envs.MX_ENABLE_FUSE_SILUMUL_QUANT.get()
         self.act_fn = SiluAndMul()
         # Set externally (see qwen3_5.py) when both projections are NVFP4 and
         # the FlashInfer fused SiLU+mul+FP4-quant kernel is available. The
@@ -255,6 +261,81 @@ class Qwen2MoeMLP(nn.Module):
         y_sf = y_sf.view(torch.uint8).permute(2, 4, 0, 1, 3, 5).reshape(m_padded, -1)
         return y_fp4, y_sf
 
+    def _can_fuse_silu_fp8_quant(self, gate_up: torch.Tensor) -> bool:
+        # Gated by MX_ENABLE_FUSE_SILUMUL_QUANT, same flag DeepSeek reads.
+        # Routed MXFP4 experts do not go through this MLP.
+        if not self.fused_quant or not is_maca():
+            return False
+        if torch.compiler.is_compiling():
+            return False
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+        from sglang.srt.layers.quantization.fp8_utils import (
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
+        )
+
+        if is_batch_invariant_mode_enabled():
+            return False
+        try:
+            torch.ops.sgl_kernel.fused_silu_mul_per_group_quant
+        except AttributeError:
+            return False
+        qm = self.down_proj.quant_method
+        weight = getattr(self.down_proj, "weight", None)
+        scale = getattr(self.down_proj, "weight_scale_inv", None)
+        block = getattr(qm, "weight_block_size", None)
+        return (
+            not (get_lora().enable_lora or get_lora().lora_paths)
+            and gate_up.ndim == 2
+            and gate_up.is_cuda
+            and gate_up.dtype == torch.bfloat16
+            and gate_up.is_contiguous()
+            and gate_up.shape[0] > 0
+            and gate_up.shape[1] % 256 == 0
+            and isinstance(qm, Fp8LinearMethod)
+            and qm.block_quant
+            and not qm.use_mxfp8
+            and not qm.use_marlin
+            and list(block) == [128, 128]
+            and qm.w8a8_block_fp8_linear
+            is deepgemm_w8a8_block_fp8_linear_with_fallback
+            and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and weight is not None
+            and weight.dtype == torch.float8_e4m3fn
+            and weight.ndim == 2
+            and weight.shape[0] % 64 == 0
+            and weight.shape[1] == gate_up.shape[1] // 2
+            and scale is not None
+            and scale.dtype == torch.float32
+        )
+
+    def _silu_fp8_quant_fused(self, gate_up: torch.Tensor):
+        quant_group_size = 128
+        tokens, fused_width = gate_up.shape
+        inter = fused_width // 2
+        groups = inter // quant_group_size
+        trans_scale = envs.MX_TRANS_FP8_SCALE_LAYOUT.get()
+        x_quant = torch.empty(
+            (tokens, inter), device=gate_up.device, dtype=torch.float8_e4m3fn
+        )
+        if trans_scale:
+            x_scale = torch.empty(
+                (groups, tokens), device=gate_up.device, dtype=torch.float32
+            ).transpose(0, 1)
+        else:
+            x_scale = torch.empty(
+                (tokens, groups), device=gate_up.device, dtype=torch.float32
+            )
+        torch.ops.sgl_kernel.fused_silu_mul_per_group_quant(
+            x_quant,
+            x_scale,
+            gate_up,
+            None,
+            trans_scale,
+        )
+        return x_quant, x_scale
+
     def forward(
         self,
         x,
@@ -262,6 +343,9 @@ class Qwen2MoeMLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
+            return x
+        if self._can_fuse_silu_fp8_quant(gate_up):
+            x, _ = self.down_proj(self._silu_fp8_quant_fused(gate_up))
             return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)

@@ -1053,6 +1053,10 @@ class CommunicateSimpleFn:
         if isinstance(hidden_states, tuple):
             gathered_hidden_states = []
             for local_hidden_states in hidden_states:
+                # Column-major FP8 scales are a transpose view. AllGather
+                # rejects non-contiguous inputs.
+                if not local_hidden_states.is_contiguous():
+                    local_hidden_states = local_hidden_states.contiguous()
                 with use_symmetric_memory(
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
