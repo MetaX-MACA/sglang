@@ -61,6 +61,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.parameter import (
@@ -278,6 +279,54 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     )
 
 
+_w13_quant_logged = False
+
+
+def _enable_moe_w13_quant(mlp: nn.Module) -> bool:
+    """Whether post-attention GemmaRMSNorm may feed pre-quantized W13 input."""
+    global _w13_quant_logged
+    enabled = (
+        _is_cuda
+        and envs.MX_ENABLE_MOE_FUSE_W13_QUANT.get()
+        and not is_dp_attention_enabled()
+        and get_moe_a2a_backend().is_none()
+        and isinstance(mlp, Qwen2MoeSparseMoeBlock)
+        and mlp.supports_standard_prequantized_moe_input()
+    )
+    if enabled and not _w13_quant_logged:
+        _w13_quant_logged = True
+        logger.info(
+            "MX_ENABLE_MOE_FUSE_W13_QUANT: GemmaRMSNorm + W13 FP8 quant "
+            "fusion enabled (standard dispatch, Triton runner, block FP8)."
+        )
+    return enabled
+
+
+def _split_moe_pre_quant(hidden_states):
+    """Return (bf16_hidden_states, (fp8, scale) | None) for the MoE block."""
+    if not isinstance(hidden_states, tuple):
+        return hidden_states, None
+    if len(hidden_states) == 2 and isinstance(hidden_states[1], tuple):
+        bf16_out, pre_quant = hidden_states
+        if len(pre_quant) == 2:
+            return bf16_out, pre_quant
+    if len(hidden_states) == 3:
+        fp8_dtypes = {torch.float8_e4m3fn}
+        if hasattr(torch, "float8_e4m3fnuz"):
+            fp8_dtypes.add(torch.float8_e4m3fnuz)
+        # Current MACA convention: (fp8, scale, bf16).
+        if hidden_states[0].dtype in fp8_dtypes:
+            return hidden_states[2], (hidden_states[0], hidden_states[1])
+        # Backward-compatible convention: (bf16, fp8, scale).
+        if hidden_states[1].dtype in fp8_dtypes:
+            return hidden_states[0], (hidden_states[1], hidden_states[2])
+    raise TypeError(
+        "Qwen3.5 MoE expected (fp8, scale, bf16), (bf16, fp8, scale), "
+        f"or (bf16, (fp8, scale)); got {type(hidden_states)} "
+        f"len={len(hidden_states)}"
+    )
+
+
 def _install_qwen_gdn_mcoplib_rmsnorm(layer: nn.Module) -> None:
     # GDN input_layernorm and post_attention_layernorm. mcoplib does not add 1,
     # so pass gemma_weight. Set SGLANG_QWEN_MCOPLIB_ADD_RMSNORM=0 to opt out.
@@ -288,6 +337,11 @@ def _install_qwen_gdn_mcoplib_rmsnorm(layer: nn.Module) -> None:
     op = torch.ops.sgl_kernel.fused_add_rmsnorm
 
     def _bind(norm: GemmaRMSNorm) -> None:
+        # Quantized post-attention norms must stay on GemmaRMSNorm.forward_cuda
+        # so they can emit the pre-quantized W13 tuple.
+        if getattr(norm, "return_quant_tuple", False):
+            return
+
         def _forward(x, residual=None, post_residual_addition=None):
             if (
                 residual is None
@@ -1054,9 +1108,13 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
+        enable_w13_quant = _enable_moe_w13_quant(self.mlp)
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            return_quant_tuple=enable_w13_quant,
+            moe_fuse_w13_quant=enable_w13_quant,
         )
         # GDN layers need both bf16 (for the small in_proj_ba gating
         # projection) and a quantized tuple only when in_proj_qkvz can consume
@@ -1107,6 +1165,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        hidden_states, pre_quant_input = _split_moe_pre_quant(hidden_states)
 
         mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
@@ -1120,6 +1179,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         defer_moe_finalize = (
             fuse_mlp_allreduce
             and isinstance(hidden_states, torch.Tensor)
+            and pre_quant_input is None
             and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
             and hasattr(self.layer_communicator, "should_use_finalize")
             and self.layer_communicator.should_use_finalize(
@@ -1134,6 +1194,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             # The last layer has no prepare_attn consumer for deferred AllReduce;
             # fall back before MLP so postprocess_layer performs the collective.
             fuse_mlp_allreduce = False
+        if defer_moe_finalize:
+            pre_quant_input = None
         with get_forward().scoped(
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
@@ -1143,6 +1205,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                     hidden_states,
                     forward_batch,
                     defer_finalize=defer_moe_finalize,
+                    pre_quant_input=pre_quant_input,
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
@@ -1301,13 +1364,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # when qkv_proj can actually consume the tuple (Fp8LinearMethod with
         # block/mxfp8 quant); MX_ENABLE_FUSE_ACT_FP8_QUANT is the runtime
         # kill-switch.
+        enable_w13_quant = _enable_moe_w13_quant(self.mlp)
         self.input_layernorm = GemmaRMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             return_quant_tuple=_linear_accepts_fp8_tuple(self.qkv_proj),
         )
         self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            return_quant_tuple=enable_w13_quant,
+            moe_fuse_w13_quant=enable_w13_quant,
         )
 
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -1554,6 +1621,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        hidden_states, pre_quant_input = _split_moe_pre_quant(hidden_states)
         mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
@@ -1566,6 +1634,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         defer_moe_finalize = (
             fuse_mlp_allreduce
             and isinstance(hidden_states, torch.Tensor)
+            and pre_quant_input is None
             and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
             and hasattr(self.layer_communicator, "should_use_finalize")
             and self.layer_communicator.should_use_finalize(
@@ -1578,6 +1647,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             and not defer_moe_finalize
         ):
             fuse_mlp_allreduce = False
+        if defer_moe_finalize:
+            pre_quant_input = None
         with get_forward().scoped(
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
@@ -1587,6 +1658,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     hidden_states,
                     forward_batch,
                     defer_finalize=defer_moe_finalize,
+                    pre_quant_input=pre_quant_input,
                 )
             else:
                 hidden_states = self.mlp(hidden_states)
