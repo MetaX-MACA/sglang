@@ -51,6 +51,7 @@ from mcoplib.custom_ops import (
 )
 from sgl_kernel import (
     rms_norm_dynamic_per_token_quant_custom,
+    rms_norm_dynamic_per_group_quant_custom,
 )
 
 # Register mcoplib op as torch.library custom op for torch.compile / PCG.
@@ -537,7 +538,8 @@ class RMSNorm(BaseFusedOp):
         force_native: bool = False,
         fused_quant: bool = False,
         packed_quant: bool = False,
-        packed_size: int = 3840
+        packed_size: int = 3840,
+        return_quant_tuple: bool = False,
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
@@ -578,6 +580,7 @@ class RMSNorm(BaseFusedOp):
         self.fused_quant = fused_quant
         self.packed_quant = packed_quant
         self.packed_size = packed_size
+        self.return_quant_tuple = return_quant_tuple
 
     def forward_cuda(
         self,
@@ -586,12 +589,42 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if isinstance(x, tuple):
+            x = x[0]
+
         if x.numel() == 0:
             if residual is not None:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
                 return x, residual
             return x
+        
+        if (
+            self.return_quant_tuple
+            and envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
+        ):
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                if not residual.is_contiguous():
+                    residual = residual.contiguous()
+            original_shape = x.shape
+            fp8_out, bf16_out, scales = rms_norm_dynamic_per_group_quant_custom(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+                torch.float8_e4m3fn,
+                128,
+                residual=residual,
+            )
+            quant_tuple = (
+                fp8_out.reshape(original_shape),
+                scales,
+                bf16_out.reshape(original_shape),
+            )
+            if residual is not None:
+                return quant_tuple, residual
+            return quant_tuple
 
         if self.fused_quant: 
             if self.packed_quant:

@@ -866,6 +866,7 @@ class MqaAttentionBase(nn.Module):
             self.q_lora_rank, 
             eps=self.eps,
             fused_quant=self.fused_quant,
+            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
         )
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
@@ -2672,6 +2673,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_quant=self.fused_quant,
+            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
@@ -3096,7 +3098,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_attn_fn,
                     self.hc_attn_scale,
                     self.hc_attn_base,
-                    norm=self.input_layernorm,
                     forward_batch=forward_batch,
                 )
                 if not norm_fused:
@@ -3118,7 +3119,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
-                norm=self.input_layernorm,
                 forward_batch=forward_batch,
             )
             if not norm_fused:
@@ -3985,7 +3985,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
-            norm=self.input_layernorm,
             forward_batch=forward_batch,
         )
         if not norm_fused:
@@ -4277,7 +4276,7 @@ class DeepseekV4Model(nn.Module):
         num_alt_streams = 5 if (_is_cuda or _is_npu) else 2
         if envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get():
             self.alt_streams = (
-                [torch.cuda.Stream() for _ in range(num_alt_streams)]
+                [device_module.Stream() for _ in range(num_alt_streams)]
                 if use_stream_pool
                 else None
             )
