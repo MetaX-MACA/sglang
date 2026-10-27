@@ -50,6 +50,7 @@ from mcoplib.custom_ops import (
     fused_add_rms_norm_dynamic_per_token_quant_padding_output as _mocop_fused_add_rms_norm_quant_pad,
 )
 from sgl_kernel import (
+    rms_norm_dynamic_per_group_quant_custom,
     rms_norm_dynamic_per_token_quant_custom,
 )
 
@@ -1320,6 +1321,7 @@ class GemmaRMSNorm(BaseFusedOp):
         packed_quant: bool = False,
         packed_size: int = 3840,
         return_quant_tuple: bool = False,
+        moe_fuse_w13_quant: bool = False,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
@@ -1328,6 +1330,7 @@ class GemmaRMSNorm(BaseFusedOp):
         self.packed_quant = packed_quant
         self.packed_size = packed_size
         self.return_quant_tuple = return_quant_tuple
+        self.moe_fuse_w13_quant = moe_fuse_w13_quant
         self.register_buffer(
             "gemma_weight", torch.ones_like(self.weight), persistent=False
         )
@@ -1392,10 +1395,16 @@ class GemmaRMSNorm(BaseFusedOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # MACA: fused GemmaRMSNorm(+residual) + FP8 per-128-group quant into a
         # single sgl_kernel call producing (fp8_out, scales, bf16_out). The
-        # fp8/scales feed an FP8 blockwise GEMM (e.g. qkv_proj); the bf16
+        # fp8/scales feed an FP8 blockwise GEMM (e.g. qkv_proj or W13); the bf16
         # element (tuple[-1]) serves the unquantized consumers. Mirrors the
         # RMSNorm.forward_cuda return_quant_tuple branch above.
-        if self.return_quant_tuple and envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get():
+        if self.return_quant_tuple and (
+            envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
+            or (
+                self.moe_fuse_w13_quant
+                and envs.MX_ENABLE_MOE_FUSE_W13_QUANT.get()
+            )
+        ):
             if x.numel() == 0:
                 return self._forward_impl(x, residual, post_residual_addition)
             if residual is not None:
@@ -1436,14 +1445,23 @@ class GemmaRMSNorm(BaseFusedOp):
                     quant_residual,
                     True,
                 )
-            else:
-                fp8_out, bf16_out, scales = rms_norm_dynamic_per_group_quant_custom(
+            elif self.moe_fuse_w13_quant:
+                fp8_out, bf16_out, scales = _mx_rms_norm_group_fp8(
                     quant_input,
                     self.gemma_weight,
                     self.variance_epsilon,
-                    torch.float8_e4m3fn,
-                    quant_group_size,
-                    residual=quant_residual,
+                    quant_residual,
+                )
+            else:
+                fp8_out, bf16_out, scales = (
+                    rms_norm_dynamic_per_group_quant_custom(
+                        quant_input,
+                        self.gemma_weight,
+                        self.variance_epsilon,
+                        torch.float8_e4m3fn,
+                        quant_group_size,
+                        residual=quant_residual,
+                    )
                 )
             fp8_out = fp8_out.reshape(original_shape)
             bf16_out = bf16_out.reshape(original_shape)

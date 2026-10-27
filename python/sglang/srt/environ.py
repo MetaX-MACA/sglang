@@ -709,6 +709,11 @@ class Envs:
     # mcoplib build that registers _C.swiglu_step_and_mul_per_block_quant;
     # otherwise the flag is a no-op.
     MX_ENABLE_MOE_FUSE_ACT_QUANT = EnvBool(False)
+    # Prefill-only: fuse the post-attention Gemma RMSNorm with the per-group
+    # FP8 quantization of the routed W13 input, then reuse the (fp8, scale)
+    # pair in the StandardDispatcher/Triton MoE W13 GEMM. Requires blockwise
+    # FP8 weights, standard dispatch, and no DP attention/DeepEP.
+    MX_ENABLE_MOE_FUSE_W13_QUANT = EnvBool(False)
     # FP8 weight/activation scale layout switched to column-major so a later
     # scale.T.contiguous() becomes a no-op. Affects all FP8 models when on;
     # PD decode with this on is known to trap, keep off by default.
