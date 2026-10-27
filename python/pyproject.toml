@@ -63,7 +63,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "watchfiles",
-  "xgrammar==0.1.32",
+  "xgrammar==0.2.1",
   "kernels<0.15",
   "jsonschema",
   "imageio",
