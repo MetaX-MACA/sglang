@@ -95,7 +95,9 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["speculative_attention_mode"] = "decode"
 
         prefill_backend, decode_backend = attention_backends_of(cfg)
-        if decode_backend == "cutedsl_mla" or decode_backend is None:
+        if decode_backend == "cutedsl_mla" or (
+            decode_backend is None and not get_platform().is_maca
+        ):
             _require_kimi_k3_cutedsl_dcp_support()
             logger.info(
                 "Kimi-K3 DCP keeps decode attention backend 'cutedsl_mla' "
@@ -120,6 +122,24 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 decode_attention_backend="tokenspeed_mla",
                 kv_cache_dtype="fp8_e4m3",
             )
+        elif (
+            decode_backend == "flashinfer" or decode_backend is None
+        ) and get_platform().is_maca:
+            if cfg.speculative_algorithm == "DSPARK":
+                raise ValueError(
+                    "Kimi-K3 DCP + DSPARK is not supported with the MetaX "
+                    "FlashInfer MLA backend."
+                )
+            logger.info(
+                "Kimi-K3 DCP on MetaX uses FlashInfer MLA for prefill and "
+                "decode (prefill=%r, decode=%r).",
+                prefill_backend,
+                decode_backend,
+            )
+            overrides.update(
+                prefill_attention_backend="flashinfer",
+                decode_attention_backend="flashinfer",
+            )
         elif decode_backend == "aiter":
             _require_kimi_k3_aiter_gluon_dcp_support()
             # Override prefill backend to aiter by default
@@ -136,7 +156,9 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             )
         else:
             raise AssertionError(
-                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla', 'tokenspeed_mla' or 'aiter', got {decode_backend!r}."
+                "Decode attention backend for Kimi-K3 DCP must be "
+                "'cutedsl_mla', 'tokenspeed_mla', 'aiter', or 'flashinfer' on MetaX; "
+                f"got {decode_backend!r}."
             )
 
         if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
