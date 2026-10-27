@@ -1855,6 +1855,37 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 
+    if (
+        is_maca()
+        and envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get()
+        and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+    ):
+        from mcoplib.op import (
+            fused_silu_mul_dq_mask_quant_fp8_nopack as _mcoplib_silu_mul_mask_quant,
+        )
+
+        column_major_scales = envs.MX_TRANS_FP8_SCALE_LAYOUT.get()
+        down_input = torch.empty(
+            (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
+        )
+        down_input_scale = torch.empty(
+            (E, G, N) if column_major_scales else (E, N, G),
+            device=hidden_states_device,
+            dtype=torch.float32,
+        )
+        if column_major_scales:
+            down_input_scale = down_input_scale.transpose(-1, -2)
+        _mcoplib_silu_mul_mask_quant(
+            down_input,
+            down_input_scale,
+            gateup_output,
+            masked_m,
+            group_size,
+            swiglu_limit,
+            *([True] if column_major_scales else []),
+        )
+        return down_input, down_input_scale
+
     # Default plain-silu path: the unified JIT masked fused quant. It allocates
     # the outputs itself, with scales directly in the layout deep_gemm consumes
     # (packed-int32 col-major for UE8M0, TMA-aligned col-major fp32 otherwise),
