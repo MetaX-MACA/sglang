@@ -309,7 +309,12 @@ def tilelang_qsa_mqa_prefill(
         starts = torch.cat([starts, starts[-1:].expand(padding)])
         ends = torch.cat([ends, ends[-1:].expand(padding)])
 
-    _tilelang_qsa_mqa_prefill_kernel(heads=heads, head_dim=head_dim, block_q=block_q)(
+    _tilelang_qsa_mqa_prefill_kernel(
+        heads=heads,
+        head_dim=head_dim,
+        block_q=block_q,
+        num_stages=1 if is_maca() else 3,
+    )(
         q_padded.reshape(-1, head_dim),
         k[:, 0].to(torch.bfloat16).contiguous(),
         logits,
