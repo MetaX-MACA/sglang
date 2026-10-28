@@ -178,6 +178,11 @@ def inplace_fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     is_fp4_experts: bool = False,
+    use_fp4_w4a8: bool = False,
+    w13_scale_b: Optional[torch.Tensor] = None,
+    w13_scale_t: Optional[torch.Tensor] = None,
+    w2_scale_b: Optional[torch.Tensor] = None,
+    w2_scale_t: Optional[torch.Tensor] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -214,6 +219,11 @@ def inplace_fused_experts(
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         is_fp4_experts=is_fp4_experts,
+        use_fp4_w4a8=use_fp4_w4a8,
+        w13_scale_b=w13_scale_b,
+        w13_scale_t=w13_scale_t,
+        w2_scale_b=w2_scale_b,
+        w2_scale_t=w2_scale_t,
     )
 
 
@@ -251,6 +261,11 @@ def outplace_fused_experts(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    use_fp4_w4a8: bool = False,
+    w13_scale_b: Optional[torch.Tensor] = None,
+    w13_scale_t: Optional[torch.Tensor] = None,
+    w2_scale_b: Optional[torch.Tensor] = None,
+    w2_scale_t: Optional[torch.Tensor] = None,
     is_fp4_experts: bool = False,
 ) -> torch.Tensor:
     return fused_experts_impl(
@@ -287,6 +302,11 @@ def outplace_fused_experts(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        use_fp4_w4a8=use_fp4_w4a8,
+        w13_scale_b=w13_scale_b,
+        w13_scale_t=w13_scale_t,
+        w2_scale_b=w2_scale_b,
+        w2_scale_t=w2_scale_t,
         is_fp4_experts=is_fp4_experts,
     )
 
@@ -315,6 +335,11 @@ def fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     is_fp4_experts: bool = False,
+    use_fp4_w4a8: bool = False,
+    w13_scale_b: Optional[torch.Tensor] = None,
+    w13_scale_t: Optional[torch.Tensor] = None,
+    w2_scale_b: Optional[torch.Tensor] = None,
+    w2_scale_t: Optional[torch.Tensor] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -356,6 +381,11 @@ def fused_experts(
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
             is_fp4_experts=is_fp4_experts,
+            use_fp4_w4a8=use_fp4_w4a8,
+            w13_scale_b=w13_scale_b,
+            w13_scale_t=w13_scale_t,
+            w2_scale_b=w2_scale_b,
+            w2_scale_t=w2_scale_t,
         )
         return hidden_states
     else:
@@ -392,6 +422,11 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            use_fp4_w4a8=use_fp4_w4a8,
+            w13_scale_b=w13_scale_b,
+            w13_scale_t=w13_scale_t,
+            w2_scale_b=w2_scale_b,
+            w2_scale_t=w2_scale_t,
             is_fp4_experts=is_fp4_experts,
         )
 
@@ -1236,6 +1271,11 @@ def fused_experts_impl(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     is_fp4_experts: bool = False,
+    use_fp4_w4a8: bool = False,
+    w13_scale_b: Optional[torch.Tensor] = None,
+    w13_scale_t: Optional[torch.Tensor] = None,
+    w2_scale_b: Optional[torch.Tensor] = None,
+    w2_scale_t: Optional[torch.Tensor] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1315,6 +1355,11 @@ def fused_experts_impl(
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         is_fp4_experts=is_fp4_experts,
+        use_fp4_w4a8=use_fp4_w4a8,
+        w13_scale_b=w13_scale_b,
+        w13_scale_t=w13_scale_t,
+        w2_scale_b=w2_scale_b,
+        w2_scale_t=w2_scale_t,
     )
 
 

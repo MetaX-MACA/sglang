@@ -132,6 +132,7 @@ SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "intel_xpu"}
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
+    "mxfp4_w4a8",
     "deep_gemm",
     "triton",
     "triton_kernel",
