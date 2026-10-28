@@ -633,6 +633,41 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return shared_output
 
+    def supports_standard_prequantized_moe_input(self) -> bool:
+        """Whether the routed standard-dispatch W13 path accepts (fp8, scale)."""
+        experts = getattr(self, "experts", None)
+        if experts is None:
+            return False
+        dispatcher = getattr(experts, "dispatcher", None)
+        runner = getattr(experts, "runner", None)
+        quant_method = getattr(experts, "quant_method", None)
+        if dispatcher is None or runner is None or quant_method is None:
+            return False
+
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatcher,
+        )
+
+        if not isinstance(dispatcher, StandardDispatcher):
+            return False
+        if getattr(dispatcher, "_original_dispatch_func", None) is not None:
+            return False
+        if getattr(runner, "fused_func", None) is None:
+            return False
+        runner_backend = getattr(runner, "runner_backend", None)
+        if runner_backend is None or not runner_backend.is_triton():
+            return False
+        if quant_method.__class__.__name__ != "Fp8MoEMethod":
+            return False
+        if not getattr(quant_method, "block_quant", False):
+            return False
+        if getattr(quant_method, "use_mxfp8", False):
+            return False
+        if getattr(quant_method, "is_fp4_expert", False):
+            return False
+        block_size = getattr(quant_method, "weight_block_size", None)
+        return block_size is not None and tuple(block_size) == (128, 128)
+
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         trace_e2e = envs.SGLANG_TRACE_QWEN_MOE_DEEPEP_E2E.get()
 
@@ -727,6 +762,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         *,
         defer_finalize: bool = False,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
@@ -746,7 +782,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output
         ):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
-        return self.experts(hidden_states, topk_output)
+        return self.experts(
+            hidden_states, topk_output, pre_quant_input=pre_quant_input
+        )
 
     def _gate_shared_output_out_of_place(
         self,
@@ -766,6 +804,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         use_fused_gate: bool = False,
         defer_finalize: bool = False,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
 
@@ -774,7 +813,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # the shared branch reads the same input and writes a separate output.
             self.alt_stream.wait_stream(current_stream)
             router_output = self._forward_router_experts(
-                hidden_states, defer_finalize=True
+                hidden_states,
+                defer_finalize=True,
+                pre_quant_input=None,
             )
             with torch.cuda.stream(self.alt_stream):
                 shared_output = self._forward_shared_experts(
@@ -813,7 +854,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # ===== END TO BE REFACTORED ====
 
         with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
+            router_output = self._forward_router_experts(
+                hidden_states, pre_quant_input=pre_quant_input
+            )
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -828,9 +871,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         defer_finalize: bool = False,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        if pre_quant_input is not None and (defer_finalize or num_tokens == 0):
+            pre_quant_input = None
         if defer_finalize and num_tokens == 0:
             raise RuntimeError("Qwen deferred finalize does not support M=0")
 
@@ -863,6 +909,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 use_fused_gate=use_fused_gate,
                 defer_finalize=defer_finalize,
+                pre_quant_input=pre_quant_input,
             )
         else:
             shared_output = self._forward_shared_experts(
@@ -873,7 +920,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     hidden_states, shared_output
                 )
             final_hidden_states = self._forward_router_experts(
-                hidden_states, defer_finalize=defer_finalize
+                hidden_states,
+                defer_finalize=defer_finalize,
+                pre_quant_input=pre_quant_input,
             )
 
         if defer_finalize:
