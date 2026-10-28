@@ -434,7 +434,7 @@ def sparse_attention_fwd_kernel_v1(
 
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] /= sumexp[h_i]
+                acc_o[h_i, d_i] /= T.max(sumexp[h_i], 1e-30)
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
 

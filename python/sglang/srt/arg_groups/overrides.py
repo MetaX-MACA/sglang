@@ -551,6 +551,7 @@ def _check_dsa_backend_constraints(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    allow_tilelang_int8: bool = False,
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
@@ -558,10 +559,18 @@ def _check_dsa_backend_constraints(
     if kv_cache_dtype == "int8":
         if hip:
             raise ValueError("DSA INT8 main KV cache is not supported on HIP")
-        unsupported = chosen - {"flashmla_sparse", "flashmla_kv"}
+        supported = {"flashmla_sparse", "flashmla_kv"}
+        if allow_tilelang_int8:
+            supported.add("tilelang")
+        unsupported = chosen - supported
         if unsupported:
+            requirement = (
+                "TileLang for GLM-5.3-Flash"
+                if allow_tilelang_int8
+                else "flashmla_sparse or flashmla_kv"
+            )
             raise ValueError(
-                "DSA INT8 main KV cache requires flashmla_sparse or flashmla_kv; "
+                f"DSA INT8 main KV cache requires {requirement}; "
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
 
@@ -605,6 +614,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     hf_config = model_config_of(view).hf_config
+    model_arch = hf_config.architectures[0]
+    glm53_flash_int8 = (
+        view.kv_cache_dtype == "int8"
+        and model_arch == "Glm5NextForConditionalGeneration"
+    )
     if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
     if not is_deepseek_dsa(hf_config):
@@ -692,7 +706,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         # dtype-aware, so an explicitly requested backend still has to clear the
         # shared backend/kv-cache-dtype rules before this arm returns early.
         _check_dsa_backend_constraints(
-            kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+            kv_cache_dtype,
+            prefill,
+            decode,
+            hip=get_platform().is_hip,
+            allow_tilelang_int8=glm53_flash_int8,
         )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
@@ -705,6 +723,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_prefill_backend"] = "triton"
         if not user_set_decode:
             declared["dsa_decode_backend"] = "triton"
+    elif glm53_flash_int8:
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "tilelang"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "tilelang"
     elif kv_cache_dtype == "int8":
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = "flashmla_sparse"
@@ -725,7 +748,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
 
     from sglang.srt.utils.common import is_maca
-    if is_maca():
+    if is_maca() and not glm53_flash_int8:
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = "flashmla_sparse"
         if not user_set_decode:
@@ -733,7 +756,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
     _check_dsa_backend_constraints(
-        kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+        kv_cache_dtype,
+        prefill,
+        decode,
+        hip=get_platform().is_hip,
+        allow_tilelang_int8=glm53_flash_int8,
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
@@ -1234,6 +1261,19 @@ def _mla_backend_page_constraints(view: Any) -> dict:
 @register_post_process
 def _mla_kv_cache_dtype_checks(view: Any) -> dict:
     """Validate resolved KV-cache dtype for TRTLLM and tokenspeed MLA backends."""
+    if (
+        view.kv_cache_dtype == "int8"
+        and model_config_of(view).hf_config.architectures[0]
+        == "Glm5NextForConditionalGeneration"
+    ):
+        if (view.dsa_prefill_backend, view.dsa_decode_backend) != (
+            "tilelang",
+            "tilelang",
+        ):
+            raise ValueError(
+                "GLM-5.3-Flash INT8 KV requires TileLang prefill and decode"
+            )
+
     if (
         view.kv_cache_dtype == "int8"
         and model_config_of(view).hf_config.architectures[0]

@@ -42,7 +42,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsa.kv_cache_layout import (
-    PACKED_BYTES_PER_TOKEN,
+    packed_kv_row_bytes,
     validate_int8_kv_cache,
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
@@ -4463,9 +4463,10 @@ class MLATokenToKVPool(KVCache):
         )
         if self.dsa_kv_cache_store_int8:
             validate_int8_kv_cache(kv_lora_rank, qk_rope_head_dim)
-            if override_kv_cache_dim != PACKED_BYTES_PER_TOKEN:
+            expected_kv_cache_dim = packed_kv_row_bytes(qk_rope_head_dim)
+            if override_kv_cache_dim != expected_kv_cache_dim:
                 raise ValueError(
-                    f"DSA INT8 KV cache requires {PACKED_BYTES_PER_TOKEN} bytes per row, "
+                    f"DSA INT8 KV cache requires {expected_kv_cache_dim} bytes per row, "
                     f"got override_kv_cache_dim={override_kv_cache_dim}"
                 )
         # Packed INT8 rows contain INT8 values, FP32 scales and BF16 RoPE.
