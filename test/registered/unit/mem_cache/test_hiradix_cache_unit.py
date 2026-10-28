@@ -3,6 +3,8 @@
 import os
 import unittest
 from array import array
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
@@ -118,6 +120,105 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
         )
         self.assertIsNone(stored_cpu[0].parent_block_hash)
         self.assertEqual(stored_cpu[1].parent_block_hash, stored_cpu[0].block_hashes[0])
+
+    def test_prefetch_host_insert_skips_unbacked_device_parent(self):
+        for policy in ("write_through", "write_through_selective"):
+            with self.subTest(policy=policy):
+                cache, allocator = self._build_cache()
+                cache.cache_controller.write_policy = policy
+                self._insert(cache, allocator, [1, 2])
+                node = self._leaf_for(cache, [1, 2])
+                self.assertFalse(node.backuped)
+                host_pool = cache.cache_controller.mem_pool_host
+                available = host_pool.available_size()
+                host_indices = host_pool.alloc(PAGE_SIZE)
+                self.assertIsNotNone(host_indices)
+
+                result = cache._insert_helper_host(
+                    node, RadixKey(array("q", [3, 4])), host_indices, ["ab" * 16]
+                )
+
+                self.assertEqual(result, (0, 0))
+                self.assertEqual(len(node.children), 0)
+                self.assertEqual(host_pool.available_size(), available)
+
+    def test_prefetch_host_insert_allows_backed_up_parent(self):
+        cache, allocator = self._build_cache()
+        self._insert(cache, allocator, [1, 2])
+        node = self._leaf_for(cache, [1, 2])
+        self.assertGreater(cache.write_backup(node, write_back=True), 0)
+        self.assertTrue(node.backuped)
+        host_indices = cache.cache_controller.mem_pool_host.alloc(PAGE_SIZE)
+        self.assertIsNotNone(host_indices)
+
+        result = cache._insert_helper_host(
+            node, RadixKey(array("q", [3, 4])), host_indices, ["ab" * 16]
+        )
+
+        self.assertEqual(result, (0, PAGE_SIZE))
+        self.assertEqual(len(node.children), 1)
+        child = next(iter(node.children.values()))
+        self.assertTrue(child.evicted)
+        self.assertTrue(child.backuped)
+
+    def test_prefetch_host_insert_allows_unbacked_parent_in_write_back(self):
+        cache, allocator = self._build_cache()
+        cache.cache_controller.write_policy = "write_back"
+        self._insert(cache, allocator, [1, 2])
+        node = self._leaf_for(cache, [1, 2])
+        self.assertFalse(node.backuped)
+        host_indices = cache.cache_controller.mem_pool_host.alloc(PAGE_SIZE)
+        self.assertIsNotNone(host_indices)
+
+        result = cache._insert_helper_host(
+            node, RadixKey(array("q", [3, 4])), host_indices, ["ab" * 16]
+        )
+
+        self.assertEqual(result, (0, PAGE_SIZE))
+        self.assertEqual(len(node.children), 1)
+        child = next(iter(node.children.values()))
+        self.assertTrue(child.evicted)
+        self.assertTrue(child.backuped)
+        self.assertFalse(node.backuped)
+
+    def test_prefetch_result_dropped_suffix_releases_pages_and_reports_zero_hits(self):
+        cache, allocator = self._build_cache()
+        self._insert(cache, allocator, [1, 2])
+        node = self._leaf_for(cache, [1, 2])
+        self.assertFalse(node.backuped)
+        host_pool = cache.cache_controller.mem_pool_host
+        available = host_pool.available_size()
+        key = RadixKey(array("q", [1, 2, 3, 4]))
+        host_indices = host_pool.alloc(len(key))
+        self.assertIsNotNone(host_indices)
+        operation = SimpleNamespace(
+            request_id="dropped-prefetch",
+            completed_tokens=len(key),
+            hash_value=["ab" * 16, "cd" * 16],
+            is_aborted=lambda: False,
+        )
+        anchor = cache.root_node
+        anchor.protect_host()
+        cache.ongoing_prefetch[operation.request_id] = (
+            anchor,
+            key,
+            host_indices,
+            operation,
+        )
+        # Storage is disabled in this fixture, so initialize the accounting
+        # normally created when attaching a storage backend. Simulate one prefetch.
+        cache.cache_controller.prefetch_tokens_occupied = len(key)
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = Mock()
+
+        cache.handle_prefetch_result(operation)
+
+        self.assertEqual(len(node.children), 0)
+        self.assertEqual(host_pool.available_size(), available)
+        self.assertNotIn(operation.request_id, cache.ongoing_prefetch)
+        self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
+        self.assertEqual(cache.pop_prefetch_loaded_tokens(operation.request_id), 0)
+        cache.storage_metrics_collector.log_prefetched_tokens.assert_called_once_with(0)
 
 
 if __name__ == "__main__":

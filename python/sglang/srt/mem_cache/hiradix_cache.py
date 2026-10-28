@@ -1539,7 +1539,7 @@ class HiRadixCache(RadixCache):
 
         fetched_key = prefetch_key[:completed_tokens]
         written_indices = host_indices[:completed_tokens]
-        matched_length = self._insert_helper_host(
+        matched_length, inserted_length = self._insert_helper_host(
             last_host_node,
             fetched_key,
             written_indices,
@@ -1551,7 +1551,7 @@ class HiRadixCache(RadixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         # Track tokens actually loaded from storage for this request (L3 hits)
-        loaded_from_storage = completed_tokens - matched_length
+        loaded_from_storage = inserted_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
 
         if self.enable_storage_metrics:
@@ -1668,11 +1668,13 @@ class HiRadixCache(RadixCache):
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
-    ):
+    ) -> tuple[int, int]:
+        # Return (redundant prefix length, inserted suffix length). The caller
+        # frees the redundant prefix; inserted pages become owned by the tree.
         access_time = get_and_increase_time_counter()
         node.last_access_time = access_time
         if len(key) == 0:
-            return 0
+            return 0, 0
 
         child_key = key.child_key(self.page_size)
 
@@ -1694,6 +1696,17 @@ class HiRadixCache(RadixCache):
                 child_key = key.child_key(self.page_size)
 
         if len(key):
+            # Write-through requires a backed-up parent before attaching a
+            # host-only child, otherwise device eviction can delete a non-leaf.
+            # Drop and free the suffix here; the caller frees the matched prefix.
+            if (
+                node is not self.root_node
+                and not node.backuped
+                and self.cache_controller.write_policy != "write_back"
+            ):
+                self.cache_controller.mem_pool_host.free(host_value)
+                return matched_length, 0
+
             new_node = TreeNode(priority=node.priority)
             new_node.parent = node
             new_node.key = key
@@ -1708,7 +1721,7 @@ class HiRadixCache(RadixCache):
             # cache indexers can resolve descendants that extend this L2-only prefix.
             self._record_store_event(new_node, medium=StorageMedium.CPU)
 
-        return matched_length
+        return matched_length, len(key)
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         access_time = get_and_increase_time_counter()
