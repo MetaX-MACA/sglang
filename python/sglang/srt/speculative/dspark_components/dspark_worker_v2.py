@@ -188,9 +188,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._draft_num_redundant_experts = resolve_dspark_num_redundant_experts(
                 num_logical_experts=num_logical_experts,
                 num_physical_experts=requested_physical_experts,
-                ep_size=ps.moe_ep_size,
+                ep_size=get_parallel().moe_ep_size,
             )
-            if ps.tp_rank == 0:
+            if get_parallel().tp_rank == 0:
                 logger.info(
                     "DSpark draft expert replication enabled: logical=%s, "
                     "redundant=%s, physical=%s.",

@@ -464,7 +464,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 and self._uses_swa_tail_prealloc()
                 and self.tree_cache.is_chunk_cache()
                 and self.tree_cache.supports_swa()
-                and args.speculative_algorithm == "DSPARK"
+                and args.speculative_algorithm in (None, "DSPARK")
                 and args.disable_overlap_schedule
                 and not args.speculative_adaptive
                 and not args.enable_unified_memory
@@ -476,7 +476,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 and args.dcp_size == 1
             ):
                 raise RuntimeError(
-                    "SGLANG_DSV4_PD_SWA_BUDGET_FIX requires DSV4 DSPARK, "
+                    "SGLANG_DSV4_PD_SWA_BUDGET_FIX requires DSV4 with no "
+                    "speculation or DSPARK, "
                     "non-overlap, chunk cache, PP1/DCP1, no HiCache/HiSparse/"
                     "unified memory/staging/adaptive speculation."
                 )
@@ -488,14 +489,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             window = self.scheduler.sliding_window_size
             if window is None or window <= 0:
                 raise RuntimeError("DSV4 SWA budget fix requires a positive window")
-            draft = spec.speculative_num_draft_tokens or 1
             interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
-            decode_alloc = spec_decode_alloc_len_per_request(
-                page_size=page,
-                speculative_num_steps=spec.speculative_num_steps,
-                speculative_eagle_topk=spec.speculative_eagle_topk,
-                speculative_num_draft_tokens=spec.speculative_num_draft_tokens,
-            )
+            if args.speculative_algorithm is None:
+                # Match compute_swa_request_cap for ordinary decode: one token
+                # per step and one page of allocation headroom.
+                draft = 1
+                decode_alloc = page
+            else:
+                draft = spec.speculative_num_draft_tokens or 1
+                decode_alloc = spec_decode_alloc_len_per_request(
+                    page_size=page,
+                    speculative_num_steps=spec.speculative_num_steps,
+                    speculative_eagle_topk=spec.speculative_eagle_topk,
+                    speculative_num_draft_tokens=spec.speculative_num_draft_tokens,
+                )
             # Same conservative live bound as compute_swa_request_cap, rounded
             # UP per request (not just after summing requests). No output-length
             # term: out-of-window SWA is recycled by the chunk-cache path.
@@ -508,7 +515,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     f"pool={self.token_to_kv_pool_allocator.size_swa}, "
                     f"required={self._dsv4_swa_live_cap}"
                 )
-            logger.info(
+            logger.debug(
                 "[DSV4_SWA_BUDGET_FIX] enabled: window=%s page=%s "
                 "draft=%s eviction_interval=%s decode_alloc=%s "
                 "live_cap=%s pool=%s; full-KV budget unchanged",

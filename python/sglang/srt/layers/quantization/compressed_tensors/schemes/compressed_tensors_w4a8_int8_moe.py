@@ -172,20 +172,12 @@ class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEScheme):
         # byte carrier directly to the masked W4A8 GEMM.
         from sglang.srt.configs.model_config import is_kimi_k3
         if self.runner.runner_backend.is_deep_gemm() and hasattr(layer, "dispatcher"):
-            if is_kimi_k3((self.quant_config.config or {}).get("hf_config")):
-                layer.dispatcher.set_quant_config(
-                    {
-                        "bf16_dispatch": True,
-                        "per_token_quant_int8_pack": True,
-                    }
-                )
-            else:
-                layer.dispatcher.set_quant_config(
-                    {
-                        "bf16_dispatch": True,
-                        "per_token_quant_int8_pack": False,
-                    }
-                )
+            layer.dispatcher.set_quant_config(
+                {
+                    "bf16_dispatch": True,
+                    "per_token_quant_int8_pack": True,
+                }
+            )
 
     def apply_weights(
         self,

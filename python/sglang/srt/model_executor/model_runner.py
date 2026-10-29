@@ -715,7 +715,7 @@ class ModelRunner:
                 rank=expert_rank,
             )
         )
-        if enable_dspark_redundant_experts and self.ps.tp_rank == 0:
+        if enable_dspark_redundant_experts and self.tp_rank == 0:
             metadata = get_global_expert_location_metadata()
             logger.info(
                 "Initialized DSpark draft expert replicas: logical=%s, physical=%s.",

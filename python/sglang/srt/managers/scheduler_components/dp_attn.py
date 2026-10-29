@@ -250,7 +250,7 @@ def _update_gather_batch(
     mlp_sync_info: MLPSyncBatchInfo,
     require_mlp_tp_gather: bool,
     require_global_token_counts: bool = False,
-        draft_require_mlp_tp_gather: Optional[bool] = None,
+    draft_require_mlp_tp_gather: Optional[bool] = None,
     skip_global_metadata=False,
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
