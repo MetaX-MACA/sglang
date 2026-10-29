@@ -3907,6 +3907,8 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        enable_mla_int8: bool = False,
+        enable_mla_int8_workspace: bool = True,
     ):
         self.size = size
         self.dtype = dtype
@@ -4014,6 +4016,12 @@ class HybridLinearKVPool(KVCache):
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
+                **({"enable_mla_int8": True} if enable_mla_int8 else {}),
+                **(
+                    {"enable_mla_int8_workspace": False}
+                    if enable_mla_int8 and not enable_mla_int8_workspace
+                    else {}
+                ),
             )
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
@@ -4427,6 +4435,8 @@ class MLATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
+        enable_mla_int8: bool = False,
+        enable_mla_int8_workspace: bool = True,
     ):
         super().__init__(
             size,
@@ -4458,13 +4468,31 @@ class MLATokenToKVPool(KVCache):
                     f"DSA INT8 KV cache requires {PACKED_BYTES_PER_TOKEN} bytes per row, "
                     f"got override_kv_cache_dim={override_kv_cache_dim}"
                 )
+        # Packed INT8 rows contain INT8 values, FP32 scales and BF16 RoPE.
+        # Allocate byte-addressable storage and expose it as INT8 to readers.
+        self.mla_kv_cache_store_int8 = (
+            enable_mla_int8 and dtype == torch.int8 and not use_dsa
+        )
+        self.mla_int8_dequant_workspace = None
+        self.enable_mla_int8_workspace = enable_mla_int8_workspace
+        if self.mla_kv_cache_store_int8:
+            if kv_lora_rank != 512 or qk_rope_head_dim != 64:
+                raise ValueError(
+                    "INT8 MLA KV cache requires kv_lora_rank=512 and "
+                    "qk_rope_head_dim=64"
+                )
+        if self.dsa_kv_cache_store_int8 or self.mla_kv_cache_store_int8:
             self.store_dtype = torch.uint8
         # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
-            override_kv_cache_dim
-            if self.dsa_kv_cache_is_quantized
-            else (kv_lora_rank + qk_rope_head_dim)
+            656
+            if self.mla_kv_cache_store_int8
+            else (
+                override_kv_cache_dim
+                if self.dsa_kv_cache_is_quantized
+                else (kv_lora_rank + qk_rope_head_dim)
+            )
         )
 
         self._create_buffers()
@@ -4494,16 +4522,37 @@ class MLATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
+                self.mla_int8_dequant_workspace = (
+                    torch.empty(
+                        (
+                            self.size + self.page_size,
+                            1,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    if self.mla_kv_cache_store_int8 and self.enable_mla_int8_workspace
+                    else None
+                )
 
     def _clear_buffers(self):
         del self.kv_buffer
+        self.mla_int8_dequant_workspace = None
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
         for kv_cache in self.kv_buffer:
             kv_size_bytes += get_tensor_size_bytes(kv_cache)
+        if self.mla_int8_dequant_workspace is not None:
+            kv_size_bytes += get_tensor_size_bytes(self.mla_int8_dequant_workspace)
         return kv_size_bytes
+
+    def get_mla_int8_dequant_workspace(self) -> torch.Tensor:
+        if self.mla_int8_dequant_workspace is None:
+            raise RuntimeError("INT8 MLA dequant workspace is not allocated")
+        return self.mla_int8_dequant_workspace
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -4589,6 +4638,14 @@ class MLATokenToKVPool(KVCache):
             "door means an attention backend took a write path that never "
             "declared which loc space it emits."
         )
+        if self.mla_kv_cache_store_int8:
+            self._write_mla_kv_buffer(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k[..., : self.kv_lora_rank],
+                cache_k[..., self.kv_lora_rank :],
+            )
+            return
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -4610,9 +4667,22 @@ class MLATokenToKVPool(KVCache):
             self.write_loc_is_dcp_resolved
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
         ), "the DSA write paths have no resolved-loc variant"
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
-            # HIP TileLang FP8 consumes the model's raw MLA layout
-            # (NoPE + optional RoPE) without per-block scales.
+        if self.mla_kv_cache_store_int8:
+            from sglang.kernels.ops.kvcache.kimi_k3_int8 import (
+                quantize_k_cache_int8_separate as quantize_kimi_kv_int8,
+            )
+
+            cache_k_nope, cache_k_rope = quantize_kimi_kv_int8(
+                cache_k_nope, cache_k_rope
+            )
+            set_mla_kv_buffer_triton(
+                dst_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+            )
+        elif _is_hip and self.use_dsa and self.dtype == fp8_dtype:
+            # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
                 dst_buffer,
@@ -4696,6 +4766,14 @@ class MLATokenToKVPool(KVCache):
             kv = kv.to(dst_dtype or torch.bfloat16)
             rope = kv[..., self.kv_lora_rank :] if self.qk_rope_head_dim else None
             return kv[..., : self.kv_lora_rank], rope
+        if self.mla_kv_cache_store_int8:
+            from sglang.kernels.ops.kvcache.kimi_k3_int8 import (
+                dequantize_k_cache_paged_int8,
+            )
+
+            kv = dequantize_k_cache_paged_int8(kv_buffer, loc.reshape(-1))
+            kv = kv.to(dst_dtype or torch.bfloat16)
+            return kv[..., : self.kv_lora_rank], kv[..., self.kv_lora_rank :]
         dst_dtype = dst_dtype or self.dtype
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),

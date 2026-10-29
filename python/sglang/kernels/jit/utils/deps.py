@@ -51,9 +51,9 @@ def get_flashinfer_include_paths() -> List[str]:
 
     for path in candidates:
         if not path.exists():
-            # MetaX FlashInfer does not bundle spdlog. Its sampling headers
-            # compile without it; keep the core header directories mandatory.
-            if path == flashinfer_data / "spdlog" / "include" and is_maca_runtime():
+            # MetaX FlashInfer uses SDK headers instead of bundled CUTLASS
+            # and spdlog; its include and csrc directories remain mandatory.
+            if is_maca_runtime() and path in candidates[2:]:
                 continue
             raise RuntimeError(
                 f"Required header path {path} for flashinfer dependency not found."

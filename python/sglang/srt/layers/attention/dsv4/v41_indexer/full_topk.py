@@ -95,7 +95,7 @@ class FullTopKIndexer:
             assert not metadata.use_topk_v2 or topk_plans is not None
             for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
                 logits = deep_gemm_fp4_paged_mqa_logits(
-                    (data.q_fp4[rows], data.q_sf[rows]),
+                    data.query_rows(rows),
                     data.k_cache,
                     data.weights[rows],
                     metadata.compressed_seq_lens[rows],
@@ -116,7 +116,7 @@ class FullTopKIndexer:
                 )
             return
         logits = deep_gemm_fp4_paged_mqa_logits(
-            (data.q_fp4, data.q_sf),
+            data.query_rows(),
             data.k_cache,
             data.weights,
             metadata.compressed_seq_lens,

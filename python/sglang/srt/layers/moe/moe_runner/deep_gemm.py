@@ -529,7 +529,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             f"{w2_weight.shape[2]} bytes, activation K={down_width}"
         )
         if self.config.activation == "situ":
-            from sglang.kernels.ops.kimi_k3 import masked_situ_quant_int8_pack
+            from sglang.kernels.ops.activation import masked_situ_quant_int8_pack
 
             beta = self.config.gemm1_alpha
             linear_beta = self.config.gemm1_clamp_limit

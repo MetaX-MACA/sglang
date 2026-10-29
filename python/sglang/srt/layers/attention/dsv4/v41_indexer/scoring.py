@@ -9,8 +9,19 @@ from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+from sglang.srt.utils.common import is_maca
+_is_maca = is_maca()
+if _is_maca:
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_maca import fp4_index_logits_decode
+else:
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
+from sglang.srt.layers.attention.dsv4.index_cache_kind import (
+    DSV4IndexCacheKind,
+    dsv4_index_cache_kind,
+)
+from sglang.srt.utils import is_maca
 
 from .types import (
     DecodeInputs,
@@ -28,10 +39,36 @@ _DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
-    q_fp4: torch.Tensor  # [rows, 1, heads, 64] int8, packed fp4
-    q_sf: torch.Tensor  # [rows, 1, heads] int32, packed ue8m0
+    q_fp4: Optional[torch.Tensor]  # [rows, 1, heads, 64] int8, packed fp4 (fp4 kind)
+    q_sf: Optional[torch.Tensor]  # [rows, 1, heads] int32, packed ue8m0 (fp4 kind)
     weights: torch.Tensor  # [rows, heads] bf16/fp32 head weights
-    k_cache: torch.Tensor  # [pages, page_size, 1, 68] uint8, the layer's index-K pool
+    k_cache: torch.Tensor  # [pages, page_size, 1, slot_bytes], the layer's index-K pool
+    q_int8: Optional[torch.Tensor] = None  # [rows, 1, heads, 128] int8 (int8 kind)
+    kind: DSV4IndexCacheKind = DSV4IndexCacheKind.FP4
+
+    def query_rows(
+        self, rows: Optional[slice | torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, ...] | torch.Tensor:
+        """The q operands of `rows`: the fp4 ``(q_fp4, q_sf)`` pair, or the int8
+        tensor."""
+        if self.kind.is_fp4:
+            return (
+                self.q_fp4 if rows is None else self.q_fp4[rows],
+                self.q_sf if rows is None else self.q_sf[rows],
+            )
+        return self.q_int8 if rows is None else self.q_int8[rows]
+
+    @property
+    def num_rows(self) -> int:
+        return self.query_rows()[0].shape[0] if self.kind.is_fp4 else self.q_int8.shape[0]
+
+    @property
+    def q_dtype(self) -> torch.dtype:
+        return self.q_fp4.dtype if self.kind.is_fp4 else self.q_int8.dtype
+
+    @property
+    def q_device(self) -> torch.device:
+        return self.q_fp4.device if self.kind.is_fp4 else self.q_int8.device
 
 
 class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
@@ -43,13 +80,39 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
     lens_per_request: List[int]  # compressed positions at each request's newest token
     rows_per_request: List[int]  # query rows of each request
     compress_lens: torch.Tensor  # [rows] int32, compressed positions the row sees
-    q_fp4: torch.Tensor  # [rows, heads, 64] int8, packed fp4
-    q_sf: torch.Tensor  # [rows, heads] int32, packed ue8m0
+    q_fp4: Optional[torch.Tensor]  # [rows, heads, 64] int8, packed fp4 (fp4 kind)
+    q_sf: Optional[torch.Tensor]  # [rows, heads] int32, packed ue8m0 (fp4 kind)
     weights: torch.Tensor  # [rows, heads] fp32 head weights
+    q_int8: Optional[torch.Tensor] = None  # [rows, heads, 128] int8 (int8 kind)
+    kind: DSV4IndexCacheKind = DSV4IndexCacheKind.FP4
+
+    def query_rows(
+        self, rows: Optional[slice | torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, ...] | torch.Tensor:
+        """The q operands of `rows`: the fp4 ``(q_fp4, q_sf)`` pair, or the int8
+        tensor."""
+        if self.kind.is_fp4:
+            return (
+                self.q_fp4 if rows is None else self.q_fp4[rows],
+                self.q_sf if rows is None else self.q_sf[rows],
+            )
+        return self.q_int8 if rows is None else self.q_int8[rows]
 
     @property
     def num_rows(self) -> int:
-        return self.q_fp4.shape[0]
+        return self.q_fp4.shape[0] if self.kind.is_fp4 else self.q_int8.shape[0]
+
+    @property
+    def num_heads(self) -> int:
+        return self.q_fp4.shape[1] if self.kind.is_fp4 else self.q_int8.shape[1]
+
+    @property
+    def q_dtype(self) -> torch.dtype:
+        return self.q_fp4.dtype if self.kind.is_fp4 else self.q_int8.dtype
+
+    @property
+    def q_device(self) -> torch.device:
+        return self.q_fp4.device if self.kind.is_fp4 else self.q_int8.device
 
     def empty_selection(self, topk: int) -> torch.Tensor:
         return self.request_starts.new_full(
@@ -86,11 +149,12 @@ def get_index_k_cache(
     layer_id: int,
     page_size: int,
 ) -> torch.Tensor:
-    """The layer's index-K pool as ``[pages, page_size, 1, 68]`` uint8."""
+    """The layer's index-K pool as ``[pages, page_size, 1, slot_bytes]``: 68 bytes
+    (64 payload + 4 scale) per fp4 slot, 132 bytes (128 int8 + 4 float32 scale)
+    per int8 slot."""
     k_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
     assert k_cache.dim() == 2
-    # fp4: 64 payload + 4 scale per slot
-    return k_cache.view(k_cache.shape[0], page_size, 1, 68)
+    return k_cache.view(k_cache.shape[0], page_size, 1, k_cache.shape[1] // page_size)
 
 
 def get_deep_gemm_decode_data(
@@ -100,6 +164,39 @@ def get_deep_gemm_decode_data(
     x, q_lora, pos = inputs.x, inputs.q_lora, inputs.positions
     # The kernel sums head scores locally, so the indexer heads must be replicated.
     assert indexer.n_local_heads == indexer.n_heads
+    kind = dsv4_index_cache_kind()
+    # Index pool page; metadata.page_table is expanded to match.
+    k_cache = get_index_k_cache(
+        token_to_kv_pool=token_to_kv_pool,
+        layer_id=inputs.layer_id,
+        page_size=inputs.paged_metadata.compressed_page_size,
+    )
+    if kind.is_int8 and is_maca():
+        # The MACA fused q kernel applies hadamard and folds the scale into the
+        # head weights, pairing with the fused K store.
+        from sglang.kernels.ops.attention.dsv4 import (
+            fused_q_indexer_rope_hadamard_quant,
+        )
+
+        q, _ = indexer.wq_b(q_lora)
+        q = q.view(-1, indexer.n_heads, indexer.index_head_dim)
+        q_int8, weights = fused_q_indexer_rope_hadamard_quant(
+            q,
+            indexer.head_weights_raw(x),
+            indexer.head_weight_scale,
+            inputs.freqs_cis,
+            pos,
+            torch.int8,
+        )
+        weights = weights.squeeze(-1).float()
+        return DeepGEMMDecodeData(
+            q_fp4=None,
+            q_sf=None,
+            weights=weights,
+            k_cache=k_cache,
+            q_int8=q_int8.unsqueeze(1),
+            kind=kind,
+        )
     if (
         x.is_cuda
         and torch.version.cuda is not None
@@ -128,13 +225,9 @@ def get_deep_gemm_decode_data(
     q_fp4 = q_fp4.view(bs, 1, indexer.n_local_heads, 64)
     q_sf = q_sf.view(bs, 1, indexer.n_local_heads)
 
-    # Index pool page (64 slots); metadata.page_table is expanded to match.
-    k_cache = get_index_k_cache(
-        token_to_kv_pool=token_to_kv_pool,
-        layer_id=inputs.layer_id,
-        page_size=inputs.paged_metadata.compressed_page_size,
+    return DeepGEMMDecodeData(
+        q_fp4=q_fp4, q_sf=q_sf, weights=weights, k_cache=k_cache, kind=kind
     )
-    return DeepGEMMDecodeData(q_fp4, q_sf, weights, k_cache)
 
 
 def get_deep_gemm_prefill_data(
@@ -168,9 +261,33 @@ def get_deep_gemm_prefill_data(
     if not slot_chunks or num_tokens == 0:
         return None
     k_slots = torch.cat(slot_chunks)
-    q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
-    q_fp4, q_sf = quantize_index_q(q)
-    weights = indexer.head_weights(inputs.x).float()
+
+    kind = dsv4_index_cache_kind()
+    if kind.is_int8 and is_maca():
+        # The MACA fused q kernel applies hadamard and folds the scale into the
+        # head weights, pairing with the fused K store.
+        from sglang.kernels.ops.attention.dsv4 import (
+            fused_q_indexer_rope_hadamard_quant,
+        )
+
+        q, _ = indexer.wq_b(inputs.q_lora)
+        q = q.view(-1, indexer.n_heads, indexer.index_head_dim)
+        q_int8, weights = fused_q_indexer_rope_hadamard_quant(
+            q,
+            indexer.head_weights_raw(inputs.x),
+            indexer.head_weight_scale,
+            inputs.freqs_cis,
+            pos,
+            torch.int8,
+        )
+        weights = weights.squeeze(-1).float()
+        q_fp4 = q_sf = None
+    else:
+        q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
+        q_fp4, q_sf = quantize_index_q(q)
+        weights = indexer.head_weights(inputs.x).float()
+        q_int8 = None
+
     compress_lens = ((pos + 1) // ratio).to(torch.int32)
     request_starts = torch.repeat_interleave(
         torch.tensor(starts, dtype=torch.int32, device=device),
@@ -186,6 +303,8 @@ def get_deep_gemm_prefill_data(
         q_fp4=q_fp4,
         q_sf=q_sf,
         weights=weights,
+        q_int8=q_int8,
+        kind=kind,
     )
 
 
@@ -196,7 +315,7 @@ def score_tiles(
     width_align: int,
 ) -> Generator[Tuple[slice, torch.Tensor], None, None]:
     yield from flat_index_logits_tiles(
-        q=(data.q_fp4, data.q_sf),
+        q=data.query_rows(),
         kv=kv,
         weights=data.weights,
         starts=data.request_starts,
@@ -358,15 +477,59 @@ def decode_scores(
     lmax = min(metadata.max_compressed_seq_len, req_to_token.shape[1] // ratio)
     if lmax == 0:
         return None
+
+    j = torch.arange(lmax, device=pos.device)
+    slots = req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
+    kind = dsv4_index_cache_kind()
+    if kind.is_int8 and is_maca():
+        from deep_gemm import int8_paged_mqa_logits
+        from sglang.kernels.ops.attention.dsv4 import (
+            fused_q_indexer_rope_hadamard_quant,
+        )
+
+        q, _ = indexer.wq_b(inputs.q_lora)
+        q = q.view(-1, indexer.n_heads, indexer.index_head_dim)
+        q, weights = fused_q_indexer_rope_hadamard_quant(
+            q,
+            indexer.head_weights_raw(inputs.x),
+            indexer.head_weight_scale,
+            inputs.freqs_cis,
+            pos,
+            torch.int8,
+        )
+        q = q.unsqueeze(1)
+        weights = weights.squeeze(-1).float()
+        kv = get_index_k_cache(
+            token_to_kv_pool=pool,
+            layer_id=inputs.layer_id,
+            page_size=metadata.compressed_page_size,
+        )
+
+        scores = int8_paged_mqa_logits(
+            q,
+            kv,
+            weights,
+            metadata.compressed_seq_lens.view(-1, 1).to(torch.int32),
+            metadata.page_table,
+            metadata.deep_gemm_metadata,
+            lmax,
+            False,
+            backend="tilelang",
+        )
+        return DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores)
+
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
-    j = torch.arange(lmax, device=pos.device)
     valid = j[None, :] < lens[:, None]
-    slots = req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
     slots = slots.masked_fill(~valid, 0)
     table = pool.get_index_k_with_scale_buffer(inputs.layer_id)
     scores = fp4_index_logits_decode(
-        q, weights, slots, lens, table, table.shape[1] // 68
+        q,
+        weights,
+        slots,
+        lens,
+        table,
+        table.shape[1] // kind.slot_bytes(indexer.index_head_dim),
     )
     return DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores)
 

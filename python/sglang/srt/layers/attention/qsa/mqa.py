@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.common import is_hip,is_maca
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -309,7 +309,12 @@ def tilelang_qsa_mqa_prefill(
         starts = torch.cat([starts, starts[-1:].expand(padding)])
         ends = torch.cat([ends, ends[-1:].expand(padding)])
 
-    _tilelang_qsa_mqa_prefill_kernel(heads=heads, head_dim=head_dim, block_q=block_q)(
+    _tilelang_qsa_mqa_prefill_kernel(
+        heads=heads,
+        head_dim=head_dim,
+        block_q=block_q,
+        num_stages=1 if is_maca() else 3,
+    )(
         q_padded.reshape(-1, head_dim),
         k[:, 0].to(torch.bfloat16).contiguous(),
         logits,
@@ -354,7 +359,7 @@ def tilelang_qsa_mqa_decode(
     # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
     # sixteen. Zero-padding preserves the weight-free head sum on both paths.
     query_heads, head_dim = q.shape[1:]
-    head_alignment = 16 if is_hip() else 8
+    head_alignment = 16 if is_hip() or is_maca() else 8
     kernel_heads = max(
         head_alignment,
         ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,

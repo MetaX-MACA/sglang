@@ -917,27 +917,40 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
     return {}
 
 
+# The default dsa index cache dtype per DeepSeek-V4 model family.
+_DSV4_INDEX_CACHE_DTYPES = {"deepseek_v41": "fp4", "deepseek_v4": "fp8"}
+
+
 @register_post_process
 def _deepseek_v4_index_cache_dtype(view: Any) -> dict:
     """Set dsa index cache by default according to model quantization method."""
     hf_config = model_config_of(view).hf_config
-    model_arch = hf_config.architectures[0]
-    if model_arch != "DeepseekV4ForCausalLM":
+    if hf_config.architectures[0] != "DeepseekV4ForCausalLM":
         return {}
 
-    if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.is_set():
-        return {}
-    
-    quant_config = getattr(hf_config, "quantization_config", None)
-    if quant_config and quant_config.get("quant_method") == "fp8":
-        if getattr(hf_config, "model_type", None) == "deepseek_v41":
-            envs.SGLANG_DSV4_INDEX_CACHE_TYPE.set("fp4")
-            logger.warning(f"Setting Index cache dtype to fp4 for deepseek_v41.")
-        elif getattr(hf_config, "model_type", None) == "deepseek_v4":
-            envs.SGLANG_DSV4_INDEX_CACHE_TYPE.set("fp8")
-            logger.warning(f"Setting Index cache dtype to fp8 for deepseek_v4.")
-        else:
-            raise NotImplementedError
+    index_cache = envs.SGLANG_DSV4_INDEX_CACHE_TYPE
+    if not index_cache.is_set():
+        quant_config = getattr(hf_config, "quantization_config", None)
+        model_type = getattr(hf_config, "model_type", None)
+        if quant_config is None:
+            compression_config = getattr(hf_config, "compression_config", None)
+            if (
+                compression_config
+                and compression_config.get("format") == "int-quantized"
+            ):
+                index_cache.set("int8")
+                logger.warning(f"Setting Index cache dtype to int8 for {model_type}.")
+        elif quant_config.get("quant_method") == "fp8":
+            inferred = _DSV4_INDEX_CACHE_DTYPES.get(model_type)
+            if inferred is None:
+                raise NotImplementedError
+            index_cache.set(inferred)
+            logger.warning(f"Setting Index cache dtype to {inferred} for {model_type}.")
+
+    if index_cache.is_set():
+        # The int8 index cache still runs on the DeepGEMM indexer, so the SM100
+        # bypass follows it: int8 turns the bypass on, every other kind off.
+        envs.SGLANG_DSV41_FORCE_DEEPGEMM_INDEXER.set(index_cache.get() == "int8")
     return {}
 
 
@@ -1205,6 +1218,54 @@ def _mla_backend_page_constraints(view: Any) -> dict:
 @register_post_process
 def _mla_kv_cache_dtype_checks(view: Any) -> dict:
     """Validate resolved KV-cache dtype for TRTLLM and tokenspeed MLA backends."""
+    if (
+        view.kv_cache_dtype == "int8"
+        and model_config_of(view).hf_config.architectures[0]
+        == "KimiK3ForConditionalGeneration"
+    ):
+        prefill_backend, decode_backend = attention_backends_of(view)
+        triton_path = prefill_backend == decode_backend == "triton"
+        flashmla_path = prefill_backend == "flashinfer" and decode_backend == "flashmla"
+        if not (triton_path or flashmla_path):
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache requires Triton prefill/decode, or "
+                "FlashInfer prefill with FlashMLA decode."
+            )
+        if flashmla_path:
+            if not get_platform().is_maca:
+                raise ValueError("Kimi-K3 FlashMLA INT8 KV cache requires MACA.")
+            if view.speculative_algorithm is not None:
+                if view.speculative_attention_mode != "prefill":
+                    raise ValueError(
+                        "FlashMLA INT8 target verify must use prefill attention."
+                    )
+                if view.speculative_draft_kv_cache_dtype not in ("bf16", "bfloat16"):
+                    raise ValueError(
+                        "FlashMLA INT8 speculative decoding requires --speculative-draft-kv-cache-dtype bfloat16."
+                    )
+                if (
+                    view.speculative_algorithm == "DSPARK"
+                    and view.speculative_draft_attention_backend
+                    not in (None, "triton", "flashinfer")
+                ):
+                    raise ValueError(
+                        "DSpark draft must use a BF16 MHA backend, not FlashMLA."
+                    )
+        if view.dtype not in ("auto", "bfloat16", "bf16"):
+            raise ValueError("Kimi-K3 INT8 KV cache requires BF16 model inputs.")
+        if view.enable_deterministic_inference:
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache does not support deterministic attention."
+            )
+        if view.enable_unified_memory:
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache does not support --enable-unified-memory."
+            )
+        if view.enable_hierarchical_cache or view.enable_lmcache:
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache does not support host-tiered KV cache."
+            )
+
     if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"

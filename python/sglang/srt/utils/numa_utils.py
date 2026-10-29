@@ -17,9 +17,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_cpu_ids_by_node, is_cuda, is_xpu
+from sglang.srt.utils.common import is_maca
 
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
+_is_maca = is_maca()
 
 logger = logging.getLogger(__name__)
 
@@ -397,6 +399,9 @@ def _query_numa_node_for_gpu(device_id: int):
     if _is_xpu:
         return _query_numa_node_for_xpu(device_id)
 
+    if _is_maca:
+        return _query_numa_node_for_maca(device_id)
+
     try:
         import pynvml
     except ModuleNotFoundError:
@@ -440,6 +445,39 @@ def _query_numa_node_for_gpu(device_id: int):
         except Exception:
             pass  # Ignore shutdown errors
 
+def _query_numa_node_for_maca(device_id: int):
+    """
+    Get the NUMA node affinity list for MACA.
+    """
+
+    try:
+        import pymxsml.mxsml as mxsml
+    except ModuleNotFoundError:
+        logger.warning("pymxsml not installed, skipping NUMA node configuration for MACA")
+        return []
+
+    try:
+        mxsml.mxSmlInit()
+        numa_node_count = len(glob.glob("/sys/devices/system/node/node[0-9]*"))
+
+        c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8
+        node_set_size = max(1, math.ceil(numa_node_count / c_ulong_bits))
+        node_set = mxsml.mxSmlGetNodeAffinity(device_id, node_set_size)
+
+        # Decode the bitmask into a list of NUMA node IDs
+        numa_nodes = []
+        for node_id in range(numa_node_count):
+            mask_array_index = node_id // c_ulong_bits
+            mask_bit_index = node_id % c_ulong_bits
+            if node_set[mask_array_index] & (1 << mask_bit_index):
+                numa_nodes.append(node_id)
+        logger.info(f"NUMA node binding ON: GPU#{device_id} is bound to NUMA nodes:{numa_nodes}")
+        return numa_nodes
+    except mxsml.MXSMLError as e:
+        logger.warning(
+            f"MXSML error querying memory affinity for GPU {device_id}: {e}, skipping NUMA node configuration for GPU"
+        )
+        return []
 
 def init_threads_binding(
     *,

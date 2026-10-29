@@ -553,9 +553,9 @@ class Envs:
     # plane; off, or no such plane, keeps the NCCL all-gather.
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
-    # FlashInfer does not support the current DSpark temperature path yet.
     # whether dspark share embed and lmhead with target model
     SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD = EnvBool(False)
+    # FlashInfer does not support the current DSpark temperature path yet.
     SGLANG_DSPARK_KERNEL_SOFTMAX_TEMP = EnvStr("triton")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
 
@@ -734,6 +734,10 @@ class Envs:
     MX_ENABLE_FUSE_RMSNORM_QUANT = EnvBool(False)
     MX_ENABLE_FUSE_SILUMUL_QUANT = EnvBool(False)
     MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE = EnvInt(256)
+    MX_ENABLE_WARMUP_OUTPUT = EnvBool(False)
+    MX_ENABLE_FUSE_ACT_FP8_QUANT = EnvBool(False)
+    MX_DSV4_PAGED_MQA_LOGITS_BACKEND = EnvStr("maca_c")
+    MX_OPT_DSV4_PREFILL_ATTN = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -1554,6 +1558,8 @@ class Envs:
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # Fp4_index_mqa_logits triton autotune
+    SGLANG_FP4_INDEXER_LOGIT_AUTOTUNE = EnvBool(False)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches) or "auto" (v41 on SM100 when FlashMLA supports it).
@@ -1596,6 +1602,8 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Use the DeepGEMM dense indexer bypassing the SM check.
+    SGLANG_DSV41_FORCE_DEEPGEMM_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
@@ -1811,6 +1819,10 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Shard Kimi-K3 shared experts across the attention TP group.
+    SGLANG_K3_ATTN_TP_SHARDED_SHARED_EXPERTS = EnvBool(True)
+    # Shard Kimi-K3 latent up/down projections across the attention TP group.
+    SGLANG_K3_ATTN_TP_SHARDED_LATENT_PROJ = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)

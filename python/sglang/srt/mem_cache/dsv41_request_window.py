@@ -127,9 +127,19 @@ def copy_packed_tokens(src, dst, src_loc, dst_loc, *, page_size, layout=KVLayout
     if not src_loc.numel():
         return
     src_loc, dst_loc = src_loc.long(), dst_loc.long()
+    # The layout counts bytes, the buffers index elements. A bf16 pool packs one
+    # plain 512-wide row per token and keeps no scale rows, so read its row width
+    # from the buffer itself instead of the quantized layout's byte counts.
+    step = src.element_size()
+    if src.dtype is torch.bfloat16:
+        data_width = src.shape[1] // page_size
+        scale_width = 0
+    else:
+        data_width = layout.data_bytes // step
+        scale_width = layout.scale_bytes // step
     for width, base in (
-        (layout.data_bytes, 0),
-        (layout.scale_bytes, page_size * layout.data_bytes),
+        (data_width, 0),
+        (scale_width, page_size * data_width),
     ):
         cols = torch.arange(width, device=src.device)
         values = src[

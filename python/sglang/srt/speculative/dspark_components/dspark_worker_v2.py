@@ -422,7 +422,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _draft_context(self):
         with ExitStack() as stack:
             if self._draft_dp_context_enabled:
-                stack.enter_context(draft_tp_context(get_parallel().attn_tp_group))
+                stack.enter_context(draft_tp_context(get_parallel().attn_tp_group, owns_attention=True))
             stack.enter_context(speculative_moe_backend_context())
             stack.enter_context(speculative_moe_a2a_backend_context())
             yield
@@ -770,6 +770,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
         )
+        if batch.hisparse_coordinator is not None:
+            batch.out_cache_loc = verify_window.verify_cache_loc
+            batch.hisparse_coordinator.prepare_spec_verify(batch)
 
         sampling_info = batch.sampling_info
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
@@ -945,6 +948,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 commit_lens=accept.commit_lens,
                 bs=bs,
                 run_compact=run_compact,
+            )
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.spec_swap.commit_compressed_tokens(
+                batch, prefix_lens=prefix_lens, commit_lens=accept.commit_lens
             )
         logits_output.hidden_states = None
 

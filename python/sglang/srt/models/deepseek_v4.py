@@ -163,6 +163,7 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
 )
+from sglang.srt.models.deepseek_common.online_rotation import check_online_rotation_weights
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
@@ -866,6 +867,7 @@ class MqaAttentionBase(nn.Module):
             self.q_lora_rank, 
             eps=self.eps,
             fused_quant=self.fused_quant,
+            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
         )
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
@@ -2664,7 +2666,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_nextn=is_nextn,
             is_deepseek_v4=True,
             vl_correction_bias=config.model_type == "deepseek_v41"
-            and config.vision_n_layers > 0,
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False),
         )
 
         self.fused_quant = envs.MX_ENABLE_FUSE_RMSNORM_QUANT.get()
@@ -2672,6 +2675,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             config.hidden_size,
             eps=config.rms_norm_eps,
             fused_quant=self.fused_quant,
+            return_quant_tuple=envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get(),
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
@@ -3096,7 +3100,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_attn_fn,
                     self.hc_attn_scale,
                     self.hc_attn_base,
-                    norm=self.input_layernorm,
                     forward_batch=forward_batch,
                 )
                 if not norm_fused:
@@ -3118,7 +3121,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
-                norm=self.input_layernorm,
                 forward_batch=forward_batch,
             )
             if not norm_fused:
@@ -3915,7 +3917,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 skip_shared_experts=_do_shared_local,
             )
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            if self.config.model_type == "deepseek_v41":
+                parallel = get_parallel()
+                hidden_states = parallel.tp_group.all_reduce(hidden_states)
+                hidden_states = hidden_states.tensor_split(parallel.attn_cp_size)[
+                    parallel.attn_cp_rank
+                ].contiguous()
+            else:
+                hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),
@@ -3985,7 +3994,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
-            norm=self.input_layernorm,
             forward_batch=forward_batch,
         )
         if not norm_fused:
@@ -4277,7 +4285,7 @@ class DeepseekV4Model(nn.Module):
         num_alt_streams = 5 if (_is_cuda or _is_npu) else 2
         if envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get():
             self.alt_streams = (
-                [torch.cuda.Stream() for _ in range(num_alt_streams)]
+                [device_module.Stream() for _ in range(num_alt_streams)]
                 if use_stream_pool
                 else None
             )
@@ -4487,11 +4495,17 @@ class DeepseekV4Model(nn.Module):
                 normalized_attn = None
                 # Decode reaches back at most SWA_WINDOW positions.
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
-                hidden_states, prev_pre, input_ids, input_ids_global = (
+                hidden_states, prev_pre, input_ids = (
                     tail.rows(hidden_states),
                     tail.rows(prev_pre),
                     tail.rows(input_ids),
-                    tail.rows(input_ids_global),
+                )
+                # CP gathers the MoE input across ranks, so its per-token ids
+                # cannot be selected with this rank's local tail indices.
+                input_ids_global = (
+                    tail.global_rows(forward_batch.input_ids)
+                    if tail.cp_metadata is not None
+                    else tail.rows(input_ids_global)
                 )
                 positions = tail.positions
                 if hash_ids is not None:
@@ -4910,14 +4924,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.vision = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if (
+            config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False)
+        ):
             if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
+                get_parallel().pp_group.world_size != 1
                 or not get_moe_a2a_backend().is_none()
             ):
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
+                    "V4.1 vision currently supports TP/EP/DP without PP or MoE A2A"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -5124,16 +5141,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
 
-    def forward(
+    def prepare_language_model_inputs(
         self,
         input_ids: torch.Tensor,
-        positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Prepare full-sequence image embeddings and model IDs before CP splits.
+
+        Scheduler hash IDs stay intact for multimodal cache keys; the language
+        model uses image_token_id for Engram masking and visual MoE routing.
+        """
         if (
-            self.vision is not None
+            getattr(self, "vision", None) is not None
             and not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.mm_inputs is not None
@@ -5142,7 +5162,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if self.vision is not None and not (
+        if getattr(self, "vision", None) is not None and not (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
         ):
@@ -5152,6 +5172,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                 input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
             )
 
+        return input_ids, input_embeds
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        input_ids, input_embeds = self.prepare_language_model_inputs(
+            input_ids, forward_batch, input_embeds
+        )
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
@@ -5327,6 +5360,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             name = name.removesuffix(".scale") + ".weight_scale_inv"
         if ".engram.wkv." in name and name.endswith(".scale"):
             name = name.removesuffix(".scale") + ".weight_scale_inv"
+        if ".engram.embed." in name and name.endswith(".weight_scale"):
+            name = name.removesuffix(".weight_scale") + ".scale"
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
@@ -5771,6 +5806,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 + ", ".join(f"{k}={v}" for k, v in sorted(skipped_by_group.items())),
             )
         unloaded_params = params_dict.keys() - loaded_params
+        check_online_rotation_weights(self, loaded_params)
 
         skipped_checking_patterns = [
             "attn_mqa.k_scale",

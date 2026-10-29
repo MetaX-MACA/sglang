@@ -181,9 +181,30 @@ def register_xpu_device_properties_for_dynamo() -> None:
     if xpu_props_type is not None:
         dynamo_utils.common_constant_types.add(xpu_props_type)
 
+def load_library_fn(lib_path: str, fn_name: str, argtypes=None, restype=None):
+    try:
+        library = ctypes.CDLL(lib_path)
+    except OSError as e:
+        raise OSError(
+            f"Failed to load shared library '{lib_path}': {e}. "
+            f"Check LD_LIBRARY_PATH or the file exists."
+        ) from e
+
+    try:
+        fn = getattr(library, fn_name)
+    except AttributeError:
+        raise AttributeError(
+            f"Symbol '{fn_name}' not found in '{lib_path}'"
+        )
+
+    if argtypes is not None:
+        fn.argtypes = argtypes
+    if restype is not None:
+        fn.restype = restype
+    return fn
+
 def is_maca() -> bool:
     return "metax" in torch.__version__
-
 
 @lru_cache(maxsize=1)
 def is_npu() -> bool:

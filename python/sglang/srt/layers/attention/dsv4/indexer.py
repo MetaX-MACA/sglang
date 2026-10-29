@@ -770,6 +770,7 @@ class C4IndexerBackendMixin:
         use_aiter_fp4 = c4_indexer.use_fp4_indexer and is_hip()
 
         positions = core_metadata.positions
+        q_lora_linear = q_lora[0] if isinstance(q_lora, tuple) else q_lora
         if use_aiter_fp4:
             widened = getattr(metadata, "fp4_q_positions", None)
             if widened is not None and widened.shape == positions.shape:
@@ -777,8 +778,11 @@ class C4IndexerBackendMixin:
         num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
         if x.shape[0] != num_queries:
             x = x[:num_queries]
-        if q_lora.shape[0] != num_queries:
-            q_lora = q_lora[:num_queries]
+        if q_lora_linear.shape[0] != num_queries:
+            if isinstance(q_lora, tuple):
+                q_lora = tuple(item[:num_queries] for item in q_lora)
+            else:
+                q_lora = q_lora[:num_queries]
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
 
@@ -904,9 +908,20 @@ class C4IndexerBackendMixin:
         hisparse_decode = (
             hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
         )
+        hisparse_verify = (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.spec_swap.enabled
+            and forward_batch.forward_mode.is_target_verify()
+        )
 
         raw_indices = None
-        if core_metadata.c4_sparse_raw_indices is not None:
+        if hisparse_verify:
+            # Verify has one query per draft token. Use the graph-stable 3D
+            # storage rather than the single-query decode buffer.
+            raw_indices = hisparse_coordinator.verify_raw_indices_buffer[
+                : forward_batch.req_pool_indices.size(0)
+            ].view(-1, c4_sparse_page_indices.size(-1))
+        elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
         elif capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
@@ -1059,6 +1074,7 @@ class C4IndexerBackendMixin:
                     metadata,
                     indexer_metadata.max_compressed_seq_len,
                     False,
+                    backend=envs.MX_DSV4_PAGED_MQA_LOGITS_BACKEND.get(),
                 )
                 run_topk_transform(rows, logits, topk_plan)
 
@@ -1088,17 +1104,26 @@ class C4IndexerBackendMixin:
                 run_paged_indexer(all_rows, deep_gemm_metadata)
 
         if hisparse_coordinator is not None:
-            if hisparse_decode:
+            if hisparse_decode or hisparse_verify:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id
                 ].compress_layer_id
+                grouped_raw_indices = (
+                    raw_indices.view(
+                        forward_batch.req_pool_indices.size(0),
+                        hisparse_coordinator.spec_swap.num_draft_tokens,
+                        -1,
+                    )
+                    if hisparse_verify
+                    else raw_indices
+                )
                 core_metadata.c4_sparse_page_indices = (
                     hisparse_coordinator.swap_in_selected_pages(
                         req_pool_indices=forward_batch.req_pool_indices,
                         compressed_seq_lens=indexer_metadata.compressed_seq_lens,
-                        top_k_result=raw_indices,
+                        top_k_result=grouped_raw_indices,
                         layer_id=compress_layer_id,
-                    )
+                    ).view(-1, c4_sparse_page_indices.size(-1))
                 )
             else:
                 # flash_mla C4 attention requires int32 page indices.

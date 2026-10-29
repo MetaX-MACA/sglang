@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
 )
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
+from sglang.srt.layers.attention.dsv4.index_cache_kind import dsv4_index_cache_kind
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix
@@ -181,6 +182,11 @@ class DeepseekV41Indexer(nn.Module):
         prefix: str,
     ):
         super().__init__()
+        if dsv4_index_cache_kind().is_fp8:
+            raise ValueError(
+                "the DeepSeek-V4.1 ratio-1/2 indexer stores fp4 or int8 slots; "
+                "an fp8 index cache belongs to the c4 indexer"
+            )
         self.n_heads = config.index_n_heads
         self.n_local_heads = self.n_heads
         self.index_head_dim = config.index_head_dim
@@ -213,8 +219,16 @@ class DeepseekV41Indexer(nn.Module):
             self.n_heads, config.hidden_size
         )
         if self.owns_k:
-            self.wk = nn.Linear(
-                head_dim, self.index_head_dim, bias=False, dtype=torch.bfloat16
+            # wk is quantized only by the weight-quantized (W8A8/W4A8) checkpoints
+            wk_quant_config = quant_config
+            if quant_config is not None and quant_config.get_name() == "fp8":
+                wk_quant_config = None
+            self.wk = ReplicatedLinear(
+                head_dim,
+                self.index_head_dim,
+                bias=False,
+                quant_config=wk_quant_config,
+                prefix=add_prefix("wk", prefix),
             )
             self.k_norm = RMSNorm(self.index_head_dim, config.rms_norm_eps)
 
@@ -229,7 +243,8 @@ class DeepseekV41Indexer(nn.Module):
             self.index_head_dim, latent.shape[-1], latent.shape[0]
         ):
             return n128k512_gemm_bf16(latent, self.wk.weight)
-        return self.wk(latent)
+        out, _ = self.wk(latent)
+        return out
 
     def index_keys(self, latent: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Pre-RoPE latents [n, D] -> fp4-rounded index keys [n, index_head_dim]."""

@@ -51,6 +51,19 @@ def _require_kimi_k3_aiter_gluon_dcp_support() -> None:
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
+    if cfg.kv_cache_dtype == "int8":
+        if cfg.dcp_size > 1:
+            raise ValueError("Kimi-K3 INT8 KV cache does not support DCP.")
+        if attention_backends_of(cfg) == (None, None):
+            logger.info("Kimi-K3 INT8 KV cache selects the Triton attention backend.")
+            return {
+                "prefill_attention_backend": "triton",
+                "decode_attention_backend": "triton",
+            }
+
+        if attention_backends_of(cfg) == ("flashinfer", "flashmla"):
+            return {"flashinfer_mla_disable_ragged": True}
+
     if cfg.dcp_size > 1:
         overrides = {}
         if cfg.enable_symm_mem:

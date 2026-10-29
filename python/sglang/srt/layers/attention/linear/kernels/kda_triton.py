@@ -14,10 +14,10 @@ if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
         fused_recurrent_linear_replayssm_decode,
     )
-    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.fla.kda import chunk_kda
+    from mcoplib.triton_fused_sigmoid_gating_delta_rule_update import (
         fused_sigmoid_gating_delta_rule_update,
     )
-    from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
 
 class TritonKDAKernel(LinearAttnKernelBase):
@@ -215,6 +215,12 @@ class TritonKDAKernel(LinearAttnKernelBase):
             replayssm_g=replayssm_g,
             replayssm_beta=replayssm_beta,
         )
+        # Varlen verify kernels only write tokens covered by cu_seqlens.
+        # Graph replay can shrink that prefix without shrinking q: keep its
+        # padding finite before downstream normalization and expert routing.
+        # token_indices = torch.arange(q.shape[1], device=q.device)
+        # covered = token_indices < query_start_loc[-1]
+        # return torch.where(covered.view(1, -1, 1, 1), out, 0.0)
 
     def extend(
         self,

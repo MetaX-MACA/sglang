@@ -409,8 +409,28 @@ class DeepseekV2MLP(nn.Module):
                 down_output,
             )
             return down_output
-
-        if self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
+        if envs.MX_ENABLE_FUSE_ACT_FP8_QUANT.get():
+            M, N = gate_up.shape
+            quant_group_size = 128
+            x_quant = torch.empty(
+                (M, N // 2),
+                device=gate_up.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            x_scale = torch.empty(
+                (M, (N // 2) // quant_group_size),
+                device=gate_up.device,
+                dtype=torch.float32,
+            )
+            torch.ops.sgl_kernel.fused_silu_mul_per_group_quant(
+                x_quant,
+                x_scale,
+                gate_up,
+                self.swiglu_limit,
+            )
+            x = (x_quant, x_scale)
+            
+        elif self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
             from aiter.ops.triton.fusions.fused_clamp_act_mul import (
                 fused_clamp_act_mul,
             )
@@ -692,6 +712,7 @@ class DeepseekV2MoE(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             layer_id=self.layer_id,
             quant_config=quant_config,
+            inplace=not envs.SGLANG_ENABLE_SHARED_EXPERTS_MULTI_STREAM.get() if _is_maca else True,
             routed_scaling_factor=self.routed_scaling_factor,
             routing_method_type=getattr(
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3

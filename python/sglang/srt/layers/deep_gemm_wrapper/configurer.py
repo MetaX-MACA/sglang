@@ -1,6 +1,7 @@
 import logging
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.index_cache_kind import dsv4_index_cache_kind
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import (
     get_device_sm,
@@ -66,6 +67,15 @@ DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_maca or _is_
 
 def _supports_paged_sparse_mqa_logits() -> bool:
     if not DEEPGEMM_BLACKWELL:
+        return False
+    if dsv4_index_cache_kind().is_int8:
+        # The int8 index cache would need an int8 sparse paged MQA-logits
+        # kernel; DeepGEMM does not expose one yet, so the candidate sparse
+        # table falls back to the dense blocks.
+        logger.info(
+            "int8 paged sparse MQA logits are not implemented; "
+            "the candidate indexer falls back to dense blocks"
+        )
         return False
     import deep_gemm
 

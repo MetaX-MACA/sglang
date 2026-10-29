@@ -986,9 +986,20 @@ class CommonKVManager(BaseKVManager):
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
                 )
-            if info.attn_tp_size != self.attn_tp_size:
+
+            decode_tp_size_aligns_prefill_world_size = (
+                info.attn_cp_size > 1
+                and (self.is_mla_backend or self.is_hybrid_mla_backend)
+                and self.attn_cp_size == 1
+                and info.attn_tp_size * info.attn_cp_size == self.attn_tp_size
+            )
+            if (
+                info.attn_tp_size != self.attn_tp_size
+                and not decode_tp_size_aligns_prefill_world_size
+            ):
                 raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both servers"
+                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
+                    "servers (including prefill CP ranks for MLA)"
                 )
 
         if self.dcp_size > 1:
@@ -1318,8 +1329,16 @@ class CommonKVManager(BaseKVManager):
 
         # Regular MLA PP slicing
         # Decode pp size should be equal to prefill pp size or 1
-        start_layer, end_layer = self._mla_kv_entry_span_with_pp(len(src_kv_ptrs))
+        num_draft = (
+            getattr(self.kv_args, "num_draft_entries", 0) if state_type is None else 0
+        )
+        start_layer, end_layer = self._mla_kv_entry_span_with_pp(
+            len(src_kv_ptrs) - num_draft
+        )
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        if num_draft:
+            # Draft entries follow the target's global layer range on both peers.
+            sliced_dst_kv_ptrs += dst_kv_ptrs[-num_draft:]
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
 
     def _mla_kv_entry_span_with_pp(self, n_src: int) -> Tuple[int, int]:
