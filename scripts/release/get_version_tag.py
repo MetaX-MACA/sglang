@@ -54,19 +54,6 @@ def run_git(*args: str, allow_failure: bool = False) -> str:
 
     return result.stdout.strip()
 
-def get_git_branch() -> str:
-    """获取当前分支名，并将斜杠替换为点（例如 release/v0.5.17 -> release.v0.5.17）。"""
-    branch = run_git("branch", "--show-current")
-    if not branch:
-        branch = run_git("rev-parse", "--abbrev-ref", "HEAD")
-        if branch == "HEAD":
-            branch = "detached"
-
-    if not branch:
-        branch = "unknown"
-
-    return branch.replace('/', '.')
-
 def get_git_short_commit() -> str:
     """获取短 commit hash。"""
     return run_git("rev-parse", "--short", "HEAD", allow_failure=True) or "unknown"
@@ -88,12 +75,11 @@ def main() -> None:
     base = get_current_base_version()
 
     # 获取自定义信息
-    branch = get_git_branch()
     commitid = get_git_short_commit()
     ai_maca = get_maca_ai_version()
 
     # 拼接自定义部分：分支名-commitid-maca版本号
-    result = f"{base}+{branch}-{commitid}-maca{ai_maca}"
+    result = f"{base}+{commitid}-maca{ai_maca}"
     # print("环境变量获取maca版本：",ai_result)
     print(result)
 

@@ -712,6 +712,7 @@ class DeepseekV2MoE(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             layer_id=self.layer_id,
             quant_config=quant_config,
+            inplace=not envs.SGLANG_ENABLE_SHARED_EXPERTS_MULTI_STREAM.get() if _is_maca else True,
             routed_scaling_factor=self.routed_scaling_factor,
             routing_method_type=getattr(
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3

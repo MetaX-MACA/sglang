@@ -1,6 +1,8 @@
 // Fused QSA (Qwen4-Exp sparse attention) indexer-prep kernels.
 // Outputs are bit-identical to the eager bf16/fp16 aten chain, mirrored step by step.
-
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -27,9 +29,7 @@ SGL_DEVICE float eager_round(float x) {
 template <>
 SGL_DEVICE float eager_round<bf16_t>(float x) {
 #ifndef USE_ROCM
-  uint16_t u;
-  asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(u) : "f"(x));
-  return __bfloat162float(__ushort_as_bfloat16(u));
+  return __bfloat162float(__float2bfloat16_rn(x));
 #else
   return static_cast<float>(DTypeTrait<bf16_t>::from(x));
 #endif
@@ -38,9 +38,7 @@ SGL_DEVICE float eager_round<bf16_t>(float x) {
 template <>
 SGL_DEVICE float eager_round<fp16_t>(float x) {
 #ifndef USE_ROCM
-  uint16_t u;
-  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(u) : "f"(x));
-  return __ushort_as_half(u);
+  return __half2float(__float2half_rn(x));
 #else
   return static_cast<float>(DTypeTrait<fp16_t>::from(x));
 #endif

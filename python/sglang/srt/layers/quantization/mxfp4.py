@@ -54,6 +54,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_maca,
     is_triton_kernels_available,
     is_xpu,
     round_up,
@@ -296,6 +297,51 @@ def dequant_mxfp4(
 
     return mx.dq_mxfp4(x, scale, float_dtype)
 
+def cast_e2m1fn_to_e4m3fn(
+    x: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Factor MXFP4 E8M0 scales into relative g32 and hierarchical 128x128 scales.
+
+    Packed FP4 weights remain unchanged; both outputs use contiguous N-major layout."""
+    assert x.dtype in (torch.int8, torch.uint8)
+    assert x.ndim == 3 and scale.ndim == 3
+    E, out_dim, in_dim_packed = x.size()
+    in_dim = in_dim_packed * 2
+    fp8_block_size = 128
+    fp4_block_size = 32
+    assert in_dim % fp8_block_size == 0 and out_dim % fp8_block_size == 0
+    assert scale.size(0) == E and scale.size(1) == out_dim
+    assert scale.size(2) == in_dim // fp4_block_size
+    MAX_OFFSET_BITS = 6
+    bOut = out_dim // fp8_block_size
+    bIn = in_dim // fp8_block_size
+    scale_Q = (
+        torch.where(scale == 0, 0, torch.pow(2.0, scale.to(torch.float32) - 127))
+        .view(E, bOut, fp8_block_size, bIn, -1)
+        .transpose(2, 3)
+        .flatten(3)
+    )
+    scale_T = scale_Q.amax(dim=-1, keepdim=True) / 2**MAX_OFFSET_BITS
+    scale_B = scale_Q / scale_T.clamp(min=2**-127)
+    scale_B = (
+        scale_B.unflatten(-1, (fp8_block_size, -1))
+        .transpose(2, 3)
+        .reshape(E, out_dim, -1)
+    )
+
+    def to_e8m0(t):
+        return (
+            (torch.log2(t.clamp(min=2 ** (-127))).round() + 127)
+            .clamp(0, 255)
+            .to(torch.uint8)
+        )
+
+    out_scale_t = to_e8m0(scale_T.squeeze(-1))
+    out_scale_b = to_e8m0(scale_B)
+    return (
+        out_scale_b.transpose(1, 2).contiguous(),
+        out_scale_t.transpose(1, 2).contiguous(),
+    )
 
 class Mxfp4Config(QuantizationConfig):
     def __init__(
@@ -385,6 +431,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.prefix = prefix
         self.topk_indices_dtype = None
+        self.use_mxfp4_w4a8 = get_moe_runner_backend().is_mxfp4_w4a8()
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -580,7 +627,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
         w13_weight_scale.quant_method = "group"
 
-        create_bias = with_bias or not _is_hip
+        create_bias = with_bias or (not _is_hip and not is_maca())
         if create_bias:
             w13_weight_bias = torch.nn.Parameter(
                 torch.zeros(
@@ -660,30 +707,42 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_deep_gemm or self.use_mega_moe:
-            from deep_gemm import transform_sf_into_required_layout
-
             # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
             layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
             layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
-            # Checkpoint scales are uint8 e8m0 (biased exponents). DeepGEMM
-            # SM100 needs them in packed-UE8M0 TMA-aligned MN-major layout.
-            # Round-trip through fp32 is exact (values are powers of two).
-            for scale_name, weight in (
-                ("w13_weight_scale", layer.w13_weight),
-                ("w2_weight_scale", layer.w2_weight),
-            ):
-                scale = getattr(layer, scale_name)
-                num_experts, n, _ = scale.data.shape
-                k = weight.shape[2] * 2
-                scale_f32 = scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
-                scale.data = transform_sf_into_required_layout(
-                    scale_f32,
-                    mn=n,
-                    k=k,
-                    recipe=(1, 32),
-                    num_groups=num_experts,
-                    disable_ue8m0_cast=False,
-                )
+            if is_maca():
+                layer.w13_weight_scale.data = (
+                        layer.w13_weight_scale.data
+                        .transpose(1, 2)
+                        .contiguous()
+                    )
+                layer.w2_weight_scale.data = (
+                        layer.w2_weight_scale.data
+                        .transpose(1, 2)
+                        .contiguous()
+                    )
+            else:
+                from deep_gemm import transform_sf_into_required_layout
+                
+                # Checkpoint scales are uint8 e8m0 (biased exponents). DeepGEMM
+                # SM100 needs them in packed-UE8M0 TMA-aligned MN-major layout.
+                # Round-trip through fp32 is exact (values are powers of two).
+                for scale_name, weight in (
+                    ("w13_weight_scale", layer.w13_weight),
+                    ("w2_weight_scale", layer.w2_weight),
+                ):
+                    scale = getattr(layer, scale_name)
+                    num_experts, n, _ = scale.data.shape
+                    k = weight.shape[2] * 2
+                    scale_f32 = scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
+                    scale.data = transform_sf_into_required_layout(
+                        scale_f32,
+                        mn=n,
+                        k=k,
+                        recipe=(1, 32),
+                        num_groups=num_experts,
+                        disable_ue8m0_cast=False,
+                    )
             if self.use_mega_moe:
                 # MegaMoE consumes the same transformed sf, plus its own
                 # interleaved/UTCCP weight layout. K3 routes EVERY batch
@@ -1105,26 +1164,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # the weights -- the whole point of MXFP4 on XPU.
             return
         else:
-            from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
-
-            w13_weight = upcast_from_mxfp(
-                layer.w13_weight,
-                layer.w13_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
+            if self.use_mxfp4_w4a8:
+                layer.w13_weight_scale_b, layer.w13_weight_scale_t = cast_e2m1fn_to_e4m3fn(
+                    layer.w13_weight, layer.w13_weight_scale
+                )
+                layer.w2_weight_scale_b, layer.w2_weight_scale_t = cast_e2m1fn_to_e4m3fn(
+                    layer.w2_weight, layer.w2_weight_scale
+                )
+            layer.w13_weight_scale.data = (
+                layer.w13_weight_scale.data.transpose(1, 2).contiguous()
             )
-            w2_weight = upcast_from_mxfp(
-                layer.w2_weight,
-                layer.w2_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
+            layer.w2_weight_scale.data = (
+                layer.w2_weight_scale.data.transpose(1, 2).contiguous()
             )
-            del layer.w13_weight
-            del layer.w2_weight
-            del layer.w13_weight_scale
-            del layer.w2_weight_scale
-            layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
-            layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
@@ -1454,6 +1506,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_marlin()
             or moe_runner_backend.is_deep_gemm()
+            or moe_runner_backend.is_mxfp4_w4a8()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         elif moe_runner_backend.is_flashinfer_mxfp4() and self._fi_kernel in (
@@ -1612,7 +1665,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
-                block_shape=[128, 128],
+                block_shape=[0, 32],
                 is_fp4_experts=True,
             )
             return self.runner.run(dispatch_output, quant_info)
@@ -1731,12 +1784,32 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w13_precision_config=getattr(self, "w13_precision_config", None),
                 w2_precision_config=getattr(self, "w2_precision_config", None),
             )
+        elif backend.is_mxfp4_w4a8():
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                block_shape=[128, 128],
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                is_fp4_experts=True,
+                use_fp4_w4a8=True,
+                w13_scale_b=layer.w13_weight_scale_b,
+                w13_scale_t=layer.w13_weight_scale_t,
+                w2_scale_b=layer.w2_weight_scale_b,
+                w2_scale_t=layer.w2_weight_scale_t,
+            )
         else:
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                block_shape=[0, 32],
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
+                is_fp4_experts=True,
             )
         return self.runner.run(dispatch_output, quant_info)
 

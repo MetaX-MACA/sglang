@@ -30,6 +30,8 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.layers.attention.dsv4.index_cache_kind import dsv4_index_cache_kind
+from sglang.srt.mem_cache.allocator.hisparse import HiSparseSpecLayout
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     INT8_SCALE_BYTES_PER_TOKEN,
     kv_cache_page_bytes,
@@ -231,6 +233,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(num_layers) > 0
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
+                draft_loc_space_scale = 1
+                if get_memory().enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    # The draft pool is direct-indexed by the target allocator's
+                    # host-expanded logical IDs.  Account for the entire dense
+                    # address space that KVCacheConfigurator allocates below.
+                    draft_loc_space_scale = parse_hisparse_config().host_to_device_ratio
                 if is_deepseek_dsa(kvc.model_config.hf_config):
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
@@ -244,9 +254,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    draft_kv_size = int(
-                        target_kv_size * draft_num_layers / target_kv_num_layers
+                    draft_kv_size = (
+                        int(target_kv_size * draft_num_layers / target_kv_num_layers)
+                        * draft_loc_space_scale
                     )
+                    # _compute_dsa_indexer_cell_size already applies the
+                    # HiSparse logical-space ratio to the draft indexer.
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,
@@ -254,9 +267,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     )
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
-                    self._cell_size = int(
-                        self._cell_size * (1 + draft_num_layers / int(num_layers))
+                    draft_kv_size = int(
+                        self._cell_size * draft_num_layers / int(num_layers)
                     )
+                    self._cell_size += draft_kv_size * draft_loc_space_scale
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
@@ -326,6 +340,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * effective_num_layers
                 * kv_size
             )
+            if (
+                kv_cache_dtype == torch.int8
+                and not is_deepseek_dsa(model_config.hf_config)
+                and model_config.hf_config.architectures[0]
+                == "KimiK3ForConditionalGeneration"
+                and kvc.mla_int8_uses_workspace
+            ):
+                cell_size += (
+                    model_config.kv_lora_rank + model_config.qk_rope_head_dim
+                ) * torch.bfloat16.itemsize
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -980,6 +1004,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
+    _hisparse_spec_layout = None
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
@@ -1066,7 +1091,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if get_memory().enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            self.c4_shrink_factor = parse_hisparse_config().host_to_device_ratio
+            hisparse = parse_hisparse_config()
+            self.c4_shrink_factor = hisparse.host_to_device_ratio
+            if self.is_speculative and not kvc.is_draft_worker:
+                self._hisparse_spec_layout = HiSparseSpecLayout(
+                    hot_slots=hisparse.device_buffer_size,
+                    page_size=self.page_size // 4,
+                    compress_ratio=4,
+                    verify_width=get_spec().speculative_num_draft_tokens,
+                    top_k=getattr(cfg.hf_text_config, "index_topk", hisparse.top_k),
+                )
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
@@ -1082,10 +1116,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         self.kv_cache_dtype = kvc.kv_cache_dtype
         self.num_layers_total = len(self.stage_compress_ratios)
-        # The low-ratio indexer pools are built with force_fp4=True
-        # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
-            self.indexer_head_dim, use_fp4_indexer=True
+            self.indexer_head_dim,
+            use_fp4_indexer=dsv4_index_cache_kind().is_fp4,
         )
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
@@ -1405,6 +1438,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             return max_running_requests + self.disaggregation_decode_extra_slots + 1
         return max_running_requests + 1
 
+    def _hisparse_spec_fixed_bytes(self, max_running_requests: int) -> int:
+        if self._hisparse_spec_layout is None:
+            return 0
+        return self._hisparse_spec_layout.fixed_state_bytes(
+            num_layers=self.num_layers(4),
+            num_req_slots=self._get_num_req_slots(max_running_requests),
+        )
+
     def _get_c128_state_fixed_bytes(self, max_running_requests: int) -> int:
         num_layers = self.num_layers(128)
         if num_layers == 0:
@@ -1554,6 +1595,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_state_fixed_bytes = self._fixed_c4_state_bytes(
             max_running_requests_per_worker
         )
+        hisparse_spec_fixed_bytes = self._hisparse_spec_fixed_bytes(
+            max_running_requests_per_worker
+        )
 
         swa_fixed_bytes = self._get_swa_fixed_bytes()
         fixed_bytes = (
@@ -1562,6 +1606,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             + swa_fixed_bytes
             + swa_ring_fixed_bytes
             + c4_state_fixed_bytes
+            + hisparse_spec_fixed_bytes
         )
         available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
@@ -1586,6 +1631,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"swa_fixed={swa_fixed_bytes / (1 << 30):.2f} GB, "
             f"swa_ring_fixed={swa_ring_fixed_bytes / (1 << 30):.2f} GB, "
             f"c4_state_fixed={c4_state_fixed_bytes / (1 << 30):.2f} GB, "
+            f"hisparse_spec_fixed={hisparse_spec_fixed_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )
         return self._to_config(sizes)

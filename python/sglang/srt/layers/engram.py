@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
+from sglang.kernels.ops.attention.dsv4.torch_quant import FP8_BLOCK_SIZE, INT8_BLOCK_SIZE
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import engram_gather
 from sglang.kernels.ops.embeddings.engram_hash import (
@@ -46,12 +46,32 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.deepseek_common.online_rotation import (
+    build_rotation,
+    get_online_rotation_module_config,
+)
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils import add_prefix, is_cuda, is_maca, load_library_fn
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
-from sglang.srt.utils.common import is_maca
-logger = logging.getLogger(__name__)
 
+logger = logging.getLogger(__name__)
+# MADV_HUGEPAGE is part of the Linux userspace ABI (value 14), but some Python
+# builds do not expose the symbolic constant even when mmap.madvise is present.
+_MADV_HUGEPAGE = getattr(mmap, "MADV_HUGEPAGE", 14)
+_is_maca = is_maca()
+
+if not hasattr(os, "memfd_create"):
+    import ctypes
+    import ctypes.util
+    _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+    _libc.memfd_create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    _libc.memfd_create.restype = ctypes.c_int
+    def _memfd_create(name, flags=0):
+        fd = _libc.memfd_create(name.encode() if isinstance(name, str) else name, flags)
+        if fd < 0:
+            raise OSError(ctypes.get_errno() or errno.EINVAL, "memfd_create failed")
+        return fd
+    os.memfd_create = _memfd_create
 
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
@@ -572,40 +592,57 @@ class _HostTable:
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
-        if not is_maca():
-            if layout == "shared":
-                self.fd = self._open_shared_fd(nbytes, name)
-                self.mm = mmap.mmap(
-                    self.fd,
-                    nbytes,
-                    flags=mmap.MAP_SHARED,
-                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
-                )
-            else:
-                self.fd = None
-                self.mm = mmap.mmap(
-                    -1,
-                    nbytes,
-                    flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
-                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
-                )
-            # Advisory before the first touch: pages are allocated huge at fault time.
-            self.mm.madvise(mmap.MADV_HUGEPAGE)
-            self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
-            if layout == "per_rank":
-                # Cached checkpoint pages, left by a previous server or by the loader,
-                # make the 512 MiB huge-page faults fall back, so empty them first.
-                _drop_page_cache_once("before pre-faulting the per-rank shard")
-                np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
-            if layout == "shared":
-                # Every rank holds the fd before rank 0 continues; the /proc path only
-                # resolves while rank 0 keeps its descriptor.
-                group.barrier()
-            err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
-            if int(err) != 0:
-                raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+        if layout == "shared":
+            self.fd = self._open_shared_fd(nbytes, name)
+            self.mm = mmap.mmap(
+                self.fd,
+                nbytes,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            )
         else:
-            self.bytes = torch.empty(nbytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+            self.fd = None
+            self.mm = mmap.mmap(
+                -1,
+                nbytes,
+                flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            )
+        # Advisory before the first touch: pages are allocated huge at fault time.
+        try:
+            self.mm.madvise(_MADV_HUGEPAGE)
+        except:
+            logger.warning(
+                "Engram host table: MADV_HUGEPAGE unavailable, continuing without huge-page advice"
+            )
+        self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
+        if layout == "per_rank":
+            # Cached checkpoint pages, left by a previous server or by the loader,
+            # make the 512 MiB huge-page faults fall back, so empty them first.
+            _drop_page_cache_once("before pre-faulting the per-rank shard")
+            np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+        if layout == "shared":
+            # Every rank holds the fd before rank 0 continues; the /proc path only
+            # resolves while rank 0 keeps its descriptor.
+            group.barrier()
+        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
+        if int(err) != 0:
+            raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+        # Host-side addresses cannot be used directly on MACA
+        if _is_maca:
+            fn = load_library_fn(
+                "libcuda.so",
+                "cudaHostGetDevicePointer",
+                argtypes=[ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint],
+                restype=ctypes.c_int,
+            )
+            device_ptr = ctypes.c_void_p()
+            host_ptr = self.bytes.data_ptr()
+            err = int(fn(ctypes.byref(device_ptr), ctypes.c_void_p(host_ptr), ctypes.c_uint(0)))
+            if err == 0 and device_ptr.value is not None:
+                self.device_ptr = device_ptr.value
+            else:
+                raise RuntimeError(f"cudaHostGetDevicePointer failed: err={err}")
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -686,8 +723,12 @@ class EngramEmbedding(nn.Module):
     one shared copy or one shard per rank (see _HostTable). Loading is sharded
     in every layout: a rank writes only its own row range.
     """
+    _DTYPE_MAP = {
+        0: (torch.float8_e4m3fn, torch.float8_e8m0fnu,  FP8_BLOCK_SIZE),
+        1: (torch.int8,          torch.bfloat16,        INT8_BLOCK_SIZE),
+    }
 
-    def __init__(self, num_embeddings: int, dim: int, layer_id: int):
+    def __init__(self, num_embeddings: int, dim: int, layer_id: int, use_int8: bool=False):
         super().__init__()
         self.dim = dim
         self.tp_size = get_parallel().tp_size
@@ -695,19 +736,18 @@ class EngramEmbedding(nn.Module):
         self.row_start = num_embeddings * tp_rank // self.tp_size
         row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
+        self.use_int8 = use_int8
+        w_dtype, s_dtype, block_size = self._DTYPE_MAP[use_int8]
+        self.quant_block_size = block_size
         self.host_table: Optional[_HostTable] = None
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
             self.weight = nn.Parameter(
-                torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
-                requires_grad=False,
+                torch.empty(self.rows, dim, dtype=w_dtype), requires_grad=False
             )
             self.scale = nn.Parameter(
-                torch.empty(
-                    self.rows, dim // FP8_BLOCK_SIZE, dtype=torch.float8_e8m0fnu
-                ),
-                requires_grad=False,
+                torch.empty(self.rows, dim // block_size, dtype=s_dtype), requires_grad=False
             )
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
@@ -715,8 +755,9 @@ class EngramEmbedding(nn.Module):
     def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
         layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
         n = num_embeddings if layout == "shared" else self.rows
+        w_dtype, s_dtype, block_size = self._DTYPE_MAP[self.use_int8]
         w_bytes = n * dim
-        s_bytes = n * (dim // FP8_BLOCK_SIZE)
+        s_bytes = n * (dim // block_size) * s_dtype.itemsize
         self.host_table = _HostTable(
             layout,
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
@@ -724,8 +765,8 @@ class EngramEmbedding(nn.Module):
             get_parallel().tp_group,
         )
         raw = self.host_table.bytes[: w_bytes + s_bytes]
-        weight = raw[:w_bytes].view(torch.float8_e4m3fn).view(n, dim)
-        scale = raw[w_bytes:].view(torch.float8_e8m0fnu).view(n, dim // FP8_BLOCK_SIZE)
+        weight = raw[:w_bytes].view(w_dtype).view(n, dim)
+        scale = raw[w_bytes:].view(s_dtype).view(n, dim // block_size)
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.scale = nn.Parameter(scale, requires_grad=False)
 
@@ -758,13 +799,15 @@ class EngramEmbedding(nn.Module):
             if indices.shape[0] == 0:
                 return self._empty(indices)
             out = self._empty(indices)
+            weight_ptr, scale_ptr = self._table_device_ptrs()
             engram_gather(
-                self.weight.data_ptr(),
-                self.scale.data_ptr(),
+                weight_ptr,
+                scale_ptr,
                 indices.reshape(-1),
                 out.view(-1, self.dim),
                 self.dim,
-                FP8_BLOCK_SIZE,
+                self.quant_block_size,
+                use_int8=self.use_int8
             )
             return out
         if cp_all_tokens and self.tp_size > 1:
@@ -797,6 +840,14 @@ class EngramEmbedding(nn.Module):
             *indices.shape, self.dim, dtype=torch.bfloat16, device=indices.device
         )
 
+    def _table_device_ptrs(self) -> tuple[int, int]:
+        if _is_maca:
+            assert self.host_table.device_ptr is not None
+            weight_ptr = self.host_table.device_ptr
+            scale_ptr = weight_ptr + self.weight.numel() * self.weight.element_size()
+            return weight_ptr, scale_ptr
+        return self.weight.data_ptr(), self.scale.data_ptr()
+
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
@@ -805,19 +856,21 @@ class EngramEmbedding(nn.Module):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
-            rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
+            rows = self.weight[local].float().unflatten(-1, (-1, self.quant_block_size))
             values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self._empty(indices)
+        weight_ptr, scale_ptr = self._table_device_ptrs()
         engram_gather(
-            self.weight.data_ptr(),
-            self.scale.data_ptr(),
+            weight_ptr,
+            scale_ptr,
             indices.reshape(-1),
             out.view(-1, self.dim),
             self.dim,
-            FP8_BLOCK_SIZE,
+            self.quant_block_size,
             row_lo=self.row_start,
             row_hi=self.row_start + self.rows,
+            use_int8=self.use_int8
         )
         return out
 
@@ -860,9 +913,14 @@ def engram_gate(
     k_weight: torch.Tensor,
     eps: float,
     clamp_value: float,
+    *,
+    gate_input: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
     followed by the shared value. Adds the gated value to every copy."""
+    query = x if gate_input is None else gate_input
+    if query.shape != x.shape or query.device != x.device:
+        raise ValueError("gate_input must have the same shape and device as x")
     if (
         _cuda_kernels(x)
         and x.ndim == 3
@@ -871,19 +929,23 @@ def engram_gate(
         and x.dtype in (torch.bfloat16, torch.float32)
         and q_weight.dtype in (torch.bfloat16, torch.float32)
         and k_weight.dtype in (torch.bfloat16, torch.float32)
-        and all(t.is_contiguous() for t in (x, kv, q_weight, k_weight))
+        and query.dtype in (torch.bfloat16, torch.float32)
+        and all(t.is_contiguous() for t in (x, kv, q_weight, k_weight, query))
     ):
-        return fused_engram_gate(x, kv, q_weight, k_weight, eps, clamp_value)
+        return fused_engram_gate(
+            x, kv, q_weight, k_weight, eps, clamp_value, gate_input=gate_input
+        )
     hc_mult, dim = x.shape[-2:]
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
     key = key.float().unflatten(-1, (hc_mult, dim))
     weight = q_weight.float() * k_weight.float()
     h = x.float()
+    q = query.float()
     # Normalized per (token, hc copy) over dim, not jointly over the copies.
-    rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(
+    rstd = torch.rsqrt(q.square().mean(-1) + eps) * torch.rsqrt(
         key.square().mean(-1) + eps
     )
-    dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
+    dot = (q * weight * key).sum(-1) * rstd * dim**-0.5
     # Signed square root before the sigmoid, matching the training kernel.
     gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(clamp_value).sqrt(), dot))
     return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
@@ -903,8 +965,30 @@ class Engram(nn.Module):
         self.eps = config.rms_norm_eps
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
+        rotation_name = (
+            add_prefix("global_rotation", prefix)
+            if prefix
+            else f"model.layers.{layer_id}.engram.global_rotation"
+        )
+        rotation_config = get_online_rotation_module_config(config, rotation_name)
+        self.global_rotation = None
+        if rotation_config is not None:
+            if int(rotation_config["hidden_size"]) != dim:
+                raise ValueError(f"{rotation_name}: hidden_size must equal {dim}")
+            if rotation_config.get("inverse") is not True:
+                raise ValueError(f"{rotation_name}: Engram requires inverse=true")
+            offline_fusions = config.online_rotation.get("offline_fusions", {})
+            if offline_fusions.get("engram_value") is not True:
+                raise ValueError(
+                    f"{rotation_name}: requires offline_fusions.engram_value=true"
+                )
+            self.global_rotation = build_rotation(rotation_config)
+        use_int8 = (
+            quant_config is not None
+            and quant_config.get_name() == "w8a8_int8"
+        )
         self.embed = EngramEmbedding(
-            layout.num_embeddings[self.layer_hash_index], layout.head_dim, layer_id
+            layout.num_embeddings[self.layer_hash_index], layout.head_dim, layer_id, use_int8
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
@@ -934,6 +1018,24 @@ class Engram(nn.Module):
             # empty M.
             return x
         kv, _ = self.wkv(emb.flatten(-2))
+        return self.apply_gate(x, kv)
+
+    def project(
+        self, hash_ids: torch.Tensor, *, cp_all_tokens: bool = False
+    ) -> torch.Tensor:
+        kv, _ = self.wkv(self.embed(hash_ids, cp_all_tokens=cp_all_tokens).flatten(-2))
+        return kv
+
+    def apply_gate(self, x: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        gate_input = (
+            self.global_rotation(x) if self.global_rotation is not None else None
+        )
         return engram_gate(
-            x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
+            x,
+            kv,
+            self.q_weight,
+            self.k_weight,
+            self.eps,
+            self.clamp_value,
+            gate_input=gate_input,
         )

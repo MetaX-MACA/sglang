@@ -1032,6 +1032,7 @@ def invoke_fused_moe_kernel(
                 expert_ids,
                 num_tokens_post_padded,
                 mul_routed_weight,
+                filter_expert=filter_expert,
             )
         elif use_int4_w4a16: 
             assert block_shape is not None, "int4_w4a16 need block_shape is not None"

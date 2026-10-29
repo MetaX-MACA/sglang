@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from abc import ABC, abstractmethod
 from functools import lru_cache
 from math import isqrt, prod
@@ -63,6 +64,8 @@ def has_decode_parallel_world() -> bool:
 
 
 def can_install_spatial_shard_parallel_decode(config: VAEConfig | None) -> bool:
+    if os.environ.get("SGLANG_DISABLE_SPATIAL_SHARD_DECODE", "0") == "1":
+        return False
     world_size = _decode_parallel_world_size()
     return (
         config is not None
@@ -74,6 +77,8 @@ def can_install_spatial_shard_parallel_decode(config: VAEConfig | None) -> bool:
 def should_run_spatial_shard_parallel_decode(
     config: VAEConfig, z: torch.Tensor
 ) -> bool:
+    if os.environ.get("SGLANG_DISABLE_SPATIAL_SHARD_DECODE", "0") == "1":
+        return False
     world_size = _decode_parallel_world_size()
     return world_size > 1 and should_use_spatial_shard_parallel_decode(
         config, z, world_size

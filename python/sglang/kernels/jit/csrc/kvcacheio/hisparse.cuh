@@ -20,9 +20,9 @@ constexpr int WARP_SIZE = 64;
 using BallotMask = uint64_t;
 constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFFFFFFFFFull;
 #else
-constexpr int WARP_SIZE = 32;
-using BallotMask = unsigned int;
-constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
+constexpr int WARP_SIZE = 64;  // MetaX C600 wavefront width (NVIDIA was 32)64;  // MetaX C600 wavefront width (NVIDIA was 32)
+using BallotMask = unsigned long long;
+constexpr BallotMask FULL_WARP_MASK = ~0ULL;  // all WARP_SIZE(=64) lanes participate
 #endif
 constexpr int32_t TOKEN_HIT = 0xFFFFFFFF;
 constexpr int32_t HASH_EMPTY = -1;
@@ -146,11 +146,12 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
     const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
     uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
     for (int j = lane_id; j < total_pairs; j += WARP_SIZE) {
-      uint64_t lo, hi;
       const uint64_t* s = src + j * 2;
-      asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(s) : "memory");
       uint64_t* d = dst + j * 2;
-      asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo), "l"(hi) : "memory");
+      const uint64_t lo = s[0];
+      const uint64_t hi = s[1];
+      d[0] = lo;
+      d[1] = hi;
     }
   }
 
@@ -160,9 +161,10 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
     const uint64_t* __restrict__ src8 =
         reinterpret_cast<const uint64_t*>(static_cast<const char*>(src_addr) + total_pairs * 16);
     uint64_t* __restrict__ dst8 = reinterpret_cast<uint64_t*>(static_cast<char*>(dst_addr) + total_pairs * 16);
-    uint64_t tmp;
-    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src8 + lane_id) : "memory");
-    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
+    // uint64_t tmp;
+    // asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src8 + lane_id) : "memory");
+    // asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
+    dst8[lane_id] = src8[lane_id];
   }
 }
 #endif
@@ -171,7 +173,7 @@ __device__ __forceinline__ int popc_mask(BallotMask mask) {
 #ifdef USE_ROCM
   return __popcll(mask);
 #else
-  return __popc(mask);
+  return __popcll(mask);
 #endif
 }
 
@@ -231,15 +233,18 @@ __global__ __launch_bounds__(BLOCK_SIZE, 1) void transfer_cache_dsv4_mla_kernel(
     const int64_t* src_indices,
     const int64_t* dst_indices,
     uint32_t num_items,
-    uint32_t num_layers) {
+    uint32_t num_layers,
+    int64_t src_layer_stride,
+    int64_t dst_layer_stride) {
   const int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
   const int total_warps = gridDim.x * NUM_WARPS;
 
   for (uint32_t i = global_tid / WARP_SIZE; i < num_items; i += total_warps) {
-    const int32_t src_index = static_cast<int32_t>(src_indices[i]);
-    const int32_t dst_index = static_cast<int32_t>(dst_indices[i]);
     for (uint32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+      const int32_t src_index = static_cast<int32_t>(src_indices[layer_id * src_layer_stride + i]);
+      const int32_t dst_index = static_cast<int32_t>(dst_indices[layer_id * dst_layer_stride + i]);
+      if (src_index < 0 || dst_index < 0) continue;
       device::hisparse::transfer_item(
           /*dst_cache=*/dst_caches[layer_id],
           /*src_cache=*/src_caches[layer_id],
@@ -261,7 +266,18 @@ void transfer_cache_dsv4_mla(
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
   TensorMatcher({L}).with_dtype<uint64_t>().with_device(device).verify(src_ptrs).verify(dst_ptrs);
-  TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(src_indices).verify(dst_indices);
+  // Existing 1D indices are shared across layers; 2D indices retain each
+  // layer's physical slot ownership after speculative cache rotation.
+  if (src_indices.ndim() == 1) {
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(src_indices);
+  } else {
+    TensorMatcher({L, N}).with_dtype<int64_t>().with_device(device).verify(src_indices);
+  }
+  if (dst_indices.ndim() == 1) {
+    TensorMatcher({N}).with_dtype<int64_t>().with_device(device).verify(dst_indices);
+  } else {
+    TensorMatcher({L, N}).with_dtype<int64_t>().with_device(device).verify(dst_indices);
+  }
 
   const auto num_items = static_cast<uint32_t>(N.unwrap());
   if (num_items == 0) {
@@ -277,23 +293,25 @@ void transfer_cache_dsv4_mla(
       static_cast<const int64_t*>(src_indices.data_ptr()),
       static_cast<const int64_t*>(dst_indices.data_ptr()),
       num_items,
-      num_layers);
+      num_layers,
+      src_indices.ndim() == 2 ? src_indices.strides()[0] : 0,
+      dst_indices.ndim() == 2 ? dst_indices.strides()[0] : 0);
 }
 
-__device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int accumulator) {
+__device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int offset, int count, int width, int accumulator) {
   int idx = lane_id + offset;
-  int val = (idx < count) ? s_data[idx] : 0;
+  int val = (lane_id < width && idx < count) ? s_data[idx] : 0;
 
 #pragma unroll
   for (int i = 1; i < WARP_SIZE; i *= 2) {
     int n = __shfl_up_sync(FULL_WARP_MASK, val, i);
-    if (lane_id >= i) val += n;
+    if (lane_id >= i && lane_id < width) val += n;
   }
   val += accumulator;
-  if (idx < count) {
+  if (lane_id < width && idx < count) {
     s_data[idx] = val;
   }
-  accumulator = __shfl_sync(FULL_WARP_MASK, val, WARP_SIZE - 1);
+  accumulator = __shfl_sync(FULL_WARP_MASK, val, width - 1);
   return accumulator;
 }
 
@@ -571,9 +589,9 @@ __global__ void load_cache_to_device_buffer_kernel(
           warp_inclusive_scan(s_evict_chunk_offset, lane_id, scan_offset, scan_count, total_evict_count);
 #else
       total_hit_count =
-          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
+          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, NUM_WARPS, total_hit_count);
       total_evict_count =
-          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
+          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, NUM_WARPS, total_evict_count);
 #endif
       if (tid == 0) {
         s_total_hits = total_hit_count;
@@ -638,7 +656,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       const int scan_count = min(scan_offset + NUM_WARPS, NUM_TOKEN_CHUNKS + 1);
       total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_misses);
 #else
-      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
+      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, NUM_WARPS, total_misses);
 #endif
       if (tid == 0) {
         s_total_misses = total_misses;

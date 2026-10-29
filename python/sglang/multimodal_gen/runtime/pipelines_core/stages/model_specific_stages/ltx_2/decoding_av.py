@@ -1,6 +1,13 @@
+import gc
+import os
+
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_decode_parallel_world_size,
+    get_local_torch_device,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -101,6 +108,26 @@ class LTX2AVDecodingStage(DecodingStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
+
+        # Release cached denoising activations before the convolution library
+        # allocates workspaces outside the torch allocator on MACA.
+        decode_world_size = (
+            get_decode_parallel_world_size() if model_parallel_is_initialized() else 1
+        )
+        if torch.cuda.is_available() and (
+            decode_world_size > 1
+            or os.environ.get("SGLANG_DECODE_MEM_RELEASE", "0") == "1"
+        ):
+            free_before, _ = torch.cuda.mem_get_info()
+            gc.collect()
+            torch.cuda.empty_cache()
+            free_after, _ = torch.cuda.mem_get_info()
+            logger.info(
+                "LTX2 decode memory release: world_size=%d free=%.2f -> %.2f GiB",
+                decode_world_size,
+                free_before / 2**30,
+                free_after / 2**30,
+            )
 
         vae_dtype = resolve_decode_precision(server_args, "vae")
         vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)

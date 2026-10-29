@@ -1,10 +1,19 @@
+import contextlib
+import os
+
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import is_ltx23_native_variant
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
+    get_local_torch_device,
     model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_cfg_group,
+    get_decode_parallel_group_coordinator,
+    get_sp_group,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -23,6 +32,147 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+# Opt-in mixed parallelism for the CFG-parallel two-stage pipeline: shard the
+# stage-2 refinement denoising loop across the CFG ranks (ulysses) instead of
+# serializing it on rank 0 while the other ranks idle.
+_REFINEMENT_SP_OVER_CFG = (
+    os.environ.get("SGLANG_LTX2_REFINEMENT_SP_OVER_CFG", "0") == "1"
+)
+
+
+def _can_use_refinement_sp_over_cfg(server_args) -> bool:
+    if not (
+        _REFINEMENT_SP_OVER_CFG
+        and server_args.enable_cfg_parallel
+        and model_parallel_is_initialized()
+    ):
+        return False
+    sp = get_sp_group()
+    cfg = get_cfg_group()
+    dec = get_decode_parallel_group_coordinator()
+    return (
+        sp.world_size == 1
+        and cfg.world_size > 1
+        and dec.ranks == cfg.ranks
+        and dec.world_size == cfg.world_size
+        and dec.rank_in_group == cfg.rank_in_group
+    )
+
+
+@contextlib.contextmanager
+def _sp_over_cfg_group(server_args):
+    """Present the CFG ranks as a sequence-parallel group for stage 2.
+
+    Stage-2 refinement is distilled (single branch), so under CFG
+    parallelism it would otherwise serialize on rank 0 while the other
+    ranks idle. Inside this context the sequence-parallel coordinator is
+    rebound to the VAE-decode group (which spans the CFG ranks), and the
+    CFG group is presented as a singleton with the server flag flipped
+    off, i.e. exactly the parallel state of a run launched with
+    ``--sp-degree N`` and CFG disabled. Every consumer in the denoising
+    loop (latent sharding, ulysses all-to-all, attention head split,
+    final gather) reads these attributes per call, so the refinement runs
+    ulysses-sharded across the ranks and every rank exits with identical
+    gathered latents. Stage 1 and the VAE decode are unaffected; all
+    state is restored on exit.
+    """
+    if not _can_use_refinement_sp_over_cfg(server_args):
+        yield
+        return
+    sp = get_sp_group()
+    cfg = get_cfg_group()
+    dec = get_decode_parallel_group_coordinator()
+    sp_fields = (
+        "ranks",
+        "world_size",
+        "rank_in_group",
+        "device_group",
+        "cpu_group",
+        "ulysses_group",
+        "ulysses_world_size",
+        "ulysses_rank",
+    )
+    cfg_fields = (
+        "ranks",
+        "world_size",
+        "rank_in_group",
+        "device_group",
+        "cpu_group",
+    )
+    sp_saved = {field: getattr(sp, field) for field in sp_fields}
+    cfg_saved = {field: getattr(cfg, field) for field in cfg_fields}
+    cfg_flag_saved = server_args.enable_cfg_parallel
+    try:
+        # Sequence parallel := decode group (spans the CFG ranks). The ring
+        # sub-group stays singleton, matching a ulysses-only launch.
+        sp.ranks = dec.ranks
+        sp.world_size = dec.world_size
+        sp.rank_in_group = dec.rank_in_group
+        sp.device_group = dec.device_group
+        sp.cpu_group = dec.cpu_group
+        sp.ulysses_group = dec.device_group
+        sp.ulysses_world_size = dec.world_size
+        sp.ulysses_rank = dec.rank_in_group
+        # CFG := singleton so the single-branch refinement dispatch stays
+        # local on every rank instead of discarding non-owner shards.
+        cfg.ranks = [cfg_saved["ranks"][cfg_saved["rank_in_group"]]]
+        cfg.world_size = 1
+        cfg.rank_in_group = 0
+        cfg.device_group = sp_saved["device_group"]
+        cfg.cpu_group = sp_saved["cpu_group"]
+        server_args.enable_cfg_parallel = False
+        logger.info(
+            "LTX2 refinement SP-over-CFG: ranks=%s rank=%d",
+            dec.ranks,
+            dec.rank_in_group,
+        )
+        yield
+    finally:
+        for field, value in sp_saved.items():
+            setattr(sp, field, value)
+        for field, value in cfg_saved.items():
+            setattr(cfg, field, value)
+        server_args.enable_cfg_parallel = cfg_flag_saved
+
+
+def _move_foreign_cuda_tensors(obj, device):
+    """Return ``obj`` with CUDA tensors on another rank's device on ``device``.
+
+    Only foreign CUDA tensors are moved; CPU tensors (generators, timesteps,
+    ...) and non-tensor objects are returned unchanged. Containers are
+    rebuilt recursively.
+    """
+    if torch.is_tensor(obj):
+        if obj.is_cuda and obj.device != device:
+            return obj.to(device)
+        return obj
+    if isinstance(obj, dict):
+        return {
+            key: _move_foreign_cuda_tensors(value, device) for key, value in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_move_foreign_cuda_tensors(value, device) for value in obj]
+    if isinstance(obj, tuple):
+        return tuple(_move_foreign_cuda_tensors(value, device) for value in obj)
+    return obj
+
+
+def _move_foreign_cuda_tensors_in_place(batch: Req) -> None:
+    """Move foreign-device CUDA tensors in the batch's fields to this rank.
+
+    The CFG-parallel executor broadcasts the stage-entry batch as a pickled
+    object, so CUDA tensors in a non-main rank's batch carry the main rank's
+    device index. The CFG branch dispatch moves its branch kwargs to the
+    local device, which masks this during stage 1, but a replicated stage-2
+    refinement consumes the batch directly and the DiT forward raises a
+    cross-device error on the non-main ranks.
+    """
+    device = get_local_torch_device()
+    for name, value in list(vars(batch).items()):
+        moved = _move_foreign_cuda_tensors(value, device)
+        if moved is not value:
+            setattr(batch, name, moved)
 
 
 class LTX2AVDenoisingStage(LTX2DenoisingStage):
@@ -158,6 +308,12 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         # Stage 2 is distilled and always runs with CFG disabled, so non-main
         # CFG ranks only need the result when the decoder will use all ranks.
         if self.server_args.enable_cfg_parallel:
+            if _can_use_refinement_sp_over_cfg(self.server_args):
+                # Mixed mode: both ranks execute stage 2 with the
+                # sequence-parallel group spanning the CFG ranks (see
+                # forward), so the refinement runs ulysses-sharded
+                # instead of serializing on rank 0.
+                return StageParallelismType.REPLICATED
             if (
                 model_parallel_is_initialized()
                 and get_decode_parallel_world_size() > 1
@@ -259,6 +415,13 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        if _can_use_refinement_sp_over_cfg(server_args):
+            with _sp_over_cfg_group(server_args):
+                _move_foreign_cuda_tensors_in_place(batch)
+                return self._forward_refinement(batch, server_args)
+        return self._forward_refinement(batch, server_args)
+
+    def _forward_refinement(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the distilled refinement schedule on top of the shared AV denoiser."""
         batch.extra["ltx2_phase"] = "stage2"
         original_clean_latent_background = getattr(

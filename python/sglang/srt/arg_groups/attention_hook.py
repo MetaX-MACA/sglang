@@ -120,6 +120,13 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     run_post_process_pass(server_args, _mla_kv_cache_dtype_checks)
 
+    if cfg.kv_cache_dtype == "int8" and model_config.hf_config.architectures[0] == "KimiK3ForConditionalGeneration":
+        declare_resolution(
+            server_args,
+            "kimi_k3_int8_kv_cache",
+            cuda_graph_config=with_phase(cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED),
+        )
+
     # The CuteDSL MLA validation + prefill fill moved to the resolution
     # pipeline (arg_groups/overrides.py: _cutedsl_prefill_backend_fill),
     # invoked here at its legacy slot.

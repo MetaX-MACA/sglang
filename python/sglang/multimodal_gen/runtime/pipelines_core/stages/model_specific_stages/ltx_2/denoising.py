@@ -1,4 +1,5 @@
 import math
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -1854,15 +1855,29 @@ class LTX2DenoisingStage(DenoisingStage):
         encoder_hidden_states = batch.prompt_embeds[0]
         audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
         encoder_attention_mask = prompt_attention_mask
-        negative_encoder_hidden_states = batch.negative_prompt_embeds[0]
-        negative_audio_encoder_hidden_states = batch.negative_audio_prompt_embeds[0]
-        negative_encoder_attention_mask = self._get_ltx_prompt_attention_mask(
-            batch,
-            is_ltx23_variant=(
-                ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage
-            ),
-            negative=True,
+        cfg_enabled = batch.do_classifier_free_guidance and os.environ.get(
+            "LTX2_DISABLE_NEG", ""
+        ).strip().lower() not in ("1", "true", "yes", "on")
+        if not cfg_enabled:
+            # The text encoder does not produce negative embeddings without CFG.
+            # Copy the request parameters so later requests/stages keep their defaults.
+            stage1_guider_params = dict(stage1_guider_params)
+            stage1_guider_params["video_cfg_scale"] = 1.0
+            stage1_guider_params["audio_cfg_scale"] = 1.0
+        cfg_enabled = cfg_enabled and (
+            float(stage1_guider_params["video_cfg_scale"]) != 1.0
+            or float(stage1_guider_params["audio_cfg_scale"]) != 1.0
         )
+        if cfg_enabled:
+            negative_encoder_hidden_states = batch.negative_prompt_embeds[0]
+            negative_audio_encoder_hidden_states = batch.negative_audio_prompt_embeds[0]
+            negative_encoder_attention_mask = self._get_ltx_prompt_attention_mask(
+                batch,
+                is_ltx23_variant=(
+                    ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage
+                ),
+                negative=True,
+            )
 
         video_skip = self._ltx2_should_skip_step(
             step.step_index, int(stage1_guider_params["video_skip_step"])
@@ -1938,8 +1953,10 @@ class LTX2DenoisingStage(DenoisingStage):
 
                 if ctx.use_ltx23_legacy_one_stage:
                     with self._ltx2_model_forward_context(ctx, step):
-                        v_pos, a_v_pos = step.current_model(
-                            **self._build_ltx2_model_kwargs(
+                        v_pos, a_v_pos = self._ltx2_call_current_model(
+                            ctx,
+                            step,
+                            self._build_ltx2_model_kwargs(
                                 ctx,
                                 base_model_kwargs_local,
                                 encoder_hidden_states=encoder_hidden_states,
@@ -1948,20 +1965,25 @@ class LTX2DenoisingStage(DenoisingStage):
                                 disable_v2a_cross_attn=(
                                     skip_v2a_cross_attn_for_video_gt
                                 ),
-                            )
+                            ),
                         )
-                        v_neg, a_v_neg = step.current_model(
-                            **self._build_ltx2_model_kwargs(
+                        if cfg_enabled:
+                            v_neg, a_v_neg = self._ltx2_call_current_model(
                                 ctx,
-                                base_model_kwargs_local,
-                                encoder_hidden_states=negative_encoder_hidden_states,
-                                audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
-                                encoder_attention_mask=negative_encoder_attention_mask,
-                                disable_v2a_cross_attn=(
-                                    skip_v2a_cross_attn_for_video_gt
+                                step,
+                                self._build_ltx2_model_kwargs(
+                                    ctx,
+                                    base_model_kwargs_local,
+                                    encoder_hidden_states=negative_encoder_hidden_states,
+                                    audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
+                                    encoder_attention_mask=negative_encoder_attention_mask,
+                                    disable_v2a_cross_attn=(
+                                        skip_v2a_cross_attn_for_video_gt
+                                    ),
                                 ),
                             )
-                        )
+                        else:
+                            v_neg, a_v_neg = v_pos, a_v_pos
 
                     v_pos = v_pos.float()
                     a_v_pos = a_v_pos.float()
@@ -1972,8 +1994,10 @@ class LTX2DenoisingStage(DenoisingStage):
                     a_v_ptb = None
                     if need_perturbed:
                         with self._ltx2_model_forward_context(ctx, step):
-                            v_ptb, a_v_ptb = step.current_model(
-                                **self._build_ltx2_model_kwargs(
+                            v_ptb, a_v_ptb = self._ltx2_call_current_model(
+                                ctx,
+                                step,
+                                self._build_ltx2_model_kwargs(
                                     ctx,
                                     base_model_kwargs_local,
                                     encoder_hidden_states=encoder_hidden_states,
@@ -1988,7 +2012,7 @@ class LTX2DenoisingStage(DenoisingStage):
                                     disable_v2a_cross_attn=(
                                         skip_v2a_cross_attn_for_video_gt
                                     ),
-                                )
+                                ),
                             )
                         v_ptb = v_ptb.float()
                         a_v_ptb = a_v_ptb.float()
@@ -1997,8 +2021,10 @@ class LTX2DenoisingStage(DenoisingStage):
                     a_v_mod = None
                     if need_modality:
                         with self._ltx2_model_forward_context(ctx, step):
-                            v_mod, a_v_mod = step.current_model(
-                                **self._build_ltx2_model_kwargs(
+                            v_mod, a_v_mod = self._ltx2_call_current_model(
+                                ctx,
+                                step,
+                                self._build_ltx2_model_kwargs(
                                     ctx,
                                     base_model_kwargs_local,
                                     encoder_hidden_states=encoder_hidden_states,
@@ -2006,7 +2032,7 @@ class LTX2DenoisingStage(DenoisingStage):
                                     encoder_attention_mask=encoder_attention_mask,
                                     disable_a2v_cross_attn=True,
                                     disable_v2a_cross_attn=True,
-                                )
+                                ),
                             )
                         v_mod = v_mod.float()
                         a_v_mod = a_v_mod.float()
@@ -2019,14 +2045,17 @@ class LTX2DenoisingStage(DenoisingStage):
                             encoder_attention_mask=encoder_attention_mask,
                             disable_v2a_cross_attn=skip_v2a_cross_attn_for_video_gt,
                         ),
-                        LTX2GuidancePassSpec(
-                            name="neg",
-                            encoder_hidden_states=negative_encoder_hidden_states,
-                            audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
-                            encoder_attention_mask=negative_encoder_attention_mask,
-                            disable_v2a_cross_attn=skip_v2a_cross_attn_for_video_gt,
-                        ),
                     ]
+                    if cfg_enabled:
+                        pass_specs.append(
+                            LTX2GuidancePassSpec(
+                                name="neg",
+                                encoder_hidden_states=negative_encoder_hidden_states,
+                                audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
+                                encoder_attention_mask=negative_encoder_attention_mask,
+                                disable_v2a_cross_attn=skip_v2a_cross_attn_for_video_gt,
+                            )
+                        )
                     if need_perturbed:
                         pass_specs.append(
                             LTX2GuidancePassSpec(
@@ -2055,6 +2084,12 @@ class LTX2DenoisingStage(DenoisingStage):
                             )
                         )
 
+                    if stage1_cfg_world_size > len(pass_specs):
+                        # Fail on every rank before entering model collectives.
+                        raise ValueError(
+                            "LTX2 stage-1 CFG parallel degree exceeds guidance pass count. "
+                            "Use fewer CFG ranks when disabling guidance branches."
+                        )
                     execution_pass_specs = (
                         [
                             pass_spec
@@ -2131,8 +2166,10 @@ class LTX2DenoisingStage(DenoisingStage):
                                     model_kwargs_chunk["perturbation_configs"] = (
                                         split_perturbation_configs[index],
                                     )
-                                video_chunk, audio_chunk = step.current_model(
-                                    **model_kwargs_chunk
+                                video_chunk, audio_chunk = (
+                                    self._ltx2_call_current_model(
+                                        ctx, step, model_kwargs_chunk
+                                    )
                                 )
                                 batched_video_chunks.append(video_chunk)
                                 batched_audio_chunks.append(audio_chunk)
@@ -2146,9 +2183,15 @@ class LTX2DenoisingStage(DenoisingStage):
                             )
                         )
                         with self._ltx2_model_forward_context(ctx, step):
-                            batched_video, batched_audio = step.current_model(
-                                **batched_model_kwargs,
-                                perturbation_configs=perturbation_configs,
+                            batched_video, batched_audio = (
+                                self._ltx2_call_current_model(
+                                    ctx,
+                                    step,
+                                    dict(
+                                        **batched_model_kwargs,
+                                        perturbation_configs=perturbation_configs,
+                                    ),
+                                )
                             )
 
                     batched_video = batched_video.float()
@@ -2167,7 +2210,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     }
                     if not stage1_cfg_parallel:
                         v_pos, a_v_pos = pass_outputs["cond"]
-                        v_neg, a_v_neg = pass_outputs["neg"]
+                        v_neg, a_v_neg = pass_outputs.get("neg", pass_outputs["cond"])
                         v_ptb, a_v_ptb = pass_outputs.get("perturbed", (None, None))
                         v_mod, a_v_mod = pass_outputs.get("modality", (None, None))
 

@@ -12,6 +12,8 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
     topk_among_blocks,
 )
+from sglang.srt.layers.attention.dsv4.index_cache_kind import dsv4_index_cache_kind
+from sglang.srt.utils import is_maca
 
 from .scoring import (
     DeepGEMMPrefillData,
@@ -100,6 +102,22 @@ class DenseBlocksBackend:
                 block_size=self.block_size,
             )
         )
+        kind = dsv4_index_cache_kind()
+        if kind.is_int8 and is_maca():
+            from sglang.kernels.ops.attention.dsv4 import topk_transform_paged
+
+            compress_lens = (inputs.positions + 1) // inputs.compress_ratio
+            metadata = inputs.paged_metadata
+            topk_transform_paged(
+                d.scores,
+                compress_lens.to(torch.int32),
+                metadata.page_table,
+                out.page_indices,
+                metadata.compressed_page_size,
+                out.raw_indices,
+            )
+            return published
+
         k = min(inputs.indexer.index_topk, d.lmax)
         idx = d.scores.topk(k, dim=-1, sorted=False).indices
         write_decode(out, d, idx)

@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.srt.layers.attention.dsv4.index_cache_kind import dsv4_index_cache_kind
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
@@ -30,9 +31,8 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache, get_tensor_size_bytes
-from sglang.srt.runtime_context import get_exec, get_platform, get_spec
+from sglang.srt.runtime_context import get_exec, get_memory, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_hip
-from sglang.srt.utils.common import is_maca
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +182,21 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     family pool; the V4.1 layouts exist only in SM100 / SM103 FlashMLA."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
+    if get_memory().enable_hisparse:
+        # HiSparse's host/device transfer policy addresses the packed V4 page.
+        # Keep auto compatible on SM100, which otherwise selects V4.1 pages.
+        if mode not in ("auto", "v4") or option not in ("auto", "fp8"):
+            raise ValueError(
+                "DeepSeek V4 HiSparse requires the V4 KV layout: use "
+                "SGLANG_DSV4_KV_LAYOUT=auto or v4 and "
+                "SGLANG_DSV4_COMPRESSED_KV_LAYOUT=auto or fp8."
+            )
+        if get_exec().kernel.dsv4_attn_backend in ("trtllm", "flashmla_mega"):
+            raise ValueError(
+                "DeepSeek V4 HiSparse requires packed V4 KV pages; use "
+                "--dsv4-attn-backend flashmla instead of trtllm or flashmla_mega."
+            )
+        return KVLayout.V4, None if option == "auto" else option
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
     assert mode in ("v41", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
@@ -728,19 +743,31 @@ class DeepSeekV4IndexerPool(KVCache):
     def get_index_k_fp4(
         self, layer_id: int, slots: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Packed fp4 rows at `slots`: (payload int8 [n, 64], scales int32 [n]),
-        from the page layout [page_size * 64 payload | page_size * 4 scale]."""
-        assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
+        """Packed rows at `slots`. The fp4 layout returns (payload int8 [n, 64],
+        scales int32 [n]) from [page_size * 64 payload | page_size * 4 scale]; the
+        int8 layout returns (payload int8 [n, 128], scales float32 [n]) from
+        [page_size * 128 payload | page_size * 4 scale]."""
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         slots = slots.to(torch.int64)
         p = self.page_size
         page, off = (slots // p).unsqueeze(-1), slots % p
-        payload_cols = (off * 64).unsqueeze(-1) + torch.arange(64, device=buf.device)
-        scale_cols = (p * 64 + off * 4).unsqueeze(-1) + torch.arange(
+        if self.use_fp4_indexer:
+            payload_cols = (off * 64).unsqueeze(-1) + torch.arange(
+                64, device=buf.device
+            )
+            scale_cols = (p * 64 + off * 4).unsqueeze(-1) + torch.arange(
+                4, device=buf.device
+            )
+            payload = buf[page, payload_cols].view(torch.int8)  # [n, 64]
+            scales = buf[page, scale_cols].contiguous().view(torch.int32).squeeze(-1)
+            return payload, scales
+        # int8 layout: the payload rows are plain int8, the scales plain float32.
+        payload_cols = (off * 128).unsqueeze(-1) + torch.arange(128, device=buf.device)
+        scale_cols = (p * 128 + off * 4).unsqueeze(-1) + torch.arange(
             4, device=buf.device
         )
-        payload = buf[page, payload_cols].view(torch.int8)  # [n, 64]
-        scales = buf[page, scale_cols].contiguous().view(torch.int32).squeeze(-1)
+        payload = buf[page, payload_cols]
+        scales = buf[page, scale_cols].view(torch.float32).contiguous().squeeze(-1)
         return payload, scales
 
     def get_index_k_dequant(
@@ -1512,6 +1539,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             for ratio, config in configs.items()
             if config.indexer_size is not None
         }
+        
+        index_k_fp4 = dsv4_index_cache_kind().is_fp4
         for ratio, sources in low_ratio_sources.items():
             # Reserved FULL page 0 pushes real slots past full_size, and one index
             # padding page is too small to cover that gap.
@@ -1523,7 +1552,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 len(sources),
                 device,
                 enable_memory_saver,
-                force_fp4=envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get()=="fp4",
+                force_fp4=index_k_fp4,
             )
 
         # HiCache and hardware backends still read these per-ratio attributes.
@@ -1882,6 +1911,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # swa_kv_pool is None under the request window and unified_kv.
         return self.kv_layout
 
+    def get_swa_key_page_size(self) -> int:
+        if self.request_window is not None:
+            return self.request_window.page_size
+        return self.swa_kv_pool.page_size
+
     def get_swa_key_bytes_per_token(self) -> int:
         """Physical bytes per SWA token (divide by element size for a view)."""
         if self.uniform_fp8:
@@ -2064,7 +2098,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 self._swa_local_layer_id(layer_id), swa_loc, kv
             )
             return
-        if self.swa_kv_pool.dtype == torch.bfloat16:
+        window = self.request_window
+        kv_dtype = window.state.dtype if window is not None else self.swa_kv_pool.dtype
+        if kv_dtype == torch.bfloat16:
             # The FlashMLA fused writer requires the packed FP8/uint8 layout.
             # BF16 pages hold plain KV rows; normalize/rotate first, then use
             # the dtype-aware store. Fused QKV projection slices need a copy

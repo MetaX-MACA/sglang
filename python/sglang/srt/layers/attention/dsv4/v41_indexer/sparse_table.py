@@ -178,7 +178,7 @@ class SparseTableBackend:
         if isinstance(metadata.deep_gemm_metadata, list):
             return self._publish_decode_chunked(inputs, data, seq_lens, out)
         logits = deep_gemm_fp4_paged_mqa_logits(
-            (data.q_fp4, data.q_sf),
+            data.query_rows(),
             data.k_cache,
             data.weights,
             metadata.compressed_seq_lens,
@@ -216,8 +216,8 @@ class SparseTableBackend:
                 seq_lens,
                 metadata.page_table,
                 metadata.compressed_page_size,
-                data.q_fp4.dtype,
-                self._get_request_ids(inputs, data.q_fp4.shape[0], blocks.device),
+                data.q_dtype,
+                self._get_request_ids(inputs, data.num_rows, blocks.device),
             )
             # consume_decode reads these on the main stream
             for t in (blocks, schedule, phys_blocks, row_valid_lens):
@@ -248,7 +248,7 @@ class SparseTableBackend:
         assert not metadata.use_topk_v2 or topk_plans is not None
         for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
             logits = deep_gemm_fp4_paged_mqa_logits(
-                (data.q_fp4[rows], data.q_sf[rows]),
+                data.query_rows(rows),
                 data.k_cache,
                 data.weights[rows],
                 metadata.compressed_seq_lens[rows],
@@ -287,8 +287,8 @@ class SparseTableBackend:
             seq_lens,
             metadata.page_table,
             metadata.compressed_page_size,
-            data.q_fp4.dtype,
-            self._get_request_ids(inputs, data.q_fp4.shape[0], blocks.device),
+            data.q_dtype,
+            self._get_request_ids(inputs, data.num_rows, blocks.device),
         )
         ready = torch.cuda.Event()
         ready.record(torch.cuda.current_stream())
@@ -309,9 +309,10 @@ class SparseTableBackend:
         assert published is not None
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
         torch.cuda.current_stream().wait_event(published.ready)
+        q_fp4, q_sf = data.query_rows()
         logits = sparse_logits(
-            data.q_fp4,
-            data.q_sf,
+            q_fp4,
+            q_sf,
             data.k_cache,
             data.weights.to(torch.bfloat16),
             published.schedule,
@@ -385,7 +386,7 @@ def publish_prefill_table(
     """The source's own top-k into ``out_positions`` and the chunk's table, from one
     pass over its dense scores; ``index_page_table`` is at ``index_page_size`` slots."""
     rows = data.num_rows
-    device = data.q_fp4.device
+    device = data.q_device
     nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
     zero_offsets = torch.zeros(rows, dtype=torch.int32, device=device)
@@ -423,7 +424,7 @@ def publish_prefill_table(
         page_size=index_page_size,
         request_ids=request_ids,
         rows_per_request=data.rows_per_request,
-        q_dtype=data.q_fp4.dtype,
+        q_dtype=data.q_dtype,
         valid_lens=valid_lens,
     )
 
@@ -435,10 +436,11 @@ def select_prefill_table(
     k_cache: torch.Tensor,
     out_positions: torch.Tensor,
 ) -> None:
-    rows, heads = data.q_sf.shape
+    rows, heads = data.num_rows, data.num_heads
+    q_fp4, q_sf = data.query_rows()
     logits = sparse_logits(
-        data.q_fp4.view(rows, 1, heads, 64),
-        data.q_sf.view(rows, 1, heads),
+        q_fp4.view(rows, 1, heads, 64),
+        q_sf.view(rows, 1, heads),
         k_cache,
         data.weights.to(torch.bfloat16),
         table.schedule,

@@ -1,8 +1,12 @@
 import dataclasses
+import logging
+import os
 from dataclasses import field
 from typing import Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -87,6 +91,37 @@ class LTX23SamplingParams(LTX2SamplingParams):
             "audio_skip_step": self.audio_skip_step,
             "audio_stg_blocks": self.audio_stg_blocks,
         }
+
+        # --- LTX2 branch env-var overrides ---
+        # Each Stage-1 guidance branch has its own env switch:
+        #   LTX2_DISABLE_NEG=1       -> disable negative (text CFG) branch: cfg_scale=1.0
+        #   LTX2_DISABLE_STG=1       -> disable perturbed (STG) branch:     stg_scale=0.0
+        #   LTX2_DISABLE_MODALITY=1  -> disable modality branch:            modality_scale=1.0
+        # Unset -> keep config defaults (4 branches); original behavior unchanged.
+        def _envflag(name):
+            return os.environ.get(name, "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+
+        gp = extra["ltx2_stage1_guider_params"]
+        _disabled = []
+        if _envflag("LTX2_DISABLE_NEG"):
+            gp["video_cfg_scale"] = 1.0
+            gp["audio_cfg_scale"] = 1.0
+            _disabled.append("neg")
+        if _envflag("LTX2_DISABLE_STG"):
+            gp["video_stg_scale"] = 0.0
+            gp["audio_stg_scale"] = 0.0
+            _disabled.append("stg")
+        if _envflag("LTX2_DISABLE_MODALITY"):
+            gp["video_modality_scale"] = 1.0
+            gp["audio_modality_scale"] = 1.0
+            _disabled.append("modality")
+        if _disabled:
+            logger.info("LTX2 disabled Stage-1 guidance branches: %s", _disabled)
         if self.skip_v2a_cross_attn_for_video_gt:
             extra["ltx2_skip_v2a_cross_attn_for_video_gt"] = True
         return extra

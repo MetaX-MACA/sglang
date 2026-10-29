@@ -66,6 +66,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     _rope_fq4,
     token_req_indices,
 )
+from sglang.srt.layers.attention.dsv4.index_cache_kind import dsv4_index_cache_kind
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
@@ -677,6 +678,8 @@ class DSV4AttnMetadata:
     c2_sparse_topk_lengths: Optional[torch.Tensor] = field(init=False, default=None)
     c2_sparse_page_indices: Optional[torch.Tensor] = field(init=False, default=None)
     c2_sparse_raw_indices: Optional[torch.Tensor] = field(init=False, default=None)
+    c1_plan: Optional[torch.Tensor] = None
+    c2_plan: Optional[torch.Tensor] = None
 
     # Combined decode tables. Only the c4 tail and lens vary by layer.
     trtllm_swa_lens: Optional[torch.Tensor] = None
@@ -875,6 +878,8 @@ class DSV4AttnMetadata:
                 "c2_sparse_topk_lengths",
                 "c2_sparse_page_indices",
                 "c2_sparse_raw_indices",
+                "c1_plan",
+                "c2_plan",
                 "request_window_layout",
                 "trtllm_swa_lens",
                 "trtllm_c4_indices",
@@ -1002,11 +1007,52 @@ class DSV4AttnMetadata:
                 self.c128_topk_lengths_clamp1 = c128_topk_lengths_clamp1
                 self.c128_page_indices = _pad_last_dim(c128_page_indices)
 
+        def _make_low_ratio_plan(
+            compress_ratio: int,
+            raw_out_loc: torch.Tensor,
+            seq_lens_casual: torch.Tensor,
+        ) -> torch.Tensor:
+            """Per-token compress plan, mirroring Compressor*Plan.generate.
+
+            ``seq_lens_casual`` is the absolute, prefix-inclusive sequence length
+            of each token (= position + 1); see expand_prefill_causally, which
+            builds it from ``seq_lens - extend_seq_lens + 1``, and the decode path,
+            which passes ``seq_lens`` directly. A token is a compress event exactly
+            when ``seq_lens_casual % compress_ratio == 0`` -- the same condition the
+            C++ planner applies as ``should_compress`` and the decode kernel applies
+            as its store gate. Padding rows (``raw_out_loc == 0``) complete no group
+            and are marked invalid. ``ragged_id`` is the token row, so ``out_loc``
+            is indexed exactly as the decode path indexes ``out_loc[work_id]``.
+
+            Only ``seq_len``/``ragged_id``/validity are read by
+            ``compress_norm_rope_store``; C4's ``buffer_len``/``read_page_*`` feed
+            the pooling kernel only and are left zero.
+            """
+            n = raw_out_loc.shape[0]
+            dev = seq_lens_casual.device
+            seq_lens = seq_lens_casual[:n].to(torch.int32)
+            plan = torch.zeros((n, 16), dtype=torch.uint8, device=dev)
+            invalid = (raw_out_loc[:n] == 0) | (seq_lens % compress_ratio != 0)
+            plan.view(torch.int32)[:, 0] = seq_lens
+            plan.view(torch.int32)[invalid, 0] = -1
+            plan.view(torch.int16)[:, 2] = torch.arange(
+                n, dtype=torch.int16, device=dev
+            )
+            return plan
+        
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
         if low_ratio_buffers is not None:
             self.c1_out_loc, self.c1_topk_lengths_clamp1 = low_ratio_buffers[:2]
             self.c2_out_loc, self.c2_topk_lengths_clamp1 = low_ratio_buffers[4:6]
+            if dsv4_index_cache_kind().is_int8 and 1 in self.low_ratios:
+                self.c1_plan = _make_low_ratio_plan(
+                    1, self.raw_out_loc, self.seq_lens_casual
+                )
+            if dsv4_index_cache_kind().is_int8 and 2 in self.low_ratios:
+                self.c2_plan = _make_low_ratio_plan(
+                    2, self.raw_out_loc, self.seq_lens_casual
+                )  
             return
         if 1 in self.low_ratios:
             self.c1_out_loc, self.c1_topk_lengths_clamp1 = (
@@ -1014,12 +1060,20 @@ class DSV4AttnMetadata:
                     1, self.seq_lens_casual, self.raw_out_loc
                 )
             )
+            if dsv4_index_cache_kind().is_int8:
+                self.c1_plan = _make_low_ratio_plan(
+                    1, self.raw_out_loc, self.seq_lens_casual
+                )
         if 2 in self.low_ratios:
             self.c2_out_loc, self.c2_topk_lengths_clamp1 = (
                 _low_ratio_compression_metadata(
                     2, self.seq_lens_casual, self.raw_out_loc
                 )
             )
+            if dsv4_index_cache_kind().is_int8:
+                self.c2_plan = _make_low_ratio_plan(
+                    2, self.raw_out_loc, self.seq_lens_casual
+                )
 
     # Cache-write locations stay in global logical order and are intentionally
     # excluded from CP reindexing.
@@ -1171,6 +1225,10 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     local_lens_cpu: Optional[List[int]] = None
     req_global: Optional[torch.Tensor] = None
     pos_global: Optional[torch.Tensor] = None
+    # prefill CP: the tail rows indexed into the FULL extend, and the row count of
+    # the CP all-gather the late layers' MoE runs on (one max_local chunk per rank).
+    cp_extend_indices: Optional[torch.Tensor] = None
+    cp_packed_rows: int = 0
 
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
@@ -1182,6 +1240,14 @@ class LateLayerTail(msgspec.Struct, frozen=True):
         return _tail_rows(
             t, token_indices=self.token_indices, contiguous_start=self.contiguous_start
         )
+
+    def global_rows(self, t: torch.Tensor) -> torch.Tensor:
+        assert self.cp_extend_indices is not None and self.cp_packed_rows, (
+            "global_rows is the CP-only tail selector"
+        )
+        rows = t.new_zeros((self.cp_packed_rows, *t.shape[1:]))
+        rows[self.cp_metadata.gather_index] = t[self.cp_extend_indices]
+        return rows
 
 
 def _tail_rows(
@@ -1803,7 +1869,13 @@ class DeepseekV4AttnBackend(
 
     @property
     def low_ratio_prefill_graph(self) -> bool:
-        return bool(self.low_ratios) and has_dense_fp4_indexer() and is_sm100_or_newer()
+        """Whether ratio-1/2 sources use captured projections and indexer metadata."""
+        return (
+            bool(self.low_ratios)
+            and has_dense_fp4_indexer()
+            and is_sm100_or_newer()
+            and get_parallel().attn_cp_size == 1
+        )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
         max_seq_len = _prefill_graph_max_seq_len()
@@ -1896,6 +1968,8 @@ class DeepseekV4AttnBackend(
                 local_lens_cpu=cp_tail["local_lens_cpu"],
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
+                cp_extend_indices=cp_tail["extend_token_indices"],
+                cp_packed_rows=cp_tail["packed_rows"],
             )
         return metadata
 
@@ -1962,6 +2036,10 @@ class DeepseekV4AttnBackend(
                 tail_request_ids[local_tail_rows], minlength=forward_batch.batch_size
             ).tolist(),
             pad_rows=pad_rows,
+            # A per-token tensor the late MoE reads must follow the all-gather
+            # layout: one max_local-row chunk per rank, indexed this way.
+            extend_token_indices=token_indices,
+            packed_rows=cp_size * max_local,
         )
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
@@ -2331,7 +2409,9 @@ class DeepseekV4AttnBackend(
 
         # Upgrade Raw->Full so compress + core_attn + indexer materialization is
         # recorded inside the cuda graph.
+        verify_prefix_lens = None
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
+            verify_prefix_lens = self.forward_metadata.seq_lens
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
                 online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
@@ -2342,6 +2422,24 @@ class DeepseekV4AttnBackend(
             )
 
         metadata = self.forward_metadata
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.spec_swap.enabled
+        ):
+            assert isinstance(metadata, DSV4Metadata)
+            # C4 write locations are produced during metadata materialization.
+            # Bind completed compression blocks before any layer writes KV;
+            # recording this here also refreshes their mapping on graph replay.
+            self.hisparse_coordinator.spec_swap.prepare_compressed_verify(
+                req_pool_indices=forward_batch.req_pool_indices,
+                prefix_lens=(
+                    verify_prefix_lens
+                    if verify_prefix_lens is not None
+                    else forward_batch.seq_lens
+                ),
+                compressed_out_locs=metadata.core_metadata.c4_out_loc,
+            )
         if isinstance(metadata, DSV4Metadata):
             core = metadata.core_metadata
             for ratio in core.low_ratios:
@@ -2726,7 +2824,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,
             swa_window_size=SWA_WINDOW,
-            swa_page_size=self.token_to_kv_pool.swa_kv_pool.page_size,
+            swa_page_size=self.token_to_kv_pool.get_swa_key_page_size(),
             num_qo_tokens=num_qo_tokens,
             max_seq_len=max(seq_lens_cpu_list),
             total_swa=total_swa,
@@ -3365,6 +3463,29 @@ class DeepseekV4AttnBackend(
             KVAndScore.from_kv_score(kv=kv, score=score),
         )
         return partner_kv, partner_score
+    
+    def _low_ratio_store_index_k(self, layer, latent, out_loc, plan) -> None:
+        """Fused index-K write: k_norm + RoPE + quantize + store."""
+        from sglang.kernels.ops.attention.dsv4.compress import (
+            compress_norm_rope_store,
+            CompressorPrefillPlan,
+        )
+
+        pool = self.token_to_kv_pool
+        indexer = layer.indexer
+        kv_compressed = indexer.forward_wk(latent)
+        plan_c = plan[: kv_compressed.shape[0]]
+        plan_obj = CompressorPrefillPlan(layer.compress_ratio, plan_c, plan_c[:0])
+        compress_norm_rope_store(
+            kv_compressed,
+            plan_obj,
+            norm_weight=indexer.k_norm.weight,
+            norm_eps=indexer.k_norm.eps,
+            freq_cis=layer.freqs_cis,
+            out_loc=out_loc,
+            kvcache=pool.get_index_k_with_scale_buffer(layer.layer_id),
+            page_size=pool.get_index_k_page_size(layer.compress_ratio),
+        )
 
     def _low_ratio_write_group(
         self,
@@ -3378,9 +3499,11 @@ class DeepseekV4AttnBackend(
         pool = self.token_to_kv_pool
         latent = layer.compressor.finish(pooled)
         freqs = layer.freqs_cis[group_pos]
-        # Index keys come from the pre-RoPE latent, so publish them first. Stored
-        # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.
+        # Index keys come from the pre-RoPE latent, so publish them first: the fp4
+        # kind stores the packed fp4 rows (per-32 ue8m0, no hadamard), the int8
+        # kind the MACA norm+rope+hadamard rows, matching the reference indexer.
         if layer.indexer is not None and layer.indexer.owns_k:
+            kind = dsv4_index_cache_kind()
             if (
                 fuse_index_store
                 and latent.is_cuda
@@ -3401,11 +3524,17 @@ class DeepseekV4AttnBackend(
                     cache=pool.get_index_k_with_scale_buffer(layer.layer_id),
                     loc=slots,
                 )
-            else:
+            elif kind.is_fp4:
                 pool.set_index_k_fp4(
                     layer_id=layer.layer_id,
                     loc=slots,
                     cache_k=layer.indexer.index_keys(latent, freqs),
+                )
+            else:
+                core = self.forward_metadata.core_metadata
+                plan = core.c1_plan if layer.compress_ratio == 1 else core.c2_plan
+                self._low_ratio_store_index_k(
+                    layer, latent, slots.to(torch.int64), plan
                 )
         if pool.get_extra_key_layout(layer.layer_id) is KVLayout.V41_FP4:
             # The fp4 cache stores e2m1 codes: the kernel rotates the tail and
@@ -3659,7 +3788,7 @@ class DeepseekV4AttnBackend(
                     compress_ratio
                 )
 
-            swa_kv_page_size = token_to_kv_pool.swa_kv_pool.page_size
+            swa_kv_page_size = token_to_kv_pool.get_swa_key_page_size()
             assert swa_k_cache.ndim == 2
             # The kernel detects quantized formats from the last dim (584/528/288
             # bytes); BF16 caches instead hold 512 elements per token.
@@ -3971,6 +4100,12 @@ class DeepseekV4AttnBackend(
             flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
+            if compress_ratio == 4 and self.hisparse_coordinator is not None:
+                flat_token_ids = (
+                    token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                        flat_token_ids
+                    )
+                )
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_workspace.get(
                 n_compressed + cache.swa_token_ids.shape[0]
@@ -4129,6 +4264,12 @@ class DeepseekV4AttnBackend(
             flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
+            if compress_ratio == 4 and self.hisparse_coordinator is not None:
+                flat_token_ids = (
+                    token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                        flat_token_ids
+                    )
+                )
 
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_workspace.get(

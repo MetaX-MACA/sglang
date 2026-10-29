@@ -1,6 +1,7 @@
 """Validated sparse GQA operators migrated from the QSA reference branch."""
 
 from typing import Optional
+from sglang.srt.utils.common import is_maca
 
 import torch
 import triton
@@ -22,8 +23,13 @@ _L20_CONFIGS = [
 
 
 def _get_best_config(total_q: int):
-    table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
-    return next(cfg for limit, cfg in table if total_q <= limit)
+    block_n, num_warps, _num_stages = next(
+        cfg for limit, cfg in (_H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS)
+        if total_q <= limit
+    )
+    if is_maca():
+        return min(block_n, 32), num_warps, 1
+    return block_n, num_warps, _num_stages
 
 
 @triton.jit

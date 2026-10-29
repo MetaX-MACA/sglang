@@ -44,7 +44,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
-
+from mcoplib.triton_situ_and_mul import situ_and_mul
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .moe_align_block_size import moe_align_block_size
 
@@ -178,6 +178,11 @@ def inplace_fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     is_fp4_experts: bool = False,
+    use_fp4_w4a8: bool = False,
+    w13_scale_b: Optional[torch.Tensor] = None,
+    w13_scale_t: Optional[torch.Tensor] = None,
+    w2_scale_b: Optional[torch.Tensor] = None,
+    w2_scale_t: Optional[torch.Tensor] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -214,6 +219,11 @@ def inplace_fused_experts(
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         is_fp4_experts=is_fp4_experts,
+        use_fp4_w4a8=use_fp4_w4a8,
+        w13_scale_b=w13_scale_b,
+        w13_scale_t=w13_scale_t,
+        w2_scale_b=w2_scale_b,
+        w2_scale_t=w2_scale_t,
     )
 
 
@@ -251,6 +261,11 @@ def outplace_fused_experts(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
+    use_fp4_w4a8: bool = False,
+    w13_scale_b: Optional[torch.Tensor] = None,
+    w13_scale_t: Optional[torch.Tensor] = None,
+    w2_scale_b: Optional[torch.Tensor] = None,
+    w2_scale_t: Optional[torch.Tensor] = None,
     is_fp4_experts: bool = False,
 ) -> torch.Tensor:
     return fused_experts_impl(
@@ -287,6 +302,11 @@ def outplace_fused_experts(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+        use_fp4_w4a8=use_fp4_w4a8,
+        w13_scale_b=w13_scale_b,
+        w13_scale_t=w13_scale_t,
+        w2_scale_b=w2_scale_b,
+        w2_scale_t=w2_scale_t,
         is_fp4_experts=is_fp4_experts,
     )
 
@@ -315,6 +335,11 @@ def fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     is_fp4_experts: bool = False,
+    use_fp4_w4a8: bool = False,
+    w13_scale_b: Optional[torch.Tensor] = None,
+    w13_scale_t: Optional[torch.Tensor] = None,
+    w2_scale_b: Optional[torch.Tensor] = None,
+    w2_scale_t: Optional[torch.Tensor] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -356,6 +381,11 @@ def fused_experts(
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
             is_fp4_experts=is_fp4_experts,
+            use_fp4_w4a8=use_fp4_w4a8,
+            w13_scale_b=w13_scale_b,
+            w13_scale_t=w13_scale_t,
+            w2_scale_b=w2_scale_b,
+            w2_scale_t=w2_scale_t,
         )
         return hidden_states
     else:
@@ -392,6 +422,11 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
+            use_fp4_w4a8=use_fp4_w4a8,
+            w13_scale_b=w13_scale_b,
+            w13_scale_t=w13_scale_t,
+            w2_scale_b=w2_scale_b,
+            w2_scale_t=w2_scale_t,
             is_fp4_experts=is_fp4_experts,
         )
 
@@ -994,16 +1029,12 @@ def _fused_moe_kernel_sequence(
                 d = x.shape[-1] // 2
                 intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
     elif activation == "situ" and is_gated:
-        d = N // 2
-        x = intermediate_cache1.view(-1, N)
-        gate = x[..., :d].float()
-        up = x[..., d:].float()
-        situ_beta = gemm1_alpha if gemm1_alpha is not None else 4.0
-        gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
-        situ_linear_beta = gemm1_limit
-        if situ_linear_beta is not None:
-            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
-        intermediate_cache2.copy_((gate * up).to(intermediate_cache1.dtype))
+        situ_and_mul(
+            intermediate_cache1.view(-1, N),
+            situ_beta=(gemm1_alpha if gemm1_alpha is not None else 4.0),
+            situ_linear_beta=gemm1_limit,
+            out=intermediate_cache2.view(-1, N // 2),
+        )
     elif activation in ("gelu", "gelu_tanh") and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
@@ -1240,6 +1271,11 @@ def fused_experts_impl(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     is_fp4_experts: bool = False,
+    use_fp4_w4a8: bool = False,
+    w13_scale_b: Optional[torch.Tensor] = None,
+    w13_scale_t: Optional[torch.Tensor] = None,
+    w2_scale_b: Optional[torch.Tensor] = None,
+    w2_scale_t: Optional[torch.Tensor] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1319,6 +1355,11 @@ def fused_experts_impl(
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         is_fp4_experts=is_fp4_experts,
+        use_fp4_w4a8=use_fp4_w4a8,
+        w13_scale_b=w13_scale_b,
+        w13_scale_t=w13_scale_t,
+        w2_scale_b=w2_scale_b,
+        w2_scale_t=w2_scale_t,
     )
 
 

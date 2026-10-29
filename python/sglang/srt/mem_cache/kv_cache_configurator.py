@@ -575,6 +575,18 @@ class KVCacheConfigurator:
                             draft_virtual_id_space
                         )
                 sizes = msgspec.structs.replace(sizes, **size_overrides)
+            elif isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
+                # HiSparse's target allocator hands out logical IDs from its
+                # host-expanded address space. Draft KV is direct-indexed by
+                # those shared IDs, so its GPU pool must span the same space.
+                draft_virtual_id_space = token_to_kv_pool_allocator.size_full
+                page = max(int(self.pool_page_size or 1), 1)
+                draft_virtual_id_space = (
+                    (draft_virtual_id_space + page - 1) // page * page
+                )
+                sizes = msgspec.structs.replace(
+                    sizes, max_total_num_tokens=draft_virtual_id_space
+                )
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
@@ -1627,7 +1639,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse:
+        if get_memory().enable_hisparse and not self.is_draft_worker:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -1746,6 +1758,15 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    @property
+    def mla_int8_uses_workspace(self) -> bool:
+        return not (
+            self.kv_cache_dtype == torch.int8
+            and self.model_config.hf_config.architectures[0]
+            == "KimiK3ForConditionalGeneration"
+            and attention_backends() == ("flashinfer", "flashmla")
+        )
+
     def _build_mla_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         token_to_kv_pool = MLATokenToKVPool(
             max_total_num_tokens,
@@ -1758,6 +1779,16 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            enable_mla_int8=(
+                self.kv_cache_dtype == torch.int8
+                and self.model_config.hf_config.architectures[0]
+                == "KimiK3ForConditionalGeneration"
+            ),
+            **(
+                {"enable_mla_int8_workspace": False}
+                if not self.mla_int8_uses_workspace
+                else {}
+            ),
         )
         return token_to_kv_pool
 
@@ -1879,6 +1910,14 @@ class KVCacheConfigurator:
                 "kv_lora_rank": self.model_config.kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
             }
+            if (
+                self.kv_cache_dtype == torch.int8
+                and self.model_config.hf_config.architectures[0]
+                == "KimiK3ForConditionalGeneration"
+            ):
+                extra_args["enable_mla_int8"] = True
+                if not self.mla_int8_uses_workspace:
+                    extra_args["enable_mla_int8_workspace"] = False
             if is_deepseek_dsa(self.model_config.hf_config):
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
@@ -2577,6 +2616,14 @@ def calculate_mla_kv_cache_dim(
     kv_lora_rank = model_config.kv_lora_rank
     qk_rope_head_dim = model_config.qk_rope_head_dim
     kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
+
+    if (
+        kv_cache_dtype == torch.int8
+        and not is_dsa_model
+        and model_config.hf_config.architectures[0] == "KimiK3ForConditionalGeneration"
+    ):
+        assert kv_lora_rank == 512 and qk_rope_head_dim == 64
+        return kv_lora_rank + kv_lora_rank // 128 * 4 + qk_rope_head_dim * 2
 
     # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
     if not is_dsa_model:
