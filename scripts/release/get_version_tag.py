@@ -72,7 +72,7 @@ def get_current_base_version() -> str:
 
 def main() -> None:
     # 获取基础版本（当前分支最近标签）
-    base = get_current_base_version()
+    base = "0.5.21"
 
     # 获取自定义信息
     commitid = get_git_short_commit()
