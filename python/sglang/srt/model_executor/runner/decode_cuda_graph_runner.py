@@ -716,7 +716,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
-        if self.require_mlp_tp_gather:
+        # Every rank participating in an in-graph collective must replay the
+        # same graph bucket. Engram's row-sharded lookup performs its own DP
+        # gather/reduce-scatter even when the MLP path itself is DP-local.
+        if self.require_mlp_tp_gather or self.require_engram_dp_gather:
             cuda_graph_bs = self._max_dp_batch_size(forward_batch)
         else:
             cuda_graph_bs = forward_batch.batch_size
@@ -1381,7 +1384,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
         else:
             raw_num_token = raw_bs * self.captured_req_width
-            if self.require_mlp_tp_gather:
+            # Keep the replay bucket rank-uniform for both MLP and Engram
+            # collectives; otherwise ranks with different local batch sizes can
+            # replay graphs whose captured collective counts do not match.
+            if self.require_mlp_tp_gather or self.require_engram_dp_gather:
                 max_batch_size = self._max_dp_batch_size(forward_batch)
                 bs = self._pad_to_bucket(max_batch_size, self.capture_bs)
             else:
