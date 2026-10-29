@@ -922,6 +922,22 @@ _DSV4_INDEX_CACHE_DTYPES = {"deepseek_v41": "fp4", "deepseek_v4": "fp8"}
 
 
 @register_post_process
+def _deepseek_v4_kv_cache_layout(view: Any) -> dict:
+    hf_config = model_config_of(view).hf_config
+    if hf_config.architectures[0] != "DeepseekV4ForCausalLM":
+        return {}
+    kv_layout = envs.SGLANG_DSV4_KV_LAYOUT
+    # Currently, compressed_kv_layout does not need to be explicitly set
+    compressed_kv_layout = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT
+    if not kv_layout.is_set():
+        model_type = getattr(hf_config, "model_type", None)
+        kv_cache_dtype = view.kv_cache_dtype
+        if model_type == 'deepseek_v41' and kv_cache_dtype == "int8":
+            kv_layout.set("v41_int8")
+            logger.warning(f"Setting kv_layout dtype to v41_int8 for {model_type}.")
+    return {}
+
+@register_post_process
 def _deepseek_v4_index_cache_dtype(view: Any) -> dict:
     """Set dsa index cache by default according to model quantization method."""
     hf_config = model_config_of(view).hf_config

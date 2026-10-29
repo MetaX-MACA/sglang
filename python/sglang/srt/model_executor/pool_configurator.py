@@ -1328,8 +1328,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
             page_size = self.page_size // compress_ratio
         if self.kv_cache_dtype is torch.int8:
-            if layout.value != "v4":
-                raise ValueError("INT8 main KV requires V4 packed pages")
+            if layout.value not in ("v4", "v41_int8"):
+                raise ValueError("INT8 main KV requires V4/v41_int8 packed pages")
             return kv_cache_page_bytes(layout, self.kv_cache_dtype, page_size) / page_size
         return layout.page_bytes(page_size) / page_size
 

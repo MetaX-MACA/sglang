@@ -10,8 +10,10 @@ from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsv4 import (
     clear_unaccepted_c128_draft_states,
     fused_k_norm_rope_flashmla,
+    fused_k_norm_rope_int8_flashmla,
     fused_norm_rope_inplace,
     fused_store_cache,
+    fused_store_cache_int8_v41,
 )
 from sglang.kernels.ops.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
@@ -32,7 +34,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache, get_tensor_size_bytes
 from sglang.srt.runtime_context import get_exec, get_memory, get_platform, get_spec
-from sglang.srt.utils import ceil_div, is_hip
+from sglang.srt.utils import ceil_div, is_hip, is_maca
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +161,9 @@ def resolve_compressed_kv_layout(
     if kv_layout is KVLayout.V4:
         assert option in (None, "fp8"), "the V4 main cache only pairs with V4 caches"
         return KVLayout.V4
+    if kv_layout is KVLayout.V41_INT8:
+        assert option is None, "the INT8 main cache has no fp8/fp4 compressed variants"
+        return KVLayout.V41_INT8
     assert kv_layout is KVLayout.V41, f"{kv_layout} is not a main-cache layout"
     if option == "fp8":
         return KVLayout.V41
@@ -199,7 +204,7 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         return KVLayout.V4, None if option == "auto" else option
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
-    assert mode in ("v41", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
+    assert mode in ("v41", "v41_int8", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
     is_sm100 = (
         torch.cuda.is_available()
         and torch.version.cuda is not None
@@ -210,6 +215,8 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         if is_sm100 and supported:
             return KVLayout.V41, option
         return KVLayout.V4, None
+    if is_maca() and mode == "v41_int8":
+        return KVLayout.V41_INT8, None
     assert is_sm100, "the V4.1 KV cache layouts need an SM100 / SM103 GPU"
     if not supported:
         logger.warning(
@@ -254,8 +261,9 @@ class DeepSeekV4SingleKVPool(KVCache):
 
         # Paged FlashMLA layout of this pool's pages; see KVLayout.
         self.kv_layout = KVLayout.parse(kv_layout)
-        if self.dtype is torch.int8 and self.kv_layout is not KVLayout.V4:
-            raise ValueError("INT8 main KV requires the V4 packed layout")
+        if self.dtype is torch.int8:
+            if self.kv_layout not in (KVLayout.V4, KVLayout.V41_INT8):
+                raise ValueError("INT8 main KV requires the V4/V41_INT8 packed layout")
         self.scale_pad = 1
         self.quantize_block_size = self.kv_layout.tile_size
         # V4 keeps its 64 RoPE dims in bf16; the V4.1 layouts quantize them too.
@@ -367,6 +375,13 @@ class DeepSeekV4SingleKVPool(KVCache):
             return dsv4_index_buf_accessor.SetK.execute(
                 pool=self, buf=self.kv_buffer[layer_id], loc=loc,
                 k_cache=cache_k.to(torch.bfloat16),
+            )
+        elif self.kv_layout is KVLayout.V41_INT8:
+            return fused_store_cache_int8_v41(
+                input=cache_k,
+                cache=self.kv_buffer[layer_id],
+                indices=loc,
+                page_size=self.page_size,
             )
         return fused_store_cache(
             input=cache_k,
@@ -1004,6 +1019,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.kv_layout in (
             KVLayout.V4,
             KVLayout.V41,
+            KVLayout.V41_INT8,
         ), f"{self.kv_layout} is only valid for a compressed (extra) cache"
         self.compressed_kv_layout_option = compressed_kv_layout
         c4_logical_size = c128_size * 32
@@ -2111,7 +2127,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
             self.set_swa_key_buffer_radix_fused(layer_id, swa_loc, kv)
             return
-
+        elif self.kv_layout is KVLayout.V41_INT8:
+            fused_k_norm_rope_int8_flashmla(
+                kv=kv,
+                kv_weight=kv_weight,
+                eps=eps,
+                freqs_cis=freqs_cis,
+                positions=positions,
+                out_loc=swa_loc,
+                kvcache=self.get_swa_raw_buffer(layer_id),
+                page_size=self.swa_page_size,
+            )
+            return
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,

@@ -22,19 +22,21 @@ class KVLayout(str, enum.Enum):
     V41 = "v41"
     # 512 e2m1 packed two per byte (even index low nibble), 32 e4m3 scales per 16 values.
     V41_FP4 = "v41_fp4"
+    # 512 int8 (rope quantized too), 16 fp32 scales per 32 values.
+    V41_INT8 = "v41_int8"
 
     @property
     def data_bytes(self) -> int:
-        return {KVLayout.V4: 576, KVLayout.V41: 512, KVLayout.V41_FP4: 256}[self]
+        return {KVLayout.V4: 576, KVLayout.V41: 512, KVLayout.V41_FP4: 256, KVLayout.V41_INT8: 512}[self]
 
     @property
     def scale_bytes(self) -> int:
-        return {KVLayout.V4: 8, KVLayout.V41: 16, KVLayout.V41_FP4: 32}[self]
+        return {KVLayout.V4: 8, KVLayout.V41: 16, KVLayout.V41_FP4: 32, KVLayout.V41_INT8: 64}[self]
 
     @property
     def tile_size(self) -> int:
         """Values sharing one scale."""
-        return {KVLayout.V4: 64, KVLayout.V41: 32, KVLayout.V41_FP4: 16}[self]
+        return {KVLayout.V4: 64, KVLayout.V41: 32, KVLayout.V41_FP4: 16, KVLayout.V41_INT8: 32}[self]
 
     @property
     def bytes_per_token(self) -> int:
@@ -43,7 +45,7 @@ class KVLayout(str, enum.Enum):
     @property
     def page_align(self) -> int:
         """Unit the page stride is padded to: the reader's TMA row stride."""
-        return {KVLayout.V4: 576, KVLayout.V41: 512, KVLayout.V41_FP4: 256}[self]
+        return {KVLayout.V4: 576, KVLayout.V41: 512, KVLayout.V41_FP4: 256, KVLayout.V41_INT8: 512}[self]
 
     @property
     def is_fp4(self) -> bool:
@@ -71,9 +73,16 @@ class KVLayout(str, enum.Enum):
 
     @property
     def int8_scale_bytes(self) -> int:
+        """One token's fp32 scale record, alignment pad included.
+
+        V4 slices 448 nope values into 7 tiles but its writer indexes them by
+        warp id (8 warps), so the 8th slot is reserved: 7 fp32 + 4 B = 32.
+        V41 quantizes all 512 values into 16 tiles with 16 writers, so nothing
+        is wasted: 16 fp32 = 64."""
         try:
             return {
                 KVLayout.V4: 32,
+                KVLayout.V41_INT8: 64,
             }[self]
         except KeyError:
             raise ValueError(f"{self.value} has no INT8 form") from None
@@ -141,9 +150,9 @@ def get_kv_cache_format(dtype: torch.dtype) -> DSV4KVCacheFormat:
 def kv_cache_bytes_per_token(layout: Union[str, KVLayout], dtype: torch.dtype) -> int:
     layout = KVLayout.parse(layout)
     if dtype is torch.int8:
-        if layout is not KVLayout.V4:
+        if layout not in (KVLayout.V4, KVLayout.V41_INT8):
             raise ValueError(
-                f"INT8 main KV requires the V4 layout, "
+                f"INT8 main KV requires the V4 or V41_INT8 layout, "
                 f"got {layout.value}"
             )
         return layout.int8_bytes_per_token

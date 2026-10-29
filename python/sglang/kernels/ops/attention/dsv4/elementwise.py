@@ -342,3 +342,62 @@ def fused_k_norm_rope_flashmla(
             kv.dtype, kvcache.dtype, head_dim, rope_dim, page_size, layout
         )
         module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
+
+
+# --- V41_INT8 K kernel (main_norm_rope_int8_v41_maca.cuh) ---
+# JIT-compiled INT8 counterpart of fused_k_norm_rope_flashmla above, with
+# per-32-element FP32 scales for both nope and rope dimensions. Layout per
+# token: [0, 512) INT8 data ([448 nope] [64 rope]); [512, 576) FP32 scales
+# ([14 nope scales] [2 rope scales]).
+# Reference: fused_deepseek_v41_qnorm_rope_kv_rope_int8_insert in mcoplib.
+
+
+@cache_once
+def _jit_main_k_norm_rope_int8_flashmla_module(
+    dtype: torch.dtype,
+    head_dim: int,
+    rope_dim: int,
+    page_size: int,
+):
+    """INT8 K kernel: rmsnorm + RoPE + INT8 quantize (per-32 dim) + paged store."""
+    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_k_norm_rope_int8_flashmla_maca"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope_int8_v41_maca.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedKNormRopeInt8FlashMLAKernel<{args}>::forward"),
+        ],
+    )
+
+
+def fused_k_norm_rope_int8_flashmla(
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+) -> None:
+    """INT8 K norm + RoPE + FlashMLA store.
+
+    Args:
+        kv: [N, 512] bf16 input K tensor
+        kv_weight: [512] bf16 RMSNorm weight
+        eps: float RMSNorm epsilon
+        freqs_cis: [max_pos, 64] complex RoPE frequency
+        positions: [N] int position IDs
+        out_loc: [N] int32 cache slot mapping
+        kvcache: int8 paged cache buffer [num_pages, page_bytes]
+        page_size: int tokens per page
+    """
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    head_dim = kv.shape[-1]
+    rope_dim = freqs_real.shape[-1]
+
+    module = _jit_main_k_norm_rope_int8_flashmla_module(
+        kv.dtype, head_dim, rope_dim, page_size
+    )
+    module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)

@@ -3960,6 +3960,7 @@ class DeepseekV4AttnBackend(
 
             use_triton_decode = (
                 self.token_to_kv_pool.dtype is torch.int8
+                and self.token_to_kv_pool.get_swa_key_layout() is KVLayout.V4
                 and envs.SGLANG_DSV4_TRITON_FLASHMLA_KV.get()
             )
             if use_triton_decode:
@@ -4113,6 +4114,10 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
+        # dequantize_k_cache_paged picks the reader from the layout each pool
+        # reports, so the extra and SWA reads can legitimately differ (a V41
+        # main cache with V41_FP4 compressed caches, an INT8 main cache with
+        # INT8 compressed ones).
         if compressed_slice is not None:
             dequantize_k_cache_paged(
                 extra_k_cache,
