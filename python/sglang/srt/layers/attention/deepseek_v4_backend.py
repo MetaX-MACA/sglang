@@ -18,16 +18,14 @@ from typing import (
 import msgspec
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
 )
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     cast_q_fp8_for_q8kv8_prefill,
-    dequantize_k_cache_paged,
     fp8_dtype,
+    gather_k_cache_paged,
     gather_dequant_requant_fp8_paged,
     q8kv8_padded_num_heads,
 )
@@ -188,244 +186,6 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     curr_size = x.shape[-1]
     target_size = ceil_align(curr_size, multiples_of)
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
-
-
-def _dsv4_topk_length_2d(
-    topk_length: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    if topk_length is None:
-        return None
-    if topk_length.ndim == 1:
-        return topk_length.unsqueeze(1)
-    if topk_length.ndim == 2:
-        return topk_length
-    if topk_length.ndim == 3 and topk_length.shape[-1] == 1:
-        return topk_length.squeeze(-1)
-    raise AssertionError(f"unsupported topk_length shape: {tuple(topk_length.shape)}")
-
-
-@triton.jit
-def _dsv4_build_unified_prefill_indices_kernel(
-    swa_indices_ptr,
-    extra_indices_ptr,
-    swa_lengths_ptr,
-    extra_lengths_ptr,
-    out_ptr,
-    swa_stride_0: tl.constexpr,
-    swa_stride_1: tl.constexpr,
-    swa_stride_2: tl.constexpr,
-    extra_stride_0: tl.constexpr,
-    extra_stride_1: tl.constexpr,
-    extra_stride_2: tl.constexpr,
-    swa_len_stride_0: tl.constexpr,
-    swa_len_stride_1: tl.constexpr,
-    extra_len_stride_0: tl.constexpr,
-    extra_len_stride_1: tl.constexpr,
-    out_stride_0: tl.constexpr,
-    out_stride_1: tl.constexpr,
-    out_stride_2: tl.constexpr,
-    H_KV: tl.constexpr,
-    SWA_TOPK: tl.constexpr,
-    EXTRA_TOPK: tl.constexpr,
-    OUT_TOPK: tl.constexpr,
-    SWA_LENGTH_H: tl.constexpr,
-    EXTRA_LENGTH_H: tl.constexpr,
-    EXTRA_OFFSET: tl.constexpr,
-    HAS_EXTRA: tl.constexpr,
-    HAS_SWA_LENGTH: tl.constexpr,
-    HAS_EXTRA_LENGTH: tl.constexpr,
-    BLOCK_TOPK: tl.constexpr,
-):
-    row_id = tl.program_id(0)
-    q_id = row_id // H_KV
-    h_id = row_id - q_id * H_KV
-    block_id = tl.program_id(1)
-    offsets = block_id * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
-
-    values = tl.full((BLOCK_TOPK,), -1, dtype=tl.int32)
-
-    swa_mask = offsets < SWA_TOPK
-    swa_raw = tl.load(
-        swa_indices_ptr
-        + q_id * swa_stride_0
-        + h_id * swa_stride_1
-        + offsets * swa_stride_2,
-        mask=swa_mask,
-        other=-1,
-    )
-    swa_length_valid = swa_mask
-    if HAS_SWA_LENGTH:
-        swa_len_h_id = tl.minimum(h_id, SWA_LENGTH_H - 1)
-        swa_len = tl.load(
-            swa_lengths_ptr + q_id * swa_len_stride_0 + swa_len_h_id * swa_len_stride_1
-        )
-        swa_length_valid = swa_mask & (offsets < swa_len)
-    values = tl.where(swa_length_valid, swa_raw, values)
-
-    if HAS_EXTRA:
-        extra_offsets = offsets - SWA_TOPK
-        extra_mask = (offsets >= SWA_TOPK) & (extra_offsets < EXTRA_TOPK)
-        extra_raw = tl.load(
-            extra_indices_ptr
-            + q_id * extra_stride_0
-            + h_id * extra_stride_1
-            + extra_offsets * extra_stride_2,
-            mask=extra_mask,
-            other=-1,
-        )
-        extra_length_valid = extra_mask
-        if HAS_EXTRA_LENGTH:
-            extra_len_h_id = tl.minimum(h_id, EXTRA_LENGTH_H - 1)
-            extra_len = tl.load(
-                extra_lengths_ptr
-                + q_id * extra_len_stride_0
-                + extra_len_h_id * extra_len_stride_1
-            )
-            extra_length_valid = extra_mask & (extra_offsets < extra_len)
-        extra_shifted = tl.where(extra_raw >= 0, extra_raw + EXTRA_OFFSET, extra_raw)
-        values = tl.where(extra_length_valid, extra_shifted, values)
-
-    out_mask = offsets < OUT_TOPK
-    tl.store(
-        out_ptr + q_id * out_stride_0 + h_id * out_stride_1 + offsets * out_stride_2,
-        values,
-        mask=out_mask,
-    )
-
-
-def _dsv4_build_unified_prefill_indices_triton(
-    *,
-    swa_page_indices: torch.Tensor,
-    extra_indices: Optional[torch.Tensor] = None,
-    swa_topk_lengths: Optional[torch.Tensor] = None,
-    extra_topk_lengths: Optional[torch.Tensor] = None,
-    extra_offset: int,
-) -> torch.Tensor:
-    assert swa_page_indices.ndim == 3
-    num_q, h_kv, swa_topk = swa_page_indices.shape
-    has_extra = extra_indices is not None
-    extra_topk = 0
-    if has_extra:
-        assert extra_indices is not None
-        assert extra_indices.ndim == 3
-        assert extra_indices.shape[:2] == (num_q, h_kv)
-        extra_topk = extra_indices.shape[-1]
-
-    out_topk = ceil_align(swa_topk + extra_topk, 128)
-    out = torch.empty(
-        (num_q, h_kv, out_topk),
-        dtype=swa_page_indices.dtype,
-        device=swa_page_indices.device,
-    )
-
-    swa_lengths_2d = _dsv4_topk_length_2d(swa_topk_lengths)
-    extra_lengths_2d = _dsv4_topk_length_2d(extra_topk_lengths)
-    empty_lengths = torch.empty(
-        (1, 1), dtype=torch.int32, device=swa_page_indices.device
-    )
-    extra_indices_arg = extra_indices if extra_indices is not None else swa_page_indices
-    swa_lengths_arg = swa_lengths_2d if swa_lengths_2d is not None else empty_lengths
-    extra_lengths_arg = (
-        extra_lengths_2d if extra_lengths_2d is not None else empty_lengths
-    )
-
-    block_topk = 128
-    grid = (num_q * h_kv, triton.cdiv(out_topk, block_topk))
-    _dsv4_build_unified_prefill_indices_kernel[grid](
-        swa_page_indices,
-        extra_indices_arg,
-        swa_lengths_arg,
-        extra_lengths_arg,
-        out,
-        swa_page_indices.stride(0),
-        swa_page_indices.stride(1),
-        swa_page_indices.stride(2),
-        extra_indices_arg.stride(0),
-        extra_indices_arg.stride(1),
-        extra_indices_arg.stride(2),
-        swa_lengths_arg.stride(0),
-        swa_lengths_arg.stride(1),
-        extra_lengths_arg.stride(0),
-        extra_lengths_arg.stride(1),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        H_KV=h_kv,
-        SWA_TOPK=swa_topk,
-        EXTRA_TOPK=extra_topk,
-        OUT_TOPK=out_topk,
-        SWA_LENGTH_H=swa_lengths_arg.shape[1],
-        EXTRA_LENGTH_H=extra_lengths_arg.shape[1],
-        EXTRA_OFFSET=extra_offset,
-        HAS_EXTRA=has_extra,
-        HAS_SWA_LENGTH=swa_lengths_2d is not None,
-        HAS_EXTRA_LENGTH=extra_lengths_2d is not None,
-        BLOCK_TOPK=block_topk,
-    )
-    return out
-
-
-def _dsv4_build_unified_prefill_inputs_from_real_decode(
-    q: torch.Tensor,
-    swa_k_cache: torch.Tensor,
-    extra_k_cache: Optional[torch.Tensor],
-    swa_page_indices: torch.Tensor,
-    extra_indices: Optional[torch.Tensor],
-    swa_topk_lengths: Optional[torch.Tensor],
-    extra_topk_lengths: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert q.ndim == 4 and q.shape[1] == 1
-    assert q.shape[-1] == 512
-    assert swa_k_cache.dtype == torch.bfloat16
-    assert swa_k_cache.shape[-1] == q.shape[-1]
-
-    q_prefill = q.squeeze(1).contiguous()
-    swa_num_tokens = swa_k_cache.shape[0] * swa_k_cache.shape[1]
-    kv_parts = [swa_k_cache.reshape(-1, 1, q.shape[-1])]
-    if extra_k_cache is not None:
-        assert extra_indices is not None
-        assert extra_k_cache.dtype == torch.bfloat16
-        assert extra_k_cache.shape[-1] == q.shape[-1]
-        kv_parts.append(extra_k_cache.reshape(-1, 1, q.shape[-1]))
-    kv_unified = torch.cat(kv_parts, dim=0).contiguous()
-
-    indices_unified = _dsv4_build_unified_prefill_indices_triton(
-        swa_page_indices=swa_page_indices,
-        extra_indices=extra_indices,
-        swa_topk_lengths=swa_topk_lengths,
-        extra_topk_lengths=extra_topk_lengths,
-        extra_offset=swa_num_tokens,
-    )
-    return q_prefill, kv_unified, indices_unified
-
-
-def _dsv4_run_bf16_sparse_prefill_attention(
-    *,
-    q_prefill: torch.Tensor,
-    kv_unified: torch.Tensor,
-    indices_unified: torch.Tensor,
-    sm_scale: float,
-    d_v: int,
-    attn_sink: Optional[torch.Tensor],
-) -> torch.Tensor:
-    if _is_xpu:
-        from sgl_kernel import flash_mla_sparse_fwd
-    elif _is_maca:
-        from flash_mla import flash_mla_sparse_fwd
-    else:
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
-
-    assert q_prefill.ndim == 3 and kv_unified.ndim == 3
-    assert q_prefill.shape[-1] == kv_unified.shape[-1]
-    return flash_mla_sparse_fwd(
-        q_prefill,
-        kv_unified,
-        indices_unified,
-        sm_scale=sm_scale,
-        d_v=d_v,
-        attn_sink=attn_sink,
-        topk_length=None,
-    )[0]
 
 
 def _dsv4_run_bf16_sparse_prefill_attention_v2(
@@ -3896,25 +3656,6 @@ class DeepseekV4AttnBackend(
                             extra_indices=extra_indices,
                             extra_topk_length=extra_topk_lengths,
                         )
-                    q_prefill, kv_unified, indices_unified = (
-                        _dsv4_build_unified_prefill_inputs_from_real_decode(
-                            q=q,
-                            swa_k_cache=swa_k_cache,
-                            extra_k_cache=extra_k_cache,
-                            swa_page_indices=swa_page_indices,
-                            extra_indices=extra_indices,
-                            swa_topk_lengths=swa_topk_lengths,
-                            extra_topk_lengths=extra_topk_lengths,
-                        )
-                    )
-                    return _dsv4_run_bf16_sparse_prefill_attention(
-                        q_prefill=q_prefill,
-                        kv_unified=kv_unified,
-                        indices_unified=indices_unified,
-                        sm_scale=self.softmax_scale,
-                        d_v=self.head_dim_v,
-                        attn_sink=attn_sink,
-                    )
                 if not _is_sm120:
                     return self._forward_prefill_sparse(
                         q=q,
@@ -4065,7 +3806,7 @@ class DeepseekV4AttnBackend(
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
     ) -> torch.Tensor:
-        """Gathers each request's SWA window and c4/c128 cache into a flat bf16
+        """Gathers each request's SWA window and compressed cache into a flat bf16
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
         if _is_xpu:
             from sgl_kernel import flash_mla_sparse_fwd
@@ -4084,8 +3825,8 @@ class DeepseekV4AttnBackend(
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
-        # Resolve the workspace + indices for this ratio, then dequant
-        # SWA + compressed regions directly into the workspace (no torch.cat).
+        # Reuse the live-row gather plan and workspace for both BF16 and
+        # quantized caches, avoiding a copy of the entire allocated pools.
         compressed_slice = None
         extra_k_cache = None
         extra_page_size = None
@@ -4119,14 +3860,14 @@ class DeepseekV4AttnBackend(
         # main cache with V41_FP4 compressed caches, an INT8 main cache with
         # INT8 compressed ones).
         if compressed_slice is not None:
-            dequantize_k_cache_paged(
+            gather_k_cache_paged(
                 extra_k_cache,
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
                 layout=token_to_kv_pool.get_extra_key_layout(layer_id),
             )
-        dequantize_k_cache_paged(
+        gather_k_cache_paged(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,

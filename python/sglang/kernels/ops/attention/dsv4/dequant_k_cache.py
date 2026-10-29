@@ -42,6 +42,71 @@ V41_NOPE_ROPE_BYTES = KVLayout.V41_INT8.data_bytes  # 512
 V41_SCALE_BYTES_PER_TOKEN = KVLayout.V41_INT8.int8_scale_bytes  # 64
 
 
+@triton.jit
+def _gather_bf16_k_cache_paged_kernel(
+    cache,
+    token_ids,
+    out,
+    CACHE_PAGE_STRIDE: tl.constexpr,
+    OUT_STRIDE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    token = tl.load(token_ids + row).to(tl.int64)
+    cols = tl.arange(0, BLOCK_DIM)
+    values = tl.load(
+        cache
+        + (token // PAGE_SIZE) * CACHE_PAGE_STRIDE
+        + (token % PAGE_SIZE) * HEAD_DIM
+        + cols,
+        mask=(token >= 0) & (cols < HEAD_DIM),
+        other=0,
+    )
+    tl.store(out + row * OUT_STRIDE + cols, values, mask=cols < HEAD_DIM)
+
+
+def gather_k_cache_paged(
+    k_cache: torch.Tensor,
+    token_ids: torch.Tensor,
+    page_size: int,
+    out: torch.Tensor,
+    layout: Union[KVLayout, str] = KVLayout.V4,
+) -> torch.Tensor:
+    """Gather live rows into an existing BF16 sparse-prefill workspace.
+
+    Quantized inputs retain their layout-specific dequantization. BF16 inputs
+    use physical page strides directly, without flattening the entire pool.
+    Negative token IDs produce zero BF16 rows.
+    """
+    if k_cache.dtype != torch.bfloat16:
+        return dequantize_k_cache_paged(
+            k_cache, token_ids, page_size=page_size, out=out, layout=layout
+        )
+
+    head_dim = DIM_NOPE + DIM_ROPE
+    assert k_cache.ndim == 2 and k_cache.stride(1) == 1
+    assert page_size > 0 and k_cache.shape[1] >= page_size * head_dim
+    assert token_ids.ndim == 1 and token_ids.is_contiguous()
+    assert token_ids.dtype in (torch.int32, torch.int64)
+    assert out.shape == (token_ids.numel(), 1, head_dim)
+    assert out.dtype == torch.bfloat16 and out.stride(-1) == 1
+    assert k_cache.device == token_ids.device == out.device
+    if token_ids.numel():
+        _gather_bf16_k_cache_paged_kernel[(token_ids.numel(),)](
+            k_cache,
+            token_ids,
+            out,
+            CACHE_PAGE_STRIDE=k_cache.stride(0),
+            OUT_STRIDE=out.stride(0),
+            PAGE_SIZE=page_size,
+            HEAD_DIM=head_dim,
+            BLOCK_DIM=triton.next_power_of_2(head_dim),
+        )
+    return out
+
+
 def dequantize_k_cache_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
