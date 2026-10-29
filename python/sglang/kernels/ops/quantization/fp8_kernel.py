@@ -794,16 +794,10 @@ def sglang_per_token_group_quant_fp8(
         and not scale_tma_aligned
     )
     # The AOT cast supports both row-major and transposed scales.
-    trans_scale_layout = (
+    use_transposed_layout = (
         shape_supported_aot
         and _mcoplib_per_token_cast_to_fp8 is not None
-        and (
-            column_major_scales
-            or envs.MX_TRANS_FP8_SCALE_LAYOUT.get()
-        )
-    )
-    use_transposed_layout = (
-        column_major_scales  or trans_scale_layout
+        and envs.MX_TRANS_FP8_SCALE_LAYOUT.get()
     )
 
     x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
@@ -829,7 +823,7 @@ def sglang_per_token_group_quant_fp8(
                 x_q, 
                 x_s, 
                 x,
-                *([True] if trans_scale_layout else []),
+                *([True] if use_transposed_layout else []),
             )
         elif can_use_group_quant:
             _mcoplib_per_token_group_quant_fp8(
