@@ -10,6 +10,10 @@ from sglang.srt.arg_groups.speculative_hook import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dspark_components.dspark_config import (
+    resolve_dspark_num_logical_experts,
+    resolve_dspark_num_redundant_experts,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -107,19 +111,61 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
         server_args.moe_a2a_backend = moe_a2a_backend
         return server_args
 
-    def test_only_megamoe_is_admitted(self):
-        """Both sides of the allowlist: megamoe passes, others raise by name."""
+    def test_supported_a2a_backends_are_admitted(self):
+        """DeepEP and MegaMoE pass; unsupported A2A backends still fail."""
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
-            _handle_dspark(self._dp_server_args(moe_a2a_backend="megamoe"))
-            for backend in ("deepep", "pplx"):
-                with self.assertRaisesRegex(ValueError, backend):
+            for backend in ("deepep", "megamoe"):
+                with self.subTest(backend=backend):
                     _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+            with self.assertRaisesRegex(ValueError, "pplx"):
+                _handle_dspark(self._dp_server_args(moe_a2a_backend="pplx"))
 
     def test_a2a_backend_with_compact_verify_mode_raises(self):
-        server_args = self._dp_server_args(moe_a2a_backend="megamoe")
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
-            with self.assertRaisesRegex(ValueError, "static"):
-                _handle_dspark(server_args)
+            for backend in ("deepep", "megamoe"):
+                with self.subTest(backend=backend):
+                    server_args = self._dp_server_args(moe_a2a_backend=backend)
+                    with self.assertRaisesRegex(ValueError, "static"):
+                        _handle_dspark(server_args)
+
+
+class TestDsparkPhysicalExpertTarget(CustomTestCase):
+    def test_bundled_config_uses_dspark_expert_count(self):
+        config = SimpleNamespace(
+            n_routed_experts=384,
+            dspark_n_routed_experts=128,
+        )
+        self.assertEqual(resolve_dspark_num_logical_experts(config), 128)
+
+    def test_standalone_config_uses_regular_expert_count(self):
+        config = SimpleNamespace(n_routed_experts=128)
+        self.assertEqual(resolve_dspark_num_logical_experts(config), 128)
+
+    def test_128_logical_experts_expand_to_384(self):
+        self.assertEqual(
+            resolve_dspark_num_redundant_experts(
+                num_logical_experts=128,
+                num_physical_experts=384,
+                ep_size=8,
+            ),
+            256,
+        )
+
+    def test_target_cannot_shrink_logical_experts(self):
+        with self.assertRaisesRegex(ValueError, "logical expert count"):
+            resolve_dspark_num_redundant_experts(
+                num_logical_experts=128,
+                num_physical_experts=64,
+                ep_size=8,
+            )
+
+    def test_target_must_be_divisible_by_ep_size(self):
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            resolve_dspark_num_redundant_experts(
+                num_logical_experts=128,
+                num_physical_experts=386,
+                ep_size=8,
+            )
 
 
 class TestDsparkFoldedSamplingDefault(CustomTestCase):

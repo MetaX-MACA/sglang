@@ -1,5 +1,5 @@
 import logging
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
@@ -10,6 +10,14 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+    set_global_expert_distribution_recorder,
+)
+from sglang.srt.eplb.expert_location import (
+    get_global_expert_location_metadata,
+    set_global_expert_location_metadata,
+)
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -30,6 +38,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_parallel,
+    get_resources,
     get_schedule,
     get_spec,
     mamba_track_grid,
@@ -46,6 +55,8 @@ from sglang.srt.speculative.draft_worker_common import (
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
     draft_is_deepseek_v4,
+    get_dspark_draft_num_logical_experts,
+    resolve_dspark_num_redundant_experts,
     resolve_runtime_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -162,6 +173,31 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         self._draft_is_moe = draft_is_deepseek_v4()
+        self._draft_expert_location_metadata = None
+        self._draft_expert_distribution_recorder = None
+        self._draft_num_redundant_experts = 0
+        requested_physical_experts = envs.SGLANG_DSPARK_NUM_PHYSICAL_EXPERTS.get()
+        self._draft_expert_replication_enabled = requested_physical_experts > 0
+        if requested_physical_experts > 0:
+            if not self._draft_is_moe:
+                raise ValueError(
+                    "SGLANG_DSPARK_NUM_PHYSICAL_EXPERTS is only supported for "
+                    "a DeepSeek-V4 MoE DSpark draft model."
+                )
+            num_logical_experts = get_dspark_draft_num_logical_experts()
+            self._draft_num_redundant_experts = resolve_dspark_num_redundant_experts(
+                num_logical_experts=num_logical_experts,
+                num_physical_experts=requested_physical_experts,
+                ep_size=ps.moe_ep_size,
+            )
+            if ps.tp_rank == 0:
+                logger.info(
+                    "DSpark draft expert replication enabled: logical=%s, "
+                    "redundant=%s, physical=%s.",
+                    num_logical_experts,
+                    self._draft_num_redundant_experts,
+                    requested_physical_experts,
+                )
         self._draft_dp_context_enabled = (
             get_parallel().enable_dp_attention and not self._draft_is_moe
         )
@@ -422,10 +458,54 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _draft_context(self):
         with ExitStack() as stack:
             if self._draft_dp_context_enabled:
-                stack.enter_context(draft_tp_context(get_parallel().attn_tp_group, owns_attention=True))
+                stack.enter_context(
+                    draft_tp_context(
+                        get_parallel().attn_tp_group,
+                        owns_attention=True,
+                    )
+                )
             stack.enter_context(speculative_moe_backend_context())
             stack.enter_context(speculative_moe_a2a_backend_context())
-            yield
+
+            if not self._draft_expert_replication_enabled:
+                yield
+                return
+
+            moe_config = get_exec().moe
+            resources = get_resources()
+            target_metadata = get_global_expert_location_metadata()
+            target_recorder = resources.expert_distribution_recorder
+
+            # Static dispatch gives each EP rank a stable physical replica and is
+            # the normal EPLB mode for an all-to-all backend such as DeepEP. The
+            # resolved config is read-only, so use its transactional scoped API.
+            draft_dispatch_algorithm = moe_config.ep_dispatch_algorithm or "static"
+            with moe_config.override(
+                    ep_num_redundant_experts=self._draft_num_redundant_experts,
+                    ep_dispatch_algorithm=draft_dispatch_algorithm,
+            ):
+                try:
+                    set_global_expert_location_metadata(
+                        self._draft_expert_location_metadata,
+                        allow_overwrite=True,
+                    )
+                    if self._draft_expert_distribution_recorder is not None:
+                        set_global_expert_distribution_recorder(
+                            self._draft_expert_distribution_recorder
+                        )
+                    yield
+                finally:
+                    self._draft_expert_location_metadata = (
+                        get_global_expert_location_metadata()
+                    )
+                    self._draft_expert_distribution_recorder = (
+                        get_global_expert_distribution_recorder()
+                    )
+                    set_global_expert_location_metadata(
+                        target_metadata,
+                        allow_overwrite=True,
+                    )
+                    set_global_expert_distribution_recorder(target_recorder)
 
     def alloc_memory_pool(
         self,

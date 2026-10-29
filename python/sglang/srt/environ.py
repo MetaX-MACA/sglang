@@ -1276,6 +1276,14 @@ class Envs:
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # Preallocate the single process-wide DeepEP buffer for the largest MoE
+    # model used by the process (for example, a DSpark draft and its target).
+    # A non-positive value keeps the first model's num_experts.
+    SGLANG_DEEPEP_MAX_NUM_EXPERTS = EnvInt(0)
+    # Expand only the DSpark draft MoE with EPLB physical expert replicas.
+    # The logical router/checkpoint expert count is unchanged. A non-positive
+    # value disables the DSpark-specific override.
+    SGLANG_DSPARK_NUM_PHYSICAL_EXPERTS = EnvInt(0)
     # Per-rank buffer capacity, not a model token limit.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
