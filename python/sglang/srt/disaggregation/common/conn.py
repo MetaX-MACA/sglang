@@ -993,13 +993,23 @@ class CommonKVManager(BaseKVManager):
                 and self.attn_cp_size == 1
                 and info.attn_tp_size * info.attn_cp_size == self.attn_tp_size
             )
-            if (
-                info.attn_tp_size != self.attn_tp_size
-                and not decode_tp_size_aligns_prefill_world_size
+            # #40177 reuses the existing MLA mapping for unequal attention TP.
+            non_cp_mla_layout = info.attn_cp_size == self.attn_cp_size == 1 and (
+                self.is_mla_backend or self.is_hybrid_mla_backend
+            )
+            # CP->DP has equal attention TP; each decode replica receives every
+            # prefill CP shard through _resolve_rank_mapping below.
+            same_attention_tp = (
+                self.attn_cp_size == 1 and info.attn_tp_size == self.attn_tp_size
+            )
+            if not (
+                decode_tp_size_aligns_prefill_world_size or non_cp_mla_layout or same_attention_tp
             ):
                 raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
-                    "servers (including prefill CP ranks for MLA)"
+                    "DeepSeek-V4.1 DSpark PD requires matching attention TP, "
+                    "a compatible Prefill-CP to decode-TP mapping, or CP=1 "
+                    "on both servers with an MLA KV layout for unequal TP. "
+                    "Decode CP is not supported."
                 )
 
         if self.dcp_size > 1:
