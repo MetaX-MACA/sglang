@@ -505,6 +505,11 @@ def hc_split_sinkhorn(
     return pre, post, comb
 
 
+# Keep the two branches on whole warps, including MACA's 64-thread warps.
+MHC_PRE_THREAD_NUM = 128 if is_maca() else 96
+MHC_PRE_THREAD_BOUND = 64 if is_maca() else 32
+
+
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -547,7 +552,7 @@ def mhc_pre_big_fuse_tilelang(
     layer_input: T.Tensor[[num_tokens, hidden_size], T.bfloat16]
 
     ENABLE_PDL = is_arch_support_pdl()
-    with T.Kernel(num_tokens, threads=96) as i:
+    with T.Kernel(num_tokens, threads=MHC_PRE_THREAD_NUM) as i:
         rms = T.alloc_fragment(1, T.float32)
         mixes = T.alloc_fragment(hc_mult3, T.float32)
         T.clear(mixes)
@@ -567,7 +572,7 @@ def mhc_pre_big_fuse_tilelang(
         mixes_shared = T.alloc_shared(hc_mult3, T.float32)
         T.copy(mixes, mixes_shared)
 
-        if T.get_thread_binding() < 32:
+        if T.get_thread_binding() < MHC_PRE_THREAD_BOUND:
             cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
             for j in T.Parallel(hc_mult):
                 post_mix[i, j] = (
@@ -988,7 +993,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
     norm_weight: T.Tensor[[hidden_size], T.bfloat16]
 
     ENABLE_PDL = is_arch_support_pdl()
-    with T.Kernel(num_tokens, threads=96) as i:
+    with T.Kernel(num_tokens, threads=MHC_PRE_THREAD_NUM) as i:
         rms = T.alloc_fragment(1, T.float32)
         mixes = T.alloc_fragment(hc_mult3, T.float32)
         T.clear(mixes)
@@ -1008,7 +1013,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
         mixes_shared = T.alloc_shared(hc_mult3, T.float32)
         T.copy(mixes, mixes_shared)
 
-        if T.get_thread_binding() < 32:
+        if T.get_thread_binding() < MHC_PRE_THREAD_BOUND:
             cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
             for j in T.Parallel(hc_mult):
                 post_mix[i, j] = (
