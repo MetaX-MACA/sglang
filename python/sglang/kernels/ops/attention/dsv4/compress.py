@@ -54,12 +54,14 @@ def _jit_compress_norm_rope_module(
     bf16_store: bool,
     layout: KVLayout,
     fp8_2buff: bool = False,
+    hadamard: bool = True,
 ) -> Module:
     if is_maca() and layout is KVLayout.V4 and not fp8_2buff:
         args = make_cpp_args(
             dtype, cache_dtype, head_dim, rope_dim, page_size,
             is_arch_support_pdl(),
             INDEXER_K_CACHE_PRESHUFFLE_TILE if aiter_can_use_preshuffle_paged_mqa() else 0,
+            hadamard,
         )
         wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
         if head_dim == 128:
@@ -477,6 +479,7 @@ def compress_norm_rope_store(
     layout: Union[KVLayout, str] = KVLayout.V4,
     fp8_2buff: bool = False,
     kvcache_rope: Optional[torch.Tensor] = None,
+    hadamard: bool = True,
 ) -> None:
     layout = KVLayout.parse(layout)
     if layout is not KVLayout.V4:
@@ -540,6 +543,7 @@ def compress_norm_rope_store(
             bf16_store,
             layout,
             fp8_2buff,
+            hadamard,
         )
         if use_fp4:
             fn, extra = module.forward_fp4, ()

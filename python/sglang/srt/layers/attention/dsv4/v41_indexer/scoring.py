@@ -215,8 +215,8 @@ def get_deep_gemm_decode_data(
         page_size=inputs.paged_metadata.compressed_page_size,
     )
     if kind.is_int8 and is_maca():
-        # The MACA fused q kernel applies hadamard and folds the scale into the
-        # head weights, pairing with the fused K store.
+        # The MACA fused q kernel folds the scale into the head weights and
+        # applies NO Hadamard rotation.
         from sglang.kernels.ops.attention.dsv4 import (
             fused_q_indexer_rope_hadamard_quant,
         )
@@ -230,6 +230,7 @@ def get_deep_gemm_decode_data(
             inputs.freqs_cis,
             pos,
             torch.int8,
+            hadamard=False,
         )
         weights = weights.squeeze(-1).float()
         return DeepGEMMDecodeData(
@@ -288,8 +289,9 @@ def get_deep_gemm_prefill_data(
 
     kind = dsv4_index_cache_kind()
     if kind.is_int8 and is_maca():
-        # The MACA fused q kernel applies hadamard and folds the scale into the
-        # head weights, pairing with the fused K store.
+        # The MACA fused q kernel folds the scale into the head weights and
+        # applies NO Hadamard rotation, pairing with the no-rotation fused K
+        # store (V4.1's reference indexer rotates neither Q nor K).
         from sglang.kernels.ops.attention.dsv4 import (
             fused_q_indexer_rope_hadamard_quant,
         )
@@ -303,6 +305,7 @@ def get_deep_gemm_prefill_data(
             inputs.freqs_cis,
             pos,
             torch.int8,
+            hadamard=False,
         )
         weights = weights.squeeze(-1).float()
         q_fp4 = q_sf = None
@@ -532,6 +535,7 @@ def decode_scores(
             inputs.freqs_cis,
             pos,
             torch.int8,
+            hadamard=False,
         )
         q = q.unsqueeze(1)
         weights = weights.squeeze(-1).float()

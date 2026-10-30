@@ -98,10 +98,12 @@ def _jit_main_k_norm_rope_q_flashmla_module(
 
 @cache_once
 def _jit_main_q_indexer_rope_hadamard_quant_module(
-    dtype: torch.dtype, output_dtype: torch.dtype = torch.float8_e4m3fn
+    dtype: torch.dtype,
+    output_dtype: torch.dtype = torch.float8_e4m3fn,
+    hadamard: bool = True,
 ):
-    """C4 indexer Q kernel: RoPE + 128-pt Hadamard + quantization."""
-    args = make_cpp_args(dtype, is_arch_support_pdl(), output_dtype)
+    """Indexer Q kernel: RoPE + quantization, optional 128-pt Hadamard."""
+    args = make_cpp_args(dtype, is_arch_support_pdl(), output_dtype, False, hadamard)
     return load_jit(
         make_name("main_q_indexer_rope_hadamard_quant"),
         *args,
@@ -195,7 +197,13 @@ def fused_q_indexer_rope_hadamard_quant(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
     output_dtype: torch.dtype = torch.float8_e4m3fn,
+    hadamard: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Indexer Q: RoPE + (fp8/int8) quant, with the 128-pt Hadamard by default."""
+    if not hadamard and (_is_hip or _is_xpu):
+        raise NotImplementedError(
+            "the no-rotation indexer Q kernel is wired for CUDA/MACA only"
+        )
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     q_output = torch.empty(q_input.shape, dtype=output_dtype, device=q_input.device)
     weights_out = torch.empty(
@@ -233,7 +241,7 @@ def fused_q_indexer_rope_hadamard_quant(
         )
     else:
         module = _jit_main_q_indexer_rope_hadamard_quant_module(
-            q_input.dtype, output_dtype
+            q_input.dtype, output_dtype, hadamard
         )
         module.forward(
             q_input,

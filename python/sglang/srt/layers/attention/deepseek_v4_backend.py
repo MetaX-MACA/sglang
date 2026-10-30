@@ -3224,8 +3224,9 @@ class DeepseekV4AttnBackend(
         return partner_kv, partner_score
     
     def _set_index_k_int8(
-        self, layer, latent, out_loc, plan) -> None:
-        """Fused index-K write: k_norm + RoPE + quantize + store."""
+        self, layer, latent, out_loc, plan, hadamard: bool = True
+    ) -> None:
+        """Fused index-K write: k_norm + RoPE + [optional Hadamard] + quantize + store."""
         from sglang.kernels.ops.attention.dsv4.compress import (
             compress_norm_rope_store,
             CompressorPrefillPlan,
@@ -3245,6 +3246,7 @@ class DeepseekV4AttnBackend(
             out_loc=out_loc,
             kvcache=pool.get_index_k_with_scale_buffer(layer.layer_id),
             page_size=pool.get_index_k_page_size(layer.compress_ratio),
+            hadamard=hadamard,
         )
 
     def _low_ratio_write_group(
@@ -3261,7 +3263,8 @@ class DeepseekV4AttnBackend(
         freqs = layer.freqs_cis[group_pos]
         # Index keys come from the pre-RoPE latent, so publish them first: the fp4
         # kind stores the packed fp4 rows (per-32 ue8m0, no hadamard), the int8
-        # kind the MACA norm+rope+hadamard rows, matching the reference indexer.
+        # kind the MACA norm+rope rows with no hadamard (matching the no-rotation
+        # fused Q kernel and V4.1's reference indexer, which rotates neither side).
         if layer.indexer is not None and layer.indexer.owns_k:
             kind = dsv4_index_cache_kind()
             if (
@@ -3294,7 +3297,11 @@ class DeepseekV4AttnBackend(
                 core = self.forward_metadata.core_metadata
                 plan = core.c1_plan if layer.compress_ratio == 1 else core.c2_plan
                 self._set_index_k_int8(
-                    layer, latent, slots.to(torch.int64), plan
+                    layer,
+                    latent,
+                    slots.to(torch.int64),
+                    plan,
+                    hadamard=False,
                 )
             else:
                 raise NotImplementedError(
