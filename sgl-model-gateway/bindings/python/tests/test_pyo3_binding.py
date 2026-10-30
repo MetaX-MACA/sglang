@@ -47,6 +47,7 @@ class TestEnumConversions:
             "manual": PolicyType.Manual,
             "consistent_hashing": PolicyType.ConsistentHashing,
             "prefix_hash": PolicyType.PrefixHash,
+            "shortest_queue": PolicyType.ShortestQueue,
         }
         for s, expected in cases.items():
             assert policy_from_str(s) == expected
@@ -356,6 +357,7 @@ class TestRouterFromArgsKitchenSink:
             "manual",
             "consistent_hashing",
             "prefix_hash",
+            "shortest_queue",
         ):
             args = RouterArgs(
                 worker_urls=["http://w1:8000"],
@@ -659,6 +661,7 @@ class TestPolicyChoiceListConsistency:
             "manual",
             "consistent_hashing",
             "prefix_hash",
+            "shortest_queue",
         ],
     )
     def test_main_policy_accepts(self, policy):
@@ -678,6 +681,7 @@ class TestPolicyChoiceListConsistency:
             "manual",
             "consistent_hashing",
             "prefix_hash",
+            "shortest_queue",
         ],
     )
     def test_prefill_policy_accepts(self, policy):
@@ -707,6 +711,7 @@ class TestPolicyChoiceListConsistency:
             "manual",
             "consistent_hashing",
             "prefix_hash",
+            "shortest_queue",
         ],
     )
     def test_decode_policy_accepts(self, policy):

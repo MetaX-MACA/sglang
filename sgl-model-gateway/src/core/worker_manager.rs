@@ -44,7 +44,7 @@ async fn fan_out(
         .map(|worker| {
             let client = client.clone();
             let url = worker.url().to_string();
-            let full_url = format!("{}/{}", url, endpoint);
+            let full_url = format!("{}/{}", worker.base_url(), endpoint);
             let api_key = worker.api_key().clone();
             let method = method.clone();
 
@@ -168,6 +168,7 @@ impl WorkerManager {
             .iter()
             .map(|worker| {
                 let url = worker.url().to_string();
+                let base_url = worker.base_url().to_string();
                 let api_key = worker.api_key().clone();
                 let worker_type = match worker.worker_type() {
                     WorkerType::Regular => None,
@@ -179,7 +180,7 @@ impl WorkerManager {
 
                 async move {
                     let load = if is_http {
-                        Self::parse_load_response(&client, &url, api_key.as_deref()).await
+                        Self::parse_load_response(&client, &base_url, api_key.as_deref()).await
                     } else {
                         -1
                     };

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
     LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy, ShortestQueuePolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -70,6 +70,7 @@ impl PolicyFactory {
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }
+            PolicyConfig::ShortestQueue => Arc::new(ShortestQueuePolicy::new()),
         }
     }
 
@@ -86,6 +87,7 @@ impl PolicyFactory {
                 Some(Arc::new(ConsistentHashingPolicy::new()))
             }
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
+            "shortest_queue" | "shortestqueue" => Some(Arc::new(ShortestQueuePolicy::new())),
             _ => None,
         }
     }

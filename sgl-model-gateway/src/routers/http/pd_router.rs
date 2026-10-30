@@ -408,6 +408,11 @@ impl PDRouter {
                             }
                         };
 
+                        let guards = (
+                            WorkerLoadGuard::new(prefill.clone(), headers),
+                            WorkerLoadGuard::new(decode.clone(), headers),
+                        );
+
                         debug!(
                             "PD retry attempt {} using prefill={} decode={}",
                             attempt,
@@ -437,6 +442,7 @@ impl PDRouter {
                                 context,
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
+                                guards,
                                 start_time,
                             )
                             .await;
@@ -523,8 +529,8 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        decode_guard: Option<WorkerLoadGuard>,
     ) -> Response {
         let status = res.status();
 
@@ -555,6 +561,8 @@ impl PDRouter {
                 }
             };
 
+            drop(decode_guard);
+
             let sse_data = format!(
                 "data: {{'error': {}}}",
                 serde_json::to_string(&error_payload).unwrap_or_default()
@@ -567,8 +575,8 @@ impl PDRouter {
                 None,
                 context.return_logprob,
                 Some(response_headers),
-                prefill,
                 decode,
+                None,
             )
         } else {
             // Handle non-streaming error response
@@ -650,14 +658,10 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        guards: (WorkerLoadGuard, WorkerLoadGuard),
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+        let (prefill_guard, decode_guard) = guards;
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -703,73 +707,54 @@ impl PDRouter {
         }
         .emit();
 
-        let prefill_fut = prefill_request.send();
-        let decode_fut = decode_request.send();
-        tokio::pin!(prefill_fut);
-        tokio::pin!(decode_fut);
-
-        // Poll both until prefill resolves; decode normally resolves later, but
-        // may resolve first if it rejects the request outright.
-        let prefill_result;
-        let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
-        loop {
+        // Finish and release prefill independently of decode response headers.
+        let prefill_future = async {
+            let result = prefill_request.send().await;
+            let prefill_client_error = result.as_ref().is_ok_and(|r| r.status().is_client_error());
+            let result = self
+                .process_prefill_response(result, prefill.url(), context.return_logprob)
+                .await;
+            let prefill_ok = prefill_client_error || result.is_ok();
+            drop(prefill_guard);
+            (prefill_ok, result)
+        };
+        let decode_future = async {
+            let result = decode_request.send().await;
+            let guard = if result.is_ok() {
+                Some(decode_guard)
+            } else {
+                drop(decode_guard);
+                None
+            };
+            (result, guard)
+        };
+        let mut prefill_future = Box::pin(prefill_future);
+        let mut decode_future = Box::pin(decode_future);
+        let mut decode_early = None;
+        let (prefill_ok, prefill_result) = loop {
             tokio::select! {
                 biased;
-                pr = &mut prefill_fut => {
-                    prefill_result = pr;
-                    break;
-                }
-                dr = &mut decode_fut, if decode_early.is_none() => {
-                    decode_early = Some(dr);
+                result = &mut prefill_future => break result,
+                result = &mut decode_future, if decode_early.is_none() => {
+                    decode_early = Some(result);
                 }
             }
-        }
-
-        // Decode can't generate without prefill's KV, so any prefill failure
-        // (non-2xx / transport error) dooms the paired decode request, which would
-        // otherwise block in WaitingForInput until the 300s disaggregation
-        // timeout. Drop the decode future to close its connection; the decode
-        // engine then detects the disconnect and aborts the request in ~4-8s.
-        let prefill_failed = match &prefill_result {
-            Ok(resp) => !resp.status().is_success(),
-            Err(_) => true,
         };
-
-        if prefill_failed {
-            warn!(
-                "Prefill failed, aborting paired decode request decode_url={} prefill_url={}",
-                decode.url(),
-                prefill.url()
-            );
-
-            // Tick prefill by its real status (4xx = client fault). Don't record
-            // decode: it was cancelled due to a prefill fault, not its own, so a
-            // prefill error storm can't trip healthy decode breakers.
-            let prefill_ok = match &prefill_result {
-                Ok(r) => r.status().is_client_error(),
-                Err(_) => false,
-            };
-            prefill.record_outcome(prefill_ok);
-
-            // Status-faithful error shaping (4xx forwarded, transport/5xx -> 502).
-            let mut response = match self
-                .process_prefill_response(prefill_result, prefill.url(), false)
-                .await
-            {
-                Err(error_response) => error_response,
-                Ok(_) => error::bad_gateway(
-                    "prefill_server_error",
-                    "Prefill reported failure but returned a success response".to_string(),
-                ),
-            };
-            response.extensions_mut().insert(BreakerOutcomesRecorded);
-            return response;
-        }
-
-        // Prefill ok: take decode's result, awaiting it if still pending.
-        let decode_result = match decode_early {
-            Some(dr) => dr,
-            None => (&mut decode_fut).await,
+        let prefill_body = match prefill_result {
+            Ok((_, body)) => body,
+            Err(mut response) => {
+                // Prefill cannot supply KV. Cancel pending decode or drop an
+                // already received response without penalising its breaker.
+                drop(decode_future);
+                drop(decode_early);
+                prefill.record_outcome(prefill_ok);
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                return response;
+            }
+        };
+        let (decode_result, decode_guard) = match decode_early {
+            Some(result) => result,
+            None => decode_future.await,
         };
 
         events::RequestReceivedEvent {}.emit();
@@ -790,7 +775,7 @@ impl PDRouter {
 
                     // Per-worker breaker attribution before the synthetic 5xx
                     // response takes over. Prefill ran concurrently in the
-                    // `tokio::join!`: tick it based on its actual response
+                    // dispatch: tick it based on its actual response
                     // status, not on the decode-driven failure. For
                     // non-streaming the response carries no tracked stream
                     // so record decode's outcome here too — but treat 4xx
@@ -803,13 +788,6 @@ impl PDRouter {
                     // decode on drop, so skip to avoid double-counting.
                     // Mark the response so the outer dispatcher skips its
                     // status-derived `record_outcome`.
-                    let prefill_ok = match &prefill_result {
-                        Ok(r) => {
-                            let s = r.status();
-                            s.is_success() || s.is_client_error()
-                        }
-                        Err(_) => false,
-                    };
                     prefill.record_outcome(prefill_ok);
                     if !context.is_stream {
                         let decode_ok = status.is_success() || status.is_client_error();
@@ -817,35 +795,11 @@ impl PDRouter {
                     }
 
                     let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(res, &context, decode, decode_guard)
                         .await;
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
                 }
-
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                };
 
                 if context.is_stream {
                     // Streaming response
@@ -868,8 +822,8 @@ impl PDRouter {
                         prefill_logprobs,
                         context.return_logprob,
                         Some(response_headers),
-                        prefill,
                         decode,
+                        decode_guard,
                     )
                 } else {
                     // Non-streaming response
@@ -879,6 +833,7 @@ impl PDRouter {
                             status,
                             context.return_logprob,
                             prefill_body,
+                            decode_guard,
                         )
                         .await
                     } else {
@@ -886,7 +841,9 @@ impl PDRouter {
                         let response_headers =
                             header_utils::preserve_response_headers(res.headers());
 
-                        match res.bytes().await {
+                        let result = res.bytes().await;
+                        drop(decode_guard);
+                        match result {
                             Ok(decode_body) => {
                                 let mut response = Response::new(Body::from(decode_body));
                                 *response.status_mut() = status;
@@ -915,20 +872,13 @@ impl PDRouter {
                 // we shortcut past the outer non-streaming
                 // `record_outcome` too — so record decode failure
                 // directly. Prefill ran concurrently in the
-                // `tokio::join!`: record its real per-worker outcome
+                // dispatch: record its real per-worker outcome
                 // (success on a 2xx/4xx send, failure on transport
                 // error) so the decode-driven 502 doesn't penalise a
                 // healthy prefill. Mark the response so the outer
                 // dispatcher skips its status-derived `record_outcome`
                 // and we don't double-count.
                 decode.record_outcome(false);
-                let prefill_ok = match &prefill_result {
-                    Ok(res) => {
-                        let s = res.status();
-                        s.is_success() || s.is_client_error()
-                    }
-                    Err(_) => false,
-                };
                 prefill.record_outcome(prefill_ok);
 
                 let mut response = error::bad_gateway(
@@ -1108,11 +1058,9 @@ impl PDRouter {
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        decode_guard: Option<WorkerLoadGuard>,
     ) -> Response {
-        use crate::core::AttachedBody;
-
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Uses select! to race stream.next() against tx.closed() so that
@@ -1137,13 +1085,20 @@ impl PDRouter {
         }
         let decode_for_log = decode.clone();
         tokio::spawn(async move {
+            let _decode_guard = decode_guard;
+            let mut done_tail = Vec::new();
             loop {
                 tokio::select! {
                     biased;
                     chunk_result = tracked.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
-                                let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
+                                // Network chunks need not align with the SSE sentinel.
+                                const DONE: &[u8] = b"data: [DONE]";
+                                done_tail.extend_from_slice(&chunk);
+                                let is_done = memmem::find(&done_tail, DONE).is_some();
+                                let keep_from = done_tail.len().saturating_sub(DONE.len() - 1);
+                                done_tail.drain(..keep_from);
 
                                 let result = if return_logprob && prefill_logprobs.is_some() {
                                     Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
@@ -1198,11 +1153,6 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
-
         let mut response = Response::new(body);
         *response.status_mut() = status;
 
@@ -1210,7 +1160,7 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
-        AttachedBody::wrap_response(response, guards)
+        response
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -1220,8 +1170,10 @@ impl PDRouter {
         status: StatusCode,
         return_logprob: bool,
         prefill_body: Option<bytes::Bytes>,
+        decode_guard: Option<WorkerLoadGuard>,
     ) -> Response {
         let response = res.bytes().await;
+        drop(decode_guard);
         let decode_body = match response {
             Ok(decode_body) => decode_body,
             Err(e) => {
@@ -1333,24 +1285,20 @@ impl PDRouter {
             return Err(error_response);
         }
 
-        // Read prefill body if needed for logprob merging
-        let prefill_body = if return_logprob {
-            match prefill_response.bytes().await {
-                Ok(body) => Some(body),
-                Err(e) => {
-                    warn!("Failed to read prefill response body for logprobs: {}", e);
-                    None
-                }
+        // A truncated response cannot confirm successful KV preparation.
+        // Consume it before releasing prefill load, retaining it for logprobs
+        // only when requested.
+        let body = match prefill_response.bytes().await {
+            Ok(body) => body,
+            Err(e) => {
+                error!("Failed to read prefill response body: {}", e);
+                return Err(error::bad_gateway(
+                    "prefill_server_error",
+                    format!("Failed to read prefill response body: {}", e),
+                ));
             }
-        } else {
-            // For non-logprob requests, just consume the response without storing
-            debug!("Consuming prefill response body (non-logprob request)");
-            match prefill_response.bytes().await {
-                Ok(_) => debug!("Prefill response consumed successfully"),
-                Err(e) => warn!("Error consuming prefill response: {}", e),
-            }
-            None
         };
+        let prefill_body = return_logprob.then_some(body);
 
         Ok((prefill_status, prefill_body))
     }
@@ -1718,6 +1666,284 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
 
+    // Real HTTP requests to an in-process server catch accidental use of @rank
+    // as a hostname as well as missing or shared data_parallel_rank fields.
+    async fn start_pd_capture_server(
+        fail_first: bool,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fail = Arc::new(AtomicBool::new(fail_first));
+        let app = axum::Router::new()
+            .route(
+                "/generate",
+                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                    let tx = tx.clone();
+                    let fail = fail.clone();
+                    async move {
+                        let stream = body["stream"] == true;
+                        tx.send(body).unwrap();
+                        if fail.swap(false, Ordering::SeqCst) {
+                            return (StatusCode::SERVICE_UNAVAILABLE, "retry").into_response();
+                        }
+                        if stream {
+                            (
+                                [(CONTENT_TYPE, "text/event-stream")],
+                                "data: {\"text\":\"ok\"}\n\ndata: [DONE]\n\n",
+                            )
+                                .into_response()
+                        } else {
+                            axum::Json(json!({"text": "ok"})).into_response()
+                        }
+                    }
+                }),
+            )
+            .route("/health_generate", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/server_info",
+                axum::routing::get(|| async { "server info" }),
+            )
+            .route("/v1/models", axum::routing::get(|| async { "models" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, rx, task)
+    }
+
+    fn capture_worker(url: String, rank: Option<usize>, kind: WorkerType) -> Arc<dyn Worker> {
+        let worker: Arc<dyn Worker> = match rank {
+            Some(rank) => Arc::new(
+                DPAwareWorkerBuilder::new(url, rank, rank + 1)
+                    .worker_type(kind)
+                    .build(),
+            ),
+            None => Arc::new(BasicWorkerBuilder::new(url).worker_type(kind).build()),
+        };
+        worker.set_healthy(true);
+        worker
+    }
+
+    fn capture_context(stream: bool) -> PDRequestContext<'static> {
+        PDRequestContext {
+            route: "/generate",
+            batch_size: None,
+            is_stream: stream,
+            return_logprob: false,
+            request_text: None,
+            model_id: None,
+            headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pd_dispatch_worker_addresses_and_independent_ranks() {
+        let (prefill_url, mut prefill_rx, prefill_task) = start_pd_capture_server(false).await;
+        let (decode_url, mut decode_rx, decode_task) = start_pd_capture_server(false).await;
+        let mut router = create_test_pd_router();
+        router.client = Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+
+        for (p_rank, d_rank) in [
+            (Some(0), Some(3)),
+            (Some(2), Some(5)),
+            (None, Some(3)),
+            (Some(2), None),
+            (None, None),
+        ] {
+            for (stream, batch_size) in [(false, None), (true, None), (false, Some(2))] {
+                let prefill = capture_worker(
+                    prefill_url.clone(),
+                    p_rank,
+                    WorkerType::Prefill {
+                        bootstrap_port: Some(8998),
+                    },
+                );
+                let decode = capture_worker(decode_url.clone(), d_rank, WorkerType::Decode);
+                let original = PDRouter::inject_bootstrap_into_value(
+                    json!({"text": "hello", "stream": stream}),
+                    prefill.as_ref(),
+                    batch_size,
+                )
+                .unwrap();
+                assert_eq!(
+                    original["bootstrap_host"],
+                    if batch_size.is_some() {
+                        json!(["127.0.0.1", "127.0.0.1"])
+                    } else {
+                        json!("127.0.0.1")
+                    }
+                );
+                let response = router
+                    .execute_dual_dispatch_internal(
+                        None,
+                        original.clone(),
+                        capture_context(stream),
+                        prefill.clone(),
+                        decode.clone(),
+                        (
+                            WorkerLoadGuard::new(prefill.clone(), None),
+                            WorkerLoadGuard::new(decode.clone(), None),
+                        ),
+                        Instant::now(),
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                assert!(!body.is_empty());
+                for (received, rank, is_decode) in [
+                    (prefill_rx.try_recv().unwrap(), p_rank, false),
+                    (decode_rx.try_recv().unwrap(), d_rank, true),
+                ] {
+                    let mut expected = original.clone();
+                    if let Some(rank) = rank {
+                        expected["data_parallel_rank"] = json!(rank);
+                    }
+                    if is_decode {
+                        if let Some(rank) = p_rank {
+                            expected["disagg_prefill_dp_rank"] = json!(rank);
+                        }
+                    }
+                    assert_eq!(received, expected);
+                }
+                assert_eq!(prefill.load(), 0);
+                assert_eq!(decode.load(), 0);
+            }
+        }
+        // The health endpoint must also use physical URLs for DP-aware workers.
+        router.worker_registry.register(capture_worker(
+            prefill_url,
+            Some(0),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        router
+            .worker_registry
+            .register(capture_worker(decode_url, Some(3), WorkerType::Decode));
+        let response = router.health_generate(Request::new(Body::empty())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        for (endpoint, expected) in [("server_info", "server info"), ("v1/models", "models")] {
+            let response = router.proxy_to_first_prefill_worker(endpoint, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), expected.as_bytes());
+        }
+        prefill_task.abort();
+        decode_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_pd_preparation_failure_sends_neither_request() {
+        let (url, mut rx, task) = start_pd_capture_server(false).await;
+        let router = create_test_pd_router();
+        for p_rank in [Some(0), None] {
+            let prefill = capture_worker(
+                url.clone(),
+                p_rank,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            );
+            let decode = capture_worker(url.clone(), Some(1), WorkerType::Decode);
+            let response = router
+                .execute_dual_dispatch_internal(
+                    None,
+                    Value::Null,
+                    capture_context(false),
+                    prefill.clone(),
+                    decode.clone(),
+                    (
+                        WorkerLoadGuard::new(prefill.clone(), None),
+                        WorkerLoadGuard::new(decode.clone(), None),
+                    ),
+                    Instant::now(),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(body.contains("pd_request_preparation_failed"), "{body}");
+            assert_eq!(prefill.load(), 0);
+            assert_eq!(decode.load(), 0);
+        }
+        assert!(rx.try_recv().is_err());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_pd_retry_prepares_new_rank() {
+        let (prefill_url, mut prefill_rx, prefill_task) = start_pd_capture_server(false).await;
+        let (decode_url, mut decode_rx, decode_task) = start_pd_capture_server(true).await;
+        let mut router = create_test_pd_router();
+        router
+            .policy_registry
+            .set_decode_policy(Arc::new(crate::policies::RoundRobinPolicy::new()));
+        // RetryExecutor counts the initial attempt in max_retries.
+        router.retry_config.max_retries = 2;
+        router.retry_config.initial_backoff_ms = 0;
+        router.client = Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        for rank in 0..2 {
+            router.worker_registry.register(capture_worker(
+                prefill_url.clone(),
+                Some(rank),
+                WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                },
+            ));
+            router.worker_registry.register(capture_worker(
+                decode_url.clone(),
+                Some(rank),
+                WorkerType::Decode,
+            ));
+        }
+        let response = router
+            .execute_dual_dispatch(
+                None,
+                &json!({"text": "retry", "stream": false, "data_parallel_rank": 99, "disagg_prefill_dp_rank": 99}),
+                capture_context(false),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let first = decode_rx.try_recv().unwrap();
+        let second = decode_rx.try_recv().unwrap();
+        assert_ne!(first["data_parallel_rank"], second["data_parallel_rank"]);
+        assert_ne!(
+            first["disagg_prefill_dp_rank"],
+            second["disagg_prefill_dp_rank"]
+        );
+        for decode in [first, second] {
+            let prefill = prefill_rx.try_recv().unwrap();
+            assert!(prefill["data_parallel_rank"].as_u64().unwrap() < 2);
+            assert_eq!(prefill["bootstrap_room"], decode["bootstrap_room"]);
+            assert_eq!(decode["bootstrap_host"], "127.0.0.1");
+            assert_eq!(
+                decode["disagg_prefill_dp_rank"],
+                prefill["data_parallel_rank"]
+            );
+        }
+        assert!(decode_rx.try_recv().is_err());
+        prefill_task.abort();
+        decode_task.abort();
+    }
+
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry =
@@ -1957,69 +2183,460 @@ mod tests {
         assert_eq!(decode_worker.load(), 0);
     }
 
+    async fn wait_load(worker: &dyn Worker, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while worker.load() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("load did not reach expected value");
+    }
+
     #[tokio::test]
-    async fn test_streaming_load_tracking() {
-        use futures_util::StreamExt;
-        use tokio::time::{sleep, Duration};
-
-        let router = create_test_pd_router();
-
-        let prefill_worker = create_test_worker(
-            "http://prefill".to_string(),
-            WorkerType::Prefill {
-                bootstrap_port: None,
-            },
-            true,
-        );
-        let decode_worker =
-            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
-
-        router.worker_registry.register(Arc::from(prefill_worker));
-        router.worker_registry.register(Arc::from(decode_worker));
-
-        let prefill_workers = router.worker_registry.get_prefill_workers();
-        let decode_workers = router.worker_registry.get_decode_workers();
-
-        let prefill_ref = prefill_workers[0].clone();
-        let decode_ref = decode_workers[0].clone();
-
-        assert_eq!(prefill_ref.load(), 0);
-        assert_eq!(decode_ref.load(), 0);
-
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = UnboundedReceiverStream::new(rx);
-
-        {
+    async fn test_streaming_load_tracks_upstream_not_client_body() {
+        for ending in ["done", "eof", "error", "cancel"] {
+            let router = create_test_pd_router();
+            let worker = capture_worker("http://decode".into(), Some(0), WorkerType::Decode);
+            let (tx, rx) =
+                tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, reqwest::Error>>();
             let response = router.create_streaming_response(
-                stream.map(Ok),
+                UnboundedReceiverStream::new(rx),
                 StatusCode::OK,
                 None,
                 false,
                 None,
-                prefill_ref.clone(),
-                decode_ref.clone(),
+                worker.clone(),
+                Some(WorkerLoadGuard::new(worker.clone(), None)),
             );
-
-            // Guards are now attached to response body, so load should be 1
-            assert_eq!(prefill_ref.load(), 1);
-            assert_eq!(decode_ref.load(), 1);
-
-            tx.send(bytes::Bytes::from("test data")).unwrap();
-
-            sleep(Duration::from_millis(10)).await;
-
-            // Load still 1 while response body exists
-            assert_eq!(prefill_ref.load(), 1);
-            assert_eq!(decode_ref.load(), 1);
-
-            drop(tx);
-
-            // Response (and its body with guards) dropped here
+            assert_eq!(worker.load(), 1);
+            match ending {
+                "done" => {
+                    tx.send(Ok(bytes::Bytes::from_static(b"data: [DO")))
+                        .unwrap();
+                    tokio::task::yield_now().await;
+                    assert_eq!(worker.load(), 1);
+                    tx.send(Ok(bytes::Bytes::from_static(b"NE]\n\n"))).unwrap();
+                }
+                "eof" => drop(tx),
+                "error" => {
+                    tx.send(Err(Client::new().get("http://[").send().await.unwrap_err()))
+                        .unwrap();
+                }
+                "cancel" => {
+                    drop(response);
+                    wait_load(worker.as_ref(), 0).await;
+                    continue;
+                }
+                _ => unreachable!(),
+            }
+            // Keep the client body alive and unread: upstream completion must
+            // release the guard even with output still buffered in the channel.
+            wait_load(worker.as_ref(), 0).await;
             drop(response);
+            assert_eq!(worker.load(), 0);
         }
+    }
 
-        // Guards dropped when response dropped
-        assert_eq!(prefill_ref.load(), 0);
-        assert_eq!(decode_ref.load(), 0);
+    struct ControlledServer {
+        url: String,
+        entered: tokio::sync::oneshot::Receiver<()>,
+        headers: tokio::sync::oneshot::Sender<()>,
+        body: tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn controlled_server() -> ControlledServer {
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (headers, headers_rx) = tokio::sync::oneshot::channel();
+        let (body, body_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+        let state = Arc::new(std::sync::Mutex::new(Some((
+            entered_tx, headers_rx, body_rx,
+        ))));
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(move || {
+                let (entered, headers, body) = state.lock().unwrap().take().unwrap();
+                async move {
+                    let _ = entered.send(());
+                    let _ = headers.await;
+                    Response::new(Body::from_stream(UnboundedReceiverStream::new(body)))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        ControlledServer {
+            url,
+            entered,
+            headers,
+            body,
+            task,
+        }
+    }
+
+    struct RawControlledServer {
+        url: String,
+        entered: tokio::sync::oneshot::Receiver<()>,
+        respond: tokio::sync::oneshot::Sender<()>,
+        replied: tokio::sync::oneshot::Receiver<()>,
+        disconnected: tokio::sync::oneshot::Receiver<()>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    // Raw HTTP allows deterministic transport failures and truncated bodies.
+    // It also observes whether cancelling decode actually closes its socket.
+    async fn raw_controlled_server(
+        response: &'static [u8],
+        close_after_response: bool,
+    ) -> RawControlledServer {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (respond, respond_rx) = tokio::sync::oneshot::channel();
+        let (replied_tx, replied) = tokio::sync::oneshot::channel();
+        let (disconnected_tx, disconnected) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            // Consume the entire request before checking for disconnection.
+            loop {
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&buffer[..n]);
+                if let Some(end) = memmem::find(&request, b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            entered_tx.send(()).unwrap();
+            tokio::select! {
+                _ = respond_rx => {
+                    socket.write_all(response).await.unwrap();
+                    let _ = replied_tx.send(());
+                    if close_after_response {
+                        socket.shutdown().await.unwrap();
+                        return;
+                    }
+                }
+                result = socket.read(&mut buffer) => {
+                    assert!(matches!(result, Ok(0) | Err(_)));
+                    let _ = disconnected_tx.send(());
+                    return;
+                }
+            }
+            let result = socket.read(&mut buffer).await;
+            assert!(matches!(result, Ok(0) | Err(_)));
+            let _ = disconnected_tx.send(());
+        });
+        RawControlledServer {
+            url,
+            entered,
+            respond,
+            replied,
+            disconnected,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prefill_failure_cancels_decode_without_breaker_penalty() {
+        for (wire_response, expected_status, client_error) in [
+            (
+                &b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"[..],
+                StatusCode::BAD_REQUEST,
+                true,
+            ),
+            (
+                &b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"[..],
+                StatusCode::SERVICE_UNAVAILABLE,
+                false,
+            ),
+            (&b""[..], StatusCode::BAD_GATEWAY, false),
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}"[..],
+                StatusCode::BAD_GATEWAY,
+                false,
+            ),
+        ] {
+            for stream in [false, true] {
+                for decode_early in [false, true] {
+                    for return_logprob in [false, true] {
+                        let p = raw_controlled_server(wire_response, true).await;
+                        let d = raw_controlled_server(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{",
+                            false,
+                        )
+                        .await;
+                        let prefill = capture_worker(
+                            p.url,
+                            Some(0),
+                            WorkerType::Prefill {
+                                bootstrap_port: Some(8998),
+                            },
+                        );
+                        let decode = capture_worker(d.url, Some(1), WorkerType::Decode);
+                        let mut router = create_test_pd_router();
+                        router.retry_config.max_retries = 1;
+                        router.client = Client::builder()
+                            .no_proxy()
+                            .timeout(std::time::Duration::from_secs(5))
+                            .build()
+                            .unwrap();
+                        router.worker_registry.register(prefill.clone());
+                        router.worker_registry.register(decode.clone());
+                        let request = tokio::spawn(async move {
+                            let mut context = capture_context(stream);
+                            context.return_logprob = return_logprob;
+                            router
+                                .execute_dual_dispatch(
+                                    None,
+                                    &json!({"text": "test", "stream": stream}),
+                                    context,
+                                )
+                                .await
+                        });
+                        p.entered.await.unwrap();
+                        d.entered.await.unwrap();
+                        assert_eq!(prefill.load(), 1);
+                        assert_eq!(decode.load(), 1);
+                        if decode_early {
+                            d.respond.send(()).unwrap();
+                            d.replied.await.unwrap();
+                            tokio::task::yield_now().await;
+                        }
+                        p.respond.send(()).unwrap();
+                        let response = tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            request,
+                        )
+                        .await
+                        .expect("prefill failure must not wait for decode")
+                        .unwrap();
+                        assert_eq!(response.status(), expected_status);
+                        assert!(response.extensions().get::<BreakerOutcomesRecorded>().is_some());
+                        assert_eq!(prefill.load(), 0);
+                        assert_eq!(decode.load(), 0);
+                        assert_eq!(
+                            prefill.circuit_breaker().total_successes(),
+                            u64::from(client_error)
+                        );
+                        assert_eq!(
+                            prefill.circuit_breaker().total_failures(),
+                            u64::from(!client_error)
+                        );
+                        assert_eq!(decode.circuit_breaker().total_successes(), 0);
+                        assert_eq!(decode.circuit_breaker().total_failures(), 0);
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            d.disconnected,
+                        )
+                        .await
+                        .expect("cancelled decode connection must close")
+                        .unwrap();
+                        p.task.await.unwrap();
+                        d.task.await.unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_decode_headers_before_prefill_body_completes() {
+        for stream in [false, true] {
+            let p = controlled_server().await;
+            let d = raw_controlled_server(
+                if stream {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\ndata: [DONE]\n\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+                },
+                true,
+            )
+            .await;
+            let prefill = capture_worker(
+                p.url,
+                Some(0),
+                WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                },
+            );
+            let decode = capture_worker(d.url, Some(1), WorkerType::Decode);
+            let mut router = create_test_pd_router();
+            router.client = Client::builder().no_proxy().build().unwrap();
+            router.worker_registry.register(prefill.clone());
+            router.worker_registry.register(decode.clone());
+            let request = tokio::spawn(async move {
+                router
+                    .execute_dual_dispatch(
+                        None,
+                        &json!({"text": "test", "stream": stream}),
+                        capture_context(stream),
+                    )
+                    .await
+            });
+            p.entered.await.unwrap();
+            d.entered.await.unwrap();
+            d.respond.send(()).unwrap();
+            d.replied.await.unwrap();
+            p.headers.send(()).unwrap();
+            p.body.send(Ok(bytes::Bytes::from_static(b"{"))).unwrap();
+            tokio::task::yield_now().await;
+            assert_eq!(prefill.load(), 1);
+            assert_eq!(decode.load(), 1);
+            assert!(!request.is_finished());
+            p.body.send(Ok(bytes::Bytes::from_static(b"}"))).unwrap();
+            drop(p.body);
+            let response = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(
+                body.as_ref(),
+                if stream {
+                    &b"data: [DONE]\n\n"[..]
+                } else {
+                    &b"{}"[..]
+                }
+            );
+            wait_load(decode.as_ref(), 0).await;
+            assert_eq!(prefill.load(), 0);
+            assert_eq!(prefill.circuit_breaker().total_successes(), 1);
+            assert_eq!(decode.circuit_breaker().total_successes(), 1);
+            assert_eq!(prefill.circuit_breaker().total_failures(), 0);
+            assert_eq!(decode.circuit_breaker().total_failures(), 0);
+            p.task.abort();
+            d.task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pd_load_boundaries_before_headers_and_after_prefill_body() {
+        for stream in [false, true] {
+            let p = controlled_server().await;
+            let d = controlled_server().await;
+            let prefill = capture_worker(
+                p.url,
+                Some(0),
+                WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                },
+            );
+            let decode = capture_worker(d.url, Some(1), WorkerType::Decode);
+            let mut router = create_test_pd_router();
+            router.client = Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap();
+            router.worker_registry.register(prefill.clone());
+            router.worker_registry.register(decode.clone());
+            let request = tokio::spawn(async move {
+                router
+                    .execute_dual_dispatch(
+                        None,
+                        &json!({"text": "test", "stream": stream}),
+                        capture_context(stream),
+                    )
+                    .await
+            });
+            p.entered.await.unwrap();
+            d.entered.await.unwrap();
+            assert_eq!(prefill.load(), 1);
+            assert_eq!(decode.load(), 1);
+            p.headers.send(()).unwrap();
+            p.body
+                .send(Ok(bytes::Bytes::from_static(b"{\"text\":")))
+                .unwrap();
+            tokio::task::yield_now().await;
+            assert_eq!(prefill.load(), 1);
+            p.body
+                .send(Ok(bytes::Bytes::from_static(b"\"ok\"}")))
+                .unwrap();
+            drop(p.body);
+            // Decode has not even sent headers yet. Prefill must be released.
+            wait_load(prefill.as_ref(), 0).await;
+            assert_eq!(decode.load(), 1);
+            d.headers.send(()).unwrap();
+            if stream {
+                let response = request.await.unwrap();
+                assert_eq!(decode.load(), 1);
+                d.body
+                    .send(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")))
+                    .unwrap();
+                wait_load(decode.as_ref(), 0).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                drop(response);
+            } else {
+                d.body.send(Ok(bytes::Bytes::from_static(b"{}"))).unwrap();
+                drop(d.body);
+                let response = request.await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(decode.load(), 0);
+            }
+            p.task.abort();
+            d.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pd_cancel_before_response_releases_both_loads() {
+        let p = controlled_server().await;
+        let d = controlled_server().await;
+        let prefill = capture_worker(
+            p.url,
+            None,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        let decode = capture_worker(d.url, None, WorkerType::Decode);
+        let mut router = create_test_pd_router();
+        router.client = Client::builder().no_proxy().build().unwrap();
+        router.worker_registry.register(prefill.clone());
+        router.worker_registry.register(decode.clone());
+        let request = tokio::spawn(async move {
+            router
+                .execute_dual_dispatch(
+                    None,
+                    &json!({"text": "test", "stream": true}),
+                    capture_context(true),
+                )
+                .await
+        });
+        p.entered.await.unwrap();
+        d.entered.await.unwrap();
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(decode.load(), 1);
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.circuit_breaker().total_successes(), 0);
+        assert_eq!(prefill.circuit_breaker().total_failures(), 0);
+        assert_eq!(decode.circuit_breaker().total_successes(), 0);
+        assert_eq!(decode.circuit_breaker().total_failures(), 0);
+        p.task.abort();
+        d.task.abort();
     }
 }

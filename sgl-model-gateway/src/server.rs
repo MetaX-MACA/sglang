@@ -399,9 +399,14 @@ async fn v1_conversations_delete_item(
 }
 
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
-        .await
-        .into_response()
+    let result =
+        WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client).await;
+    let has_failures = !result.failed.is_empty();
+    let mut response = result.into_response();
+    if has_failures {
+        *response.status_mut() = StatusCode::BAD_GATEWAY;
+    }
+    response
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {

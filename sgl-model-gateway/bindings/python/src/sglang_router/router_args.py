@@ -31,6 +31,7 @@ _POLICY_CHOICES = (
     "manual",
     "consistent_hashing",
     "prefix_hash",
+    "shortest_queue",
 )
 
 

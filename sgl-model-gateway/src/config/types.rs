@@ -320,6 +320,9 @@ pub enum PolicyConfig {
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },
+
+    #[serde(rename = "shortest_queue")]
+    ShortestQueue,
 }
 
 fn default_prefix_token_count() -> usize {
@@ -349,6 +352,7 @@ impl PolicyConfig {
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
+            PolicyConfig::ShortestQueue => "shortest_queue",
         }
     }
 }

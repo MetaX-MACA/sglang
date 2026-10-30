@@ -16,6 +16,7 @@ pub enum PolicyType {
     Manual,
     ConsistentHashing,
     PrefixHash,
+    ShortestQueue,
 }
 
 #[pyclass(eq)]
@@ -471,6 +472,7 @@ impl Router {
             match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
                 PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
+                PolicyType::ShortestQueue => ConfigPolicyConfig::ShortestQueue,
                 PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
                     cache_threshold: self.cache_threshold,
                     balance_abs_threshold: self.balance_abs_threshold,

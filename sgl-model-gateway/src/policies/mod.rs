@@ -20,6 +20,7 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+mod shortest_queue;
 pub mod tree;
 pub(crate) mod utils;
 pub use bucket::BucketPolicy;
@@ -32,6 +33,7 @@ pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+pub use shortest_queue::ShortestQueuePolicy;
 pub use tree::PrefixMatchResult;
 
 /// Core trait for load balancing policies

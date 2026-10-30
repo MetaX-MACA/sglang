@@ -45,20 +45,15 @@ pub(crate) fn parse_bootstrap_host_from_url(url: &str) -> String {
         _ => url,
     };
 
-    match url::Url::parse(metadata_url) {
+    // Without a scheme, "worker:8080" can parse as a scheme named "worker"
+    // with no host. Add the scheme before parsing, not only after an error.
+    let parsed = if metadata_url.contains("://") {
+        url::Url::parse(metadata_url)
+    } else {
+        url::Url::parse(&format!("http://{metadata_url}"))
+    };
+    match parsed {
         Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-        Err(_) if !metadata_url.contains("://") => {
-            match url::Url::parse(&format!("http://{}", metadata_url)) {
-                Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-                Err(_) => {
-                    tracing::warn!(
-                        "Failed to parse URL '{}', defaulting to localhost",
-                        metadata_url
-                    );
-                    "localhost".to_string()
-                }
-            }
-        }
         Err(_) => {
             tracing::warn!(
                 "Failed to parse URL '{}', defaulting to localhost",
@@ -1314,6 +1309,17 @@ mod tests {
 
     #[test]
     fn test_parse_bootstrap_host_strips_dp_rank_suffix() {
+        for (url, expected) in [
+            ("http://10.0.0.8:9292", "10.0.0.8"),
+            ("http://prefill.example:9292@0", "prefill.example"),
+            ("prefill.example:9292@3", "prefill.example"),
+            ("10.0.0.8:9292@3", "10.0.0.8"),
+            ("http://[::1]:9292@3", "[::1]"),
+            ("[::1]:9292@3", "[::1]"),
+            ("http://user:pass@prefill.example:9292", "prefill.example"),
+        ] {
+            assert_eq!(parse_bootstrap_host_from_url(url), expected, "{url}");
+        }
         assert_eq!(
             parse_bootstrap_host_from_url("http://10.66.5.115:20664@3"),
             "10.66.5.115"
