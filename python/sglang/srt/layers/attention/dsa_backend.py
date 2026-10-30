@@ -24,6 +24,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.utils.common import get_bool_env_var, is_maca
 
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
@@ -509,7 +510,7 @@ class DeepseekSparseAttnBackend(
         seed_dsa_topk_from_draft_extend: bool = False,
     ):
         super().__init__()
-        self.forward_metadata: DSAMetadata
+        self.forward_metadata: Optional[DSAMetadata] = None
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
         self.num_splits = (
@@ -1333,7 +1334,7 @@ class DeepseekSparseAttnBackend(
                     cache_seqlens=dsa_cache_seqlens_int32,
                     seq_len_q=1,
                 )
-                if use_flashmla_kv and not _is_xpu
+                if use_flashmla_kv and not _is_xpu and not is_maca()
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
@@ -1604,7 +1605,7 @@ class DeepseekSparseAttnBackend(
 
             seqlens_expanded = cache_seqlens_int32
             dsa_extend_seq_lens_list = [1] * bs
-            if self.dsa_decode_impl == "flashmla_kv":
+            if self.dsa_decode_impl == "flashmla_kv" and not is_maca():
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
                 ].slice(slice(0, bs + 1))
@@ -1668,7 +1669,7 @@ class DeepseekSparseAttnBackend(
             )
             dsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
-            if self.dsa_decode_impl == "flashmla_kv":
+            if self.dsa_decode_impl == "flashmla_kv" and not is_maca():
                 flashmla_metadata = self.decode_cuda_graph_metadata[
                     "flashmla_metadata"
                 ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
@@ -2038,7 +2039,7 @@ class DeepseekSparseAttnBackend(
             effective_n_per_batch=effective_n_per_batch,
         )
 
-        if self.dsa_decode_impl == "flashmla_kv":
+        if self.dsa_decode_impl == "flashmla_kv" and not is_maca():
             flashmla_metadata = metadata.flashmla_metadata.slice(
                 slice(0, seqlens_expanded_size + 1)
             )
@@ -2748,7 +2749,10 @@ class DeepseekSparseAttnBackend(
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+        if is_maca():
+            from flash_mla import flash_mla_sparse_fwd
+        else:
+            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
@@ -2796,14 +2800,21 @@ class DeepseekSparseAttnBackend(
             # they ever diverge.
             topk_length = None
 
+        vendor_kwargs = {}
+        if is_maca() and get_bool_env_var("MX_ENABLE_FLASH_MLA_OPT", default="false"):
+            vendor_kwargs["indices_all_valid_per_q"] = (indices_input != -1).all(
+                dim=-1, keepdim=True
+            )
+        if sink_input is not None or not is_maca():
+            vendor_kwargs["attn_sink"] = sink_input
         o, _, _ = flash_mla_sparse_fwd(
             q=q_input,
             kv=kv_cache,
             indices=indices_input,
             sm_scale=sm_scale,
             d_v=v_head_dim,
-            attn_sink=sink_input,
             topk_length=topk_length,
+            **vendor_kwargs,
         )
 
         # Trim output back to original num_heads if we padded
@@ -3240,6 +3251,59 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
+    def _forward_flashmla_kv_maca(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        sm_scale: float,
+        layer,
+        metadata: DSAMetadata,
+        page_table_1,
+    ) -> torch.Tensor:
+        from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+
+        sched_meta, _ = get_mla_metadata()
+        q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        if self.dsa_kv_cache_store_fp8:
+            # MACA's packed FP8 decode consumes the absorbed NoPE query.
+            q_all = q_all[..., : self.kv_lora_rank]
+        num_q_heads = q_all.shape[2]
+        target_q_heads = self.flashmla_kv_num_q_heads
+        if target_q_heads != num_q_heads:
+            q_input = q_all.new_zeros(
+                q_all.shape[0], q_all.shape[1], target_q_heads, q_all.shape[3]
+            )
+            q_input[:, :, :num_q_heads, :] = q_all
+        else:
+            q_input = q_all
+
+        assert self.physical_page_size == 64, "only page size 64 is supported"
+        kv_cache = kv_cache.view(-1, self.physical_page_size, 1, self.kv_cache_dim)
+        indices = page_table_1.unsqueeze(1)
+        assert indices.shape[-1] == self.dsa_index_topk
+        kwargs = {}
+        if get_bool_env_var("MX_ENABLE_FLASH_MLA_OPT", default="true"):
+            kwargs["indices_all_valid_per_q"] = (indices != -1).all(
+                dim=-1, keepdim=True
+            )
+        o, _ = flash_mla_with_kvcache(
+            q=q_input,
+            k_cache=kv_cache,
+            cache_seqlens=metadata.dsa_cache_seqlens_int32,
+            head_dim_v=v_head_dim,
+            tile_scheduler_metadata=sched_meta,
+            num_splits=None,
+            softmax_scale=sm_scale,
+            indices=indices,
+            block_table=torch.empty(
+                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
+            ),
+            is_fp8_kvcache=self.dsa_kv_cache_store_fp8,
+            **kwargs,
+        )
+        return o[:, :, :num_q_heads, :]
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -3250,6 +3314,10 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
+        if is_maca():
+            return self._forward_flashmla_kv_maca(
+                q_all, kv_cache, v_head_dim, sm_scale, layer, metadata, page_table_1
+            )
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32
@@ -4030,6 +4098,10 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
+        if self.forward_metadata is None:
+            if forward_batch.forward_mode.is_idle():
+                return None
+            raise RuntimeError("DSA metadata is missing for a non-idle indexer forward")
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
             and (
@@ -4049,6 +4121,8 @@ class DeepseekSparseAttnBackend(
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
+        if is_maca():
+            return None
         from sgl_kernel.flash_mla import get_mla_metadata
 
         num_heads_q = self.flashmla_kv_num_q_heads

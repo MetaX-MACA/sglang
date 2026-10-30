@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.dsa_backend import (
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -183,6 +184,49 @@ class TestDSABackendDPPadding(unittest.TestCase):
         self.assertEqual(output.shape, (4, 1, 2, 2))
         self.assertTrue(torch.all(output[:2] == 1))
         self.assertTrue(torch.all(output[2:] == 0))
+
+
+class TestMACAFlashMLACacheLayout(CustomTestCase):
+    def test_physical_pages_and_padded_heads_preserve_sparse_attention(self):
+        """GLM warmup failed when the port used the removed cache page field."""
+        backend = SimpleNamespace(
+            physical_page_size=64,
+            kv_cache_dim=3,
+            kv_lora_rank=2,
+            dsa_kv_cache_store_fp8=False,
+            flashmla_kv_num_q_heads=4,
+            dsa_index_topk=4,
+        )
+        layer = SimpleNamespace(tp_q_head_num=2, head_dim=3)
+        q = torch.arange(12, dtype=torch.float32).view(2, 2, 3) / 10
+        cache = torch.arange(128 * 3, dtype=torch.float32).view(128, 3) / 100
+        indices = torch.tensor([[0, 64, -1, -1], [1, 65, 66, -1]], dtype=torch.int32)
+        metadata = SimpleNamespace(
+            dsa_cache_seqlens_int32=torch.tensor([2, 3], dtype=torch.int32)
+        )
+        vendor = ModuleType("flash_mla")
+        vendor.get_mla_metadata = lambda: (None, None)
+
+        def sparse_attention(*, q, k_cache, indices, **kwargs):
+            # Emulate only the external FlashMLA boundary on CPU.
+            keys = k_cache[indices.clamp_min(0) // 64, indices.clamp_min(0) % 64, 0]
+            scores = torch.einsum("bshd,bskd->bshk", q, keys) * kwargs["softmax_scale"]
+            scores.masked_fill_(indices.unsqueeze(2) < 0, float("-inf"))
+            values = keys[..., : kwargs["head_dim_v"]]
+            return torch.einsum("bshk,bskd->bshd", scores.softmax(-1), values), None
+
+        vendor.flash_mla_with_kvcache = sparse_attention
+        expected = torch.stack(
+            [
+                (q[row] @ cache[selected].T * 0.5).softmax(-1) @ cache[selected, :2]
+                for row, selected in enumerate(([0, 64], [1, 65, 66]))
+            ]
+        )
+        with patch.dict("sys.modules", {"flash_mla": vendor}):
+            output = DeepseekSparseAttnBackend._forward_flashmla_kv_maca(
+                backend, q, cache, 2, 0.5, layer, metadata, indices
+            )
+        torch.testing.assert_close(output[:, 0], expected)
 
 
 if __name__ == "__main__":
