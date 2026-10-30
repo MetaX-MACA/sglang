@@ -91,7 +91,9 @@ class IndexerKPool(MultiPlatformOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
-        self.alt_stream = alt_stream
+        self.alt_stream = (
+            None if envs.MX_DISABLE_INDEXER_POLL_ALT_STREAM.get() else alt_stream
+        )
         self.compress_gate_stream = None
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.cp_size = get_parallel().attn_cp_size if self.dsa_enable_prefill_cp else 1

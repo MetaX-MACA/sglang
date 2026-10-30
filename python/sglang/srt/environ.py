@@ -1251,6 +1251,13 @@ class Envs:
     MX_ENABLE_DSA_INDEXER_GEMM_BF16 = EnvBool(False)
     MX_USE_INDEXER_LOGITS_OPT = EnvBool(True)
 
+    # ===================================================================
+    # GLM5.3FLASH
+    # ===================================================================
+
+    MX_DISABLE_GLM_5_3_FLASHMULTI_STREAM = EnvBool(False)
+    MX_DISABLE_INDEXER_POLL_ALT_STREAM = EnvBool(False)
+
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =

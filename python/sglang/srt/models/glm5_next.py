@@ -1130,13 +1130,9 @@ class Glm5NextModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         self.alt_stream = (
-            torch.cuda.Stream()
-            if (
-                _is_cuda
-                or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
-                or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
-            )
-            else None
+            None
+            if envs.MX_DISABLE_GLM_5_3_FLASHMULTI_STREAM.get()
+            else torch.cuda.Stream()
         )
 
         self.layers, self.start_layer, self.end_layer = make_layers(

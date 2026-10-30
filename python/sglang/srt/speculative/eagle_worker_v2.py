@@ -957,12 +957,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         # Prepare for draft extend in a separate stream
-        if self.plan_stream:
-            fwd_stream = torch.get_device_module(self.device).current_stream()
-            self.plan_stream.wait_stream(fwd_stream)
         with self.plan_stream_ctx:
-            if self.plan_stream is not None:
-                self.plan_stream.wait_event(draft_extend_handoff_event)
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
                 batch,
