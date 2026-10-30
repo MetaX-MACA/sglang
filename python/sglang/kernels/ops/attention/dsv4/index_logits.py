@@ -110,7 +110,6 @@ def flat_index_logits_tiles(
                 tile_starts,
                 tile_starts + lengths[tile],
                 False,
-                backend="maca_c",
             )
             yield tile, _align_score_rows(logits, width_align)
 
@@ -155,7 +154,6 @@ def deep_gemm_fp4_paged_mqa_logits(
             deep_gemm_metadata,
             max_seq_len,
             False,
-            backend="maca_c",
         )
 
 

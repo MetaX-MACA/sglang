@@ -550,7 +550,6 @@ def decode_scores(
             metadata.deep_gemm_metadata,
             lmax,
             False,
-            backend="tilelang",
         )
         return DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=None, scores=scores)
 

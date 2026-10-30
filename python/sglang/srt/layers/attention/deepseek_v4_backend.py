@@ -3223,7 +3223,8 @@ class DeepseekV4AttnBackend(
         )
         return partner_kv, partner_score
     
-    def _low_ratio_store_index_k(self, layer, latent, out_loc, plan) -> None:
+    def _set_index_k_int8(
+        self, layer, latent, out_loc, plan) -> None:
         """Fused index-K write: k_norm + RoPE + quantize + store."""
         from sglang.kernels.ops.attention.dsv4.compress import (
             compress_norm_rope_store,
@@ -3289,11 +3290,15 @@ class DeepseekV4AttnBackend(
                     loc=slots,
                     cache_k=layer.indexer.index_keys(latent, freqs),
                 )
-            else:
+            elif kind.is_int8 and _is_maca:
                 core = self.forward_metadata.core_metadata
                 plan = core.c1_plan if layer.compress_ratio == 1 else core.c2_plan
-                self._low_ratio_store_index_k(
+                self._set_index_k_int8(
                     layer, latent, slots.to(torch.int64), plan
+                )
+            else:
+                raise NotImplementedError(
+                    f"Unsupported kind '{kind}' for the current platform."
                 )
         if pool.get_extra_key_layout(layer.layer_id) is KVLayout.V41_FP4:
             # The fp4 cache stores e2m1 codes: the kernel rotates the tail and
