@@ -4,12 +4,13 @@ from typing import Optional, Union
 import torch
 from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
 
-try:
-    from sgl_kernel import flash_ops
-except:
-    raise ImportError(
-        "Can not import FA3 in sgl_kernel. Please check your installation."
-    )
+if "metax" not in torch.__version__:
+    try:
+        from sgl_kernel import flash_ops  # noqa: F401
+    except ImportError as error:
+        raise ImportError(
+            "Can not import FA3 in sgl_kernel. Please check your installation."
+        ) from error
 
 
 @lru_cache(maxsize=1)

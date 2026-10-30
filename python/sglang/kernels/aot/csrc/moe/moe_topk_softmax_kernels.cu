@@ -24,7 +24,9 @@ limitations under the License.
 #include <cub/cub.cuh>
 #include <cub/util_type.cuh>
 #ifndef USE_MUSA
+#ifndef USE_MACA
 #include <cuda/functional>
+#endif
 #endif
 #else
 #include <hipcub/hipcub.hpp>
@@ -38,7 +40,7 @@ limitations under the License.
 
 // Define reduction operators based on CUDA version
 // CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum
-#if CUDA_VERSION >= 12090
+#if CUDA_VERSION >= 12090 && !defined(USE_MACA)
 using MaxReduceOp = cuda::maximum<>;
 using MinReduceOp = cuda::minimum<>;
 #else

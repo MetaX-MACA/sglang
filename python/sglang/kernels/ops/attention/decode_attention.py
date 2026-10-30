@@ -28,6 +28,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_maca_runtime
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
@@ -38,6 +39,7 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
+_is_maca = is_maca_runtime()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
 
 logger = logging.getLogger(__name__)
@@ -788,7 +790,7 @@ def _decode_grouped_att_m_fwd(
     tune_mla: bool = False,
     forced_kv_splits: int = 0,
 ):
-    BLOCK = 32
+    BLOCK = 16 if _is_maca else 32
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
@@ -817,7 +819,7 @@ def _decode_grouped_att_m_fwd(
     MAX_KV_SPLITS = max_kv_splits
     head_tiles = _grouped_head_tiles(head_num, kv_group_num)
 
-    extra_kargs = {}
+    extra_kargs = {"scenario": "flashattn-fwd"} if _is_maca else {}
     num_stages = 2
     num_warps = 4
     if _is_hip:
@@ -883,8 +885,8 @@ def _decode_grouped_att_m_fwd(
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=4 if _is_maca else num_warps,
+        num_stages=1 if _is_maca else num_stages,
         Lk=Lk,
         Lv=Lv,
         HAS_MLA=has_mla,

@@ -136,6 +136,6 @@ def apply_token_bitmask_inplace_triton(
         bitmask_shape[1],
         NUM_SMS,
         BLOCK_SIZE,
-        num_warps=BLOCK_SIZE // 32 // (16 // logits.element_size()),
+        num_warps=min(16, BLOCK_SIZE // 32 // (16 // logits.element_size())),
         num_stages=3,
     )

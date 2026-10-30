@@ -49,7 +49,11 @@ struct Signal {
 };
 
 struct __align__(16) RankData {
+#ifdef USE_MACA
+  void* ptrs[8];
+#else
   const void* __restrict__ ptrs[8];
+#endif
 };
 
 struct __align__(16) RankSignals {
@@ -151,6 +155,10 @@ DINLINE O downcast(array_t<float, O::size> val) {
 }
 
 static DINLINE void st_flag_release(FlagType* flag_addr, FlagType flag) {
+#ifdef USE_MACA
+  __threadfence();
+  *reinterpret_cast<volatile FlagType*>(flag_addr) = flag;
+#else
 #ifdef USE_MUSA
   volatile_store((uint32_t)flag, (uint32_t*)flag_addr);
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
@@ -158,9 +166,14 @@ static DINLINE void st_flag_release(FlagType* flag_addr, FlagType flag) {
 #else
   asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
 #endif
+#endif
 }
 
 static DINLINE FlagType ld_flag_acquire(FlagType* flag_addr) {
+#ifdef USE_MACA
+  __threadfence();
+  return *reinterpret_cast<volatile FlagType*>(flag_addr);
+#else
 #ifdef USE_MUSA
   flushInv_byp();
   return (uint32_t)volatile_load((uint32_t*)flag_addr);
@@ -173,16 +186,27 @@ static DINLINE FlagType ld_flag_acquire(FlagType* flag_addr) {
   asm volatile("ld.volatile.global.u32 %0, [%1]; membar.gl;" : "=r"(flag) : "l"(flag_addr));
 #endif
   return flag;
+#endif
 }
 
 static DINLINE void st_flag_volatile(FlagType* flag_addr, FlagType flag) {
+#ifdef USE_MACA
+  __threadfence();
+  *reinterpret_cast<volatile FlagType*>(flag_addr) = flag;
+#else
   asm volatile("st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
+#endif
 }
 
 static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
+#ifdef USE_MACA
+  __threadfence();
+  return *reinterpret_cast<volatile FlagType*>(flag_addr);
+#else
   FlagType flag;
   asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr));
   return flag;
+#endif
 }
 
 // is_start: whether this is the very first synchronization barrier.
@@ -531,7 +555,9 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_2s
 
 using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
 static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
+#ifndef USE_MACA
 static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
+#endif
 
 class CustomAllreduce {
  public:

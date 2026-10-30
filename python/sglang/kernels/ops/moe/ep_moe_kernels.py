@@ -191,7 +191,7 @@ def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
 def cutlass_w4_run_moe_ep_preproess(topk_ids: torch.Tensor):
     _, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
 
-    BLOCK_SIZE = 512
+    BLOCK_SIZE = 256
     grid = (triton.cdiv(topk_ids.numel(), BLOCK_SIZE),)
     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
     compute_src2dst_triton_kernel[grid](

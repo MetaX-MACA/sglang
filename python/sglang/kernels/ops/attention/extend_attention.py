@@ -23,6 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_maca_runtime
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.prefill_attention import context_attention_fwd
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
@@ -34,6 +35,7 @@ if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 _is_hip = is_hip()
+_is_maca = is_maca_runtime()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
 
@@ -118,6 +120,13 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
+        elif _is_maca:
+            if Lq <= 128:
+                BLOCK_M, BLOCK_N = (64, 64)
+            elif Lq <= 256:
+                BLOCK_M, BLOCK_N = (64, 32)
+            else:
+                BLOCK_M, BLOCK_N = (16, 16)
         elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
             # Ampere architecture (A100, etc.)
             # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
@@ -139,7 +148,7 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
             # Older architectures
             BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 
-        num_warps = 4 if Lq <= 64 else 8
+        num_warps = 4 if _is_maca or Lq <= 64 else 8
 
     return BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps
 
@@ -1076,7 +1085,7 @@ def extend_attention_fwd(
         _get_num_stages_for_extend_attention(Lq, Lv, BLOCK_N) if kimi_k3_shape else 1
     )
 
-    extra_kargs = {}
+    extra_kargs = {"scenario": "flashattn-fwd"} if _is_maca else {}
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 

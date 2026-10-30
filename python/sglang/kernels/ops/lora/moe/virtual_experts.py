@@ -716,6 +716,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         False,
         False,
         False,
+        False,
         None,
         fuse_add_to_output=True,
         add_output_mask=token_lora_mask,

@@ -204,7 +204,11 @@ def _find_cuda_home():
             cuda_home = os.path.dirname(os.path.dirname(nvcc_path))
         else:
             # Guess #3
-            cuda_home = "/usr/local/cuda"
+            cuda_home = (
+                os.environ.get("MACA_PATH", "/opt/maca")
+                if "metax" in torch.__version__
+                else "/usr/local/cuda"
+            )
     return cuda_home
 
 
@@ -226,9 +230,16 @@ def _preload_cuda_library():
     cuda_major = torch.version.cuda.split(".")[0] if torch.version.cuda else "12"
     lib_versions = list(dict.fromkeys([cuda_major, "13", "12"]))
 
+    if "metax" in torch.__version__:
+        maca_home = Path(os.environ.get("MACA_PATH", "/opt/maca"))
+        candidate_dirs = [maca_home / "lib", maca_home / "lib64", *candidate_dirs]
+        lib_names = ["libruntime_cu.so"]
+    else:
+        lib_names = [f"libcudart.so.{version}" for version in lib_versions]
+
     for base in candidate_dirs:
-        for lib_version in lib_versions:
-            candidate = base / f"libcudart.so.{lib_version}"
+        for lib_name in lib_names:
+            candidate = base / lib_name
             if candidate.exists():
                 try:
                     cuda_runtime_lib = candidate.resolve()
