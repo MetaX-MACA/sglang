@@ -13,6 +13,20 @@ except ImportError:
 _FLASHINFER_NORM_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 
 
+def _maca_rmsnorm(input, weight, eps, out, *, gemma=False):
+    # The MACA AOT extension omits these ops. FlashInfer handles normal eager
+    # calls; retain a torch path for float32 inputs and torch.compile tracing.
+    x = input.float()
+    scale = weight.float() + 1.0 if gemma else weight.float()
+    result = (x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps) * scale).to(
+        input.dtype
+    )
+    if out is None:
+        return result
+    out.copy_(result)
+    return out
+
+
 def _rmsnorm_internal(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -20,6 +34,8 @@ def _rmsnorm_internal(
     out: Optional[torch.Tensor],
     enable_pdl: Optional[bool],
 ) -> torch.Tensor:
+    if "metax" in torch.__version__:
+        return _maca_rmsnorm(input, weight, eps, out)
     if out is None:
         out = torch.empty_like(input)
     if enable_pdl is None:
@@ -49,6 +65,8 @@ def _gemma_rmsnorm_internal(
     out: Optional[torch.Tensor],
     enable_pdl: Optional[bool],
 ) -> torch.Tensor:
+    if "metax" in torch.__version__:
+        return _maca_rmsnorm(input, weight, eps, out, gemma=True)
     if out is None:
         out = torch.empty_like(input)
     if enable_pdl is None:
@@ -64,6 +82,11 @@ def _gemma_fused_add_rmsnorm_internal(
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
+    if "metax" in torch.__version__:
+        acc = input.float() + residual.float()
+        residual.copy_(acc.to(residual.dtype))
+        _maca_rmsnorm(acc, weight, eps, input, gemma=True)
+        return
     if enable_pdl is None:
         enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm.default(
@@ -198,6 +221,8 @@ def gemma_rmsnorm(
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
     ):
+        if enable_pdl is None:
+            enable_pdl = is_arch_support_pdl()
         return _flashinfer_norm.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
     else:
         return _gemma_rmsnorm_internal(input, weight, eps, out, enable_pdl)
@@ -238,6 +263,8 @@ def gemma_fused_add_rmsnorm(
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
     ):
+        if enable_pdl is None:
+            enable_pdl = is_arch_support_pdl()
         _flashinfer_norm.gemma_fused_add_rmsnorm(
             input, residual, weight, eps, enable_pdl
         )

@@ -82,12 +82,16 @@ SGL_DEVICE float cta_reduce_sum(float v, int warp, int lane, float* scratch) {
 }
 
 SGL_DEVICE float triton_scale_reciprocal(float scale) {
+#ifdef __MACACC__
+  return 1.0f / scale;
+#else
   float reciprocal;
   // Triton's static FP8 quantizer lowers `1.0 / scale` to div.full.f32.
   // Match it exactly because a one-ULP difference at an E4M3 midpoint can
   // change the quantized byte.
   asm("div.full.f32 %0, %1, %2;" : "=f"(reciprocal) : "f"(1.0f), "f"(scale));
   return reciprocal;
+#endif
 }
 
 template <bool kHasResidual, bool kHasInputBias = false, bool kQuantizeFp8 = false, bool kQuantizeNvfp4 = false>

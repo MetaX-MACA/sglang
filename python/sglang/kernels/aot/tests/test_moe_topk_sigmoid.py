@@ -48,9 +48,12 @@ def test_topk_sigmoid(num_tokens, num_experts, topk):
         f"Weights mismatch: torch={topk_weights_ref} vs SGLang={topk_weights}"
     )
 
-    assert torch.allclose(topk_indices_ref.int(), topk_indices, atol=0, rtol=0), (
-        f"Indices mismatch: torch={topk_indices_ref}, SGLang={topk_indices}"
-    )
+    # Equal scores may select tied experts in a different order than torch.topk.
+    # Compare their scores exactly and require distinct experts in every row.
+    selected_scores = torch.gather(sigmoid_output, 1, topk_indices.long())
+    torch.testing.assert_close(selected_scores, topk_weights_ref, atol=0, rtol=0)
+    sorted_indices = topk_indices.sort(dim=-1).values
+    assert torch.all(sorted_indices[:, 1:] != sorted_indices[:, :-1])
 
 
 @pytest.mark.parametrize(

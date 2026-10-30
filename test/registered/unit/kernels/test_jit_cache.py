@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shlex
 import sys
 
 import msgspec
@@ -428,6 +429,25 @@ def test_generated_ninja_asks_both_compilers_for_dependencies():
     assert all('-MD -MF "$out.d"' in line for line in compile_commands)
 
 
+@pytest.mark.parametrize("maca", [False, True])
+def test_grid_constant_compatibility_is_scoped_to_maca_device_builds(monkeypatch, maca):
+    """Restore CUDA declarations without erasing qualifiers on other platforms."""
+    from sglang.kernels.jit.utils.compile import toolchain
+
+    monkeypatch.setattr(toolchain, "is_hip_runtime", lambda: False)
+    monkeypatch.setattr(toolchain, "is_maca_runtime", lambda: maca)
+    text = ninja.generate(_spec(cuda_wrappers=(("run", "K::run"),)))
+    fields = dict(line.split(" = ", 1) for line in text.splitlines() if " = " in line)
+    cuda_flags = shlex.split(fields["cudaflags"])
+    compat = "sgl_kernel/maca_compat.h"
+    assert compat not in shlex.split(fields["cxxflags"])
+    if maca:
+        assert cuda_flags[cuda_flags.index("-include") + 1] == compat
+        assert (KERNEL_PATH / "include" / compat).is_file()
+    else:
+        assert compat not in cuda_flags
+
+
 def test_pure_cpp_module_does_not_link_the_gpu_runtime():
     """A module with no `.cu` sources must not ask the linker for libcudart.
 
@@ -442,7 +462,7 @@ def test_pure_cpp_module_does_not_link_the_gpu_runtime():
         for line in ninja.generate(cpu_only).splitlines()
         if line.startswith("ldflags = ")
     )
-    assert "cudart" not in ldflags and "amdhip" not in ldflags
+    assert not any(runtime in ldflags for runtime in ("cudart", "amdhip", "runtime_cu"))
 
     with_device = _spec(cuda_files=("/tmp/a.cu",), cpp_wrappers=(), header_only=False)
     ldflags = next(
@@ -450,7 +470,7 @@ def test_pure_cpp_module_does_not_link_the_gpu_runtime():
         for line in ninja.generate(with_device).splitlines()
         if line.startswith("ldflags = ")
     )
-    assert "cudart" in ldflags or "amdhip" in ldflags
+    assert any(runtime in ldflags for runtime in ("cudart", "amdhip", "runtime_cu"))
 
 
 def test_generated_ninja_is_deterministic():
