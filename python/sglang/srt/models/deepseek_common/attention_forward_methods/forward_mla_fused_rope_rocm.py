@@ -4,6 +4,7 @@ import os
 from typing import TYPE_CHECKING
 
 import torch
+from sgl_kernel import cutlass_scaled_batch_mm, scaled_int8_quant
 
 from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -22,7 +23,10 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
-    from sglang.kernels.ops.gemm import bmm_fp8
+    try:
+        from sglang.kernels.ops.gemm import bmm_fp8
+    except:
+        bmm_fp8 = None
 
 if _is_hip:
     from sglang.kernels.ops.attention.rocm_mla_decode_rope import (
@@ -221,6 +225,17 @@ class DeepseekMLAFusedRopeRocmForwardMixin:
                 attn_output_scale,
                 self.w_scale,
                 torch.bfloat16,
+            )
+        elif self.w_vc.dtype == torch.int8:
+            attn_output_quant_val, attn_output_quant_scale, _ = scaled_int8_quant(
+                attn_output.transpose(0, 1).contiguous()
+            )
+            attn_bmm_output = cutlass_scaled_batch_mm(
+                a=attn_output_quant_val,
+                b=self.w_vc,
+                scale_a=attn_output_quant_scale,
+                scale_b=self.w_vc_scale,
+                out_dtype=attn_output.dtype,
             )
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from functools import cached_property
 from typing import (
@@ -224,6 +225,7 @@ from sglang.srt.utils import (
     make_pp_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.common import is_maca
 from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter:
@@ -233,6 +235,8 @@ if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
         get_dsv3_gemm_output_zero_allocator_size,
     )
+
+_is_maca = is_maca()
 
 if _use_aiter:
     pass
@@ -569,7 +573,11 @@ class MoEGate(nn.Module):
                 return torch.mm(hidden_states, self.weight.t(), out_dtype=torch.float32)
             return F.linear(hidden_states.float(), self.weight.float(), None)
 
-        if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
+        if _is_maca and not self.is_deepseek_v4:
+            logits = F.linear(hidden_states, self.weight, None)
+        elif (
+            not _is_maca and hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens
+        ):
             logits = tiny_gemm_bf16(
                 hidden_states,
                 self.weight,
@@ -673,6 +681,9 @@ class DeepseekV2MoE(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.enable_shared_experts_multi_stream = (
+            envs.SGLANG_ENABLE_SHARED_EXPERTS_MULTI_STREAM.get()
+        )
         self.routed_quant_stream = routed_quant_stream
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
@@ -722,6 +733,8 @@ class DeepseekV2MoE(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             layer_id=self.layer_id,
             quant_config=quant_config,
+            # Both streams read hidden_states; routed output needs its own buffer.
+            inplace=not (_is_maca and self.enable_shared_experts_multi_stream),
             routed_scaling_factor=self.routed_scaling_factor,
             routing_method_type=getattr(
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
@@ -1013,7 +1026,8 @@ class DeepseekV2MoE(nn.Module):
                     fwd.mlp_reduce_scatter,
                 )
             elif (
-                self.alt_stream is not None
+                self.enable_shared_experts_multi_stream
+                and self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
@@ -1468,6 +1482,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
+        shared_event = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -1480,7 +1495,10 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
-                if self.alt_stream is not None:
+                if (
+                    self.enable_shared_experts_multi_stream
+                    and self.alt_stream is not None
+                ):
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
@@ -1668,13 +1686,7 @@ class DeepseekV2MoE(nn.Module):
             topk_output=topk_output,
         )
 
-        if (
-            hidden_states.shape[0] > 0
-            and not sbo_enabled_flag
-            and self.num_fused_shared_experts == 0
-            and self.alt_stream is not None
-            and not is_in_breakable_cuda_graph()
-        ):
+        if shared_event is not None and not is_in_breakable_cuda_graph():
             torch.cuda.current_stream().wait_event(shared_event)
 
         if shared_output is not None:
@@ -2194,6 +2206,9 @@ class DeepseekV2AttentionMLA(
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
 
+        self.w_kc_scale = None
+        self.w_vc_scale = None
+
         self.w_scale_k = None
         self.w_scale_v = None
         self.use_deep_gemm_bmm = False
@@ -2209,9 +2224,14 @@ class DeepseekV2AttentionMLA(
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
             in {"awq", "awq_marlin", "moe_wna16"}
         )
-        self._use_min_latency_fused_a_gemm: bool | None = None
+        # self.use_min_latency_fused_a_gemm = (
+        #     self.has_fused_proj
+        #     and not get_exec().deterministic.enable_deterministic_inference
+        #     and not self.is_packed_weight
+        #     and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
+        # )
         self.fused_a_gemm_backend = "auto"
-
+        self._use_min_latency_fused_a_gemm = False
         self.has_q_b_proj = hasattr(self, "q_b_proj")
         q_b_proj_verified_shapes = {(2048, 2048), (4096, 2048)}
         q_b_weight = (
@@ -3223,6 +3243,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
+        self.enable_dequant_bf16 = (
+            True if os.getenv("MX_ENABLE_DEQUANT_BF16") else False
+        )
         self.determine_num_fused_shared_experts()
         self.use_dsa = is_deepseek_dsa(config)
         self.model = DeepseekV2Model(

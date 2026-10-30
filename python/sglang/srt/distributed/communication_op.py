@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import broadcast_pyobj
 
 from .parallel_state import (
@@ -20,6 +21,8 @@ from .parallel_state import (
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
+    if envs.MX_ALLREDUCE_SYNC.get():
+        torch.cuda.synchronize()
     return get_tp_group().all_reduce(input_)
 
 

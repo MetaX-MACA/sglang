@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx1250_supported,
     is_hip,
+    is_maca,
     is_musa,
     is_npu,
     is_xpu,
@@ -82,7 +83,7 @@ if _is_cuda or _is_xpu or _is_musa:
             ) -> torch.Tensor:
                 return flashinfer.norm.layernorm(input, gamma, beta, eps)
 
-            _flashinfer_layernorm_available = True
+            _flashinfer_layernorm_available = not is_maca()
         except (ImportError, AttributeError):
             _flashinfer_layernorm_available = False
 

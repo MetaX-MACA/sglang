@@ -878,6 +878,12 @@ class Envs:
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 
     # ===================================================================
+    # MACA communication options (vendor environment names)
+    # ===================================================================
+    MX_ALLREDUCE_SYNC = EnvBool(False)
+    MX_DISABLE_DENSE_REDUCE_SCATTER = EnvBool(False)
+
+    # ===================================================================
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
@@ -966,6 +972,10 @@ class Envs:
     # 288 GB MI355 in nightly-4-gpu-mi35x-minimax-m3). Worth setting only when the
     # scaled fraction is itself too small to hold the model weights.
     SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION = EnvBool(False)
+    # Use mcoplib for MACA sgl_kernel, FP8 quantization, and AWQ dequantization.
+    SGLANG_USE_MCOPLIB = EnvBool(True)
+    OVERLAP_QK_NORM = EnvBool(False)
+    ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16 = EnvBool(False)
     # Route Kimi-K3-style h12 + fp8 MLA decode through aiter Triton Gluon when
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
@@ -1302,6 +1312,9 @@ class Envs:
     SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE = EnvStr("mxfp8")
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
+    # DeepSeek/GLM: overlap separate shared and routed experts. On MACA,
+    # routed experts must not overwrite the input consumed by the shared stream.
+    SGLANG_ENABLE_SHARED_EXPERTS_MULTI_STREAM = EnvBool(False)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)

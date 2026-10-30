@@ -44,12 +44,14 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
+    CompressedTensorsW4A8Int8MoEMethod,
     CompressedTensorsW4A16Fp4,
     CompressedTensorsW4A16Nvfp4MoE,
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8Int8DynamicMoE,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
@@ -629,6 +631,19 @@ class CompressedTensorsConfig(QuantizationConfig):
             and weight_quant.symmetric
         )
 
+    def _is_dynamic_token_int8_w8a8(
+        self, weight_quant: BaseModel, input_quant: BaseModel
+    ) -> bool:
+        # Confirm weights and activations quantized.
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_int8_w8a8 = (
+            weight_quant.type == QuantizationType.INT
+            and input_quant.type == QuantizationType.INT
+        )
+        return is_int8_w8a8 and self._is_dynamic_token_w8a8(weight_quant, input_quant)
+
     def _is_wNa16_group_channel(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -902,8 +917,8 @@ class CompressedTensorsConfig(QuantizationConfig):
                     and get_moe_runner_backend().is_flashinfer_trtllm()
                 ):
                     return CompressedTensorsMxInt4MoE(self, weight_quant=weight_quant)
-                elif _is_hip:
-                    logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
+                elif _is_hip or _is_cuda:
+                    logger.info_once("Using CompressedTensorsWNA16TritonMoE")
                     return CompressedTensorsWNA16TritonMoE(
                         self, weight_quant=weight_quant
                     )
@@ -962,6 +977,11 @@ class CompressedTensorsConfig(QuantizationConfig):
         elif self._is_fp8_w8a8(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
             return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
+        elif not _is_npu and self._is_dynamic_token_int8_w8a8(
+            weight_quant, input_quant
+        ):
+            logger.info_once("Using CompressedTensorsW8A8Int8DynamicMoE")
+            return CompressedTensorsW8A8Int8DynamicMoE(weight_quant, input_quant)
         elif self._is_dynamic_token_w8a8(weight_quant, input_quant):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW8A8Int8DynamicMoE")
@@ -982,9 +1002,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
             else:
-                raise NotImplementedError(
-                    "The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
-                )
+                return CompressedTensorsW4A8Int8MoEMethod(self)
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"

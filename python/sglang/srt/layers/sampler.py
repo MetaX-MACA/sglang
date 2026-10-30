@@ -30,6 +30,7 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_gfx1250_supported,
     is_hip,
+    is_maca,
     is_musa,
     is_npu,
     is_xpu,
@@ -40,10 +41,44 @@ if is_cuda():
         min_p_sampling_from_probs,
         top_k_top_p_sampling_from_probs,
     )
-    from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-    )
+
+    if is_maca():
+        from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
+        from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
+
+        # MACA FlashInfer requires caller-provided random samples and returns
+        # a success mask for top-k/top-p sampling.
+        _maca_min_p_sampling = min_p_sampling_from_probs
+        _maca_top_k_top_p_sampling = top_k_top_p_sampling_from_probs
+
+        def min_p_sampling_from_probs(probs, min_ps):
+            uniform_samples = torch.rand(probs.shape[0], device=probs.device)
+            return _maca_min_p_sampling(probs, uniform_samples, min_ps)
+
+        def top_k_top_p_sampling_from_probs(probs, top_ks, top_ps, **kwargs):
+            uniform_samples = torch.rand((32, probs.shape[0]), device=probs.device)
+            token_ids, success = _maca_top_k_top_p_sampling(
+                probs, uniform_samples, top_ks, top_ps, **kwargs
+            )
+            if not success.all():
+                # Exhausting rejection rounds must not emit invalid token IDs.
+                fallback_probs, fallback_top_ks = probs, top_ks
+                if kwargs.get("filter_apply_order", "top_k_first") == "top_k_first":
+                    fallback_probs = top_k_renorm_prob(probs, top_ks)
+                    fallback_top_ks = torch.full_like(top_ks, probs.shape[-1])
+                fallback = top_k_top_p_min_p_sampling_from_probs_torch(
+                    fallback_probs,
+                    fallback_top_ks,
+                    top_ps,
+                    min_ps=None,
+                    need_min_p_sampling=False,
+                    sampling_seed=None,
+                    positions=None,
+                )
+                token_ids = torch.where(success, token_ids, fallback)
+            return token_ids
+    else:
+        from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
 if is_musa() or is_xpu():
     from sgl_kernel import (

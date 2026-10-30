@@ -55,6 +55,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_gfx942_supported,
     is_hip,
+    is_maca,
     is_xpu,
     next_power_of_2,
 )
@@ -320,6 +321,8 @@ class TritonAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = get_exec().kernel.triton_attention_num_kv_splits
+        if is_maca():
+            self.max_kv_splits = min(self.max_kv_splits, 16)
         if self.use_mla and not _is_xpu:
             self.max_kv_splits = _mla_decode_kv_splits_cap(
                 self.max_kv_splits,

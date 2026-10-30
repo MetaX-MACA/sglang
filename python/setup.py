@@ -47,6 +47,10 @@ except ModuleNotFoundError as exc:
 _BUILD_RUST_EXTS_ENV = "SGLANG_BUILD_RUST_EXTS"
 _PYTHON_DIR = Path(__file__).resolve().parent
 _RUST_WORKSPACE_DIR = _PYTHON_DIR.parent / "rust"
+_VERSION_HELPERS = runpy.run_path(
+    os.fspath(_PYTHON_DIR / "sglang" / "_build_version.py")
+)
+_SCM_VERSION = _VERSION_HELPERS["SCM_VERSION"]
 _RUST_BUILD_HELPERS = runpy.run_path(
     os.fspath(_PYTHON_DIR / "sglang" / "srt" / "rust_extensions" / "torch_build.py")
 )
@@ -241,8 +245,9 @@ if build_rust is not None:
             super().run()
 
     setup(
+        use_scm_version=_SCM_VERSION,
         cmdclass={"build_rust": BuildRust},
         rust_extensions=_declared_rust_extensions(),
     )
 else:
-    setup()
+    setup(use_scm_version=_SCM_VERSION)

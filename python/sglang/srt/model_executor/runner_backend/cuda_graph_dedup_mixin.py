@@ -21,7 +21,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_maca
 
 logger = logging.getLogger(__name__)
 
@@ -300,6 +300,10 @@ class DedupedCudaGraphMixin:
         )
 
     def build_deduped_cuda_graph(self):
+        # Dedup queries and replays raw graphs through NVIDIA CUDA bindings.
+        # MACA graph capture/replay must stay within its PyTorch runtime.
+        if is_maca():
+            return None
         if not envs.SGLANG_ENABLE_CUDA_GRAPH_DEDUP.get():
             return None
         if cuda_drv is None or cuda_rt is None:

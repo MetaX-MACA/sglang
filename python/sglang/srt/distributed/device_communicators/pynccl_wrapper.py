@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.distributed import ReduceOp
 
+from sglang.srt.utils.common import is_maca
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,7 +56,7 @@ def find_nccl_library() -> str:
         )
     else:
         if torch.version.cuda is not None:
-            so_file = "libnccl.so.2"
+            so_file = "libmccl.so" if is_maca() else "libnccl.so.2"
         elif torch.version.hip is not None:
             so_file = "librccl.so.1"
         elif hasattr(torch.version, "musa") and torch.version.musa is not None:
@@ -441,11 +443,19 @@ class NCCLLibrary:
 
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: Dict[str, Any] = {}
-            exported_functions = NCCLLibrary.exported_functions
-            if hasattr(self.lib, "ncclCommWindowRegister"):
+            prefix = "mccl" if is_maca() else "nccl"
+            exported_functions = list(NCCLLibrary.exported_functions)
+            if hasattr(self.lib, f"{prefix}CommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
             for func in exported_functions:
-                f = getattr(self.lib, func.name)
+                symbol = func.name.replace("nccl", prefix, 1)
+                if (
+                    is_maca()
+                    and func.name == "ncclCommInitRankConfig"
+                    and not hasattr(self.lib, symbol)
+                ):
+                    continue
+                f = getattr(self.lib, symbol)
                 f.restype = func.restype
                 f.argtypes = func.argtypes
                 _funcs[func.name] = f
@@ -486,6 +496,8 @@ class NCCLLibrary:
         rank: int,
         config: Optional[ncclConfig_t] = None,
     ) -> ncclComm_t:
+        if is_maca() and "ncclCommInitRankConfig" not in self._funcs:
+            return self.ncclCommInitRank(world_size, unique_id, rank)
         comm = ncclComm_t()
         if config is None:
             # Equivalent to NCCL_CONFIG_INITIALIZER (header-layout version).

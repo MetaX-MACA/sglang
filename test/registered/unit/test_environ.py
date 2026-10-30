@@ -1,5 +1,6 @@
 """Unit tests for sglang.srt.environ: EnvField semantics and the deprecated-env registry."""
 
+import ast
 import os
 import re
 import subprocess
@@ -7,11 +8,38 @@ import sys
 import unittest
 import warnings
 from contextlib import ExitStack
+from pathlib import Path
 
 from sglang.srt.environ import _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestEnvConsumerRegistry(CustomTestCase):
+    def test_runtime_env_reads_are_registered(self):
+        """A ported MLA read of OVERLAP_QK_NORM crashed startup without its field."""
+        source_root = Path(__file__).resolve().parents[3] / "python/sglang/srt"
+        missing = []
+        for path in source_root.rglob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            if "envs" not in source:
+                continue
+            for node in ast.walk(ast.parse(source)):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "envs"
+                    and node.attr.isupper()
+                    and not hasattr(envs, node.attr)
+                ):
+                    missing.append(
+                        f"{path.relative_to(source_root)}:{node.lineno}: {node.attr}"
+                    )
+        self.assertFalse(
+            missing, "Unregistered environment fields:\n" + "\n".join(missing)
+        )
 
 
 class TestEnvField(unittest.TestCase):
