@@ -19,7 +19,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.common import is_gfx1250_supported, is_maca
 
 _is_hip = is_hip()
 if _is_hip:
@@ -770,7 +770,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
             if ENABLE_PDL:
                 T.pdl_sync()
 
-            for pz in T.Pipelined(split_size // hidden_block, num_stages=2):
+            for pz in T.Pipelined(split_size // hidden_block, num_stages=1):
                 x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
                 fn_smem = T.alloc_shared((32, hidden_block), T.float32)
 
@@ -864,6 +864,16 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     n_sms = torch.cuda.get_device_properties(0).multi_processor_count
 
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
+
+
+@functools.cache
+def compute_num_split(num_tokens: int, hc_hidden_size: int) -> int:
+    n_split = 16 if num_tokens >= 512 else 64
+    # deep_gemm.tf32_hc_prenorm_gemm requirement
+    assert hc_hidden_size % 8 == 0
+    assert hc_hidden_size % n_split == 0
+    assert (hc_hidden_size // n_split) % 8 == 0
+    return n_split
 
 
 def get_mhc_pre_token_count_representatives(
@@ -1155,7 +1165,11 @@ def mhc_pre(
         )
 
     if _use_deep_gemm_hc_prenorm():
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        n_splits = (
+            compute_num_split(num_tokens, hc_hidden_size)
+            if is_maca()
+            else _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        )
 
         gemm_out_mul = torch.empty(
             n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
@@ -1164,7 +1178,9 @@ def mhc_pre(
             n_splits, num_tokens, dtype=torch.float32, device=residual.device
         )
 
-        from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+        from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+            tf32_hc_prenorm_gemm,
+        )
 
         tf32_hc_prenorm_gemm(
             residual_flat.view(num_tokens, hc_hidden_size),
@@ -1718,7 +1734,11 @@ def mhc_fused_post_pre(
         tile_n = 2 if num_tokens < 8 else 3
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
     else:
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        n_splits = (
+            compute_num_split(num_tokens, hc_hidden_size)
+            if is_maca()
+            else _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        )
 
     gemm_out_mul = torch.empty(
         n_splits,

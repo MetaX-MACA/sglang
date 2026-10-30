@@ -48,9 +48,9 @@ using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
 using bf16_t = __hip_bfloat16;
 using bf16x2_t = __hip_bfloat162;
 using fp8x2_e4m3_t = uint16_t;
-#ifndef __grid_constant__
-#define __grid_constant__
-#endif
+// #ifndef
+// #define
+// #endif
 #endif
 
 // ============================================================================

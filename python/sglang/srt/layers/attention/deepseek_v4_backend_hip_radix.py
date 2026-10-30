@@ -3039,7 +3039,7 @@ class DeepseekV4HipRadixBackend(
     ) -> torch.Tensor:
         """inv_rope=(freqs_real, positions) has the kernel apply the inverse RoPE
         to the last freqs_real.shape[-1] dims of every output head."""
-        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
+        if forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
 
         assert k is v, "DeepseekV4 shares k and v"

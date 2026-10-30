@@ -24,7 +24,7 @@ constexpr uint32_t kMaxTopK = 1024;
 // init below index up to RADIX + 1 == 257 threads, so a block sized after a
 // small topk would silently skip part of the histogram.
 constexpr uint32_t kTopKBlockSize = kMaxTopK;
-constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
+constexpr uint32_t kSMEM = 12 * 1024 * sizeof(uint32_t);  // 48KB (bytes)
 
 struct TopKParams {
   const float* __restrict__ scores;
