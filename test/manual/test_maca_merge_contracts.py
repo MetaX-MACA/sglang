@@ -122,6 +122,437 @@ class TestMacaMergeContracts(CustomTestCase):
             fn(2000, 1000, Scalar(offset), Scalar(8), 8, 5, source_offset, 1, 1)
             self.assertEqual(bool(store.call_args.kwargs["mask"]), expected)
 
+    def test_collective_library_binds_native_and_maca_symbols(self):
+        descriptor = NS(name="ncclAllReduce", restype=int, argtypes=[])
+        config = NS(name="ncclCommInitRankConfig", restype=int, argtypes=[])
+        for maca, prefix in ((False, "nccl"), (True, "mccl")):
+            funcs = {f"{prefix}AllReduce": Mock()}
+            if not maca:
+                funcs[f"{prefix}CommInitRankConfig"] = Mock()
+            registry = NS(
+                exported_functions=[descriptor, config],
+                exported_functions_symm_mem=[],
+                path_to_dict_mapping={},
+                path_to_library_cache={},
+            )
+            ns = {
+                "NCCLLibrary": registry,
+                "ctypes": NS(CDLL=lambda _: NS(**funcs)),
+                "is_maca": lambda: maca,
+            }
+            init = load(
+                "python/sglang/srt/distributed/device_communicators/pynccl_wrapper.py",
+                "__init__",
+                ns,
+                owner="NCCLLibrary",
+            )
+            instance = NS()
+            init(instance, "test.so")
+            self.assertIs(instance._funcs["ncclAllReduce"], funcs[f"{prefix}AllReduce"])
+            self.assertEqual("ncclCommInitRankConfig" in instance._funcs, not maca)
+            self.assertEqual(len(registry.exported_functions), 2)
+            if maca:
+                instance.ncclCommInitRank = Mock(return_value="communicator")
+                init_config = load(
+                    "python/sglang/srt/distributed/device_communicators/pynccl_wrapper.py",
+                    "ncclCommInitRankConfig",
+                    ns,
+                    owner="NCCLLibrary",
+                )
+                self.assertEqual(init_config(instance, 2, "id", 1), "communicator")
+                instance.ncclCommInitRank.assert_called_once_with(2, "id", 1)
+
+    def test_portable_capture_status_queries_requested_stream(self):
+        original_stream = NS(cuda_stream=1234)
+        requested_stream = NS(cuda_stream=5678)
+        current_stream = original_stream
+
+        @contextmanager
+        def use_stream(stream):
+            nonlocal current_stream
+            previous = current_stream
+            current_stream = stream
+            try:
+                yield
+            finally:
+                current_stream = previous
+
+        device = NS(stream=Mock(side_effect=use_stream))
+        for platform in ("maca", "hip", "xpu"):
+            for active in (False, True):
+                with self.subTest(platform=platform, active=active):
+
+                    def capture_status():
+                        self.assertIs(current_stream, requested_stream)
+                        return active
+
+                    device.is_current_stream_capturing = Mock(
+                        side_effect=capture_status
+                    )
+                    native_query = Mock(
+                        side_effect=AssertionError("NVIDIA runtime used")
+                    )
+                    ns = {
+                        "is_maca": lambda: platform == "maca",
+                        "is_hip": lambda: platform == "hip",
+                        "_is_xpu": platform == "xpu",
+                        "get_device_module": lambda: device,
+                        "_capture_status": native_query,
+                        "rt": None,
+                    }
+                    fn = load(
+                        "python/sglang/srt/model_executor/runner_backend_utils/"
+                        "breakable_cuda_graph/breakable_cuda_graph.py",
+                        "_is_stream_capturing",
+                        ns,
+                    )
+                    self.assertEqual(fn(requested_stream), active)
+                    self.assertIs(current_stream, original_stream)
+                    device.stream.assert_called_with(requested_stream)
+                    device.is_current_stream_capturing.assert_called_once_with()
+                    native_query.assert_not_called()
+
+    def test_nvidia_capture_status_keeps_native_runtime_query(self):
+        stream = NS(cuda_stream=1234)
+        query = Mock()
+        portable_device = Mock(side_effect=AssertionError("portable query used"))
+        ns = {
+            "is_maca": lambda: False,
+            "is_hip": lambda: False,
+            "_is_xpu": False,
+            "get_device_module": portable_device,
+            "_capture_status": query,
+            "rt": NS(cudaStreamCaptureStatus=NS(cudaStreamCaptureStatusActive=1)),
+        }
+        fn = load(
+            "python/sglang/srt/model_executor/runner_backend_utils/"
+            "breakable_cuda_graph/breakable_cuda_graph.py",
+            "_is_stream_capturing",
+            ns,
+        )
+        for status in (0, 1, 2):
+            query.return_value = status
+            self.assertEqual(fn(stream), status == 1)
+            query.assert_called_with(stream.cuda_stream)
+        portable_device.assert_not_called()
+
+    def test_maca_graph_dedup_uses_plain_torch_graphs(self):
+        native_graph = Mock(return_value=NS(raw_cuda_graph=Mock()))
+        registry = Mock()
+        ns = {
+            "is_maca": lambda: True,
+            "envs": NS(SGLANG_ENABLE_CUDA_GRAPH_DEDUP=NS(get=lambda: True)),
+            "cuda_drv": object(),
+            "cuda_rt": object(),
+            "torch": NS(cuda=NS(CUDAGraph=native_graph)),
+            "DedupedCudaGraphRegistry": registry,
+        }
+        fn = load(
+            "python/sglang/srt/model_executor/runner_backend/cuda_graph_dedup_mixin.py",
+            "build_deduped_cuda_graph",
+            ns,
+            owner="DedupedCudaGraphMixin",
+        )
+        self.assertIsNone(fn(NS()))
+        native_graph.assert_not_called()
+        registry.assert_not_called()
+        ns["is_maca"] = lambda: False
+        self.assertIs(fn(NS()), registry.return_value)
+        native_graph.assert_called_once_with(keep_graph=True)
+        registry.assert_called_once_with()
+
+    def test_w8a8_preserves_batched_prequantized_input_shape(self):
+        q = Mock(shape=(2, 3, 128))
+        scale = Mock(shape=(2, 3, 1))
+        output = Mock()
+        gemm = Mock(return_value=output)
+        fn = load(
+            "python/sglang/srt/layers/quantization/w8a8_int8.py",
+            "apply",
+            {
+                "use_intel_amx_backend": lambda _: False,
+                "_is_cpu_arm64": False,
+                "int8_scaled_mm": gemm,
+            },
+            owner="W8A8Int8LinearMethod",
+        )
+        layer = NS(weight=NS(shape=(128, 256)), weight_scale=object())
+        fn(None, layer, (DType.BF16, q, scale))
+        q.view.assert_called_once_with(-1, 128)
+        scale.view.assert_called_once_with(-1, 1)
+        self.assertIs(gemm.call_args.args[0], q.view.return_value)
+        output.view.assert_called_once_with([2, 3, 256])
+
+    def test_moe_runner_conversion_matches_fused_execution_signature(self):
+        import copy
+        import inspect
+
+        runner = ast.parse(
+            (ROOT / "python/sglang/srt/layers/moe/moe_runner/triton.py").read_text()
+        )
+        source = ast.parse(
+            (
+                ROOT
+                / "python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py"
+            ).read_text()
+        )
+        sequence = copy.deepcopy(
+            next(
+                n
+                for n in source.body
+                if isinstance(n, ast.FunctionDef)
+                and n.name == "_fused_moe_kernel_sequence"
+            )
+        )
+        sequence.body = [ast.Pass()]
+        namespace = {}
+        exec("from __future__ import annotations\n" + ast.unparse(sequence), namespace)
+        call = next(
+            n
+            for n in ast.walk(runner)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == sequence.name
+        )
+        inspect.signature(namespace[sequence.name]).bind(
+            *[None] * len(call.args), **{k.arg: None for k in call.keywords}
+        )
+        converter = next(
+            n
+            for n in runner.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name == "pre_permute_standard_to_triton"
+        )
+        unpack = next(
+            n
+            for n in converter.body
+            if isinstance(n, ast.Assign)
+            and isinstance(n.value, ast.Call)
+            and isinstance(n.value.func, ast.Name)
+            and n.value.func.id == "_prepare_fused_moe_run"
+        )
+        prepare = next(
+            n
+            for n in source.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_prepare_fused_moe_run"
+        )
+        returned = next(n for n in prepare.body if isinstance(n, ast.Return))
+        self.assertEqual(len(unpack.targets[0].elts), len(returned.value.elts))
+
+    def test_moe_activation_reaches_kernel_sequence(self):
+        for name, inplace in (
+            ("inplace_fused_experts", True),
+            ("outplace_fused_experts", False),
+        ):
+            impl = Mock()
+            fn = load(
+                "python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py",
+                name,
+                {
+                    "register_custom_op": lambda *a, **kw: lambda fn: fn,
+                    "fused_experts_impl": impl,
+                },
+            )
+            fn(*[object() for _ in range(5)], activation="gelu")
+            self.assertEqual(impl.call_args.args[7:9], (inplace, "gelu"))
+
+    def test_mctlass_rejects_unsupported_output_semantics(self):
+        path = ROOT / "python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py"
+        tree = ast.parse(path.read_text())
+        fn = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "invoke_fused_moe_kernel"
+        )
+        assignment = next(
+            n
+            for n in fn.body
+            if isinstance(n, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "mctlass_output_supported"
+                for t in n.targets
+            )
+        )
+        code = compile(
+            ast.Module(body=[assignment], type_ignores=[]), str(path), "exec"
+        )
+        ns = dict(
+            bias=None,
+            block_shape=None,
+            C=NS(is_contiguous=lambda: True, dtype=TorchStub.bfloat16),
+            torch=TorchStub,
+            c_sorted=False,
+            fuse_add_to_output=False,
+            mask_output=False,
+            lora_preserve_base=False,
+            fuse_sum_all_reduce=False,
+            fuse_swiglu=False,
+        )
+        exec(code, ns)
+        self.assertTrue(ns["mctlass_output_supported"])
+        for name, value in (
+            ("bias", object()),
+            ("block_shape", [128, 128]),
+            ("C", NS(is_contiguous=lambda: False)),
+            ("c_sorted", True),
+            ("mask_output", True),
+            ("fuse_add_to_output", True),
+            ("lora_preserve_base", True),
+            ("fuse_sum_all_reduce", True),
+            ("fuse_swiglu", True),
+        ):
+            with patch.dict(ns, {name: value}):
+                exec(code, ns)
+                self.assertFalse(ns["mctlass_output_supported"], name)
+
+    def test_mctlass_int8_dispatch_preserves_scales_and_route_weights(self):
+        class Tensor:
+            dtype = DType.BF16
+            shape = (5, 2, 8)
+
+            @property
+            def ndim(self):
+                return len(self.shape)
+
+            def stride(self, dim):
+                return 1
+
+            def is_contiguous(self):
+                return True
+
+            def size(self, dim):
+                return self.shape[dim]
+
+            def view(self, *shape):
+                return self
+
+            def contiguous(self):
+                return self
+
+            def numel(self):
+                return 10
+
+        a, b, c = Tensor(), Tensor(), Tensor()
+        a.shape = (5, 8)
+        b.shape = (3, 8, 8)
+        weights, ids = Tensor(), Tensor()
+        scale_a, scale_b = Tensor(), Tensor()
+        scale_a.shape = (5, 1)
+        scale_b.shape = (3, 8)
+        gemm = Mock()
+        triton_kernel = MagicMock()
+        ns = {
+            "torch": NS(bfloat16=DType.BF16, float16=object()),
+            "tl": NS(bfloat16=object()),
+            "triton": NS(cdiv=lambda a, b: (a + b - 1) // b),
+            "_is_maca": True,
+            "enable_mctlass_fused_moe": True,
+            "enable_mctlass_fused_moe_python_api": True,
+            "per_token_quant_int8": lambda x: (a, scale_a),
+            "envs": NS(
+                ENABLE_MACA_SGLANG_FUSED_MOE_MCTLASS_W4A16=NS(get=lambda: False)
+            ),
+            "gemm": gemm,
+            "fused_moe_kernel": triton_kernel,
+            "is_arch_support_pdl": lambda: False,
+        }
+        fn = load(
+            "python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py",
+            "invoke_fused_moe_kernel",
+            ns,
+        )
+        for python_api in (True, False):
+            with self.subTest(python_api=python_api):
+                ns["enable_mctlass_fused_moe_python_api"] = python_api
+                gemm.reset_mock()
+                triton_kernel.reset_mock()
+                fn(
+                    a,
+                    b,
+                    None,
+                    c,
+                    None,
+                    scale_b,
+                    None,
+                    weights,
+                    ids,
+                    Tensor(),
+                    Tensor(),
+                    Tensor(),
+                    True,
+                    2,
+                    {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 8, "BLOCK_SIZE_K": 8},
+                    object(),
+                    use_fp8_w8a8=False,
+                    use_int8_w8a8=True,
+                    use_int8_w8a16=False,
+                    use_int4_w4a8=False,
+                    use_int4_w4a16=False,
+                    per_channel_quant=True,
+                    filter_expert=True,
+                )
+                if python_api:
+                    args = gemm.call_args.args
+                    self.assertIs(args[9], scale_a)
+                    self.assertIs(args[10], scale_b)
+                    self.assertIs(args[12], weights)
+                    self.assertTrue(args[-1])
+                    self.assertTrue(gemm.call_args.kwargs["filter_expert"])
+                    triton_kernel.__getitem__.assert_not_called()
+                else:
+                    gemm.assert_not_called()
+                    launch = triton_kernel.__getitem__.return_value
+                    launch.assert_called_once()
+                    self.assertIs(launch.call_args.args[6], scale_a)
+                    self.assertIs(launch.call_args.args[7], scale_b)
+                    self.assertIs(launch.call_args.args[8], weights)
+
+    def test_mctlass_mxfp4_queries_each_stage_and_aligns_down_tile(self):
+        path = (
+            ROOT / "python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py"
+        )
+        tree = ast.parse(path.read_text())
+        fn = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "_fused_moe_kernel_sequence"
+        )
+        calls = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "get_kernel_m"
+        ]
+        packed = [
+            n for n in calls if any(k.arg == "is_b_e2m1fp4x2" for k in n.keywords)
+        ]
+        self.assertEqual(len(packed), 2)
+        self.assertTrue(
+            all(any(k.arg == "mul_weight" for k in n.keywords) for n in packed)
+        )
+        # Execute the production re-alignment branch with intentionally different tiles.
+        down_branch = next(
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.If)
+            and ast.unparse(n.test) == "down_m != stage1_config['BLOCK_SIZE_M']"
+        )
+        align = Mock(return_value=("tokens", "experts", "padded"))
+        ns = dict(
+            down_m=64,
+            stage1_config={"BLOCK_SIZE_M": 16},
+            moe_align_block_size=align,
+            topk_ids=object(),
+            E=3,
+        )
+        exec(
+            compile(ast.Module(body=[down_branch], type_ignores=[]), str(path), "exec"),
+            ns,
+        )
+        self.assertEqual(ns["sorted_token_ids"], "tokens")
+        align.assert_called_once_with(ns["topk_ids"], 64, 3)
+
     def test_triton_kernels_do_not_capture_host_platform_flags(self):
         path = ROOT / "python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py"
         tree = ast.parse(path.read_text())
@@ -180,6 +611,48 @@ class TestMacaMergeContracts(CustomTestCase):
             q, scales = fn(x)
         self.assertEqual((q.shape, scales.shape), ((0, 2, 256), (0, 2, 2)))
         self.assertEqual((q.device, scales.device), ("cuda:3", "cuda:3"))
+
+    def test_maca_mqa_schedule_does_not_read_device_scalar(self):
+        context_lens = Mock()
+        context_lens.item.side_effect = RuntimeError("host sync during capture")
+        schedule = object()
+
+        def backend(lengths, block_kv, num_sms, *, workers_per_sm=None):
+            if workers_per_sm is None:
+                lengths.item()
+            self.assertEqual((block_kv, num_sms, workers_per_sm), (64, 80, 8))
+            return schedule
+
+        ns = {"is_maca": lambda: True}
+        fn = load(
+            "python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py",
+            "get_paged_mqa_logits_metadata",
+            ns,
+        )
+        with patch.dict(
+            sys.modules, {"deep_gemm": NS(get_paged_mqa_logits_metadata=backend)}
+        ):
+            self.assertIs(fn(context_lens, 64, 80), schedule)
+        context_lens.item.assert_not_called()
+
+    def test_nvidia_mqa_schedule_preserves_three_argument_api(self):
+        schedule = object()
+        lengths = object()
+
+        def backend(context_lens, block_kv, num_sms):
+            self.assertIs(context_lens, lengths)
+            self.assertEqual((block_kv, num_sms), (64, 80))
+            return schedule
+
+        fn = load(
+            "python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py",
+            "get_paged_mqa_logits_metadata",
+            {"is_maca": lambda: False},
+        )
+        with patch.dict(
+            sys.modules, {"deep_gemm": NS(get_paged_mqa_logits_metadata=backend)}
+        ):
+            self.assertIs(fn(lengths, 64, 80), schedule)
 
 
 

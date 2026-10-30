@@ -77,6 +77,26 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # Attention and MLP execution still use the padded mode.
         self.assertEqual(batch.forward_mode, ForwardMode.EXTEND)
 
+    def test_padded_idle_prunes_all_hidden_state_views(self):
+        """An idle DP rank has no logits or captured states, even with padded rows."""
+        hidden = torch.randn(4, 8)
+        before_norm = torch.randn_like(hidden)
+        for aux in (hidden, [hidden, before_norm]):
+            with self.subTest(packed=isinstance(aux, torch.Tensor)):
+                pruned, before, auxiliary, *_ = LogitsProcessor._get_pruned_states(
+                    None,
+                    hidden,
+                    before_norm,
+                    aux,
+                    LogitsMetadata(forward_mode=ForwardMode.IDLE),
+                )
+                self.assertEqual(pruned.shape, (0, 8))
+                self.assertEqual(before.shape, (0, 8))
+                states = (
+                    [auxiliary] if isinstance(auxiliary, torch.Tensor) else auxiliary
+                )
+                self.assertTrue(all(state.shape == (0, 8) for state in states))
+
     def test_init_mlp_sync_metadata_scales_speculative_request_width(self):
         spec_info = SimpleNamespace(
             num_tokens_per_req=4,

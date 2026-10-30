@@ -17,7 +17,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_flashinfer_available, next_power_of_2, set_weight_attrs
+from sglang.srt.utils import next_power_of_2, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -32,17 +32,6 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
-    )
-
-if is_flashinfer_available():
-    from flashinfer.fp4_quantization import block_scale_interleave
-    from flashinfer.fused_moe import (
-        convert_to_block_layout,
-        trtllm_mxint4_block_scale_moe,
-    )
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
     )
 
 
@@ -171,6 +160,12 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         num_experts,
     ):
         """Prepare quantized weights for kernel (done offline with weights)."""
+        from flashinfer.fp4_quantization import block_scale_interleave
+        from flashinfer.fused_moe import convert_to_block_layout
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
 
         epilogue_tile_m = 128
         gemm1_weights_mxint4_shuffled = []
@@ -297,6 +292,8 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from flashinfer.fused_moe import trtllm_mxint4_block_scale_moe
+
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert self.moe_runner_config.is_gated, (

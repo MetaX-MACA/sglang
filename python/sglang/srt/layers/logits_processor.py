@@ -803,6 +803,17 @@ class LogitsProcessor(nn.Module):
                 pin_memory=is_pin_memory_available(),
             ).to(pruned_states.device, non_blocking=True)
 
+        if logits_metadata.forward_mode.is_idle():
+            pruned_states = pruned_states[:0]
+            if pruned_states_before_norm is not None:
+                pruned_states_before_norm = pruned_states_before_norm[:0]
+            if aux_pruned_states is not None:
+                aux_pruned_states = (
+                    aux_pruned_states[:0]
+                    if isinstance(aux_pruned_states, torch.Tensor)
+                    else [hidden[:0] for hidden in aux_pruned_states]
+                )
+
         return (
             pruned_states,
             pruned_states_before_norm,

@@ -1,14 +1,12 @@
 import torch.distributed as dist
 
-from sglang.srt.utils import is_flashinfer_available
-
-if is_flashinfer_available():
+try:
     from flashinfer.comm.mnnvl import CommBackend
-else:
+except ImportError:
 
     class CommBackend:
         """
-        Placeholder base class when flashinfer is not available
+        Placeholder when FlashInfer does not provide MNNVL
         """
 
         pass

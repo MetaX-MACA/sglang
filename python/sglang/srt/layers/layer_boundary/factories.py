@@ -152,6 +152,8 @@ def _resolve_ffn(
     can_move_output = output_transform is None or output_transform.before_reduce_scatter
     use_reduce_scatter = strategy in ("rs", "rs+rsv") and can_move_output
     use_reduce_scatterv = strategy in ("rsv", "rs+rsv") and can_move_output
+    if not sparse and envs.MX_DISABLE_DENSE_REDUCE_SCATTER.get():
+        use_reduce_scatter = use_reduce_scatterv = False
     cp_shards = _prefill_cp_shards_tokens()
     axes, attention, local, full = _row_layouts(variant)
     on_rank_rows = _ffn_on_rank_rows(sparse, dense_tp_size)

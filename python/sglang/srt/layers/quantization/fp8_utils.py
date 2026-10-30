@@ -252,8 +252,6 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
-
     @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
     def _bmm_fp8_batched_op(
         A: torch.Tensor,
@@ -262,6 +260,8 @@ if _is_cuda:
         A_scale: torch.Tensor,
         B_scale: torch.Tensor,
     ) -> None:
+        from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
+
         _raw_bmm_fp8_batched(A, B, A_scale, B_scale, out.dtype, out)
 
     def bmm_fp8(

@@ -1008,5 +1008,30 @@ class TestLayerTypesValidationPatch(CustomTestCase):
         self.assertEqual(len(config.mlp_layer_types), 5)
 
 
+class TestMacaDynamicCache(CustomTestCase):
+    def test_empty_cache_matches_key_and_value_ranks(self):
+        """MACA cannot concatenate HF's rank-one sentinel with attention states."""
+        from transformers.cache_utils import DynamicLayer
+
+        original = DynamicLayer.lazy_initialization
+        try:
+            with patch.object(torch, "__version__", "2.10.0+metax"):
+                hf_transformers_patches._patch_dynamic_cache_empty_tensors()
+                patched = DynamicLayer.lazy_initialization
+                hf_transformers_patches._patch_dynamic_cache_empty_tensors()
+                self.assertIs(DynamicLayer.lazy_initialization, patched)
+                layer = DynamicLayer()
+                keys = torch.randn(2, 4, 3, 8)
+                values = torch.randn(2, 4, 3, 6)
+                layer.lazy_initialization(keys, values)
+                self.assertEqual(layer.keys.shape, (2, 4, 0, 8))
+                self.assertEqual(layer.values.shape, (2, 4, 0, 6))
+                cached_keys, cached_values = layer.update(keys, values)
+                torch.testing.assert_close(cached_keys, keys)
+                torch.testing.assert_close(cached_values, values)
+        finally:
+            DynamicLayer.lazy_initialization = original
+
+
 if __name__ == "__main__":
     unittest.main()

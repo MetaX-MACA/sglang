@@ -2,11 +2,13 @@ import unittest
 
 import test_declared_decoder_boundary as fixture
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary import (
     TokenAxis,
 )
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.factories import _resolve_ffn
 from sglang.srt.layers.layer_boundary.ops import moe_cp_take_back_output
 from sglang.test.boundary_fixtures import make_test_stages
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -19,6 +21,21 @@ class TestDenseMlpUnderPrefillCP(CustomTestCase):
     """A TP-sharded dense MLP under prefill CP must gather tokens across CP ranks
     before its all-reduce, or CP pairs sum partial outputs of different tokens
     (issue #38019: Qwen3-32B emitted garbage that never reached EOS)."""
+
+    def test_dense_reduce_scatter_switch_preserves_sparse_contract(self):
+        """Disabling dense reduce-scatter must leave MoE transport permissions intact."""
+        parallel = fixture.parallel_of(attn_dp=1, attn_tp=2)
+        for disabled in (False, True):
+            with (
+                envs.MX_DISABLE_DENSE_REDUCE_SCATTER.override(disabled),
+                fixture.planning(parallel),
+            ):
+                for sparse in (False, True):
+                    output = _resolve_ffn(BatchVariant.ORDINARY, sparse=sparse)[
+                        0
+                    ].output
+                    self.assertEqual(output.may_reduce_scatter, sparse or not disabled)
+                    self.assertEqual(output.may_reduce_scatterv, sparse or not disabled)
 
     def test_dense_mlp_gathers_across_cp(self):
         parallel = fixture.parallel_of(
