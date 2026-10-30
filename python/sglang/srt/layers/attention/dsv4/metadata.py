@@ -22,7 +22,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
-from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
+from sglang.srt.utils import is_hip, is_maca, is_sm120_supported, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -211,16 +211,22 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            use_jit_indexer = not self.force_deep_gemm_metadata and (
-                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                or self.compressed_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+            use_jit_indexer = (
+                not is_maca()
+                and not self.force_deep_gemm_metadata
+                and (
+                    envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+                    or self.compressed_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+                )
             )
             if use_jit_indexer:
                 from sglang.kernels.ops.attention.dsv4 import (
                     get_paged_mqa_logits_metadata,
                 )
             else:
-                from deep_gemm import get_paged_mqa_logits_metadata
+                from sglang.srt.layers.deep_gemm_wrapper import (
+                    get_paged_mqa_logits_metadata,
+                )
 
             compressed_seq_lens = self.compressed_seq_lens.to(torch.int32)
             if compressed_seq_lens.dim() == 1:

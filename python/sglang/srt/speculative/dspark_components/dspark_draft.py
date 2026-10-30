@@ -473,6 +473,10 @@ class DraftBlockProposer:
         # Hand-built batch bypasses ForwardBatch.init_new: rebind the write
         # loc to the draft's kernel-facing ids (no-op on plain pools).
         self.draft_model_runner.kv_index_translator.bind_own_plan(idle_batch)
+        from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+
+        idle_batch.is_dsa = is_deepseek_dsa(batch.model_config.hf_config)
+        idle_batch.is_ds_compressed = is_deepseek_v4(batch.model_config.hf_config)
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)

@@ -750,6 +750,135 @@ class TestMacaMergeContracts(CustomTestCase):
         ):
             self.assertIs(fn(lengths, 64, 80), schedule)
 
+    def test_dsv4_query_dtype_preserves_native_fp8(self):
+        path = ROOT / "python/sglang/srt/layers/attention/dsv4/indexer.py"
+        tree = ast.parse(path.read_text())
+        owner = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "C4Indexer"
+        )
+        fn = next(
+            n
+            for n in owner.body
+            if isinstance(n, ast.FunctionDef) and n.name == "compute_q"
+        )
+        start = next(
+            i
+            for i, node in enumerate(fn.body)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "index_cache_type"
+                for t in node.targets
+            )
+        )
+        # Execute the selection and quantizer call, omitting the projection setup.
+        body = ast.FunctionDef(
+            name="select_query",
+            args=ast.arguments(
+                posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]
+            ),
+            body=fn.body[start:],
+            decorator_list=[],
+        )
+        module = ast.fix_missing_locations(ast.Module(body=[body], type_ignores=[]))
+        for maca, expected in ((False, DType.FP8), (True, DType.INT8)):
+            quantize = Mock()
+            ns = {
+                "is_maca": lambda: maca,
+                "envs": NS(SGLANG_DSV4_INDEX_CACHE_TYPE=NS(get=lambda: "int8")),
+                "torch": TorchStub,
+                "q": object(),
+                "weight": object(),
+                "positions": object(),
+                "self": NS(weight_scale=1.0, freqs_cis=object()),
+                "fused_q_indexer_rope_hadamard_quant": quantize,
+            }
+            exec(compile(module, str(path), "exec"), ns)
+            ns["select_query"]()
+            self.assertIs(quantize.call_args.args[-1], expected)
+
+    def test_bf16_paged_kv_has_correct_physical_size(self):
+        layout = NS(V4=NS(page_bytes=lambda size: ((size * 584 + 575) // 576) * 576))
+        ns = {
+            "torch": TorchStub,
+            "KVLayout": layout,
+            "KVCache": object,
+            "ceil_div": lambda a, b: (a + b - 1) // b,
+        }
+        cls = load(
+            "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py",
+            "DeepSeekV4SingleKVPool",
+            ns,
+        )
+        for dtype in (DType.BF16, DType.FP8):
+            pool = cls.__new__(cls)
+            pool.dtype = dtype
+            pool.store_dtype = DType.BF16 if dtype is DType.BF16 else DType.UINT8
+            pool.qk_nope_head_dim, pool.qk_rope_head_dim = 448, 64
+            pool.quantize_block_size, pool.scale_pad = 64, 1
+            pool.rope_storage_dtype = DType.BF16
+            pool.kv_layout, pool.page_size, pool.device = layout.V4, 64, "cuda:3"
+            buf = pool.create_buffer(num_pages=3)
+            expected = (
+                64 * 1024 if dtype is DType.BF16 else ((64 * 584 + 575) // 576) * 576
+            )
+            self.assertEqual(buf.nbytes, 3 * expected)
+            self.assertEqual(pool.bytes_per_page_padded, expected)
+            self.assertEqual(buf.dtype, pool.store_dtype)
+
+    def test_dsv4_bf16_cache_view_uses_elements_not_fp8_bytes(self):
+        path = "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py"
+        ns = {"torch": TorchStub}
+        swa_bytes = load(
+            path, "get_swa_key_bytes_per_token", ns, owner="DeepSeekV4TokenToKVPool"
+        )
+        extra_bytes = load(
+            path, "get_extra_key_bytes_per_token", ns, owner="DeepSeekV4TokenToKVPool"
+        )
+        for dtype, expected_bytes in ((DType.BF16, 1024), (DType.FP8, 584)):
+            with self.subTest(dtype=dtype):
+                pool = NS(
+                    dtype=dtype,
+                    uniform_fp8=False,
+                    qk_nope_head_dim=448,
+                    qk_rope_head_dim=64,
+                    kv_layout=NS(bytes_per_token=584),
+                    layer_mapping={
+                        0: (None, None, NS(kv_cache_total_dim=expected_bytes))
+                    },
+                )
+                view_dim = expected_bytes // dtype.itemsize
+                self.assertEqual(swa_bytes(pool) // dtype.itemsize, view_dim)
+                self.assertEqual(extra_bytes(pool, 0) // dtype.itemsize, view_dim)
+                self.assertEqual(view_dim, 512 if dtype is DType.BF16 else 584)
+
+    def test_unified_fp8_accounting_includes_rope_pool(self):
+        ns = {"get_tensor_size_bytes": lambda b: b.nbytes}
+        fn = load(
+            "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py",
+            "get_kv_size_bytes",
+            ns,
+            owner="DeepSeekV4UnifiedKVPool",
+        )
+        pool = NS(fp8=True, kv_buffer=[NS(nbytes=512)], kv_buffer_rope=[NS(nbytes=128)])
+        self.assertEqual(fn(pool), 640)
+
+    def test_stage_accounting_handles_missing_c4_and_low_ratio_pools(self):
+        ns = {}
+        fn = load(
+            "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py",
+            "get_kv_size_bytes",
+            ns,
+            owner="DeepSeekV4TokenToKVPool",
+        )
+        pool = NS(
+            _unified_kv=False,
+            swa_kv_pool=NS(get_kv_size_bytes=lambda: 10),
+            kv_pools={1: NS(get_kv_size_bytes=lambda: 20), 4: None},
+            index_pools={1: NS(get_kv_size_bytes=lambda: 3)},
+        )
+        self.assertEqual(fn(pool), 33)
 
 
 if __name__ == "__main__":
