@@ -495,16 +495,7 @@ def run_eagle_verify(
 
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
-    if plan_stream:
-        plan_stream.wait_stream(fwd_stream)
     with plan_stream_ctx:
-        if plan_stream is not None:
-            if verify_handoff_event is not None:
-                plan_stream.wait_event(verify_handoff_event)
-            else:
-                # Workers without an explicit event ring still need a correct
-                # draft/tree frontier before plan-stream GPU work can start.
-                plan_stream.wait_stream(fwd_stream)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,
