@@ -23,6 +23,138 @@ from .utils import make_name
 
 
 @triton.jit
+def _candidate_maxima_kernel(
+    SCORES,
+    LENS,
+    OUT,
+    WIDTH: tl.constexpr,
+    NBLOCKS: tl.constexpr,
+    SCORE_ROW: tl.constexpr,
+    LENS_STRIDE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    blocks = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    columns = blocks[:, None] * BLOCK_SIZE + offsets[None, :]
+    length = tl.load(LENS + row * LENS_STRIDE)
+    values = tl.load(
+        SCORES + row.to(tl.int64) * SCORE_ROW + columns,
+        mask=(columns < WIDTH) & (columns < length),
+        other=-float("inf"),
+    )
+    maxima = tl.max(values, axis=1)
+    maxima = tl.where(blocks == (length - 1) // BLOCK_SIZE, float("inf"), maxima)
+    # Empty rows have no newest block (Triton // truncates negative integers).
+    maxima = tl.where(length > 0, maxima, -float("inf"))
+    tl.store(OUT + row.to(tl.int64) * NBLOCKS + blocks, maxima, blocks < NBLOCKS)
+
+
+@triton.jit
+def _publish_candidate_keep_kernel(
+    INDICES,
+    VALUES,
+    IDS,
+    KEEP,
+    K: tl.constexpr,
+    NBLOCKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.arange(0, BLOCK)
+    idx = tl.load(INDICES + row * K + col, col < K, other=0)
+    value = tl.load(VALUES + row * K + col, col < K, other=-float("inf"))
+    valid = (col < K) & (value > -float("inf"))
+    tl.store(IDS + row * K + col, tl.where(valid, idx, -1).to(tl.int32), col < K)
+    tl.store(KEEP + row * NBLOCKS + idx, True, valid)
+
+
+def select_candidate_block_mask(
+    scores: torch.Tensor, lens: torch.Tensor, topk_blocks: int, block_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select blocks and publish one bool per block, without a position mask."""
+    assert scores.ndim == 2 and scores.stride(1) == 1
+    assert block_size > 0 and (block_size & (block_size - 1)) == 0
+    rows, width = scores.shape
+    nblocks = triton.cdiv(width, block_size)
+    maxima = scores.new_empty((rows, nblocks))
+    if rows and nblocks:
+        _candidate_maxima_kernel[(rows, triton.cdiv(nblocks, 128))](
+            scores,
+            lens,
+            maxima,
+            width,
+            nblocks,
+            scores.stride(0),
+            lens.stride(0),
+            block_size,
+            128,
+            num_warps=4,
+        )
+    top = maxima.topk(min(topk_blocks, nblocks), dim=-1)
+    ids = torch.empty_like(top.indices, dtype=torch.int32)
+    keep = torch.zeros((rows, nblocks), dtype=torch.bool, device=scores.device)
+    k = ids.shape[1]
+    if rows and k:
+        _publish_candidate_keep_kernel[(rows,)](
+            top.indices,
+            top.values,
+            ids,
+            keep,
+            k,
+            nblocks,
+            triton.next_power_of_2(k),
+            num_warps=4,
+        )
+    return ids, keep
+
+
+@triton.jit
+def _mask_candidate_scores_kernel(
+    SCORES,
+    KEEP,
+    LENS,
+    WIDTH: tl.constexpr,
+    SCORE_ROW: tl.constexpr,
+    KEEP_ROW: tl.constexpr,
+    LENS_STRIDE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    length = tl.load(LENS + row * LENS_STRIDE)
+    active = (col < WIDTH) & (col < length)
+    keep = tl.load(KEEP + row * KEEP_ROW + col // BLOCK_SIZE, active, other=True)
+    # Retained logits are never read or rewritten. The native top-k ignores
+    # positions beyond length, so those also need no writes.
+    tl.store(SCORES + row * SCORE_ROW + col, -float("inf"), active & ~keep)
+
+
+def mask_candidate_scores_(
+    scores: torch.Tensor, keep: torch.Tensor, lens: torch.Tensor, block_size: int
+) -> None:
+    """Mask excluded blocks in place, with no score reads or full-sized copy."""
+    rows, width = scores.shape
+    assert scores.stride(1) == keep.stride(1) == 1
+    assert keep.shape[0] == rows and keep.shape[1] >= triton.cdiv(width, block_size)
+    if rows and width:
+        _mask_candidate_scores_kernel[(rows, triton.cdiv(width, 1024))](
+            scores,
+            keep,
+            lens,
+            width,
+            scores.stride(0),
+            keep.stride(0),
+            lens.stride(0),
+            block_size,
+            1024,
+            num_warps=4,
+        )
+
+
+@triton.jit
 def _candidate_row_lens_kernel(
     LENS,
     NBLOCKS,

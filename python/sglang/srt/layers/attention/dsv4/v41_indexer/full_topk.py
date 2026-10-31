@@ -10,7 +10,10 @@ import torch
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
+from sglang.kernels.ops.attention.dsv4.topk import (
+    topk_transform_paged,
+    topk_transform_paged_torch,
+)
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
@@ -137,6 +140,17 @@ class FullTopKIndexer:
             req_to_token=self.req_to_token,
         )
         if d is None:
+            return
+        if d.slots is None:
+            metadata = inputs.paged_metadata
+            topk_transform_paged(
+                d.scores,
+                d.lens.to(torch.int32),
+                metadata.page_table,
+                out.page_indices,
+                metadata.compressed_page_size,
+                out.raw_indices,
+            )
             return
         k = min(inputs.indexer.index_topk, d.lmax)
         idx = d.scores.topk(k, dim=-1, sorted=False).indices

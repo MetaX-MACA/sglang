@@ -375,7 +375,7 @@ class DecodeScores(msgspec.Struct, frozen=True):
     bs: int
     lmax: int
     lens: torch.Tensor  # [bs]
-    slots: torch.Tensor  # [bs, lmax]
+    slots: Optional[torch.Tensor]  # [bs, lmax]; paged INT8 selects via page table
     scores: torch.Tensor  # [bs, lmax]
 
 
@@ -487,8 +487,6 @@ def decode_scores(
     if lmax == 0:
         return None
 
-    j = torch.arange(lmax, device=pos.device)
-    slots = req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
     kind = dsv4_index_cache_kind()
     if kind.is_int8 and is_maca():
         from deep_gemm import int8_paged_mqa_logits
@@ -525,8 +523,10 @@ def decode_scores(
             False,
             backend="tilelang",
         )
-        return DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores)
+        return DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=None, scores=scores)
 
+    j = torch.arange(lmax, device=pos.device)
+    slots = req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
     valid = j[None, :] < lens[:, None]
@@ -544,6 +544,7 @@ def decode_scores(
 
 
 def write_decode(out: Selection, d: DecodeScores, idx: torch.Tensor) -> None:
+    assert d.slots is not None, "paged INT8 uses topk_transform_paged"
     k = idx.shape[1]
     idx = idx.sort(dim=-1).values
     reach = idx < d.lens[:, None]
