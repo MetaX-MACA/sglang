@@ -1,12 +1,15 @@
 #pragma once
 
 // Multi-step speculative HiSparse cache-management kernels.
-// DSv4 cache transfer remains in hisparse.cuh.
+// Linear and page-padded C4 transfers share the same speculative swap state.
 
 #include <sgl_kernel/tensor.h>  // TensorMatcher and symbolic tensor validation
 #include <sgl_kernel/utils.h>   // RuntimeCheck and host utilities
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>  // LaunchKernel and PDL helpers
+
+#include <sgl_kernel/deepseek_v4/kvcacheio.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -15,13 +18,13 @@
 
 namespace sglang {
 
-#ifdef USE_ROCM
+#if defined(USE_ROCM) || defined(__MACACC__)
 constexpr int WARP_SIZE = 64;
 using BallotMask = uint64_t;
 constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFFFFFFFFFull;
 #else
 constexpr int WARP_SIZE = 32;
-using BallotMask = unsigned int;
+using BallotMask = uint32_t;
 constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
 #endif
 constexpr int64_t HASH_DELETED = -2;
@@ -284,7 +287,7 @@ __device__ __forceinline__ void ring_hash_erase_atomic(
   atomic_cas_i64(vals + secondary_slot, expected, HASH_DELETED);
 }
 
-#ifdef USE_ROCM
+// #ifdef USE_ROCM
 template <int ITEM_SIZE_BYTES>
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* __restrict__ src_addr, void* __restrict__ dst_addr) {
@@ -304,68 +307,69 @@ transfer_item_warp(int32_t lane_id, const void* __restrict__ src_addr, void* __r
   }
 }
 
-#else
-template <int ITEM_SIZE_BYTES>
-__device__ __forceinline__ void transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr) {
-  // Issue the 512B body and 64B edge loads before either store so both host
-  // reads can remain in flight. Rows alternate between 0B and 64B offsets in
-  // a 128B transaction, so place the body on the aligned side of each row.
-  if constexpr (ITEM_SIZE_BYTES == 576) {
-    const auto src = static_cast<const char*>(src_addr);
-    auto dst = static_cast<char*>(dst_addr);
-    const bool edge_first = (reinterpret_cast<uintptr_t>(src_addr) & 127u) == 64u;
-    const int32_t body_offset = edge_first ? 64 : 0;
-    const int32_t edge_offset = edge_first ? 0 : 512;
-    uint64_t body_lo, body_hi;
-    uint64_t edge_lo, edge_hi;
-    const auto body_src = reinterpret_cast<const uint64_t*>(src + body_offset + lane_id * 16);
-    auto body_dst = reinterpret_cast<uint64_t*>(dst + body_offset + lane_id * 16);
-    asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(body_lo), "=l"(body_hi) : "l"(body_src) : "memory");
-    if (lane_id < 4) {
-      const auto edge_src = reinterpret_cast<const uint64_t*>(src + edge_offset + lane_id * 16);
-      asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(edge_lo), "=l"(edge_hi) : "l"(edge_src) : "memory");
-    }
-    asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(body_dst), "l"(body_lo), "l"(body_hi) : "memory");
-    if (lane_id < 4) {
-      auto edge_dst = reinterpret_cast<uint64_t*>(dst + edge_offset + lane_id * 16);
-      asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(edge_dst), "l"(edge_lo), "l"(edge_hi) : "memory");
-    }
-    return;
-  }
-
-  // 128-bit bulk transfer via paired 64-bit loads (avoids alignment issues with uint4)
-  constexpr int total_pairs = ITEM_SIZE_BYTES / 16;  // number of 16-byte chunks
-  {
-    const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
-    uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
-    for (int j = lane_id; j < total_pairs; j += WARP_SIZE) {
-      uint64_t lo, hi;
-      const uint64_t* s = src + j * 2;
-      asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(s) : "memory");
-      uint64_t* d = dst + j * 2;
-      asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo), "l"(hi) : "memory");
-    }
-  }
-
-  // Tail: 64-bit for remaining 8-byte chunk (if item_size not multiple of 16)
-  constexpr int tail_8B = (ITEM_SIZE_BYTES - total_pairs * 16) / 8;
-  if (tail_8B > 0 && lane_id < tail_8B) {
-    const uint64_t* __restrict__ src8 =
-        reinterpret_cast<const uint64_t*>(static_cast<const char*>(src_addr) + total_pairs * 16);
-    uint64_t* __restrict__ dst8 = reinterpret_cast<uint64_t*>(static_cast<char*>(dst_addr) + total_pairs * 16);
-    uint64_t tmp;
-    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src8 + lane_id) : "memory");
-    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
-  }
-}
-
-#endif
+// #else
+// template <int ITEM_SIZE_BYTES>
+// __device__ __forceinline__ void transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr) {
+//   // Issue the 512B body and 64B edge loads before either store so both host
+//   // reads can remain in flight. Rows alternate between 0B and 64B offsets in
+//   // a 128B transaction, so place the body on the aligned side of each row.
+//   if constexpr (ITEM_SIZE_BYTES == 576) {
+//     const auto src = static_cast<const char*>(src_addr);
+//     auto dst = static_cast<char*>(dst_addr);
+//     const bool edge_first = (reinterpret_cast<uintptr_t>(src_addr) & 127u) == 64u;
+//     const int32_t body_offset = edge_first ? 64 : 0;
+//     const int32_t edge_offset = edge_first ? 0 : 512;
+//     uint64_t body_lo, body_hi;
+//     uint64_t edge_lo, edge_hi;
+//     const auto body_src = reinterpret_cast<const uint64_t*>(src + body_offset + lane_id * 16);
+//     auto body_dst = reinterpret_cast<uint64_t*>(dst + body_offset + lane_id * 16);
+//     asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(body_lo), "=l"(body_hi) : "l"(body_src) : "memory");
+//     if (lane_id < 4) {
+//       const auto edge_src = reinterpret_cast<const uint64_t*>(src + edge_offset + lane_id * 16);
+//       asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(edge_lo), "=l"(edge_hi) : "l"(edge_src) : "memory");
+//     }
+//     asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(body_dst), "l"(body_lo), "l"(body_hi) : "memory");
+//     if (lane_id < 4) {
+//       auto edge_dst = reinterpret_cast<uint64_t*>(dst + edge_offset + lane_id * 16);
+//       asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(edge_dst), "l"(edge_lo), "l"(edge_hi) : "memory");
+//     }
+//     return;
+//   }
+//
+//   // 128-bit bulk transfer via paired 64-bit loads (avoids alignment issues with uint4)
+//   constexpr int total_pairs = ITEM_SIZE_BYTES / 16;  // number of 16-byte chunks
+//   {
+//     const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
+//     uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
+//     for (int j = lane_id; j < total_pairs; j += WARP_SIZE) {
+//       uint64_t lo, hi;
+//       const uint64_t* s = src + j * 2;
+//       asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(s) : "memory");
+//       uint64_t* d = dst + j * 2;
+//       asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo), "l"(hi) : "memory");
+//     }
+//   }
+//
+//   // Tail: 64-bit for remaining 8-byte chunk (if item_size not multiple of 16)
+//   constexpr int tail_8B = (ITEM_SIZE_BYTES - total_pairs * 16) / 8;
+//   if (tail_8B > 0 && lane_id < tail_8B) {
+//     const uint64_t* __restrict__ src8 =
+//         reinterpret_cast<const uint64_t*>(static_cast<const char*>(src_addr) + total_pairs * 16);
+//     uint64_t* __restrict__ dst8 = reinterpret_cast<uint64_t*>(static_cast<char*>(dst_addr) + total_pairs * 16);
+//     uint64_t tmp;
+//     asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src8 + lane_id) : "memory");
+//     asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
+//   }
+// }
+//
+// #endif
 
 __device__ __forceinline__ int first_set_lane(BallotMask mask) {
 #ifdef USE_ROCM
   return __ffsll(mask) - 1;
 #else
-  return __ffs(mask) - 1;
+  // return __ffs(mask) - 1;
+  return __ffsll(mask) - 1;
 #endif
 }
 
@@ -413,7 +417,14 @@ __device__ __forceinline__ bool try_get_extra_page_device_loc(
 
 // Flatten all speculative steps. Each lane resolves one occurrence; the warp
 // cooperatively copies only lanes that won a unique-miss claim.
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan>
+template <
+    int BLOCK_SIZE,
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int ITEM_SIZE_BYTES,
+    int NUM_STEPS,
+    bool RecordMissPlan,
+    bool IsDsv4Layout>
 __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -446,8 +457,17 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
         miss_count_out[bid] = 0;
       }
     }
-    for (int64_t i = tid; i < total_occurrences; i += BLOCK_SIZE)
-      req_top_k_device_locs[i] = 0;
+    if constexpr (IsDsv4Layout) {
+      // Empty C4 histories still have a clamped attention length of one.
+      // Preserve the indexer's mask and the offsets within padding page zero.
+      for (int64_t i = tid; i < total_occurrences; i += BLOCK_SIZE) {
+        const int32_t token = top_k_tokens[bid * top_k_tokens_stride + i];
+        req_top_k_device_locs[i] = token >= 0 ? token % page_size : -1;
+      }
+    } else {
+      for (int64_t i = tid; i < total_occurrences; i += BLOCK_SIZE)
+        req_top_k_device_locs[i] = 0;
+    }
     return;
   }
 
@@ -598,15 +618,27 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
           miss_dst_out[bid * plan_stride + copy_miss_idx] = copy_loc;
         }
       }
-      const auto src_k = static_cast<const char*>(host_cache_k) + copy_src_loc * ITEM_SIZE_BYTES;
-      auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(copy_loc) * ITEM_SIZE_BYTES;
-      transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+      if constexpr (IsDsv4Layout) {
+        device::hisparse::transfer_item(
+            device_buffer_k, const_cast<void*>(host_cache_k), copy_loc, static_cast<int32_t>(copy_src_loc), ITEM_SIZE_BYTES);
+      } else {
+        const auto src_k = static_cast<const char*>(host_cache_k) + copy_src_loc * ITEM_SIZE_BYTES;
+        auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(copy_loc) * ITEM_SIZE_BYTES;
+        transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+      }
     }
     copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
   }
 }
 
-template <int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan, bool USE_PDL>
+template <
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int ITEM_SIZE_BYTES,
+    int NUM_STEPS,
+    bool RecordMissPlan,
+    bool USE_PDL,
+    bool IsDsv4Layout>
 __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ top_k_device_locs,
@@ -872,9 +904,14 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
             miss_dst_out[bid * plan_stride + miss_idx] = dst_loc;
           }
         }
-        const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * ITEM_SIZE_BYTES;
-        auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(dst_loc) * ITEM_SIZE_BYTES;
-        transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+        if constexpr (IsDsv4Layout) {
+          device::hisparse::transfer_item(
+              device_buffer_k, const_cast<void*>(host_cache_k), dst_loc, static_cast<int32_t>(src_loc), ITEM_SIZE_BYTES);
+        } else {
+          const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * ITEM_SIZE_BYTES;
+          auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(dst_loc) * ITEM_SIZE_BYTES;
+          transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+        }
       }
       copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
     }
@@ -935,7 +972,8 @@ template <
     int ITEM_SIZE_BYTES,
     int NUM_STEPS,
     bool RecordMissPlan,
-    bool USE_PDL>
+    bool USE_PDL,
+    bool IsDsv4Layout>
 void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -957,8 +995,8 @@ void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView miss_count_out) {
   using namespace host;
 
-  static_assert(NUM_STEPS > 1 && NUM_STEPS <= 4, "HiSparse speculative swap requires 2-4 steps.");
-  static_assert(NUM_TOP_K >= 1024, "HiSparse speculative swap requires top_k >= 1024.");
+  static_assert(NUM_STEPS > 1, "HiSparse speculative swap requires at least two steps.");
+  static_assert(NUM_TOP_K > 0, "HiSparse speculative swap requires positive top_k.");
   static_assert(NUM_STEPS * NUM_TOP_K <= 8192, "HiSparse speculative swap supports at most 8192 occurrences.");
 
   const int64_t bs = top_k_tokens.shape()[0];
@@ -1057,12 +1095,13 @@ void load_cache_to_device_buffer_spec(
           HOT_BUFFER_SIZE,
           ITEM_SIZE_BYTES,
           NUM_STEPS,
-          RecordMissPlan>,
+          RecordMissPlan,
+          IsDsv4Layout>,
       static_cast<const int32_t*>(top_k_tokens.data_ptr()),
       static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
       static_cast<const int64_t*>(host_cache_locs.data_ptr()),
       static_cast<int32_t*>(device_buffer_locs.data_ptr()),
-      host_cache_k.data_ptr(),
+      runtime::get_device_accessible_ptr(host_cache_k),
       device_buffer_k.data_ptr(),
       static_cast<int32_t*>(top_k_device_locs.data_ptr()),
       static_cast<const int64_t*>(req_pool_indices.data_ptr()),
@@ -1088,13 +1127,14 @@ void load_cache_to_device_buffer_spec(
               ITEM_SIZE_BYTES,
               NUM_STEPS,
               RecordMissPlan,
-              USE_PDL>,
+              USE_PDL,
+              IsDsv4Layout>,
           static_cast<const int32_t*>(top_k_tokens.data_ptr()),
           static_cast<int32_t*>(top_k_device_locs.data_ptr()),
           static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
           static_cast<int32_t*>(device_buffer_locs.data_ptr()),
           static_cast<const int64_t*>(host_cache_locs.data_ptr()),
-          host_cache_k.data_ptr(),
+          runtime::get_device_accessible_ptr(host_cache_k),
           device_buffer_k.data_ptr(),
           static_cast<const int64_t*>(req_pool_indices.data_ptr()),
           cache_state,

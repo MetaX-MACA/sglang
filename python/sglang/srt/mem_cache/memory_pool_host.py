@@ -491,6 +491,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 dst_ptrs=self.data_ptrs,
                 src_indices=device_indices.to(dtype=torch.int64),
                 dst_indices=host_indices.to(dtype=torch.int64),
+                item_size_bytes=(
+                    1024 if self.device_buffers[0].dtype == torch.bfloat16 else 584
+                ),
             )
             return
         host_rows = self._to_page_indices(host_indices)
@@ -598,6 +601,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 dst_ptrs=self.device_ptrs[layer_id : layer_id + 1],
                 src_indices=host_indices.to(dtype=torch.int64),
                 dst_indices=device_indices.to(dtype=torch.int64),
+                item_size_bytes=(
+                    1024 if self.device_buffers[0].dtype == torch.bfloat16 else 584
+                ),
             )
             return
         host_rows = self._to_page_indices(host_indices)
