@@ -88,6 +88,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
     prepare_mamba_track_for_verify,
+    record_stream_each,
 )
 from sglang.srt.utils import (
     is_cuda,
@@ -848,9 +849,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+        fwd_stream = torch.get_device_module(self.device).current_stream()
+        record_stream_each((batch.seq_lens, batch.req_pool_indices), fwd_stream)
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
@@ -1036,6 +1036,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 chain_stride=self.verify_num_draft_tokens,
             )
 
+        online_c128 = getattr(self.model_runner.attn_backend, "online_c128_mtp", None)
+        if online_c128 is not None and online_c128.enabled():
+            online_c128.commit_pending(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=accept.new_seq_lens,
+            )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
@@ -1105,6 +1111,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+            extra_keep_alive_refs=[target_verify.verify_forward_batch],
         )
 
     def _commit_target_mamba_states_after_verify(

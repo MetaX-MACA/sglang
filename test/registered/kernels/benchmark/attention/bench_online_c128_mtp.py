@@ -51,6 +51,7 @@ class BenchmarkCase:
     layer_bs: int
     num_verify_tokens: int
     state_slot_stride: int
+    empty_i32: torch.Tensor
 
 
 def round_up_div(x: int, y: int) -> int:
@@ -115,6 +116,7 @@ def make_case(batch_size: int, num_verify_tokens: int) -> BenchmarkCase:
         layer_bs=batch_size,
         num_verify_tokens=num_verify_tokens,
         state_slot_stride=state_slot_stride,
+        empty_i32=torch.empty(0, device=DEFAULT_DEVICE, dtype=torch.int32),
     )
 
 
@@ -123,6 +125,8 @@ def call_write_prefix(module, case: BenchmarkCase) -> None:
         case.kv_score_input,
         case.seq_lens,
         case.req_pool_indices,
+        case.empty_i32,
+        case.empty_i32,
         case.req_to_token,
         case.ape,
         case.state,
