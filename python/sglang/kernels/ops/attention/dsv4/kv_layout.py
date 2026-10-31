@@ -1,4 +1,4 @@
-"""Paged fp8 / fp4 KV cache layouts of the DeepSeek-V4 family sparse MLA decode kernels.
+"""Paged KV cache layouts of the DeepSeek-V4 family sparse MLA decode kernels.
 
 A page block stores ``page_size`` data rows followed by ``page_size`` scale rows.
 The reader selects the format from the bytes per token (the last dim of the
@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import enum
 from typing import Union
+
+import torch
 
 
 class KVLayout(str, enum.Enum):
@@ -89,8 +91,105 @@ class KVLayout(str, enum.Enum):
             return value
         return cls(str(value).lower())
 
+    @property
+    def int8_scale_bytes(self) -> int:
+        try:
+            return {
+                KVLayout.V4: 32,
+            }[self]
+        except KeyError:
+            raise ValueError(f"{self.value} has no INT8 form") from None
+
+    @property
+    def int8_bytes_per_token(self) -> int:
+        return self.data_bytes + self.int8_scale_bytes
+
+    @property
+    def bf16_bytes_per_token(self) -> int:
+        """The whole latent at 2 B per element. V4 is the only layout that keeps
+        RoPE in bf16 and the nope values unquantized."""
+        if self is not KVLayout.V4:
+            raise ValueError(f"{self.value} has no bf16 form")
+        return HEAD_DIM * 2
+
 
 def is_valid_kv_layout_pair(kv: KVLayout, extra_kv: KVLayout) -> bool:
     """The (main, extra) cache pairs the decode kernel accepts: identical layouts,
     or the fp4 extra cache next to a V4.1 fp8 main cache."""
     return extra_kv is kv or (kv is KVLayout.V41 and extra_kv is KVLayout.V41_FP4)
+
+
+# V4 dtype variants. KVLayout properties retain their original FP8/FP4 semantics.
+class DSV4KVCacheFormat(enum.IntEnum):
+    BF16 = 0
+    FP8 = 1
+    INT8 = 2
+
+
+# Latent dimensions. Layout-independent: every layout covers the same 512
+# values, they only differ in how those values are packed.
+NOPE_DIM = 448
+ROPE_DIM = 64
+HEAD_DIM = NOPE_DIM + ROPE_DIM
+
+FP8_SCALE_BYTES_PER_TOKEN = KVLayout.V4.scale_bytes
+INT8_SCALE_BYTES_PER_TOKEN = KVLayout.V4.int8_scale_bytes  # 32
+
+INT8_SCALE_EPS = 1.0e-4
+INT8_QMAX = 127.0
+
+
+def is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+    )
+
+
+def get_kv_cache_format(dtype: torch.dtype) -> DSV4KVCacheFormat:
+    if dtype is torch.int8:
+        return DSV4KVCacheFormat.INT8
+    if is_fp8_dtype(dtype) or dtype is torch.uint8:
+        # The production FP8 pool exposes a float8 view, while a few kernel
+        # call sites intentionally pass its raw uint8 storage.
+        return DSV4KVCacheFormat.FP8
+    if dtype is torch.bfloat16:
+        return DSV4KVCacheFormat.BF16
+    raise ValueError(f"Unsupported DSV4 main KV cache dtype: {dtype}")
+
+
+def kv_cache_bytes_per_token(layout: Union[str, KVLayout], dtype: torch.dtype) -> int:
+    layout = KVLayout.parse(layout)
+    if dtype is torch.int8:
+        if layout is not KVLayout.V4:
+            raise ValueError(f"INT8 main KV requires the V4 layout, got {layout.value}")
+        return layout.int8_bytes_per_token
+    elif dtype is torch.bfloat16:
+        if layout is not KVLayout.V4:
+            raise ValueError("BF16 main KV requires the V4 layout")
+        return layout.bf16_bytes_per_token
+    get_kv_cache_format(dtype)
+    return layout.bytes_per_token
+
+
+def kv_cache_scale_bytes_per_token(
+    layout: Union[str, KVLayout], dtype: torch.dtype
+) -> int:
+    layout = KVLayout.parse(layout)
+    kv_cache_bytes_per_token(layout, dtype)
+    if dtype is torch.bfloat16:
+        return 0
+    if dtype is torch.int8:
+        return layout.int8_scale_bytes
+    return layout.scale_bytes
+
+
+def kv_cache_page_bytes(
+    layout: Union[str, KVLayout], dtype: torch.dtype, page_size: int
+) -> int:
+    layout = KVLayout.parse(layout)
+    raw = page_size * kv_cache_bytes_per_token(layout, dtype)
+    if dtype is torch.bfloat16:
+        return raw
+    return -(-raw // layout.page_align) * layout.page_align

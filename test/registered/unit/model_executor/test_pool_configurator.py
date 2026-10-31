@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.mem_cache.page_interleave import (
     compute_page_shard_scratch_bytes,
@@ -1393,6 +1395,7 @@ class TestSWAPoolFloor(CustomTestCase):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         cfg = object.__new__(DSV4PoolConfigurator)
+        cfg.kv_cache_dtype = torch.float8_e4m3fn
         cfg.qk_nope_head_dim, cfg.qk_rope_head_dim = 128, 64
         cfg.attn_head_dim = 192
         cfg.indexer_head_dim = 128
@@ -1491,6 +1494,10 @@ class TestSWAPoolFloor(CustomTestCase):
                 cfg._get_bytes_per_full_token(),
                 0.1 * cfg.bytes_per_swa_token + 585 / 4 + 864 / 128 + 132 / 4,
             )
+            cfg.kv_cache_dtype = torch.int8
+            self.assertEqual(cfg._get_paged_kv_bytes_per_token(), 609.75)
+            self.assertEqual(cfg._get_paged_kv_bytes_per_token(4), 612)
+            self.assertEqual(cfg._get_paged_kv_bytes_per_token(128), 864)
 
     def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
@@ -1517,6 +1524,7 @@ class TestSWAPoolFloor(CustomTestCase):
         spec = SimpleNamespace(is_dspark=lambda: True, is_none=lambda: False)
         kvc = SimpleNamespace(
             kv_cache_dtype_str="fp8_e4m3",
+            kv_cache_dtype=torch.float8_e4m3fn,
             model_config=cfg,
             layer_info=SimpleNamespace(start_layer=0, end_layer=40),
             pp_size=1,
