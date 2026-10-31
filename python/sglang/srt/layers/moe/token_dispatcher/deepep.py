@@ -35,6 +35,7 @@ from sglang.srt.utils import (
     is_blackwell,
     is_flashinfer_available,
     is_hip,
+    is_maca,
     is_npu,
     load_json_config,
 )
@@ -281,11 +282,11 @@ class DeepEPBuffer:
                     f"Consider using --deepep-config to change the behavior."
                 )
 
-        use_mnnvl_fabric = _is_mnnvl_fabric_supported()
+        use_mnnvl_fabric = not is_maca() and _is_mnnvl_fabric_supported()
         buffer_kwargs = dict(
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
-            allow_mnnvl=use_mnnvl_fabric,
+            **({"allow_mnnvl": use_mnnvl_fabric} if not is_maca() else {}),
         )
         # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
         # support, so cross-pod GB200/GB300 EP groups use
@@ -297,8 +298,7 @@ class DeepEPBuffer:
         #   cu12x -> fzyzcjy/DeepEP, which has no use_fabric kwarg but already
         #            auto-enables fabric in C++ when supported, so we skip it:
         #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
-        is_cu12 = get_cuda_version()[0] == 12
-        if not is_cu12 and use_mnnvl_fabric:
+        if use_mnnvl_fabric and get_cuda_version()[0] != 12:
             buffer_kwargs["use_fabric"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
@@ -820,6 +820,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
+        use_fp8 = self.use_fp8
+        if self.quant_config.get("per_token_quant_int8_pack", False):
+            from sglang.kernels.ops.quantization.int8_kernel import (
+                per_token_quant_int8_pack,
+            )
+
+            hidden_states = per_token_quant_int8_pack(hidden_states)
+            use_fp8 = False
+        elif self.quant_config.get("bf16_dispatch", False):
+            use_fp8 = False
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific. Dropping use_ue8m0
         # makes DeepEP return fp32 column-major scales the e8m0 cast cannot view.
@@ -830,7 +840,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
-            if self.use_fp8
+            if use_fp8 and not is_maca()
             else dict()
         )
 
@@ -843,7 +853,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
-                use_fp8=self.use_fp8,
+                use_fp8=use_fp8,
                 **npu_mxfp_quantization_opts,
                 **(
                     dict(topk_weights=topk_weights)

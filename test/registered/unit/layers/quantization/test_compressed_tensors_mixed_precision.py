@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW4A8Int8MoEMethod,
     CompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
@@ -152,6 +153,51 @@ class TestIgnoreListPrefixMatching(CustomTestCase):
 
 class TestMixedPrecisionFormat(CustomTestCase):
     """The per-group `format` must win over a top-level "mixed-precision"."""
+
+    def test_explicit_w4a8_experts_resolve_for_deepep(self):
+        """Explicit FusedMoE targets previously left DeepEP expert weights unmatched."""
+        from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+
+        def int_group(target, weight_bits):
+            return {
+                "targets": [target],
+                "weights": {
+                    "num_bits": weight_bits,
+                    "type": "int",
+                    "symmetric": True,
+                    "strategy": "channel",
+                    "dynamic": False,
+                },
+                "input_activations": {
+                    "num_bits": 8,
+                    "type": "int",
+                    "symmetric": True,
+                    "strategy": "token",
+                    "dynamic": True,
+                },
+            }
+
+        config = {
+            "quant_method": "compressed-tensors",
+            "format": "int-quantized",
+            "config_groups": {
+                "linear": int_group("Linear", 8),
+                "experts": int_group("FusedMoE", 4),
+            },
+            "ignore": [],
+        }
+        quant_config = CompressedTensorsConfig.from_config(config)
+        # Scheme selection requires the actual layer type, not its GPU buffers.
+        layer = DeepEPMoE.__new__(DeepEPMoE)
+        torch.nn.Module.__init__(layer)
+        scheme = quant_config.get_moe_scheme(layer, layer_name=EXPERTS_LAYER)
+        self.assertIsInstance(scheme, CompressedTensorsW4A8Int8MoEMethod)
+        self.assertEqual(
+            quant_config.target_scheme_map["Linear"]["weights"].num_bits, 8
+        )
+        self.assertEqual(
+            quant_config.target_scheme_map["DeepEPMoE"]["weights"].num_bits, 4
+        )
 
     def test_input_activations_survive_mixed_precision(self):
         config = _mixed_precision_config(FP8_GROUP, NVFP4_GROUP)

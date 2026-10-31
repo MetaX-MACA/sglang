@@ -17,6 +17,7 @@ from sglang.kernels.ops.quantization.per_token_group_quant import per_token_grou
 
 logger = logging.getLogger(__name__)
 
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -45,6 +46,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
+    is_maca,
     is_musa,
     is_npu,
 )
@@ -300,6 +302,7 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     block_shape: Optional[List[int]] = None
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
+    use_int4_w4a8: bool = False
     use_mxfp8: bool = False
 
     def __post_init__(self):
@@ -376,7 +379,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             else None
         )
         with deep_gemm_wrapper.contiguous_layout_alignment_scope(alignment):
-            if not runner_input.use_masked_gemm:
+            if quant_info.use_int4_w4a8:
+                if not runner_input.use_masked_gemm:
+                    raise NotImplementedError(
+                        "W4A8 DeepGEMM requires DeepEP low_latency"
+                    )
+                hidden_states = self._run_masked_int8_int4_gemm(
+                    runner_input, quant_info, running_state
+                )
+            elif not runner_input.use_masked_gemm:
                 if weight_dtype == torch.bfloat16:
                     hidden_states = self._run_bf16_contiguous_gemm(
                         runner_input, quant_info, running_state
@@ -395,6 +406,93 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                         runner_input, quant_info, running_state
                     )
         return DeepGemmRunnerOutput(hidden_states=hidden_states)
+
+    def _run_masked_int8_int4_gemm(
+        self,
+        runner_input: DeepGemmRunnerInput,
+        quant_info: DeepGemmMoeQuantInfo,
+        running_state: dict,
+    ) -> torch.Tensor:
+        """W4A8 MoE for DeepEP's low-latency masked expert layout."""
+        if self.config.activation != "silu":
+            raise NotImplementedError(
+                "MACA W4A8 masked GEMM currently supports SiLU only"
+            )
+        if not is_maca():
+            raise NotImplementedError("W4A8 masked GEMM requires MACA mctlassEx")
+        from mctlassEx import MaskedGroupedGEMM
+
+        hidden_states = runner_input.hidden_states
+        masked_m = runner_input.masked_m
+        assert masked_m is not None
+        assert hidden_states.dtype == torch.bfloat16, (
+            "DeepGEMM W4A8 expects BF16 activations from DeepEP, "
+            f"got {hidden_states.dtype}"
+        )
+        assert runner_input.hidden_states_scale is None
+
+        w13_weight = quant_info.w13_weight
+        w2_weight = quant_info.w2_weight
+        w13_scale = quant_info.w13_scale
+        w2_scale = quant_info.w2_scale
+        assert w13_scale is not None and w2_scale is not None
+        assert w13_weight.dtype == torch.quint4x2
+        assert w2_weight.dtype == torch.quint4x2
+
+        num_groups, max_tokens, _ = hidden_states.shape
+        gateup_width = w13_weight.shape[1]
+        assert w13_weight.shape[0] == num_groups
+        assert w2_weight.shape[0] == num_groups
+        # Both the GEMM and fused activation skip rows outside masked_m.
+        gateup_output = torch.empty(
+            (num_groups, max_tokens, gateup_width),
+            device=running_state["hidden_states_device"],
+            dtype=torch.bfloat16,
+        )
+        gemm = MaskedGroupedGEMM()
+        gemm(
+            [max_tokens, gateup_width, w13_weight.shape[-1] * 2],
+            hidden_states.view(torch.int8),
+            w13_weight,
+            gateup_output,
+            masked_m,
+            A_packed=True,
+            scale_b=w13_scale,
+        )
+        dispose_tensor(hidden_states)
+
+        down_width = gateup_width // 2
+        assert w2_weight.shape[2] * 2 == down_width, (
+            "W4A8 down-projection K mismatch: packed weight has "
+            f"{w2_weight.shape[2]} bytes, activation K={down_width}"
+        )
+        from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked
+
+        down_input_packed = silu_and_mul_masked(
+            gateup_output, masked_m, self.swiglu_limit
+        )
+        del gateup_output
+
+        output_width = w2_weight.shape[1]
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            down_output = torch.empty(
+                (num_groups, max_tokens, output_width),
+                device=down_input_packed.device,
+                dtype=torch.bfloat16,
+            )
+        gemm(
+            [max_tokens, output_width, w2_weight.shape[-1] * 2],
+            down_input_packed.view(torch.int8),
+            w2_weight,
+            down_output,
+            masked_m,
+            A_packed=True,
+            scale_b=w2_scale,
+        )
+        dispose_tensor(down_input_packed)
+        return down_output
 
     def _run_contiguous_gemm(
         self,

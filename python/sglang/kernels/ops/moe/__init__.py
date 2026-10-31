@@ -304,3 +304,13 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="moe.silu_and_mul_masked",
+        backend=KernelBackend.AOT,
+        target="sglang.kernels.ops.moe.ep_moe_kernels:silu_and_mul_masked",
+        capabilities=_CUDA,
+        description="MACA packed INT8 activation for W4A8 masked expert GEMM (mcoplib).",
+    )
+)

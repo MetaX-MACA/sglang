@@ -218,3 +218,13 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="quantization.per_token_quant_int8_pack",
+        backend=KernelBackend.AOT,
+        target="sglang.kernels.ops.quantization.int8_kernel:per_token_quant_int8_pack",
+        capabilities=_CUDA,
+        description="MACA packed INT8 activation for W4A8 masked expert GEMM (mcoplib).",
+    )
+)
