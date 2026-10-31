@@ -36,6 +36,8 @@ def _triton_fused_store_flashmla_kernel(
     cache_fp8_ptr,
     cache_bf16_ptr,
     cache_u8_ptr,
+    cache_int8_ptr,
+    cache_fp32_ptr,
     indices_ptr,
     N,
     PAGE_SIZE: tl.constexpr,
@@ -54,6 +56,7 @@ def _triton_fused_store_flashmla_kernel(
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
     EPS: tl.constexpr,
+    INT8_STORE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     tile_id = tl.program_id(1)
@@ -84,27 +87,40 @@ def _triton_fused_store_flashmla_kernel(
         x_fp32 = x_bf16.to(tl.float32)
 
         abs_max = tl.max(tl.abs(x_fp32))
-        scale = tl.maximum(abs_max, EPS) / FP8_MAX
-
-        # cast scale to ue8m0 format
-        log2_scale = tl.log2(scale)
-        ceil_log2 = tl.math.ceil(log2_scale)
-        inv_scale = tl.exp2(-ceil_log2)
-
-        x_fp8 = tl.clamp(x_fp32 * inv_scale, FP8_MIN, FP8_MAX).to(
-            cache_fp8_ptr.dtype.element_ty
-        )
-
         nope_offset = (
             page * BYTES_PER_PAGE + slot * SLOT_BYTES + tile_id * TILE_SIZE + tile_lane
         )
-        tl.store(cache_fp8_ptr + nope_offset, x_fp8)
+        if INT8_STORE:
+            scale = tl.maximum(abs_max, 1.0e-4) / 127.0
+            quantized = tl.extra.cuda.libdevice.round(x_fp32 / scale).to(tl.int8)
+            tl.store(cache_int8_ptr + nope_offset, quantized)
+            scale_offset = (page * BYTES_PER_PAGE + S_OFFSET + slot * 32) // 4 + tile_id
+            tl.store(cache_fp32_ptr + scale_offset, scale)
+        else:
+            scale = tl.maximum(abs_max, EPS) / FP8_MAX
 
-        ue8m0 = (ceil_log2.to(tl.int32) + UE8M0_BIAS).to(tl.uint8)
-        scale_offset = (
-            page * BYTES_PER_PAGE + S_OFFSET + slot * SCALES_PER_TOKEN + tile_id
-        )
-        tl.store(cache_u8_ptr + scale_offset, ue8m0)
+            # cast scale to ue8m0 format
+            log2_scale = tl.log2(scale)
+            ceil_log2 = tl.math.ceil(log2_scale)
+            inv_scale = tl.exp2(-ceil_log2)
+
+            x_fp8 = tl.clamp(x_fp32 * inv_scale, FP8_MIN, FP8_MAX).to(
+                cache_fp8_ptr.dtype.element_ty
+            )
+
+            nope_offset = (
+                page * BYTES_PER_PAGE
+                + slot * SLOT_BYTES
+                + tile_id * TILE_SIZE
+                + tile_lane
+            )
+            tl.store(cache_fp8_ptr + nope_offset, x_fp8)
+
+            ue8m0 = (ceil_log2.to(tl.int32) + UE8M0_BIAS).to(tl.uint8)
+            scale_offset = (
+                page * BYTES_PER_PAGE + S_OFFSET + slot * SCALES_PER_TOKEN + tile_id
+            )
+            tl.store(cache_u8_ptr + scale_offset, ue8m0)
 
 
 def triton_fused_store_flashmla(
@@ -127,7 +143,9 @@ def triton_fused_store_flashmla(
         input,
         cache_fp8,
         cache_bf16,
-        cache,
+        cache.view(torch.uint8),
+        cache.view(torch.int8),
+        cache.view(torch.float32),
         indices_i32,
         N,
         PAGE_SIZE=page_size,
@@ -146,6 +164,7 @@ def triton_fused_store_flashmla(
         FP8_MIN=_FP8_INFO.min,
         FP8_MAX=_FP8_INFO.max,
         EPS=1e-8,
+        INT8_STORE=cache.dtype is torch.int8,
     )
 
 

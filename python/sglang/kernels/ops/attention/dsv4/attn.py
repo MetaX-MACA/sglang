@@ -110,6 +110,14 @@ def fused_store_cache(
         RoPE tail in-kernel, so ``input`` must then be the un-rotated latent.
     """
     layout = KVLayout.parse(layout)
+    if type == "flashmla" and cache.dtype is torch.int8:
+        assert layout is KVLayout.V4, "INT8 main KV requires the V4 layout"
+        assert freqs_cis is None, "the V4 store receives already-rotated inputs"
+        from sglang.kernels.ops.kvcache.triton_store_cache import (
+            triton_fused_store_flashmla,
+        )
+
+        return triton_fused_store_flashmla(input, cache, indices, page_size)
     if is_maca() and type == "flashmla" and cache.dtype is torch.bfloat16:
         assert layout is KVLayout.V4
         from .index_buf_accessor import _set_k_bf16_triton

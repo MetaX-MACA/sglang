@@ -14,7 +14,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
-
+from sglang.kernels.ops.attention.dsv4.kv_layout import (
+    kv_cache_bytes_per_token,
+    kv_cache_page_bytes,
+)
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
@@ -1099,6 +1102,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.kv_bytes = self._unified_row_bytes
         elif get_exec().kernel.dsv4_attn_backend == "trtllm":
             self.kv_bytes = self.attn_head_dim
+        elif kvc.kv_cache_dtype is torch.int8:
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                select_dsv4_kv_layout,
+            )
+
+            kv_layout, _ = select_dsv4_kv_layout()
+            # Raises ValueError for any layout without an INT8 form.
+            self.kv_bytes = kv_cache_bytes_per_token(kv_layout, kvc.kv_cache_dtype)
         else:
             # One FlashMLA-layout latent slot, in bytes.
             self.kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
@@ -1347,6 +1358,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 layout, compress_ratio, compressed_option
             )
             page_size = self.page_size // compress_ratio
+        if self.kv_cache_dtype is torch.int8:
+            if layout.value != "v4":
+                raise ValueError("INT8 main KV requires V4 packed pages")
+            return (
+                kv_cache_page_bytes(layout, self.kv_cache_dtype, page_size) / page_size
+            )
         return layout.page_bytes(page_size) / page_size
 
     def _get_bytes_per_swa_token(self) -> float:
