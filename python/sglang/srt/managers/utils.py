@@ -284,6 +284,18 @@ def validate_input_length(
     return None
 
 
+def _pp_metadata_to_cpu(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.cpu()
+    if isinstance(value, list):
+        return [_pp_metadata_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_pp_metadata_to_cpu(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _pp_metadata_to_cpu(item) for key, item in value.items()}
+    return value
+
+
 def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
     """Build the tensor payload needed to reconstruct PP output processing state."""
 
@@ -294,7 +306,7 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
     logits_output.finalize_input_logprobs()
     sampling_mask_output = logits_output.sampling_mask_output
 
-    return {
+    payload = {
         "extend_input_len_per_req": result.extend_input_len_per_req,
         "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
         "next_token_logprobs": result.logits_output.next_token_logprobs,
@@ -331,6 +343,13 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "input_top_logprobs_idx": result.logits_output.input_top_logprobs_idx,
         "input_token_ids_logprobs_val": result.logits_output.input_token_ids_logprobs_val,
         "input_token_ids_logprobs_idx": result.logits_output.input_token_ids_logprobs_idx,
+    }
+    # Only top-level tensors use the PP tensor transport. Nested tensors are
+    # pickled as metadata; CUDA storage there would open the sender's device
+    # on receiving ranks. Keep those copies synchronous before serialization.
+    return {
+        key: value if isinstance(value, torch.Tensor) else _pp_metadata_to_cpu(value)
+        for key, value in payload.items()
     }
 
 
