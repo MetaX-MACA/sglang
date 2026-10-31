@@ -207,3 +207,40 @@ def sglang_per_token_group_quant_int8(
     )
 
     return per_token_group_quant(x, group_size=group_size, out_dtype=dtype)
+
+
+def per_token_quant_int8_pack(routed_input: torch.Tensor) -> torch.Tensor:
+    """Quantize BF16 tokens to INT8 and append each raw FP32 scale.
+
+    The BF16 result is a byte carrier.  Each row contains ``D`` INT8 values,
+    four scale bytes, and padding up to the alignment required by W4A8
+    MaskedGroupedGEMM.
+    """
+    from sglang.srt.utils import is_maca
+
+    if not is_maca():
+        raise NotImplementedError("Packed INT8 activations require MACA mcoplib")
+    if routed_input.dtype != torch.bfloat16:
+        raise TypeError(f"routed_input must be BF16, got {routed_input.dtype}")
+    if routed_input.dim() != 2:
+        raise ValueError(
+            f"routed_input must have shape [T, D], got {tuple(routed_input.shape)}"
+        )
+    if not routed_input.is_contiguous():
+        raise ValueError("routed_input must be contiguous")
+
+    hidden_size = routed_input.shape[1]
+    packed_size = (hidden_size // 2 + 257) // 256 * 256
+    output = torch.empty(
+        (routed_input.shape[0], packed_size),
+        dtype=torch.bfloat16,
+        device=routed_input.device,
+    )
+
+    if routed_input.shape[0] == 0:
+        return output
+
+    from mcoplib import op as mcoplib_op
+
+    mcoplib_op.per_token_quant_int8_pack(output, routed_input)
+    return output
