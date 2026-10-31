@@ -14,7 +14,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_maca
 
 logger = logging.getLogger(__name__)
 
@@ -355,13 +355,24 @@ def alloc_with_pin_memory(
     dtype: torch.dtype,
     device: str,
     pin_memory: bool,
-    allocator: None,
+    allocator: HostTensorAllocator | None,
     registration_granularity_bytes: int | None = None,
 ) -> torch.Tensor:
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.
     """
+    if (
+        is_maca()
+        and allocator is not None
+        and type(allocator) is not HostTensorAllocator
+    ):
+        # Storage allocators own their backing buffers (for example shm).
+        return alloc_with_host_register(
+            dims, dtype, device, pin_memory, allocator, registration_granularity_bytes
+        )
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
+    # PyTorch owns this allocation; destroy must not cudaHostUnregister it.
+    setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
     return buffer
 
 
@@ -374,6 +385,12 @@ def _resolve_device_accessible_ptr_fn():
     else:
         if not hasattr(torch.ops.sgl_kernel, "get_device_accessible_ptr"):
             get_device_accessible_ptr = None
+
+    if get_device_accessible_ptr is None and is_maca():
+        # Older MACA wheels omit the address-query op. Raw CPU addresses are
+        # not valid device aliases there, so resolve them through the JIT
+        # runtime rather than assuming CUDA UVA address equality.
+        from sglang.kernels.ops.memory.host_pointer import get_device_accessible_ptr
 
     if get_device_accessible_ptr is None:
         # CUDA's UVA makes host and device addresses equal; on HIP they differ.
@@ -427,5 +444,6 @@ ALLOC_MEMORY_FUNCS = defaultdict(
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
         "xpu": alloc_with_pin_memory,
+        **({"cuda": alloc_with_pin_memory} if is_maca() else {}),
     },
 )
