@@ -15,14 +15,17 @@ import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_write_back_jit_kernel,
+    transfer_hicache_all_layer_mla,
     transfer_hicache_all_layer_mla_staged_lf_page_unified,
     transfer_hicache_all_layer_staged_lf_page_unified,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_maca, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-large")
+
+# backend-specific: ROCm exercises native nontemporal vector copies and mapped-host reads.
+register_amd_ci(est_time=180, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -467,8 +470,8 @@ def test_page_unified_mla_write_back_invalid_input(invalid, match):
 
 
 @pytest.mark.skipif(
-    is_hip(),
-    reason="ROCm maps registered host memory at a distinct device address.",
+    is_hip() or is_maca(),
+    reason="ROCm and MACA use distinct device mappings for registered host memory.",
 )
 def test_registered_mmap_kernel_ptr_table_fallback_matches_device_alias(
     monkeypatch: pytest.MonkeyPatch,
@@ -660,6 +663,220 @@ def test_registered_mmap_page_first_kernel_operands_and_graph(
         torch.cuda.synchronize()
         del graph
         host_pool.destroy()
+
+
+@pytest.mark.parametrize("item_bytes", [156096, 8448, 1728, 32768])
+@pytest.mark.parametrize("registered_allocator", [False, True])
+def test_v4_registered_page_first_staged_write_back(
+    item_bytes, registered_allocator, monkeypatch
+):
+    from sglang.srt.mem_cache import memory_pool_host
+    from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+    from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator
+
+    if registered_allocator:
+
+        class RegisteredAllocator(HostTensorAllocator):
+            pass
+
+        monkeypatch.setattr(
+            memory_pool_host,
+            "get_allocator_from_storage",
+            lambda _: RegisteredAllocator(),
+        )
+
+    layers = 3
+    sources = [
+        (
+            (
+                torch.arange(7 * item_bytes, device=DEVICE).view(7, item_bytes)
+                + layer * 31
+            )
+            % 251
+        ).to(torch.uint8)
+        for layer in range(layers)
+    ]
+    # Exercise both MACA's default pinned allocator and custom registered
+    # storage backing, with one physical KV/index/state page per item.
+    host = DeepSeekV4PagedHostPool(
+        pool_name="staged_v4_regression",
+        device_buffers=sources,
+        item_bytes=item_bytes,
+        num_host_pages=8,
+        slot_page_size=1,
+        layout="page_first",
+        allocator_type="default",
+        pin_memory=True,
+    )
+    try:
+        assert host.can_use_write_back_jit
+        host.kv_buffer.fill_(255)
+        # Force staging reuse and a short final chunk.
+        host.staging_buffer = host.staging_buffer[:2]
+        src_indices = torch.tensor([5, 0, 4, 5, 2], device=DEVICE)
+        dst_indices = torch.tensor([6, 2, 0, 5, 3])
+        expected = torch.full_like(host.kv_buffer, 255)
+        for layer, source in enumerate(sources):
+            expected[dst_indices, layer] = source[src_indices].cpu()
+
+        def reject_aot_fallback(**kwargs):
+            raise AssertionError("staged write-back unexpectedly used legacy AOT")
+
+        monkeypatch.setattr(
+            memory_pool_host, "transfer_kv_all_layer_mla_lf_pf", reject_aot_fallback
+        )
+        host.backup_from_device_all_layer(None, dst_indices, src_indices, "kernel")
+        torch.cuda.synchronize()
+        assert torch.equal(host.kv_buffer, expected)
+        # Exercise the production cache-hit path after write-back, including
+        # per-layer reads from registered host memory into fresh device pages.
+        restore_indices = torch.tensor([1, 2, 3, 4, 6], device=DEVICE)
+        for layer, source in enumerate(sources):
+            source.zero_()
+            host.load_to_device_per_layer(
+                None, dst_indices.to(DEVICE), restore_indices, layer, "kernel"
+            )
+            torch.cuda.synchronize()
+            restored = torch.zeros_like(source, device="cpu")
+            restored[restore_indices.cpu()] = expected[dst_indices, layer]
+            assert torch.equal(source.cpu(), restored)
+    finally:
+        host.destroy()
+
+
+@pytest.mark.parametrize("head_dim", [128, 512])
+@pytest.mark.parametrize("registered_allocator", [False, True])
+def test_v4_registered_state_page_first_roundtrip(
+    head_dim, registered_allocator, monkeypatch
+):
+    from sglang.srt.mem_cache import memory_pool_host
+    from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+    from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4StateHostPool
+    from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator
+
+    if registered_allocator:
+
+        class RegisteredAllocator(HostTensorAllocator):
+            pass
+
+        monkeypatch.setattr(
+            memory_pool_host,
+            "get_allocator_from_storage",
+            lambda _: RegisteredAllocator(),
+        )
+
+    ring_size = 4
+    swa_page_size = 256
+    states = [
+        CompressStatePool(
+            size=28,
+            ring_size=ring_size,
+            overlap=True,
+            head_dim=head_dim,
+            dtype=torch.float32,
+            device=DEVICE,
+            enable_memory_saver=False,
+            ratio=4,
+        )
+        for _ in range(3)
+    ]
+    host = DeepSeekV4StateHostPool(
+        pool_name="state_roundtrip",
+        state_pools=states,
+        num_host_pages=8,
+        swa_page_size=swa_page_size,
+        layout="page_first",
+        pin_memory=True,
+    )
+    try:
+        assert host.can_use_write_back_jit
+        host.staging_buffer = host.staging_buffer[:2]
+        for layer, source in enumerate(host.device_page_views):
+            source.copy_(
+                ((torch.arange(source.numel(), device=DEVICE) + layer * 31) % 251)
+                .to(torch.uint8)
+                .view_as(source)
+            )
+        host.kv_buffer.fill_(255)
+        source_rows = torch.tensor([5, 0, 4, 5, 2], device=DEVICE)
+        host_rows = torch.tensor([6, 2, 0, 5, 3])
+        restore_rows = torch.tensor([1, 2, 3, 4, 6], device=DEVICE)
+
+        def expand(rows):
+            return (
+                rows[:, None] * swa_page_size
+                + torch.arange(swa_page_size, device=rows.device)
+            ).flatten()
+
+        expected = torch.full_like(host.kv_buffer, 255)
+        for layer, source in enumerate(host.device_page_views):
+            expected[host_rows, layer] = source[source_rows].cpu()
+
+        def reject_legacy(**kwargs):
+            raise AssertionError("MACA state transfer used a raw host pointer")
+
+        if is_maca() and registered_allocator:
+            monkeypatch.setattr(
+                memory_pool_host, "transfer_kv_per_layer_mla_pf_lf", reject_legacy
+            )
+        host.backup_from_device_all_layer(
+            None, expand(host_rows), expand(source_rows), "kernel"
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(host.kv_buffer, expected)
+        for layer, source in enumerate(host.device_page_views):
+            source.zero_()
+            host.load_to_device_per_layer(
+                None,
+                expand(host_rows.to(DEVICE)),
+                expand(restore_rows),
+                layer,
+                "kernel",
+            )
+            torch.cuda.synchronize()
+            restored = torch.zeros_like(source, device="cpu")
+            restored[restore_rows.cpu()] = expected[host_rows, layer]
+            assert torch.equal(source.cpu(), restored)
+    finally:
+        host.destroy()
+
+
+@pytest.mark.parametrize("unroll", [1, 2, 4])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16])
+def test_all_layer_register_copy_vector_widths(unroll, dtype):
+    # A 128-byte round uses 4/8/16-byte packages at these unroll factors.
+    # Explicitly exercise all load_nc/store_nc overloads, including on MACA
+    # where those native vector operations replace CUDA-only inline PTX.
+    row_elements = 128 // dtype.itemsize
+    source_cpu = [
+        (
+            (torch.arange(80 * row_elements).view(80, row_elements) + layer * 37) % 251
+        ).to(dtype)
+        for layer in range(3)
+    ]
+    sources = [source.to(DEVICE) for source in source_cpu]
+    destinations = [torch.full_like(source, 255) for source in sources]
+    src_indices = torch.tensor([67, 2, 41, 0, 67], device=DEVICE)
+    dst_indices = torch.tensor([1, 72, 3, 79, 0], device=DEVICE)
+    ptrs = [
+        torch.tensor(
+            [tensor.data_ptr() for tensor in tensors], dtype=torch.uint64, device=DEVICE
+        )
+        for tensors in (destinations, sources)
+    ]
+    transfer_hicache_all_layer_mla(
+        ptrs[0],
+        dst_indices,
+        ptrs[1],
+        src_indices,
+        cache_src_stride_bytes=128,
+        cache_dst_stride_bytes=128,
+        unroll=unroll,
+    )
+    for source, destination in zip(source_cpu, destinations):
+        expected = torch.full_like(source, 255)
+        expected[dst_indices.cpu()] = source[src_indices.cpu()]
+        torch.testing.assert_close(destination.cpu(), expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

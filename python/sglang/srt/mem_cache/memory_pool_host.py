@@ -7,14 +7,18 @@ from typing import Optional
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
+    can_use_page_unified_load_back_jit_kernel,
     can_use_write_back_jit_kernel,
 )
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
+from sglang.kernels.ops.kvcache.hicache import (
+    transfer_hicache_one_layer_mla_page_unified_lf,
+)
 from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_maca, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -50,6 +54,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
@@ -327,6 +332,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         )
         self.can_use_jit = False
         self.can_use_write_back_jit = False
+        self._use_page_first_load_jit = False
         self._init_write_back_staging_buffers()
         self.clear()
 
@@ -341,6 +347,16 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
             element_size=self.item_bytes * self.dtype.itemsize,
         )
+        if is_maca() and type(self.allocator) is not HostTensorAllocator:
+            # The legacy wheel's page-first reader uses a raw host address.
+            # This JIT reader resolves the registered mapping on its device.
+            self._use_page_first_load_jit = can_use_page_unified_load_back_jit_kernel(
+                group_bytes=self.item_bytes,
+            )
+            if not self._use_page_first_load_jit:
+                raise RuntimeError(
+                    "MACA V4 page-first pools require the JIT load-back kernel."
+                )
         staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
         self.staging_buffer = torch.empty(
             (staging_page_capacity, self.layer_num, self.item_bytes),
@@ -595,6 +611,22 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 dst_indices=device_rows,
                 item_size=self.item_bytes,
             )
+        elif (
+            io_backend == "kernel"
+            and self.layout == "page_first"
+            and getattr(self, "_use_page_first_load_jit", False)
+        ):
+            dst = self.device_buffers[layer_id]
+            row_elements = self.item_bytes // dst.element_size()
+            transfer_hicache_one_layer_mla_page_unified_lf(
+                cache_dst=dst.view(-1, row_elements),
+                src=self.kv_buffer.view(dst.dtype).view(
+                    self.num_host_pages, self.layer_num, 1, row_elements
+                ),
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                layer_id=layer_id,
+            )
         elif io_backend == "kernel" and self.layout == "page_first":
             transfer_kv_per_layer_mla_pf_lf(
                 src=self.kv_buffer,
@@ -834,6 +866,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         )
         self.can_use_jit = False
         self.can_use_write_back_jit = False
+        self._use_page_first_load_jit = False
         self._init_write_back_staging_buffers()
 
     def _init_device_page_views(self) -> None:
@@ -880,6 +913,14 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
             element_size=self.state_page_bytes * self.dtype.itemsize,
         )
+        if is_maca() and type(self.allocator) is not HostTensorAllocator:
+            self._use_page_first_load_jit = can_use_page_unified_load_back_jit_kernel(
+                group_bytes=self.state_page_bytes,
+            )
+            if not self._use_page_first_load_jit:
+                raise RuntimeError(
+                    "MACA V4 state page-first pools require the JIT load-back kernel."
+                )
         staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
         self.staging_buffer = torch.empty(
             (staging_page_capacity, self.layer_num, self.state_page_bytes),
@@ -1066,6 +1107,20 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 src_indices=host_rows,
                 dst_indices=device_rows,
                 item_size=self.state_page_bytes,
+            )
+        elif (
+            io_backend == "kernel"
+            and self.layout == "page_first"
+            and getattr(self, "_use_page_first_load_jit", False)
+        ):
+            transfer_hicache_one_layer_mla_page_unified_lf(
+                cache_dst=self.device_page_views[layer_id],
+                src=self.kv_buffer.view(
+                    self.num_host_pages, self.layer_num, 1, self.state_page_bytes
+                ),
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                layer_id=layer_id,
             )
         elif io_backend == "kernel" and self.layout == "page_first":
             transfer_kv_per_layer_mla_pf_lf(

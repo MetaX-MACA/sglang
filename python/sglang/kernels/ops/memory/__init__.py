@@ -83,3 +83,13 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="memory.get_device_accessible_ptr",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.memory.host_pointer:get_device_accessible_ptr",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        description="Resolve the device mapping of registered host memory.",
+    )
+)

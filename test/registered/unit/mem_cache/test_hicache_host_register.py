@@ -70,6 +70,39 @@ class _FakeCudart:
 
 
 class TestHiCacheHostRegister(unittest.TestCase):
+    def test_torch_owned_pinned_buffer_is_not_unregistered(self):
+        buffer = torch.empty(8, dtype=torch.uint8)
+        cudart = _FakeCudart()
+        with (
+            mock.patch.object(torch, "empty", return_value=buffer),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            result = host_common.alloc_with_pin_memory(
+                (8,), torch.uint8, "cpu", True, None
+            )
+            _cuda_host_unregister(result)
+        self.assertIs(result, buffer)
+        self.assertEqual(cudart.unregistrations, [])
+
+    def test_maca_pinned_allocator_preserves_custom_storage(self):
+        class StorageAllocator(host_common.HostTensorAllocator):
+            pass
+
+        allocator = StorageAllocator()
+        with (
+            mock.patch.object(host_common, "is_maca", return_value=True),
+            mock.patch.object(host_common, "alloc_with_host_register") as registered,
+            mock.patch.object(torch, "empty") as empty,
+        ):
+            result = host_common.alloc_with_pin_memory(
+                (8,), torch.uint8, "cpu", True, allocator, 32
+            )
+        registered.assert_called_once_with(
+            (8,), torch.uint8, "cpu", True, allocator, 32
+        )
+        empty.assert_not_called()
+        self.assertIs(result, registered.return_value)
+
     def _hip_non_userptr(self):
         return (
             mock.patch.object(host_common, "_is_hip", True),
