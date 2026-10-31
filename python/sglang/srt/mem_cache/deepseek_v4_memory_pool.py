@@ -33,10 +33,13 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backend
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.dsv4_index_cache import (
+    get_dsv4_index_cache_storage_dtype,
+    get_dsv4_index_cache_type,
+)
 from sglang.srt.mem_cache.memory_pool import KVCache, get_tensor_size_bytes
 from sglang.srt.runtime_context import get_exec, get_memory, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
-from sglang.srt.utils.common import is_maca
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +49,11 @@ ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
 def get_dsv4_indexer_bytes_per_token(index_head_dim: int, use_fp4_indexer: bool) -> int:
-    """Return payload and quant-scale bytes for one compressed indexer token."""
+    """Return storage bytes for one compressed indexer token."""
     if use_fp4_indexer:
         return index_head_dim // 2 + index_head_dim // 32
+    if get_dsv4_index_cache_type() == "bf16":
+        return index_head_dim * 2
     return index_head_dim + index_head_dim // 128 * 4
 
 
@@ -567,11 +572,7 @@ DSV41_INDEX_PAGE_SIZE = dsv41_index_page_size()
 
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128
-    index_k_with_scale_buffer_dtype = (
-        torch.int8
-        if is_maca() and envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "int8"
-        else torch.uint8
-    )
+    index_k_with_scale_buffer_dtype = torch.uint8
 
     def __init__(
         self,
@@ -603,6 +604,14 @@ class DeepSeekV4IndexerPool(KVCache):
         if use_fp4_indexer is None:
             use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
         self.use_fp4_indexer = use_fp4_indexer
+        self.index_k_with_scale_buffer_dtype = get_dsv4_index_cache_storage_dtype()
+        if (
+            self.use_fp4_indexer
+            and self.index_k_with_scale_buffer_dtype is torch.bfloat16
+        ):
+            raise ValueError(
+                "BF16 V4 index cache is incompatible with FP4 indexer storage"
+            )
         self.uses_aiter_fp4_layout = _is_hip and self.use_fp4_indexer
         # Low-ratio pools round to nearest even; c4 keeps threshold rounding.
         self.index_k_rne = False
@@ -649,7 +658,7 @@ class DeepSeekV4IndexerPool(KVCache):
                 self.index_k_with_scale_buffer = [
                     torch.zeros(
                         num_pages,
-                        page_bytes,
+                        page_bytes // self.index_k_with_scale_buffer_dtype.itemsize,
                         dtype=self.index_k_with_scale_buffer_dtype,
                         device=self.device,
                     )
@@ -702,6 +711,15 @@ class DeepSeekV4IndexerPool(KVCache):
         max_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         buf = self.index_k_with_scale_buffer[layer_id]
+        if self.index_k_with_scale_buffer_dtype is torch.bfloat16:
+            return index_buf_accessor.GetBatchedK.execute(
+                self,
+                buf,
+                seq_len_tensor=seq_len_tensor,
+                page_indices=page_indices,
+                seq_len_sum=seq_len_sum,
+                max_seq_len=max_seq_len,
+            ), None
         return index_buf_accessor.GetKAndS.execute(
             self,
             buf,
@@ -716,7 +734,7 @@ class DeepSeekV4IndexerPool(KVCache):
         layer_id: int,
         loc: torch.Tensor,
         index_k: torch.Tensor,
-        index_k_scale: torch.Tensor,
+        index_k_scale: Optional[torch.Tensor],
     ) -> None:
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         index_buf_accessor.SetKAndS.execute(
@@ -729,6 +747,10 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        if self.index_k_with_scale_buffer_dtype is torch.bfloat16:
+            return self.set_index_k_scale_buffer(
+                layer_id, loc, cache_k.to(torch.bfloat16), None
+            )
         return fused_store_cache(
             input=cache_k,
             cache=self.index_k_with_scale_buffer[layer_id - self.start_layer],

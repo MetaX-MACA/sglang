@@ -44,6 +44,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_rows_per_chunk,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.mem_cache.dsv4_index_cache import get_dsv4_index_cache_type
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -579,7 +580,7 @@ class C4IndexerBackendMixin:
         # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
         if not is_cuda() or is_hip():
             return False
-        if is_maca() and envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() != "fp8":
+        if is_maca() and get_dsv4_index_cache_type() != "fp8":
             return False
         # The gather plan is built from eager, child-local ForwardBatch metadata.
         # Rewritten, TBO-split, and graph-backed batches must use the paged path.
@@ -803,6 +804,7 @@ class C4IndexerBackendMixin:
             )
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
+        use_bf16_indexer = not use_fp4_indexer and get_dsv4_index_cache_type() == "bf16"
 
         if use_aiter_fp4:
             q = q_indexer
@@ -827,6 +829,8 @@ class C4IndexerBackendMixin:
             from deep_gemm import fp8_fp4_paged_mqa_logits as fn
         elif use_aiter_fp4:
             fn = None
+        elif use_bf16_indexer:
+            from deep_gemm import bf16_paged_mqa_logits as fn
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
@@ -845,7 +849,7 @@ class C4IndexerBackendMixin:
 
             fn = fp8_paged_mqa_logits_triton
         else:
-            if not is_maca() or envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() == "fp8":
+            if not is_maca() or get_dsv4_index_cache_type() == "fp8":
                 from deep_gemm import fp8_paged_mqa_logits as fn
             else:
                 from deep_gemm import int8_paged_mqa_logits as fn
@@ -869,11 +873,19 @@ class C4IndexerBackendMixin:
             core_metadata.c4_sparse_page_indices, value=-1
         )
         _use_tilelang = (
-            envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+            and not use_fp4_indexer
+            and not use_bf16_indexer
         )
-        _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
+        _use_aiter = (
+            envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            and not use_fp4_indexer
+            and not use_bf16_indexer
+        )
         _use_torch_fn = (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() and not use_fp4_indexer
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            and not use_fp4_indexer
+            and not use_bf16_indexer
         )
         if (
             _c4sl.dim() == 1
@@ -1049,7 +1061,9 @@ class C4IndexerBackendMixin:
                 layer_id=c4_indexer.layer_id,
             )
             assert c4_indexer_kv_cache.dim() == 2
-            head_dim_with_sf = 68 if use_fp4_indexer else 132
+            head_dim_with_sf = (
+                68 if use_fp4_indexer else (128 if use_bf16_indexer else 132)
+            )
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
@@ -1060,12 +1074,20 @@ class C4IndexerBackendMixin:
                 topk_plan: Optional[torch.Tensor] = None,
             ) -> None:
                 row_q = (q[0][rows], q[1][rows]) if isinstance(q, tuple) else q[rows]
+                row_weights = weights[rows]
+                row_lengths = _c4sl[rows]
+                row_pages = page_table[rows]
+                if use_bf16_indexer:
+                    # The vendor BF16 Triton path requires contiguous int32 metadata.
+                    row_weights = row_weights.contiguous()
+                    row_lengths = row_lengths.to(torch.int32).contiguous()
+                    row_pages = row_pages.to(torch.int32).contiguous()
                 logits = fn(
                     row_q,
                     c4_indexer_kv_cache,
-                    weights[rows],
-                    _c4sl[rows],
-                    page_table[rows],
+                    row_weights,
+                    row_lengths,
+                    row_pages,
                     metadata,
                     indexer_metadata.max_compressed_seq_len,
                     False,
@@ -1220,13 +1242,13 @@ class C4Indexer(nn.Module):
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
             )
-        index_cache_type = (
-            envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get() if is_maca() else "fp8"
-        )
+        index_cache_type = get_dsv4_index_cache_type()
         if index_cache_type == "fp8":
             output_dtype = torch.float8_e4m3fn
         elif index_cache_type == "int8":
             output_dtype = torch.int8
+        elif index_cache_type == "bf16":
+            output_dtype = torch.bfloat16
         else:
             raise NotImplementedError(
                 f"DSV4 index cache type {index_cache_type!r} is not supported"

@@ -645,7 +645,8 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
 
   constexpr bool kUseFp8Output = std::is_same_v<OutDType, fp8_e4m3_t>;
   constexpr bool kUseInt8Output = std::is_same_v<OutDType, int8_t>;
-  static_assert(kUseFp8Output || kUseInt8Output, "OutDType must be fp8_e4m3_t or int8_t");
+  constexpr bool kUseBf16Output = std::is_same_v<OutDType, bf16_t>;
+  static_assert(kUseFp8Output || kUseInt8Output || kUseBf16Output, "OutDType must be FP8, INT8, or BF16");
 
   using Storage = AlignedVector<DType, kVecSize>;
   using Float4 = AlignedVector<float, kVecSize>;
@@ -765,7 +766,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     if (lane_id == 0) {
       params.weights_out[work_id] = weight_val * params.weight_scale * scale;
     }
-  } else {
+  } else if constexpr (kUseInt8Output) {
     float local_max = math::abs(data[0]);
 #pragma unroll
     for (int i = 1; i < kVecSize; ++i) {
@@ -785,6 +786,14 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     if (lane_id == 0) {
       params.weights_out[work_id] = weight_val * params.weight_scale * scale;
     }
+  } else {
+    using OutStorage = AlignedVector<OutDType, kVecSize>;
+    OutStorage result;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) result[i] = cast<OutDType>(data[i]);
+    auto out_row = static_cast<OutDType*>(params.q_output) + work_id * kHeadDim;
+    result.store(out_row, lane_id);
+    if (lane_id == 0) params.weights_out[work_id] = weight_val * params.weight_scale;
   }
 }
 

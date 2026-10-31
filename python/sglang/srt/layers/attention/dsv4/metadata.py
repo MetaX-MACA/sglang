@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_rows_per_chunk,
     mqa_logits_should_chunk,
 )
+from sglang.srt.mem_cache.dsv4_index_cache import get_dsv4_index_cache_type
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -204,8 +205,12 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
+        torch_fp8_logits = (
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            and get_dsv4_index_cache_type() != "bf16"
+        )
         if (
-            is_hip() or is_xpu() or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            is_hip() or is_xpu() or torch_fp8_logits
         ) and not self.force_deep_gemm_metadata:
             self.deep_gemm_metadata = None
         else:

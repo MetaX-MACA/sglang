@@ -706,7 +706,9 @@ def _dsv4_indexer_regions(kvcache: Any, page_size: int) -> list[_IndexerRegion]:
                 device_buffers=fused,
                 item_bytes=fused[0].shape[1] * fused[0].element_size(),
                 slot_page_size=page_size,
-                page_aligned_only=False,
+                # A BF16 index row is 128 elements, unlike the 512-element
+                # main-KV rows handled by the token-granular MLA copy helper.
+                page_aligned_only=fused[0].dtype is torch.bfloat16,
             )
         ]
 
