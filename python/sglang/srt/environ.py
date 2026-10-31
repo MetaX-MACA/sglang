@@ -549,6 +549,8 @@ class Envs:
     # plane; off, or no such plane, keeps the NCCL all-gather.
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
+    # Load draft-local vocabulary weights from quantized DSpark checkpoints.
+    SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD = EnvBool(False)
     # FlashInfer does not support the current DSpark temperature path yet.
     SGLANG_DSPARK_KERNEL_SOFTMAX_TEMP = EnvStr("triton")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
