@@ -1,4 +1,5 @@
 import logging
+from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -10,6 +11,10 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -453,8 +458,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextmanager
     def _draft_context(self):
-        return draft_tp_context(self._draft_dp_context_enabled)
+        with ExitStack() as stack:
+            stack.enter_context(draft_tp_context(self._draft_dp_context_enabled))
+            stack.enter_context(speculative_moe_backend_context())
+            stack.enter_context(speculative_moe_a2a_backend_context())
+            yield
 
     def alloc_memory_pool(
         self,
@@ -827,7 +837,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_idle_decode_step()
             if get_parallel().attn_dp_enabled:
                 if self._draft_is_moe:
-                    self._proposer.run_idle_participation(batch)
+                    with self._draft_context():
+                        self._proposer.run_idle_participation(batch)
                 if coordination_plan is not None:
                     coordination_plan.apply(
                         batch, "target", rank, local_only=target_local_only
