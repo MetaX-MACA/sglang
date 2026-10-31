@@ -39,40 +39,30 @@ SGL_DEVICE PointerInfo get_pointer_paged(void* cache, int32_t index) {
   return {static_cast<int64_t*>(value_ptr), static_cast<int64_t*>(scale_ptr)};
 }
 
-SGL_DEVICE void transfer_item(void* dst_cache, void* src_cache, const int32_t dst_index, const int32_t src_index) {
-  const auto [dst_value_ptr, dst_scale_ptr] = get_pointer_paged(dst_cache, dst_index);
-  const auto [src_value_ptr, src_scale_ptr] = get_pointer_paged(src_cache, src_index);
-
-  int64_t local_items[2];
-  const int64_t* tail_src_ptr;
-  int64_t* tail_dst_ptr;
-
-  const int32_t lane_id = threadIdx.x % 32;
-
-  for (int i = 0; i < 2; ++i) {
-    const auto j = lane_id + i * 32;
-    local_items[i] = src_value_ptr[j];
+// BF16 pages are a flat run of 512-element rows; FP8 V4 pages keep
+// values and scales in separate runs and include page-end alignment padding.
+SGL_DEVICE void transfer_item(
+    void* dst_cache, void* src_cache, const int32_t dst_index, const int32_t src_index,
+    const int64_t item_bytes = kItemBytes) {
+#if defined(USE_ROCM) || defined(__MACACC__)
+  constexpr int kWaveSize = 64;
+#else
+  constexpr int kWaveSize = 32;
+#endif
+  const int lane = threadIdx.x % kWaveSize;
+  if (item_bytes == 1024) {
+    const auto src = static_cast<const int64_t*>(src_cache) + static_cast<int64_t>(src_index) * 128;
+    auto dst = static_cast<int64_t*>(dst_cache) + static_cast<int64_t>(dst_index) * 128;
+    for (int i = lane; i < 128; i += kWaveSize) dst[i] = src[i];
+    return;
   }
-
-  if (lane_id < 8) {  // handle the tail element safely
-    const auto last_id = 64 + lane_id;
-    tail_src_ptr = src_value_ptr + last_id;
-    tail_dst_ptr = dst_value_ptr + last_id;
-  } else {  // broadcast load/store is safe
-    tail_src_ptr = src_scale_ptr;
-    tail_dst_ptr = dst_scale_ptr;
+  const auto [dst_value, dst_scale] = get_pointer_paged(dst_cache, dst_index);
+  const auto [src_value, src_scale] = get_pointer_paged(src_cache, src_index);
+  // Treat the split runs as one 73-word copy, with one owner per word.
+  for (int i = lane; i < 73; i += kWaveSize) {
+    if (i < 72) dst_value[i] = src_value[i];
+    else *dst_scale = *src_scale;
   }
-
-  const auto tail_item = *tail_src_ptr;
-
-  // store first 512 bytes of value
-  for (int i = 0; i < 2; ++i) {
-    const auto j = lane_id + i * 32;
-    dst_value_ptr[j] = local_items[i];
-  }
-
-  // store the tail element
-  *tail_dst_ptr = tail_item;
 }
 
 }  // namespace device::hisparse
