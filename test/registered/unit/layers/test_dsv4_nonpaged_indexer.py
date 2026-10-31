@@ -77,6 +77,29 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
         self.assertEqual(args[1:], (64, 1))
         jit_metadata.assert_not_called()
 
+    def test_bf16_indexer_keeps_paged_metadata_with_fp8_fallback_toggle(self):
+        expected = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
+        vendor = SimpleNamespace(
+            get_num_sms=lambda: 1,
+            get_paged_mqa_logits_metadata=lambda *args, **kwargs: expected,
+        )
+        with (
+            patch.dict(sys.modules, {"deep_gemm": vendor}),
+            patch("sglang.srt.mem_cache.dsv4_index_cache.is_maca", return_value=True),
+            envs.SGLANG_DSV4_INDEX_CACHE_TYPE.override("bf16"),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
+            envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(False),
+            envs.SGLANG_OPT_USE_TOPK_V2.override(False),
+        ):
+            metadata = PagedIndexerMetadata(
+                page_size=256,
+                compressed_page_size=64,
+                page_table=torch.zeros((1, 1), dtype=torch.int32),
+                compressed_seq_lens=torch.tensor([65], dtype=torch.int32),
+                use_topk_v2=False,
+            )
+        torch.testing.assert_close(metadata.deep_gemm_metadata, expected)
+
     def test_torch_fallback_skips_deep_gemm_and_ineligible_topk_plan(self):
         with (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
@@ -324,6 +347,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
             patch(f"{_INDEXER}.is_cuda", return_value=True),
             patch(f"{_INDEXER}.is_hip", return_value=False),
+            patch(f"{_INDEXER}.is_maca", return_value=False),
             get_parallel().override(attn_cp_size=1),
             patch(
                 f"{_INDEXER}.is_in_tc_piecewise_cuda_graph",
@@ -779,7 +803,9 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
         deep_gemm = SimpleNamespace(
             get_num_sms=MagicMock(return_value=1),
             get_paged_mqa_logits_metadata=MagicMock(
-                side_effect=lambda c4, *_: torch.zeros((2, 2), dtype=torch.int32)
+                side_effect=lambda c4, *_, **kwargs: torch.zeros(
+                    (2, 2), dtype=torch.int32
+                )
             ),
         )
         c4_seq_lens = torch.arange(1, num_rows + 1, dtype=torch.int32)

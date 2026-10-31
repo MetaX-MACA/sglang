@@ -781,10 +781,14 @@ class TestMacaMergeContracts(CustomTestCase):
             decorator_list=[],
         )
         module = ast.fix_missing_locations(ast.Module(body=[body], type_ignores=[]))
-        for maca, expected in ((False, DType.FP8), (True, DType.INT8)):
+        for mode, expected in (
+            ("fp8", DType.FP8),
+            ("int8", DType.INT8),
+            ("bf16", DType.BF16),
+        ):
             quantize = Mock()
             ns = {
-                "is_maca": lambda: maca,
+                "get_dsv4_index_cache_type": lambda: mode,
                 "envs": NS(SGLANG_DSV4_INDEX_CACHE_TYPE=NS(get=lambda: "int8")),
                 "torch": TorchStub,
                 "q": object(),
@@ -804,6 +808,12 @@ class TestMacaMergeContracts(CustomTestCase):
             "KVLayout": layout,
             "KVCache": object,
             "ceil_div": lambda a, b: (a + b - 1) // b,
+            "kv_cache_page_bytes": lambda layout, dtype, size: (
+                size * 1024
+                if dtype is DType.BF16
+                else ((size * 584 + 575) // 576) * 576
+            ),
+            "kv_cache_scale_bytes_per_token": lambda layout, dtype: 8,
         }
         cls = load(
             "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py",
