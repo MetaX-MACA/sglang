@@ -24,6 +24,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -725,9 +726,8 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
-    # ModelSlim NPU checkpoints carry QuaRot-aligned, MTP-local
-    # embedding/head weights. The native CUDA path keeps the original DSpark
-    # behavior and shares the target model's vocabulary modules.
+    # NPU and explicitly enabled quantized checkpoints own draft-local vocabulary
+    # modules; other checkpoints share the target model's modules.
     uses_own_vocab_modules = _is_npu
     precompile_kernels_after_loading = (
         DeepseekV4ForCausalLM.precompile_kernels_after_loading
@@ -822,7 +822,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     num_stages=self.num_stages,
                     num_target_layers=self.num_target_features,
                     quant_config=quant_config,
-                    prefix=add_prefix(f"stages.{stage_id}", prefix),
+                    prefix=add_prefix(f"mtp.{stage_id}", prefix),
                     alt_streams=self.alt_streams,
                     hc_stats_stream=self.hc_stats_stream,
                     moe_routed_quant_stream=self.moe_routed_quant_stream,
@@ -845,7 +845,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             getattr(config, "hc_pre_from_prev_sublayer", False)
         )
 
-        if self.uses_own_vocab_modules:
+        self.separate_lmhead_name = f"mtp.{self.num_stages - 1}.head"
+        self.separate_emb_name = "mtp.0.emb.tok_emb"
+        self.uses_own_vocab_modules = (
+            _is_npu or envs.SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD.get()
+        )
+        if _is_npu:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -858,12 +863,36 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 prefix=add_prefix("lm_head", prefix),
                 use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
+        elif self.uses_own_vocab_modules:
+            self.pp_group = get_parallel().pp_group
+            if self.pp_group.is_first_rank:
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    enable_tp=not is_dp_attention_enabled(),
+                    prefix=self.separate_emb_name,
+                )
+            else:
+                self.embed_tokens = PPMissingLayer()
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                    self.lm_head = self.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        config.vocab_size,
+                        config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=self.separate_lmhead_name,
+                        use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                    )
+            else:
+                self.lm_head = PPMissingLayer()
         else:
             self.embed_tokens: Optional[nn.Module] = None
             self.lm_head: Optional[nn.Module] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
-        if self.lm_head is not None:
+        if self.lm_head is not None and not isinstance(self.lm_head, PPMissingLayer):
             self.markov_head.configure_tp_shard(lm_head=self.lm_head)
 
     @property
@@ -1087,6 +1116,27 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+        self._assert_embed_and_lmhead_loaded(
+            params_dict=params_dict, loaded_params=loaded_params
+        )
+
+    def _assert_embed_and_lmhead_loaded(
+        self, *, params_dict: dict, loaded_params: set
+    ) -> None:
+        if not envs.SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD.get():
+            return
+        expected = {
+            name
+            for name in params_dict
+            if name.startswith(("embed_tokens.", "lm_head."))
+        }
+        missing = expected - loaded_params
+        if missing:
+            raise ValueError(
+                "DSpark V4 separate vocabulary weights are missing from the "
+                f"checkpoint: {sorted(missing)}. Provide the draft embedding/head "
+                "weights or disable SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD."
+            )
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set
@@ -1104,6 +1154,33 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 f"or disable the confidence head (enable_confidence_head=False)."
             )
 
+    def _remap_dspark_vocab_weight_name(
+        self, stage_idx: int, rest: str
+    ) -> Optional[str]:
+        vocab_prefixes = (
+            ("emb.tok_emb.", "embed_tokens.", 0),
+            ("embed.", "embed_tokens.", 0),
+            ("embed_tokens.", "embed_tokens.", 0),
+            ("head.", "lm_head.", self.num_stages - 1),
+            ("lm_head.", "lm_head.", self.num_stages - 1),
+        )
+        for source, target, owner_stage in vocab_prefixes:
+            if not rest.startswith(source):
+                continue
+            if stage_idx != owner_stage:
+                return None
+            if not self.uses_own_vocab_modules:
+                raise ValueError(
+                    "DSpark V4 checkpoint contains separate embedding/LM head "
+                    "weights; set SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD=True "
+                    "to load them instead of sharing target vocabulary weights."
+                )
+            suffix = rest.removeprefix(source)
+            if suffix == "scale":
+                suffix = "weight_scale_inv"
+            return target + suffix
+        return None
+
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
         if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
             return None
@@ -1116,6 +1193,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if len(parts) < 3:
             return None
         stage_id, rest = parts[1], parts[2]
+        if not stage_id.isdigit():
+            return None
+        if rest.startswith(
+            ("emb.tok_emb.", "embed.", "embed_tokens.", "head.", "lm_head.")
+        ):
+            return self._remap_dspark_vocab_weight_name(int(stage_id), rest)
 
         if rest.startswith("markov_head."):
             rest = rest.replace("markov_head.embed.", "markov_head.markov_w1.", 1)
