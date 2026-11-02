@@ -2621,9 +2621,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None
         elif _is_fake_transfer(decode_req.req):
-            committed_output_id = _generate_fake_prefill_handoff_output_id(
-                decode_req.req
-            )
+            if envs.MX_ENABLE_WARMUP_OUTPUT.get():
+                committed_output_id = output_id[0].item()
+            else:
+                committed_output_id = _generate_fake_prefill_handoff_output_id(
+                    decode_req.req
+                )
         else:
             committed_output_id = output_id[0].item()
         decode_req.req.output_ids.append(committed_output_id)
