@@ -1271,6 +1271,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.config = text_config
         self.quant_config = quant_config
+        import os
+        self.enable_dequant_bf16 = True if os.getenv("MX_ENABLE_DEQUANT_BF16") else False      
         self.use_dsa = is_deepseek_dsa(text_config)
         self.num_fused_shared_experts = 0
         self.model = None
@@ -1279,7 +1281,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         if not self.encoder_only:
             self.determine_num_fused_shared_experts()
             self.model = Glm5NextModel(
-                text_config, quant_config, prefix=add_prefix("model", prefix)
+                text_config, quant_config, prefix=add_prefix("language_model", "model")
             )
             if self.pp_group.is_last_rank:
                 if self.pp_group.world_size == 1 and text_config.tie_word_embeddings:
@@ -1322,7 +1324,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             self.visual = Glm5NextVisionModel(
                 config.vision_config,
                 quant_config=quant_config,
-                prefix=add_prefix("visual", prefix),
+                prefix=add_prefix("visual", "model"),
                 use_data_parallel=self.use_data_parallel,
             )
         self.is_mrope_enabled = not self.encoder_only and "mrope_section" in (
@@ -1740,7 +1742,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             fused_cat_dim = 0
 
         params_dict = dict(self.named_parameters())
-
+        loaded_params = set()
         def maybe_map_fp8_block_scale_name(name: str) -> str:
             # Quark stores dequantization scales without native block-FP8's
             # "_inv" suffix, including fused w13/w2 expert parameters.
@@ -1834,6 +1836,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
                 break
             else:
                 is_expert_weight = False
@@ -1855,6 +1858,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
+                    loaded_params.add(name)
                     break
                 else:
                     if is_expert_weight:
@@ -1902,6 +1906,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                                     param, "weight_loader", default_weight_loader
                                 )
                                 weight_loader(param, fused_weight)
+                                loaded_params.add(target)
                             cached_a_proj.pop(q_a_proj_name, None)
                             cached_a_proj.pop(kv_a_proj_name, None)
                         continue
@@ -1918,6 +1923,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
 
         if getattr(self, "encoder_only", False):
             run_post = False
@@ -1929,6 +1935,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
         if run_post:
             DeepseekV2WeightLoaderMixin.post_load_weights(
                 self, is_nextn=is_nextn, weight_names=weight_names
+            )
+
+        missing = set(params_dict.keys()) - loaded_params
+        if missing:
+            logging.warning(
+                f"glm5 weight is missing "
+                f"{sorted(missing)}. "
             )
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
