@@ -46,6 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_attn_backend,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
@@ -78,6 +79,28 @@ _is_hip = is_hip()
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def _cp_late_layer_tail(model, forward_batch: ForwardBatch):
+    """The late-layer tail the model body selected for this prefill CP extend.
+
+    Non-CP returns it to the caller through ``DeepseekV4ForCausalLM.forward``; the
+    CP path calls the body directly, so re-derive it from the backend here. Returns
+    None unless that tail carries a CP layout.
+    """
+    # TODO(upstream): No community-merged fix is available yet; this redundant
+    # implementation is a temporary workaround. Remove once upstream lands.
+    body = getattr(model, "model", None)
+    if getattr(body, "late_layer_start", None) is None:
+        return None
+    if not forward_batch.forward_mode.is_extend_without_speculative():
+        return None
+    tail = getattr(
+        getattr(get_attn_backend(), "tail_forward_metadata", None),
+        "late_layer_tail",
+        None,
+    )
+    return tail if (tail is not None and tail.cp_metadata is not None) else None
 
 
 class EagerRunner(BaseRunner):
@@ -425,6 +448,13 @@ class EagerRunner(BaseRunner):
             )
 
         stream = torch.cuda.current_stream()
+        tail = (
+            _cp_late_layer_tail(model, forward_batch)
+            if aux_hidden_states is not None
+            else None
+        )
+        if tail is not None:
+            forward_batch.attn_cp_metadata = tail.cp_metadata
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
         # DSpark aux tensors ride the same CP token split; gather them the same way.
         if aux_hidden_states is not None:
@@ -445,14 +475,28 @@ class EagerRunner(BaseRunner):
             # DSpark aux capture is on, else it overrides the packed aux.
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        return model.logits_processor(
-            forward_batch.input_ids,
+        input_ids = forward_batch.input_ids
+        logits_metadata = forward_batch
+        if tail is not None:
+            # Mirrors the implementation in DeepseekV4Model::forward()
+            from sglang.srt.layers.logits_processor import LogitsMetadata
+
+            input_ids = input_ids[tail.cp_extend_indices]
+            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+            logits_metadata.extend_seq_lens = tail.extend_seq_lens
+            logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+            logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+        output = model.logits_processor(
+            input_ids,
             hidden_states,
             model.lm_head,
-            forward_batch,
+            logits_metadata,
             aux_hidden_states,
             **logits_kwargs,
         )
+        if tail is not None:
+            output.hidden_states_token_indices = tail.cp_extend_indices
+        return output
 
     def _execute_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None

@@ -4481,6 +4481,12 @@ class DeepseekV4Model(nn.Module):
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
+            assert self.start_layer <= self.late_layer_start < self.end_layer, (
+                "decoder SWA bounded replay switches layers at late_layer_start, so"
+                f" this rank must own it: start_layer={self.start_layer},"
+                f" end_layer={self.end_layer},"
+                f" late_layer_start={self.late_layer_start}"
+            )
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
