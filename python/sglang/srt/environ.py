@@ -1694,8 +1694,9 @@ class Envs:
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(False)
-    # Storage format for the MACA DSV4 index cache: int8, fp8, or bf16.
+    # Storage format for the DSV4 index cache.
     SGLANG_DSV4_INDEX_CACHE_TYPE = EnvStr("int8")
+    SGLANG_DSA_INDEX_CACHE_TYPE = EnvStr("int8")
 
     # ===================================================================
     # Inkling
