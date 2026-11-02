@@ -1955,6 +1955,7 @@ class Envs:
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
 
+    MX_ENABLE_WARMUP_OUTPUT = EnvBool(False)
 
 envs = Envs()
 EnvField._allow_set_name = False

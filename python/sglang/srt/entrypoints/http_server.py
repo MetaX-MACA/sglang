@@ -2269,7 +2269,13 @@ async def _send_disaggregation_warmup_requests(
         async with session.post(
             url + "/generate", json=json_data, ssl=ssl_context
         ) as response:
-            await response.read()
+            if envs.MX_ENABLE_WARMUP_OUTPUT.get():
+                raw = await response.read()
+                encoding = response.get_encoding()
+                text = raw.decode(encoding, errors="replace")
+                logger.info(f'[DP{dp_rank}] warmup request returns: {text}')
+            else:
+                await response.read()
             return response.status
 
     async with aiohttp.ClientSession(
@@ -2421,6 +2427,8 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
+            if envs.MX_ENABLE_WARMUP_OUTPUT.get():
+                logger.info(f'warmup request returns: {res.text}')
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
