@@ -4676,12 +4676,7 @@ class MLATokenToKVPool(KVCache):
             cache_k_nope, cache_k_rope = quantize_kimi_kv_int8(
                 cache_k_nope, cache_k_rope
             )
-            set_mla_kv_buffer_triton(
-                dst_buffer,
-                loc,
-                cache_k_nope,
-                cache_k_rope,
-            )
+            self._scatter_mla_rows(dst_buffer, loc, cache_k_nope, cache_k_rope)
         elif _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.

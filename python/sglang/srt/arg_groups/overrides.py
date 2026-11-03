@@ -1281,19 +1281,40 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
     ):
         prefill_backend, decode_backend = attention_backends_of(view)
         triton_path = prefill_backend == decode_backend == "triton"
-        flashmla_path = prefill_backend == "flashinfer" and decode_backend == "flashmla"
+        flashmla_path = (
+            prefill_backend in ("flashinfer", "flashmla") and decode_backend == "flashmla"
+        )
         if not (triton_path or flashmla_path):
             raise ValueError(
                 "Kimi-K3 INT8 KV cache requires Triton prefill/decode, or "
-                "FlashInfer prefill with FlashMLA decode."
+                "FlashInfer or FlashMLA prefill with FlashMLA decode."
             )
         if flashmla_path:
             if not get_platform().is_maca:
                 raise ValueError("Kimi-K3 FlashMLA INT8 KV cache requires MACA.")
             if view.speculative_algorithm is not None:
-                if view.speculative_attention_mode != "prefill":
+                if prefill_backend == "flashmla":
+                    from sglang.srt.speculative.ragged_verify import (
+                        RaggedVerifyMode,
+                        read_ragged_verify_mode,
+                    )
+
+                    if (
+                        view.speculative_algorithm != "DSPARK"
+                        or read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+                    ):
+                        raise ValueError(
+                            "FlashMLA INT8 prefill requires static DSPARK verification "
+                            "when speculative decoding is enabled."
+                        )
+                verify_mode = (
+                    "decode"
+                    if view.dcp_size > 1 and view.speculative_algorithm == "DSPARK"
+                    else "prefill"
+                )
+                if view.speculative_attention_mode != verify_mode:
                     raise ValueError(
-                        "FlashMLA INT8 target verify must use prefill attention."
+                        f"FlashMLA INT8 target verify must use {verify_mode} attention."
                     )
                 if view.speculative_draft_kv_cache_dtype not in ("bf16", "bfloat16"):
                     raise ValueError(

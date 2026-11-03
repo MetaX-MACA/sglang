@@ -1760,12 +1760,9 @@ class KVCacheConfigurator:
 
     @property
     def mla_int8_uses_workspace(self) -> bool:
-        return not (
-            self.kv_cache_dtype == torch.int8
-            and self.model_config.hf_config.architectures[0]
-            == "KimiK3ForConditionalGeneration"
-            and attention_backends() == ("flashinfer", "flashmla")
-        )
+        # FlashInfer and Triton use pool-owned BF16 storage for dequantization.
+        # FlashMLA reads packed INT8 pages directly.
+        return attention_backends() != ("flashmla", "flashmla")
 
     def _build_mla_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         token_to_kv_pool = MLATokenToKVPool(

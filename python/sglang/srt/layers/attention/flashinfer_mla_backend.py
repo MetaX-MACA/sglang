@@ -225,6 +225,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
+        *,
+        native_int8_kv: bool = False,
     ):
         super().__init__()
 
@@ -240,7 +242,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.mla_kv_cache_store_int8 = getattr(
             mla_pool, "mla_kv_cache_store_int8", False
         )
+        self.mla_kv_pool = mla_pool
+        self.kv_index_translator = model_runner.kv_index_translator
+        self.page_size = model_runner.page_size
         if self.mla_kv_cache_store_int8:
+            if native_int8_kv:
+                self.enable_chunk_kv = False
+                return
+
             from sglang.srt.runtime_context import attention_backends
 
             if not (
@@ -253,7 +262,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     "prefill paired with FlashMLA decode; "
                     "other INT8 backend combinations are not supported."
                 )
-        self.kv_index_translator = model_runner.kv_index_translator
         self.enable_chunk_kv = (
             not skip_prefill
             and get_disagg().disaggregation_mode != "decode"
@@ -261,7 +269,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             and not get_exec().kernel.flashinfer_mla_disable_ragged
             and not self.mla_kv_cache_store_int8
         )
-        self.page_size = model_runner.page_size
 
         # Allocate buffers
         # different from flashinfer zero_init_global_workspace_buffer
@@ -402,6 +409,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     kv_len_arr=self.cuda_graph_kv_lens[:bs],
                     backend="auto",
                 )
+                if self.mla_kv_cache_store_int8:
+                    # All verify graphs read this fixed physical-index storage.
+                    prefill_wrapper._mla_int8_graph_kv_indices = (
+                        self.cuda_graph_kv_indices
+                    )
                 self.prefill_cuda_graph_metadata[
                     self._verify_graph_key(bs, spec_info)
                 ] = prefill_wrapper
@@ -653,7 +665,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         ``.to("cpu")`` copies per call (qo_indptr / kv_indptr / kv_len_arr); on
         the graph-replay hot path each of those drains the whole GPU queue and
         stalls the scheduler CPU behind the in-flight draft graph. All three
-        arrays are host-derivable, so we feed ``fast_mla_decode_plan`` directly.
+        arrays are host-derivable, so we feed them to the fast plan directly.
+        INT8 verify also refreshes the graph-bound device metadata.
 
         Returns None when the slow (device-fed) plan must run instead: at
         capture (the real plan() populates ``_cached_module`` and the wrapper's
@@ -775,18 +788,23 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     qall[:, :, layer.v_head_dim :],
                 )
             o = q.new_empty(q.shape)
-            if self.mla_kv_cache_store_int8:
+            if self.mla_kv_cache_store_int8 and k_buf.dtype != torch.bfloat16:
                 from sglang.kernels.ops.kvcache.kimi_k3_int8 import (
-                    dequantize_k_cache_paged_int8,
+                    dequantize_k_cache_paged_int8_to_workspace,
                 )
 
                 if self.extend_bf16_kv_indices is None:
                     raise RuntimeError("INT8 prefill requires referenced KV indices")
-                k_buf = dequantize_k_cache_paged_int8(
+                # Keep the physical token address space used by the wrapper.
+                # This pool-owned workspace is reused across layers and graphs.
+                workspace = self.mla_kv_pool.get_mla_int8_dequant_workspace()
+                dequantize_k_cache_paged_int8_to_workspace(
                     k_buf,
                     self.extend_bf16_kv_indices,
+                    workspace,
                     num_tokens=self.extend_int8_kv_num_tokens,
                 )
+                k_buf = workspace
             o = prefill_wrapper_paged.run(
                 q,
                 q_rope,
@@ -798,21 +816,28 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def _prepare_int8_prefill_indices(self, wrapper, kv_indices, kv_indptr):
-        physical = getattr(wrapper, "_mla_int8_physical_indices", None)
-        if physical is None or physical.numel() != kv_indices.numel():
+        """Use physical IDs in both FlashInfer and the BF16 dequant workspace.
+
+        Graph capture may see a tiny prefix while replay has a long context.
+        Bind dequantization to the graph's full-capacity indices and a stable
+        device count, rather than capturing an allocation sized to that prefix.
+        """
+        physical = getattr(wrapper, "_mla_int8_graph_kv_indices", None)
+        if physical is not None:
+            if kv_indices.numel() > physical.numel():
+                raise ValueError("INT8 MLA KV indices exceed captured graph capacity")
+            if kv_indices.data_ptr() != physical.data_ptr():
+                physical[: kv_indices.numel()].copy_(kv_indices)
+            kv_indices = physical
+        if not hasattr(wrapper, "_mla_int8_num_tokens"):
             with torch.inference_mode(False):
-                physical = torch.empty_like(kv_indices)
                 wrapper._mla_int8_num_tokens = torch.empty(
                     (1,), dtype=kv_indptr.dtype, device=kv_indptr.device
                 )
-            wrapper._mla_int8_physical_indices = physical
-        physical.copy_(kv_indices)
-        self.extend_bf16_kv_indices = physical
         wrapper._mla_int8_num_tokens.copy_(kv_indptr[-1:])
+        self.extend_bf16_kv_indices = kv_indices
         self.extend_int8_kv_num_tokens = wrapper._mla_int8_num_tokens
-        return torch.arange(
-            kv_indices.numel(), dtype=kv_indices.dtype, device=kv_indices.device
-        )
+        return kv_indices
 
     def forward_decode(
         self,
@@ -1149,7 +1174,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
             )
 
         self.attn_backend.extend_bf16_kv_indices = kv_indices
-        if self.attn_backend.mla_kv_cache_store_int8 and not use_ragged:
+        if (
+            self.attn_backend.mla_kv_cache_store_int8
+            and not use_ragged
+            and attn_dcp_metadata is None
+        ):
             kv_indices = self.attn_backend._prepare_int8_prefill_indices(
                 wrapper_paged, kv_indices, kv_indptr
             )
@@ -1166,7 +1195,14 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 causal=True,
             )
         elif fast_verify_plan_kwargs is not None:
-            fast_mla_decode_plan(
+            # Unlike decode, verify builds fresh indptr/lens each step. Refresh
+            # the captured buffers as well as the host-side plan.
+            plan = (
+                fast_mla_prefill_plan
+                if self.attn_backend.mla_kv_cache_store_int8
+                else fast_mla_decode_plan
+            )
+            plan(
                 wrapper_paged,
                 fast_verify_plan_kwargs["qo_indptr_cpu"],
                 fast_verify_plan_kwargs["kv_indptr_cpu"],

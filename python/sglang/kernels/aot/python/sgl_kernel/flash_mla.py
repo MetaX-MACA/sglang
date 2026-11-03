@@ -164,7 +164,7 @@ def flash_mla_with_kvcache(
                 q.dtype != torch.bfloat16
                 or k_cache.dtype != torch.int8
                 or q.ndim != 4
-                or q.shape[1] != 1
+                or q.shape[1] < 1
                 or q.shape[-1] != 576
                 or k_cache.ndim != 4
                 or k_cache.shape[1:] != (64, 1, 656)
@@ -172,7 +172,7 @@ def flash_mla_with_kvcache(
                 or head_dim_v != 512
             ):
                 raise ValueError(
-                    "Dense INT8 FlashMLA expects single-token BF16 Q and paged INT8 KV (64, 1, 656)"
+                    "Dense INT8 FlashMLA expects BF16 Q and paged INT8 KV (64, 1, 656)"
                 )
             if block_table is None or cache_seqlens is None or num_splits is not None:
                 raise ValueError(

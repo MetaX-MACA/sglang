@@ -3565,6 +3565,10 @@ class KimiK3LinearForCausalLM(nn.Module):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
+        if kv_cache_dtype == torch.int8:
+            # DCP extend gathers dequantized latent KV, not the packed cache bytes.
+            kv_buffer_shape = (*kv_buffer_shape[:-1], 576)
+            kv_cache_dtype = torch.bfloat16
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,

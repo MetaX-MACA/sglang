@@ -53,15 +53,31 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if cfg.kv_cache_dtype == "int8":
         if cfg.dcp_size > 1:
-            raise ValueError("Kimi-K3 INT8 KV cache does not support DCP.")
-        if attention_backends_of(cfg) == (None, None):
-            logger.info("Kimi-K3 INT8 KV cache selects the Triton attention backend.")
-            return {
-                "prefill_attention_backend": "triton",
-                "decode_attention_backend": "triton",
+            if not get_platform().is_maca or attention_backends_of(cfg) not in (
+                (None, None),
+                ("flashinfer", "flashmla"),
+                ("flashmla", "flashmla"),
+            ):
+                raise ValueError(
+                    "Kimi-K3 INT8 DCP requires MACA and FlashMLA decode."
+                )
+            if cfg.speculative_algorithm not in (None, "DSPARK"):
+                raise ValueError("Kimi-K3 INT8 DCP only supports DSPARK speculation.")
+        elif attention_backends_of(cfg) == (None, None):
+            backend = "flashmla" if get_platform().is_maca else "triton"
+            logger.info("Kimi-K3 INT8 KV cache selects the %s attention backend.", backend)
+            overrides = {
+                "prefill_attention_backend": backend,
+                "decode_attention_backend": backend,
             }
+            if backend == "flashmla":
+                overrides["flashinfer_mla_disable_ragged"] = True
+            return overrides
 
-        if attention_backends_of(cfg) == ("flashinfer", "flashmla"):
+        if cfg.dcp_size == 1 and attention_backends_of(cfg) in (
+            ("flashinfer", "flashmla"),
+            ("flashmla", "flashmla"),
+        ):
             return {"flashinfer_mla_disable_ragged": True}
 
     if cfg.dcp_size > 1:
@@ -88,14 +104,21 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 )
 
             # DSPARK target-verify + draft-extend must run on the decode
-            # (cutedsl_mla) backend, whose _run_decode_kernel implements the DCP
-            # signature (causal_seqs / cp_world / cp_rank). The default
+            # backend: cutedsl_mla implements causal_seqs / cp_world / cp_rank;
+            # INT8 FlashMLA flattens static verify into causal single-Q rows.
+            # The default
             # "prefill" routes verify to trtllm_mla, whose base _run_decode_kernel
             # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
             overrides["speculative_attention_mode"] = "decode"
 
         prefill_backend, decode_backend = attention_backends_of(cfg)
-        if decode_backend == "cutedsl_mla" or (
+        if cfg.kv_cache_dtype == "int8":
+            overrides.update(
+                prefill_attention_backend=prefill_backend or "flashmla",
+                decode_attention_backend="flashmla",
+                flashinfer_mla_disable_ragged=True,
+            )
+        elif decode_backend == "cutedsl_mla" or (
             decode_backend is None and not get_platform().is_maca
         ):
             _require_kimi_k3_cutedsl_dcp_support()

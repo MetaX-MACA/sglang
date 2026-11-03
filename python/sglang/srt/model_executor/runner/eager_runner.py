@@ -318,8 +318,26 @@ class EagerRunner(BaseRunner):
             or cp_active
             or forward_batch.forward_mode.is_target_verify()
         ):
-            if model_runner.attn_dcp_size > 1 and hasattr(
-                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            args = model_runner.server_args
+            flashmla_prefill = (
+                args.prefill_attention_backend or args.attention_backend
+            ) == "flashmla"
+            int8_sharded_mla = (
+                model_runner.kv_cache_dtype == torch.int8
+                and model_runner.model_config.hf_config.architectures[0]
+                == "KimiK3ForConditionalGeneration"
+                and (
+                    (flashmla_prefill and forward_batch.forward_mode.is_extend_without_speculative())
+                    or (
+                        get_spec().speculative_algorithm == "DSPARK"
+                        and forward_batch.forward_mode.is_target_verify()
+                    )
+                )
+            )
+            if (
+                model_runner.attn_dcp_size > 1
+                and not int8_sharded_mla
+                and hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp")
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (
