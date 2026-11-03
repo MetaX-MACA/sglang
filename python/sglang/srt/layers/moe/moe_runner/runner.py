@@ -147,7 +147,7 @@ class MoeRunner:
             # register the hpc_ops fused func before the pool lookup.
             from sglang.srt.layers.moe.moe_runner import hpc_ops  # noqa: F401
         elif runner_backend.is_mxfp4_w4a8():
-            self.runner_core = None  # MCTlass MXFP4 W4A8 requires the fused path
+            self.runner_core = None  # MXFP4 W4A8 requires the fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
