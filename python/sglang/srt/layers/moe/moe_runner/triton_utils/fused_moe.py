@@ -797,7 +797,7 @@ def _fused_moe_kernel_sequence(
         assert is_fp4_experts and block_shape == [128, 128]
         assert (
             enable_mctlass_fused_moe_python_api
-        ), "MXFP4 W4A8 requires the MCTlass Python API"
+        ), "MXFP4 W4A8 requires the Python API"
         down_moe_use_tma = up_moe_use_tma = False
     num_tokens = hidden_states.shape[0]
     E, N, _ = w1.shape
