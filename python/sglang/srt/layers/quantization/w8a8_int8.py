@@ -12,7 +12,7 @@ from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -326,12 +326,20 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale = Parameter(
             layer.w2_weight_scale.data, requires_grad=False
         )
+        if self.runner.runner_backend.is_deep_gemm() and hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config(
+                {"bf16_dispatch": True, "dispatcher_output_dtype": "bf16"}
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        from sglang.srt.layers.quantization.int8_utils import (
+            get_int8_moe_runner_backend,
+        )
+
+        self.runner = MoeRunner(get_int8_moe_runner_backend(), moe_runner_config)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         return TritonMoeQuantInfo(
@@ -357,6 +365,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         if use_intel_amx_backend(layer) or _is_cpu_arm64:
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
+            topk_output = dispatch_output.topk_output
             topk_weights, topk_ids, _ = topk_output
             topk_ids = topk_ids.int()
             x, topk_weights = apply_topk_weights_cpu(
@@ -384,5 +393,19 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
-        quant_info = self.get_triton_quant_info(layer)
+        if self.runner.runner_backend.is_deep_gemm():
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                DeepGemmMoeQuantInfo,
+            )
+
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_fp8=False,
+                use_int8_w8a8=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+            )
+        else:
+            quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
