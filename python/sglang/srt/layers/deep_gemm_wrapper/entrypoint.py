@@ -1,3 +1,4 @@
+import inspect
 import logging
 from contextlib import contextmanager
 from typing import Any, Optional, Tuple, Union
@@ -63,10 +64,14 @@ def get_paged_mqa_logits_metadata(
 ) -> torch.Tensor:
     import deep_gemm
 
-    # MetaX's automatic density selection reads a GPU scalar with .item().
-    # Pin the legacy density so schedules have stable shapes and can be
-    # rebuilt inside graph capture without synchronizing with the host.
-    kwargs = {"workers_per_sm": 8} if is_maca() else {}
+    # Pin worker density where supported; legacy APIs keep their defaults.
+    kwargs = {}
+    if (
+        is_maca()
+        and "workers_per_sm"
+        in inspect.signature(deep_gemm.get_paged_mqa_logits_metadata).parameters
+    ):
+        kwargs["workers_per_sm"] = 8
     return deep_gemm.get_paged_mqa_logits_metadata(
         context_lens, block_kv, num_sms, **kwargs
     )
@@ -151,15 +156,14 @@ def grouped_gemm_nt_int8int8bf16_masked(
     masked_m: torch.Tensor,
     expected_m: int,
 ):
+    # A Tensor is a BF16 byte carrier containing INT8 rows and FP32 scales.
+    # Tuple inputs carry values and per-token scales in separate allocations.
     if not isinstance(lhs, tuple):
         lhs = (lhs.view(torch.int8), None)
-    deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(
-        lhs,
-        rhs,
-        out,
-        masked_m,
-        expected_m,
+    return deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_masked(
+        lhs, rhs, out, masked_m, expected_m
     )
+
 
 def _ensure_cuda(
     pair: Tuple[torch.Tensor, torch.Tensor],

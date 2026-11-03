@@ -6,6 +6,30 @@ from sglang.kernels.ops.gemm.int8_kernel import w8a8_block_int8_matmul
 from sglang.kernels.ops.quantization.int8_kernel import per_token_group_quant_int8
 
 
+def get_int8_moe_runner_backend():
+    from sglang.srt.layers.moe.utils import (
+        MoeRunnerBackend,
+        get_deepep_mode,
+        get_moe_a2a_backend,
+        get_moe_runner_backend,
+    )
+    from sglang.srt.utils import is_maca
+
+    backend = get_moe_runner_backend()
+    if not backend.is_deep_gemm():
+        return MoeRunnerBackend.TRITON
+    if not (
+        is_maca()
+        and get_moe_a2a_backend().is_deepep()
+        and get_deepep_mode().is_low_latency()
+    ):
+        raise ValueError(
+            "W8A8 INT8 DeepGEMM requires MACA, --moe-a2a-backend deepep "
+            "and --deepep-mode low_latency."
+        )
+    return backend
+
+
 def apply_w8a8_block_int8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,

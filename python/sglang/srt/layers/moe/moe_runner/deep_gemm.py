@@ -322,8 +322,8 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
     use_int4_w4a8: bool = False
+    use_int8_w8a8: bool = False
     use_mxfp8: bool = False
-    use_int4_w4a8: bool = False
 
     def __post_init__(self):
         if self.use_mxfp8:
@@ -400,7 +400,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             else None
         )
         with deep_gemm_wrapper.contiguous_layout_alignment_scope(alignment):
-            if getattr(quant_info, "use_int4_w4a8", False):
+            if quant_info.use_int8_w8a8:
+                if not runner_input.use_masked_gemm:
+                    raise NotImplementedError(
+                        "W8A8 INT8 DeepGEMM requires DeepEP low_latency"
+                    )
+                hidden_states = self._run_masked_int8_gemm(
+                    runner_input, quant_info, running_state
+                )
+            elif getattr(quant_info, "use_int4_w4a8", False):
                 if not runner_input.use_masked_gemm:
                     raise NotImplementedError(
                         "DeepGEMM W4A8 currently requires a masked expert layout. "
@@ -432,6 +440,58 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                         runner_input, quant_info, running_state
                     )
         return DeepGemmRunnerOutput(hidden_states=hidden_states)
+
+    def _run_masked_int8_gemm(
+        self,
+        runner_input: DeepGemmRunnerInput,
+        quant_info: DeepGemmMoeQuantInfo,
+        running_state: dict,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked
+        from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+
+        if not is_maca() or self.config.activation != "silu":
+            raise NotImplementedError("INT8 masked GEMM requires MACA and SiLU")
+        hidden_states = runner_input.hidden_states
+        masked_m = runner_input.masked_m
+        assert masked_m is not None
+        assert hidden_states.dtype == torch.bfloat16
+        assert runner_input.hidden_states_scale is None
+        assert quant_info.w13_weight.dtype == torch.int8
+        assert quant_info.w2_weight.dtype == torch.int8
+        assert quant_info.w13_scale is not None and quant_info.w2_scale is not None
+        num_groups, max_tokens, hidden_size = hidden_states.shape
+        gateup_width = quant_info.w13_weight.shape[1]
+        gateup_output = torch.empty(
+            (num_groups, max_tokens, gateup_width),
+            device=hidden_states.device,
+            dtype=torch.bfloat16,
+        )
+        # Quantize each received expert row; DeepEP keeps its BF16 wire format.
+        deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
+            per_token_quant_int8(hidden_states),
+            (quant_info.w13_weight, quant_info.w13_scale),
+            gateup_output,
+            masked_m,
+            runner_input.expected_m,
+        )
+        dispose_tensor(hidden_states)
+        down_input = silu_and_mul_masked(gateup_output, masked_m, self.swiglu_limit)
+        del gateup_output
+        down_output = torch.empty(
+            (num_groups, max_tokens, hidden_size),
+            device=down_input.device,
+            dtype=torch.bfloat16,
+        )
+        deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
+            down_input,
+            (quant_info.w2_weight, quant_info.w2_scale),
+            down_output,
+            masked_m,
+            runner_input.expected_m,
+        )
+        dispose_tensor(down_input)
+        return down_output
 
     def _run_masked_int8_int4_gemm(
         self,

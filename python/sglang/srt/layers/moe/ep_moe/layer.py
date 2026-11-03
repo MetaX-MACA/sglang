@@ -201,6 +201,14 @@ class DeepEPMoE(FusedMoE):
                 self.deprecate_flag = False
         elif (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and get_moe_runner_backend().is_deep_gemm()
+            and quant_config is not None
+            and quant_config.get_name() in ("w8a8_int8", "compressed_tensors")
+        ):
+            # Quantized INT8 experts use the modern runner/dispatcher contract.
+            self.deprecate_flag = True
+        elif (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         ):
             self.deprecate_flag = True
