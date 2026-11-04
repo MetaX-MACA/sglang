@@ -10,9 +10,15 @@ from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.srt.utils.common import is_maca
+_is_maca = is_maca()
+if _is_maca:
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_maca import fp4_index_logits_decode
+else:
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
-    fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
