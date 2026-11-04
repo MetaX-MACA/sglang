@@ -58,6 +58,20 @@ for _mod, _fn in _TRITON_KERNELS:
     )
 del _mod, _fn
 
+for _mod, _fn in (
+    ("dsa.quant_k_cache", "quantize_k_cache_int8_separate"),
+    ("dsa.triton_flashmla_kv", "flash_mla_with_kvcache_triton"),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.CUDA}),
+        )
+    )
+del _mod, _fn
+
 register_kernel(
     KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",

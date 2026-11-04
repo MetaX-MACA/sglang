@@ -402,7 +402,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
-        assert not self.dsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_is_quantized
         # A write invalidates any cached remote copy for this layer.
         if self.pending_remote_kv_layer_id == layer_id:
             self._finalize_pending_kv_broadcast(set_remote_layer_id=False)

@@ -2,6 +2,38 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsa.kv_cache_layout import (
+    QUANT_GROUP_SIZE,
+    validate_int8_kv_cache,
+)
+
+
+def quantize_k_cache_int8_separate(k_nope: torch.Tensor, k_rope: torch.Tensor):
+    """Pack [INT8 NoPE | FP32 scales] and BF16 RoPE as separate byte tensors."""
+    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant_int8
+
+    nope = k_nope.squeeze(1) if k_nope.ndim == 3 else k_nope
+    rope = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
+    if nope.ndim != 2 or rope.ndim != 2:
+        raise ValueError("DSA INT8 writer expects [tokens, dim] or [tokens, 1, dim]")
+    validate_int8_kv_cache(nope.shape[1], rope.shape[1])
+    if nope.shape[0] != rope.shape[0] or nope.device != rope.device:
+        raise ValueError("DSA INT8 NoPE and RoPE must have matching rows and devices")
+    if nope.dtype is not torch.bfloat16 or rope.dtype is not torch.bfloat16:
+        raise TypeError("DSA INT8 writer expects BF16 NoPE and RoPE inputs")
+
+    num_tokens, dim_nope = nope.shape
+    packed = torch.empty(
+        (num_tokens, dim_nope + dim_nope // QUANT_GROUP_SIZE * 4),
+        dtype=torch.uint8,
+        device=nope.device,
+    )
+    if num_tokens:
+        quant, scales = act_quant_int8(nope.contiguous(), QUANT_GROUP_SIZE)
+        packed[:, :dim_nope] = quant.view(torch.uint8)
+        packed[:, dim_nope:] = scales.contiguous().view(torch.uint8)
+    return packed.unsqueeze(1), rope.contiguous().view(torch.uint8).unsqueeze(1)
+
 
 def gather_dsa_kv_scales(
     scale_src,

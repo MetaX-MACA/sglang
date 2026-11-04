@@ -22,7 +22,7 @@ PAGED = TopkTransformMethod.PAGED
 
 def _make_backend(prefill_impl: str, *, fp8_kv_cache: bool):
     backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
-    backend.dsa_kv_cache_store_fp8 = fp8_kv_cache
+    backend.dsa_kv_cache_is_quantized = fp8_kv_cache
     backend.dsa_prefill_impl = prefill_impl
     return backend
 

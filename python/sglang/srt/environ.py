@@ -1166,6 +1166,8 @@ class Envs:
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
+    # Read packed DSA FP8/INT8 KV with Triton instead of MACA FlashMLA.
+    SGLANG_DSA_TRITON_FLASHMLA_KV = EnvBool(False)
     SGLANG_SM120_TRITON_FLASHMLA = EnvBool(True)
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
     # layout. The scheduler continues to allocate 256-token logical pages.

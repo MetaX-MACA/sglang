@@ -226,7 +226,7 @@ class TestTritonSparseMLATopkTransformRouting(CustomTestCase):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
-        backend.dsa_kv_cache_store_fp8 = store_fp8
+        backend.dsa_kv_cache_is_quantized = store_fp8
         backend.dsa_prefill_impl = prefill_impl
         return backend.get_topk_transform_method(
             ForwardMode.EXTEND if mode is None else mode

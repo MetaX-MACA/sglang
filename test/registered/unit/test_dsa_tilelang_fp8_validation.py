@@ -11,6 +11,17 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDsaTilelangFp8Validation(CustomTestCase):
+    def test_int8_requires_packed_cache_consumers(self):
+        _check_tilelang_dsa_fp8_kv("int8", "flashmla_sparse", "flashmla_kv", hip=False)
+        for prefill, decode in (("tilelang", "flashmla_kv"), ("fa3", "trtllm")):
+            with self.subTest(prefill=prefill, decode=decode):
+                with self.assertRaisesRegex(ValueError, "INT8 main KV"):
+                    _check_tilelang_dsa_fp8_kv("int8", prefill, decode, hip=False)
+        with self.assertRaisesRegex(ValueError, "HIP"):
+            _check_tilelang_dsa_fp8_kv(
+                "int8", "flashmla_sparse", "flashmla_kv", hip=True
+            )
+
     def test_cuda_fp8_tilelang_decode_rejected(self):
         with self.assertRaises(ValueError):
             _check_tilelang_dsa_fp8_kv("fp8_e4m3", "flashmla_kv", "tilelang", hip=False)

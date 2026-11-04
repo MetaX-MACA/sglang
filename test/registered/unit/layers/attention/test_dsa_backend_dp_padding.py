@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     _restore_trtllm_decode_dp_padding,
@@ -187,13 +188,43 @@ class TestDSABackendDPPadding(unittest.TestCase):
 
 
 class TestMACAFlashMLACacheLayout(CustomTestCase):
+    def test_int8_triton_fallback_uses_physical_pages(self):
+        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_kv_cache_store_fp8 = False
+        backend.dsa_kv_cache_store_int8 = True
+        backend.dsa_kv_cache_is_quantized = True
+        backend.physical_page_size = 64
+        backend.kv_cache_dim = 656
+        layer = SimpleNamespace(tp_q_head_num=2, head_dim=576)
+        query = torch.zeros(2, 2, 576)
+        cache = torch.zeros(128, 1, 656, dtype=torch.int8)
+        indices = torch.zeros(2, 4, dtype=torch.int32)
+        expected = torch.zeros(2, 1, 2, 512)
+
+        def fallback(**kwargs):
+            self.assertEqual(kwargs["k_cache"].shape, (2, 64, 1, 656))
+            self.assertTrue(torch.equal(kwargs["indices"], indices.unsqueeze(1)))
+            return expected, None
+
+        with (
+            envs.SGLANG_DSA_TRITON_FLASHMLA_KV.override(True),
+            patch(
+                "sglang.kernels.ops.attention.dsa.triton_flashmla_kv.flash_mla_with_kvcache_triton",
+                side_effect=fallback,
+            ),
+        ):
+            output = backend._forward_flashmla_kv(
+                query, cache, 512, 0.5, layer, None, indices
+            )
+        self.assertIs(output, expected)
+
     def test_physical_pages_and_padded_heads_preserve_sparse_attention(self):
         """GLM warmup failed when the port used the removed cache page field."""
         backend = SimpleNamespace(
             physical_page_size=64,
             kv_cache_dim=3,
             kv_lora_rank=2,
-            dsa_kv_cache_store_fp8=False,
+            dsa_kv_cache_is_quantized=False,
             flashmla_kv_num_q_heads=4,
             dsa_index_topk=4,
         )
