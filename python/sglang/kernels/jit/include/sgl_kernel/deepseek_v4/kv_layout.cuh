@@ -10,7 +10,7 @@
 
 #include <bit>
 #include <cstdint>
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(__MACACC__)
 #include <cuda_fp8.h>
 #endif
 

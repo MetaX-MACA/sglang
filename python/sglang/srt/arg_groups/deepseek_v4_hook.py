@@ -9,6 +9,7 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
+    _deepseek_v4_index_cache_dtype,
     declare_resolution,
     model_config_of,
     resolved_view,
@@ -47,6 +48,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # its legacy slot.
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
+    run_post_process_pass(server_args, _deepseek_v4_index_cache_dtype)
 
     if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported

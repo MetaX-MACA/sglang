@@ -1606,7 +1606,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 len(sources),
                 device,
                 enable_memory_saver,
-                force_fp4=True,
+                force_fp4=envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get()=="fp4",
             )
 
         # HiCache and hardware backends still read these per-ratio attributes.
