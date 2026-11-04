@@ -30,7 +30,7 @@ class DeviceOrderError(ValueError):
     """A device ordering request cannot be used safely."""
 
 
-class _MxCmiNotFound(DeviceOrderError):
+class _DeviceOrderToolNotFound(DeviceOrderError):
     """Automatic ordering is unavailable; preserve existing visibility."""
 
 
@@ -48,6 +48,20 @@ class _Request:
         return ",".join(map(str, range(self.count)))
 
 
+def _diagnostic_text(text):
+    """Use neutral tool names in external diagnostics and log messages."""
+    labels = {
+        "mx-cmi": "device-order tool",
+        "mx-smi": "device-inventory tool",
+    }
+    return re.sub(
+        "|".join(re.escape(name) for name in labels),
+        lambda match: labels[match.group().lower()],
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
 def _log(level, message):
     # Package initialization precedes the normal CLI logging setup. Do not
     # reconfigure the root logger or leave a duplicate handler behind.
@@ -63,7 +77,7 @@ def _log(level, message):
     _logger.setLevel(logging.INFO)
     _logger.propagate = False
     try:
-        _logger.log(level, message)
+        _logger.log(level, _diagnostic_text(message))
     finally:
         _logger.removeHandler(handler)
         _logger.setLevel(old_level)
@@ -358,13 +372,19 @@ def _parse_tool_output(stdout):
 def _parse_order(stdout, count):
     assignments = _parse_tool_output(stdout).get(_ENV, [])
     if len(assignments) != 1:
-        raise DeviceOrderError(f"mx-cmi must return exactly one {_ENV} assignment.")
+        raise DeviceOrderError(
+            f"The device-order tool must return exactly one {_ENV} assignment."
+        )
     value = assignments[0]
     if not re.fullmatch(r"[0-9]+(?:,[0-9]+)*", value):
-        raise DeviceOrderError("mx-cmi returned an invalid device-order assignment.")
+        raise DeviceOrderError(
+            "The device-order tool returned an invalid device-order assignment."
+        )
     ids = [int(item) for item in value.split(",")]
     if len(ids) != count or len(set(ids)) != count:
-        raise DeviceOrderError(f"mx-cmi must return {count} distinct device IDs.")
+        raise DeviceOrderError(
+            f"The device-order tool must return {count} distinct device IDs."
+        )
     # Scheme 2 may change the numeric set. Container/UMD enforce the allocation
     # boundary; do not reinterpret these IDs as host ranks or shell commands.
     return value
@@ -376,13 +396,14 @@ def _diagnostics(stdout, stderr):
         return value.decode(errors="replace") if isinstance(value, bytes) else value
 
     return "".join(
-        f"\n{name}:\n{decode(value).strip()}"
+        f"\n{name}:\n{_diagnostic_text(decode(value).strip())}"
         for name, value in (("stdout", stdout), ("stderr", stderr))
         if value and decode(value).strip()
     )
 
 
 def _run_command(command):
+    tool_label = _diagnostic_text(Path(command[0]).name)
     try:
         result = subprocess.run(
             command,
@@ -394,18 +415,24 @@ def _run_command(command):
         )
     except subprocess.TimeoutExpired as exc:
         raise DeviceOrderError(
-            f"{command[0]} timed out after {_TOOL_TIMEOUT}s."
+            f"{tool_label} timed out after {_TOOL_TIMEOUT}s."
             + _diagnostics(exc.stdout, exc.stderr)
         ) from exc
     except FileNotFoundError as exc:
         if Path(command[0]).name == "mx-cmi" and not Path(command[0]).exists():
-            raise _MxCmiNotFound(f"Cannot find {command[0]}: {exc}") from exc
-        raise DeviceOrderError(f"Cannot run {command[0]}: {exc}") from exc
+            raise _DeviceOrderToolNotFound(
+                f"{tool_label} is unavailable: {_diagnostic_text(str(exc))}"
+            ) from exc
+        raise DeviceOrderError(
+            f"Cannot run {tool_label}: {_diagnostic_text(str(exc))}"
+        ) from exc
     except OSError as exc:
-        raise DeviceOrderError(f"Cannot run {command[0]}: {exc}") from exc
+        raise DeviceOrderError(
+            f"Cannot run {tool_label}: {_diagnostic_text(str(exc))}"
+        ) from exc
     if result.returncode:
         raise DeviceOrderError(
-            f"{command[0]} exited {result.returncode}."
+            f"{tool_label} exited with status {result.returncode}."
             + _diagnostics(result.stdout, result.stderr)
         )
     return result
@@ -447,18 +474,19 @@ def _get_device_count():
             continue
         if not match:
             raise DeviceOrderError(
-                "Cannot determine available device IDs from mx-smi."
+                "Cannot determine available device IDs from the device-inventory tool."
                 + _diagnostics(result.stdout, result.stderr)
             )
         ids.append(int(match[1]))
         die_count += 2 if match[2] in ("MXC588", "C588") else 1
     if not ids or sorted(ids) != list(range(len(ids))):
         raise DeviceOrderError(
-            "mx-smi must list a nonempty, contiguous set of available device IDs "
+            "The device-inventory tool must list a nonempty, contiguous set "
+            "of available device IDs "
             "starting at 0." + _diagnostics(result.stdout, result.stderr)
         )
     if result.stderr.strip():
-        _log(logging.INFO, "mx-smi diagnostic:\n" + result.stderr.strip())
+        _log(logging.INFO, "Device-inventory tool diagnostics:\n" + result.stderr.strip())
     return die_count
 
 
@@ -475,7 +503,7 @@ def _run_tool(request, visible, tool_path="mx-cmi"):
             str(exc) + _diagnostics(result.stdout, result.stderr)
         ) from exc
     if result.stderr.strip():
-        _log(logging.INFO, "mx-cmi diagnostic:\n" + result.stderr.strip())
+        _log(logging.INFO, "Device-order tool diagnostics:\n" + result.stderr.strip())
     return order
 
 
@@ -511,7 +539,7 @@ def maybe_configure_maca_devices():
             return
         tool_path = shutil.which("mx-cmi")
         if tool_path is None:
-            raise _MxCmiNotFound("mx-cmi was not found in PATH.")
+            raise _DeviceOrderToolNotFound("The device-order tool was not found in PATH.")
         # Config merging needs the full parser and is deferred in this demo;
         # do not mistake YAML topology for defaults and allocate the wrong GPUs.
         if args.config is not None:
@@ -545,7 +573,7 @@ def maybe_configure_maca_devices():
             f"input_devices={visible} "
             f"MACA_VISIBLE_DEVICES={order}",
         )
-    except _MxCmiNotFound as exc:
+    except _DeviceOrderToolNotFound as exc:
         visibility = (
             f"preserving {_ENV}={os.environ[_ENV]!r}"
             if _ENV in os.environ
