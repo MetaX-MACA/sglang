@@ -737,6 +737,12 @@ class Envs:
     MX_ENABLE_FUSE_RMSNORM_QUANT = EnvBool(False)
     MX_ENABLE_FUSE_SILUMUL_QUANT = EnvBool(False)
     MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE = EnvInt(256)
+    MX_ENABLE_WARMUP_OUTPUT = EnvBool(True)
+    MX_DSV4_PAGED_MQA_LOGITS_BACKEND = EnvStr("maca_c")
+    MX_OPT_DSV4_PREFILL_ATTN = EnvBool(True)
+    MX_OPT_TOPK_TRANSFORM = EnvBool(True)
+    MX_OPT_MHC_PRE = EnvBool(True)
+    MX_OPT_MHC_POST = EnvBool(True)
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -1956,8 +1962,6 @@ class Envs:
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
-
-    MX_ENABLE_WARMUP_OUTPUT = EnvBool(False)
 
 envs = Envs()
 EnvField._allow_set_name = False
