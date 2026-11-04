@@ -3,14 +3,59 @@ Generator for SGLang Diffusion ComfyUI integration.
 """
 
 import atexit
+from contextlib import contextmanager
 import logging
 import os
+import sys
 
 from ..executors.flux import FluxExecutor
 from ..executors.minimax_h3 import MiniMaxH3Executor
 from ..executors.zimage import ZImageExecutor
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _spawn_safe_embedded_main(main_module=None):
+    """Prevent SGLang spawn workers from re-executing ComfyUI's main script.
+
+    Embedded ComfyUI runs from ``main.py``, whose module-scope imports assume
+    ComfyUI's top-level ``utils`` package. A spawn child re-executes that file
+    before SGLang's worker bootstrap, but custom-node modules can shadow
+    top-level names. Temporarily hiding the launcher identity keeps the child
+    on the explicit ``bootstrap_scheduler_process`` import path instead.
+    """
+    main_module = main_module or sys.modules.get("__main__")
+    main_path = getattr(main_module, "__file__", "") if main_module else ""
+    normalized = str(main_path).replace("\\", "/")
+    if not (
+        main_module is not None
+        and os.path.basename(normalized) == "main.py"
+        and "/ComfyUI/" in normalized
+    ):
+        yield
+        return
+
+    missing = object()
+    saved = {
+        name: getattr(main_module, name, missing)
+        for name in ("__file__", "__spec__")
+    }
+    if hasattr(main_module, "__file__"):
+        delattr(main_module, "__file__")
+    # multiprocessing.spawn reads __main__.__spec__.name directly. A missing
+    # __spec__ raises before it can fall back to a script target, so keep the
+    # attribute present with an empty value while hiding __file__.
+    main_module.__spec__ = None
+    logger.info("Using explicit SGLang spawn bootstrap for embedded ComfyUI")
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is not missing:
+                setattr(main_module, name, value)
+            elif hasattr(main_module, name):
+                delattr(main_module, name)
 
 
 class _HeaderTensor:
@@ -195,11 +240,12 @@ class SGLDiffusionGenerator:
         # reloads the DiT from CPU.
         kwargs.setdefault("dit_cpu_offload", False)
         kwargs = self._server_args_kwargs(kwargs)
-        self.generator = DiffGenerator.from_pretrained(
-            model_path=model_path,
-            pipeline_class_name=pipeline_class_name,
-            **kwargs,
-        )
+        with _spawn_safe_embedded_main():
+            self.generator = DiffGenerator.from_pretrained(
+                model_path=model_path,
+                pipeline_class_name=pipeline_class_name,
+                **kwargs,
+            )
         return self.generator
 
     @staticmethod

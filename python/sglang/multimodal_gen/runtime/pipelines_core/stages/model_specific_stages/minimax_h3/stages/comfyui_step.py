@@ -450,7 +450,7 @@ def comfyui_payload_to_branch_inputs(
     audio = audio_x.to(torch.float32)
     text = _as_text_embeddings(context)
     if layout is not None and not _layout_signature_matches(
-        layout, video_x, audio, text
+        layout, video, audio, text
     ):
         _logger.warning(
             "Ignoring stale ComfyUI PackedLayout signature %s for video %s "

@@ -58,6 +58,9 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
     attach_cuda_tensors,
     detach_cuda_tensors,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_replica_group,
+)
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
 from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -767,42 +770,24 @@ class SchedulerDisaggMixin:
         """Broadcast *data* from rank 0 to all other ranks.
 
         Rank 0 passes the real payload; non-rank-0 passes ``None``.
-        Broadcasts through all applicable groups (SP, CFG, TP).
+        Broadcasts once within the DP replica. Broadcasting through the
+        orthogonal SP/CFG/TP groups is incorrect because their local rank 0
+        need not be global rank 0, the only rank that owns the payload.
         """
-        sa = self.server_args
-
-        if sa.sp_degree != 1:
-            data = broadcast_pyobj(
-                data,
-                self.worker.sp_group.rank,
-                self.worker.sp_cpu_group,
-                src=self.worker.sp_group.ranks[0],
-            )
-
-        if sa.enable_cfg_parallel:
-            data = broadcast_pyobj(
-                data,
-                self.worker.cfg_group.rank,
-                self.worker.cfg_cpu_group,
-                src=self.worker.cfg_group.ranks[0],
-            )
-
-        if sa.tp_size > 1:
-            data = broadcast_pyobj(
-                data,
-                self.worker.tp_group.rank,
-                self.worker.tp_cpu_group,
-                src=self.worker.tp_group.ranks[0],
-            )
-
-        return data
+        replica_group = get_replica_group()
+        return broadcast_pyobj(
+            data,
+            replica_group.rank,
+            replica_group.cpu_group,
+            src=replica_group.ranks[0],
+        )
 
     def _broadcast_recv_reqs(self: Scheduler, recv_reqs):
         """ComfyUI multi-rank recv: pickle the Req skeleton, NCCL the CUDA tensors.
 
-        The general SP/CFG/TP path stays in ``Scheduler.recv_reqs`` as the
-        original whole-list ``broadcast_pyobj``. This helper is only the
-        ComfyUI overlay and does not use disagg extract.
+        ``Scheduler.recv_reqs`` uses the same replica-wide scalar helper for
+        non-ComfyUI requests. This variant additionally keeps CUDA tensors on
+        NCCL rather than pickling them onto the CPU group.
         """
         is_rank0 = self.gpu_id == 0
         if is_rank0:
@@ -831,21 +816,13 @@ class SchedulerDisaggMixin:
     ) -> dict | None:
         """Broadcast a tensor dict from rank 0 to non-rank-0 via NCCL.
 
-        Uses ``GroupCoordinator.broadcast_tensor_dict`` which ships tensor
-        metadata over the CPU group and the tensor payload over the device
-        (NCCL) group, so large GPU buffers never bounce through CPU.
+        Uses the DP replica group so every rank in this scheduler's pipeline
+        shares one source. ``GroupCoordinator.broadcast_tensor_dict`` ships
+        tensor metadata over the CPU group and the tensor payload over the
+        device (NCCL) group, so large GPU buffers never bounce through CPU.
         """
-        sa = self.server_args
-
-        if sa.sp_degree != 1:
-            tensor_dict = self.worker.sp_group.broadcast_tensor_dict(tensor_dict, src=0)
-        if sa.enable_cfg_parallel:
-            tensor_dict = self.worker.cfg_group.broadcast_tensor_dict(
-                tensor_dict, src=0
-            )
-        if sa.tp_size > 1:
-            tensor_dict = self.worker.tp_group.broadcast_tensor_dict(tensor_dict, src=0)
-        return tensor_dict
+        replica_group = get_replica_group()
+        return replica_group.broadcast_tensor_dict(tensor_dict, src=0)
 
     def _broadcast_req_to_all_ranks(self: Scheduler, req: Req | None) -> Req | None:
         """Broadcast a fully-loaded Req (scalars + GPU tensors) from rank 0.
