@@ -627,7 +627,7 @@ def dispatch_w8a8_block_fp8_linear(
     backend = get_fp8_gemm_runner_backend()
     if (
         weight_block_size == [32, 32]
-        and get_platform().is_sm90
+        and (get_platform().is_sm90 or get_platform().is_maca)
         and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         and (backend.is_auto() or backend.is_deep_gemm())
     ):
@@ -1291,7 +1291,7 @@ def _deepgemm_block_fp8_supported(
     if output_dtype != torch.bfloat16:
         return False
     n, k = weight_shape
-    if list(block_size) == [32, 32] and get_platform().is_sm90:
+    if list(block_size) == [32, 32] and (get_platform().is_sm90 or get_platform().is_maca):
         return n % 8 == 0 and k % 32 == 0
     return list(block_size) == [128, 128] and n % 64 == 0 and k % 128 == 0
 
