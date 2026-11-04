@@ -11,7 +11,7 @@ def get_dsv4_index_cache_type() -> str:
         return "fp8"
     value = envs.SGLANG_DSV4_INDEX_CACHE_TYPE.get().strip().lower()
     value = "bf16" if value == "bfloat16" else value
-    if value not in ("int8", "fp8", "bf16"):
+    if value not in ("int8", "fp8", "bf16", "fp4"):
         raise ValueError(
             f"SGLANG_DSV4_INDEX_CACHE_TYPE must be int8, fp8, or bf16; got {value!r}"
         )
@@ -19,6 +19,6 @@ def get_dsv4_index_cache_type() -> str:
 
 
 def get_dsv4_index_cache_storage_dtype() -> torch.dtype:
-    return {"int8": torch.int8, "fp8": torch.uint8, "bf16": torch.bfloat16}[
+    return {"int8": torch.int8, "fp8": torch.uint8, "bf16": torch.bfloat16, "fp4": torch.uint8}[
         get_dsv4_index_cache_type()
     ]

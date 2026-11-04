@@ -229,9 +229,7 @@ class PagedIndexerMetadata:
                     get_paged_mqa_logits_metadata,
                 )
             else:
-                from sglang.srt.layers.deep_gemm_wrapper import (
-                    get_paged_mqa_logits_metadata,
-                )
+                from deep_gemm import get_paged_mqa_logits_metadata
 
             compressed_seq_lens = self.compressed_seq_lens.to(torch.int32)
             if compressed_seq_lens.dim() == 1:
