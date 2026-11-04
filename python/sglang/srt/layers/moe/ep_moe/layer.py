@@ -41,6 +41,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
+from sglang.srt.layers.quantization.compressed_tensors.schemes import CompressedTensorsW4A8Int8MoEMethod
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -109,6 +110,7 @@ class GroupedGemmRunner(torch.nn.Module):
         scale_b: torch.Tensor = None,
         block_shape: Optional[List[int]] = None,
         c_dtype=None,
+        use_int4_w4a8: bool = False,
     ):
         if self.use_flashinfer:
             # TODO: flashinfer
@@ -138,6 +140,7 @@ class GroupedGemmRunner(torch.nn.Module):
                 block_shape=block_shape,
                 c_dtype=c_dtype,
                 use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+                use_int4_w4a8=use_int4_w4a8,
             )
         return c
 
@@ -439,6 +442,13 @@ class DeepEPMoE(FusedMoE):
         hidden_states, _, _,_, _, reorder_topk_ids, seg_indptr = dispatch_output
         assert self.quant_method is not None
         assert self.activation == "silu"
+
+        use_int4_w4a8 = isinstance(
+            getattr(self, "scheme", None), CompressedTensorsW4A8Int8MoEMethod
+        )
+        w13_weight = self.w13_weight_packed if use_int4_w4a8 else self.w13_weight
+        w2_weight = self.w2_weight_packed if use_int4_w4a8 else self.w2_weight
+
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
@@ -461,7 +471,7 @@ class DeepEPMoE(FusedMoE):
         # GroupGemm-0
         gateup_output = torch.empty(
             hidden_states.shape[0],
-            self.w13_weight.shape[1],
+            w13_weight.shape[1],
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
@@ -476,7 +486,7 @@ class DeepEPMoE(FusedMoE):
             scale_a_ptr = None
             gateup_output = self.grouped_gemm_runner(
                 a=hidden_states_int8,
-                b=self.w13_weight,
+                b=w13_weight,
                 c=gateup_output,
                 batch_size=self.num_local_experts,
                 weight_column_major=True,
@@ -490,6 +500,7 @@ class DeepEPMoE(FusedMoE):
                     else self.w13_weight_scale
                 ),
                 block_shape=None,
+                use_int4_w4a8=use_int4_w4a8,
             )
 
         # Act
@@ -515,6 +526,13 @@ class DeepEPMoE(FusedMoE):
                 dtype=torch.float32
             )
             if gateup_output.shape[0] > 0:
+                # # DS-V4 clamps gate/up before SiLU multiplication and quantization.
+                swiglu_limit = self.moe_runner_config.swiglu_limit
+                if swiglu_limit is not None:
+                    gate, up = gateup_output.chunk(2, dim=-1)
+                    gate.clamp_(max=swiglu_limit)
+                    up.clamp_(min=-swiglu_limit, max=swiglu_limit)
+
                 fused_silu_mul_dq_reorder_quant(
                     down_input,
                     down_input_scale,
@@ -530,14 +548,14 @@ class DeepEPMoE(FusedMoE):
         # GroupGemm-1
         down_output = torch.empty(
             down_input.shape[0],
-            self.w2_weight.shape[1],
+            w2_weight.shape[1],
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
         if down_input.shape[0] > 0:
             down_output = self.grouped_gemm_runner(
                 a=down_input,
-                b=self.w2_weight,
+                b=w2_weight,
                 c=down_output,
                 batch_size=self.num_local_experts,
                 weight_column_major=True,
@@ -551,6 +569,7 @@ class DeepEPMoE(FusedMoE):
                     else self.w2_weight_scale
                 ),
                 block_shape=None,
+                use_int4_w4a8=use_int4_w4a8,
             )
         return down_output
     

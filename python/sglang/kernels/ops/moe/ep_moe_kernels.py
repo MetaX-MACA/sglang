@@ -2931,6 +2931,7 @@ def grouped_gemm_triton(
     block_shape: Optional[List[int]] = None,
     c_dtype=None,
     use_per_token_if_dynamic: bool = True,
+    use_int4_w4a8: bool = False,
 ):
     assert weight_column_major == True  # TODO: more
     if use_fp8_w8a8 and block_shape is None:
@@ -2976,8 +2977,40 @@ def grouped_gemm_triton(
         assert c_dtype is not None
         c = torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=c_dtype)
 
+    if use_int4_w4a8:
+        assert a.dim() == 2 and b.dim() == 3
+        M, K = a.shape
+        N = b.shape[1]
+        assert scale_b is not None and scale_b.shape == (batch_size, N, 1)
+        assert scale_b.dtype == torch.float32
+        assert c.shape == (M, N) and c.dtype == torch.bfloat16
+        assert seg_indptr is not None and weight_indices is not None
+        if M == 0:
+            return c
+        if scale_a is None:
+            assert a.dtype == torch.bfloat16
+            a_quant_val, a_quant_scale, _ = scaled_int8_quant(a)
+        else:
+            assert a.dtype == torch.int8 and scale_a.shape == (M, 1)
+            assert scale_a.dtype == torch.float32
+            a_quant_val, a_quant_scale = a, scale_a
 
-    if (b.dtype == torch.int8):
+        b_int4 = b.view(torch.quint4x2)
+        seg_indptr = seg_indptr.to(torch.int32)
+        weight_indices = weight_indices.to(torch.int32)
+        m_num_tiles_indptr = m_num_tiles_indptr.to(torch.int32)
+        gemm = ContinuousGroupedGEMM()
+        blocksize_m = gemm.get_blocksize_m(
+            a_quant_val, b_int4, c, a_quant_scale, scale_b
+        )
+        gemm.compute_m_num_tiles_indptr(
+            a_quant_val, b_int4, c, seg_indptr, m_num_tiles_indptr, blocksize_m
+        )
+        gemm(
+            [M, N, K], a_quant_val, b_int4, c, a_quant_scale, scale_b, None,
+            seg_indptr, weight_indices, m_num_tiles_indptr,
+        )
+    elif b.dtype == torch.int8:
         assert b.dim() == 3 and scale_b.dim() == 3, "Unexpected shape of b for grouped_gemm_int8 kernel"
 
         if scale_a is None:
