@@ -12,7 +12,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.srt.utils import is_xpu
-
+from sglang.srt.environ import envs
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
 
@@ -118,6 +118,12 @@ def topk_transform_paged(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
     else:
+        if envs.MX_OPT_TOPK_TRANSFORM.get():
+            torch.ops.sgl_kernel.topk_transform_v1.default(
+                scores, seq_lens, out_page_indices, page_tables, page_size, out_raw_indices
+            )
+            return
+
         module = _jit_topk_v1_module()
         module.topk_transform(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices

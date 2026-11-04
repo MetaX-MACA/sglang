@@ -1091,6 +1091,7 @@ class C4IndexerBackendMixin:
                     metadata,
                     indexer_metadata.max_compressed_seq_len,
                     False,
+                    backend=envs.MX_DSV4_PAGED_MQA_LOGITS_BACKEND.get(),
                 )
                 run_topk_transform(rows, logits, topk_plan)
 

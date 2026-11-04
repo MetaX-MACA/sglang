@@ -1128,6 +1128,21 @@ def mhc_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if norm_weight is None:
+        from sglang.kernels.ops.layernorm.mhc_vllm import mhc_pre_vllm
+        post_mix, comb_mix, layer_input = mhc_pre_vllm(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+        return post_mix, comb_mix, layer_input
+
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
@@ -1384,6 +1399,11 @@ def mhc_post(
         residual = strict_contiguous(residual)
         post_layer_mix = strict_contiguous(post_layer_mix)
         comb_res_mix = strict_contiguous(comb_res_mix)
+    
+    if envs.MX_OPT_MHC_POST.get():
+        from mcoplib.tilelang_mhc_post import mhc_post as mhc_post_opt
+        return mhc_post_opt(x, residual, post_layer_mix, comb_res_mix)
+
     out = torch.empty_like(residual)
     mhc_post_tilelang(
         comb_res_mix,
