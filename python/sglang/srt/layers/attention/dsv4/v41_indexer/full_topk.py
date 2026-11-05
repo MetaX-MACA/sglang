@@ -10,7 +10,10 @@ import torch
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
+from sglang.kernels.ops.attention.dsv4.topk import (
+    topk_transform_paged,
+    topk_transform_paged_torch,
+)
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
@@ -28,7 +31,6 @@ from .types import (
     CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
-    Selection,
 )
 
 if TYPE_CHECKING:
@@ -49,45 +51,44 @@ class FullTopKIndexer:
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
         self.use_deep_gemm_decode = use_deep_gemm_decode
 
-    def topk_prefill(self, inputs: PrefillInputs, out: Selection) -> None:
+    def topk_prefill(self, inputs: PrefillInputs) -> None:
         if self.use_deep_gemm_prefill:
-            self._deep_gemm_prefill(inputs, out)
+            self._deep_gemm_prefill(inputs)
         else:
-            self._torch_prefill(inputs, out)
+            self._torch_prefill(inputs)
 
-    def topk_prefill_captured(self, inputs: CapturedPrefillInputs, out: Selection):
-        self._deep_gemm_prefill_captured(inputs, out)
+    def topk_prefill_captured(self, inputs: CapturedPrefillInputs) -> None:
+        self._deep_gemm_prefill_captured(inputs)
 
-    def topk_decode(self, inputs: DecodeInputs, out: Selection) -> None:
+    def topk_decode(self, inputs: DecodeInputs) -> None:
         if self.use_deep_gemm_decode:
-            self._deep_gemm_decode(inputs, out)
+            self._deep_gemm_decode(inputs)
         else:
-            self._torch_decode(inputs, out)
+            self._torch_decode(inputs)
 
-    def _deep_gemm_prefill(self, inputs: PrefillInputs, out: Selection) -> None:
-        out.reset()
+    def _deep_gemm_prefill(self, inputs: PrefillInputs) -> None:
+        inputs.reset_outputs()
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return
         kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
             inputs.layer_id, data.k_slots
         )
-        selected = dense_prefill_topk(data, kv, topk=inputs.indexer.index_topk)
-        data.write_selection(selected=selected, out=out)
+        dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])
+        data.write_page_indices(inputs)
 
-    def _torch_prefill(self, inputs: PrefillInputs, out: Selection) -> None:
+    def _torch_prefill(self, inputs: PrefillInputs) -> None:
         requests = prefill_requests(
             inputs=inputs,
-            out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
         )
         for request, chunks in requests:
             for chunk in chunks:
                 idx = chunk.scores.topk(request.k, dim=-1, sorted=False).indices
-                write_prefill(out, request, chunk, idx)
+                write_prefill(inputs, request, chunk, idx)
 
-    def _deep_gemm_decode(self, inputs: DecodeInputs, out: Selection) -> None:
+    def _deep_gemm_decode(self, inputs: DecodeInputs) -> None:
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
         metadata = inputs.paged_metadata
         if isinstance(metadata.deep_gemm_metadata, list):
@@ -107,8 +108,8 @@ class FullTopKIndexer:
                 topk_transform_paged_from_metadata(
                     logits,
                     metadata,
-                    out.page_indices,
-                    out.raw_indices,
+                    inputs.out_page_indices,
+                    inputs.out_raw_indices,
                     rows=rows,
                     topk_metadata=(
                         topk_plans[chunk_idx] if topk_plans is not None else None
@@ -126,24 +127,34 @@ class FullTopKIndexer:
         )
         # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(
-            logits, metadata, out.page_indices, out.raw_indices
+            logits, metadata, inputs.out_page_indices, inputs.out_raw_indices
         )
 
-    def _torch_decode(self, inputs: DecodeInputs, out: Selection) -> None:
+    def _torch_decode(self, inputs: DecodeInputs) -> None:
         d = decode_scores(
             inputs=inputs,
-            out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
         )
         if d is None:
             return
+        if d.slots is None:
+            metadata = inputs.paged_metadata
+            topk_transform_paged(
+                d.scores,
+                d.lens.to(torch.int32),
+                metadata.page_table,
+                inputs.out_page_indices,
+                metadata.compressed_page_size,
+                inputs.out_raw_indices,
+            )
+            return
         k = min(inputs.indexer.index_topk, d.lmax)
         idx = d.scores.topk(k, dim=-1, sorted=False).indices
-        write_decode(out, d, idx)
+        write_decode(inputs, d, idx)
 
     def _deep_gemm_prefill_captured(
-        self, inputs: CapturedPrefillInputs, out: Selection
+        self, inputs: CapturedPrefillInputs
     ) -> None:
         indexer = inputs.indexer
         metadata = inputs.paged_metadata
@@ -178,7 +189,7 @@ class FullTopKIndexer:
                 logits,
                 lens[rows],
                 page_table[rows],
-                out.page_indices[rows, :topk],
+                inputs.out_page_indices[rows, :topk],
                 page_size,
-                out.raw_indices[rows, :topk] if out.raw_indices is not None else None,
+                inputs.out_raw_indices[rows, :topk],
             )

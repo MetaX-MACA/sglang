@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -148,6 +149,8 @@ def materialize_cuda_refs(value: Any) -> Any:
 
 def _spill_one(value: Any) -> Any:
     if isinstance(value, torch.Tensor) and value.is_cuda:
+        if os.getenv("SGLANG_DISABLE_CUDA_IPC") == "1":
+            return value
         try:
             return CudaIpcRef.from_tensor(value)
         except RuntimeError as exc:

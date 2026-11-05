@@ -33,8 +33,8 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.layers.attention.dsv4.index_cache_kind import dsv4_index_cache_kind
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseSpecLayout
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
-    INT8_SCALE_BYTES_PER_TOKEN,
     kv_cache_page_bytes,
+    kv_cache_bytes_per_token,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
@@ -889,7 +889,7 @@ def compute_swa_request_cap(
 
     if max_running_requests is None:
         max_running_requests = get_schedule().max_running_requests
-    num_reqs = max_running_requests // attn_dp_size
+    num_reqs = max(1, max_running_requests // attn_dp_size)
     if get_disagg().disaggregation_mode == "decode":
         return (
             per_request * num_reqs
@@ -1039,11 +1039,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         elif get_exec().kernel.dsv4_attn_backend == "trtllm":
             self.kv_bytes = self.attn_head_dim
         elif kvc.kv_cache_dtype is torch.int8:
-            # 448 INT8 NOPE + 64 BF16 RoPE + 7 FP32 scales and padding.
-            self.kv_bytes = (
-                self.qk_nope_head_dim + self.qk_rope_head_dim * 2
-                + INT8_SCALE_BYTES_PER_TOKEN
-            )
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import select_dsv4_kv_layout
+            kv_layout, _ = select_dsv4_kv_layout()
+            # Raises ValueError for any layout without an INT8 form.
+            self.kv_bytes = kv_cache_bytes_per_token(kv_layout, kvc.kv_cache_dtype)
         else:
             # One FlashMLA-layout latent slot, in bytes.
             self.kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
@@ -1080,7 +1079,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
         self.attn_dp_size = kvc.attn_dp_size
         self.requested_max_running_requests_per_worker = (
-            get_schedule().max_running_requests // kvc.attn_dp_size
+            max(1, get_schedule().max_running_requests // kvc.attn_dp_size)
             if get_schedule().max_running_requests is not None
             else None
         )
@@ -1329,8 +1328,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
             page_size = self.page_size // compress_ratio
         if self.kv_cache_dtype is torch.int8:
-            if layout.value != "v4":
-                raise ValueError("INT8 main KV requires V4 packed pages")
+            if layout.value not in ("v4", "v41_int8"):
+                raise ValueError("INT8 main KV requires V4/v41_int8 packed pages")
             return kv_cache_page_bytes(layout, self.kv_cache_dtype, page_size) / page_size
         return layout.page_bytes(page_size) / page_size
 

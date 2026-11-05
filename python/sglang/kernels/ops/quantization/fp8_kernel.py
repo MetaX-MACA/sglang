@@ -35,6 +35,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import is_maca
 from sglang.srt.utils.patch_torch import register_fake_if_exists
+import mcoplib.sgl_kernel
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -134,11 +135,24 @@ if _is_maca and envs.SGLANG_USE_MCOPLIB.get():
         try:
             # mcoplib.op is a standalone pybind extension; unlike
             # mcoplib.sgl_kernel it does not register torch operators.
-            from mcoplib.op import (
-                per_token_cast_to_fp8 as _mcoplib_per_token_cast_to_fp8,
+            # from mcoplib.sgl_kernel import (
+            #     per_token_cast_to_fp8 as _mcoplib_per_token_cast_to_fp8,
+            # )
+            _mcoplib_per_token_cast_to_fp8 = (
+                torch.ops.sgl_kernel.per_token_cast_to_fp8.default
             )
-        except (ImportError, ModuleNotFoundError, OSError, AttributeError):
-            pass
+        except (ImportError, ModuleNotFoundError, OSError, AttributeError) as e:
+            logger.warning(
+                "from mcoplib.op import per_token_cast_to_fp8 FAILED "
+                "(%s: %s) -> _mcoplib_per_token_cast_to_fp8 stays None. "
+                "per-token-group(128) FP8 activation quantization will fall back to "
+                "the eager torch impl per_token_cast_to_fp8() "
+                "(abs/amax/mul/copy, ~100x slower per call). "
+                "Check that the installed mcoplib exposes "
+                "mcoplib.op.per_token_cast_to_fp8 and that SGLANG_USE_MCOPLIB=1.",
+                type(e).__name__,
+                e,
+            )
 
 
 

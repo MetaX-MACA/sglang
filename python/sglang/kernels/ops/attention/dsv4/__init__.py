@@ -3,6 +3,7 @@
 # --- merged from sglang.kernels.ops.attention.dsv4 (RFC #29630 Phase 4) ---
 from .attn import (
     fused_store_cache,
+    fused_store_cache_int8_v41,
     get_paged_mqa_logits_metadata,
     triton_create_paged_compress_data,
 )
@@ -14,8 +15,13 @@ from .compress import (
     compress_norm_rope_store,
 )
 from .compress_old import fused_norm_rope_inplace
+from .dequant_k_cache import (
+    dequantize_k_cache_paged,
+    dequantize_k_cache_paged_int8_v41,
+)
 from .elementwise import (
     fused_k_norm_rope_flashmla,
+    fused_k_norm_rope_int8_flashmla,
     fused_q_indexer_rope_first_quant,
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
@@ -44,7 +50,11 @@ __all__ = [
     "fused_q_indexer_rope_first_quant",
     "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",
+    "fused_k_norm_rope_int8_flashmla",
     "fused_k_norm_rope_flashmla",
+    "dequantize_k_cache_paged",
+    "dequantize_k_cache_paged_int8_v41",
+    "fused_store_cache_int8_v41",
     "sglang_per_token_group_quant_fp8_dsv4_wo_a",
     "make_name",
     "get_paged_mqa_logits_metadata",

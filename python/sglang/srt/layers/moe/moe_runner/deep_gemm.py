@@ -544,7 +544,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             from sglang.kernels.ops.moe.ep_moe_kernels import (
                 silu_and_mul_masked,
             )
-            down_input_packed = silu_and_mul_masked(gateup_output, masked_m)
+            down_input_packed = silu_and_mul_masked(gateup_output, masked_m, self.swiglu_limit)
         del gateup_output
 
         down_input_device = down_input_packed.device
@@ -1678,6 +1678,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
         topk_ids,
         topk_weights,
         num_recv_tokens_per_expert,
+        _,
+        _
     ) = dispatch_output
     assert runner_config.activation in ("silu", "situ")
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -452,6 +453,75 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.max_total_num_tokens = min(
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
+            )
+
+        # DSV4_PD_SWA_PEAK_BUDGET_V1
+        self._dsv4_swa_live_cap = None
+        if os.getenv("SGLANG_DSV4_PD_SWA_BUDGET_FIX") == "1":
+            args = self.scheduler.server_args
+            if not (
+                isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                and self._uses_swa_tail_prealloc()
+                and self.tree_cache.is_chunk_cache()
+                and self.tree_cache.supports_swa()
+                and args.speculative_algorithm in (None, "DSPARK")
+                and args.disable_overlap_schedule
+                and not args.speculative_adaptive
+                and not args.enable_unified_memory
+                and not args.disaggregation_decode_enable_radix_cache
+                and not self.scheduler.enable_decode_hicache
+                and not self.scheduler.enable_hisparse
+                and not self.enable_staging
+                and self.pp_size == 1
+                and args.dcp_size == 1
+            ):
+                raise RuntimeError(
+                    "SGLANG_DSV4_PD_SWA_BUDGET_FIX requires DSV4 with no "
+                    "speculation or DSPARK, "
+                    "non-overlap, chunk cache, PP1/DCP1, no HiCache/HiSparse/"
+                    "unified memory/staging/adaptive speculation."
+                )
+            from sglang.srt.runtime_context import get_spec
+            from sglang.srt.utils import spec_decode_alloc_len_per_request
+
+            spec = get_spec()
+            page = self.token_to_kv_pool_allocator.page_size
+            window = self.scheduler.sliding_window_size
+            if window is None or window <= 0:
+                raise RuntimeError("DSV4 SWA budget fix requires a positive window")
+            interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
+            if args.speculative_algorithm is None:
+                # Match compute_swa_request_cap for ordinary decode: one token
+                # per step and one page of allocation headroom.
+                draft = 1
+                decode_alloc = page
+            else:
+                draft = spec.speculative_num_draft_tokens or 1
+                decode_alloc = spec_decode_alloc_len_per_request(
+                    page_size=page,
+                    speculative_num_steps=spec.speculative_num_steps,
+                    speculative_eagle_topk=spec.speculative_eagle_topk,
+                    speculative_num_draft_tokens=spec.speculative_num_draft_tokens,
+                )
+            # Same conservative live bound as compute_swa_request_cap, rounded
+            # UP per request (not just after summing requests). No output-length
+            # term: out-of-window SWA is recycled by the chunk-cache path.
+            self._dsv4_swa_live_cap = ceil_align(
+                window + interval * draft + page + decode_alloc, page
+            )
+            if self.token_to_kv_pool_allocator.size_swa < self._dsv4_swa_live_cap:
+                raise RuntimeError(
+                    "DSV4 SWA pool cannot fit one conservative live envelope: "
+                    f"pool={self.token_to_kv_pool_allocator.size_swa}, "
+                    f"required={self._dsv4_swa_live_cap}"
+                )
+            logger.debug(
+                "[DSV4_SWA_BUDGET_FIX] enabled: window=%s page=%s "
+                "draft=%s eviction_interval=%s decode_alloc=%s "
+                "live_cap=%s pool=%s; full-KV budget unchanged",
+                window, page, draft, interval, decode_alloc,
+                self._dsv4_swa_live_cap,
+                self.token_to_kv_pool_allocator.size_swa,
             )
 
         if get_disagg().disaggregation_enable_kv_checksum:
@@ -1480,10 +1550,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.sampling_params.max_new_tokens,
                     CLIP_MAX_NEW_TOKEN,
                 )
-                swa_required_for_admission = max(
-                    swa_required,
-                    swa_len + max_new_tokens - retractable_swa_tokens,
-                )
+                if self._dsv4_swa_live_cap is not None:
+                    # Keep the immediate physical-allocation check, while
+                    # replacing linear future-output reservation with a full
+                    # conservative sliding-window live envelope.
+                    swa_required_for_admission = max(
+                        swa_required, self._dsv4_swa_live_cap
+                    )
+                else:
+                    swa_required_for_admission = max(
+                        swa_required,
+                        swa_len + max_new_tokens - retractable_swa_tokens,
+                    )
             elif swa_allocatable_tokens is not None:
                 swa_required_for_admission = full_required_for_admission
 
@@ -1966,6 +2044,44 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         allocatable_tokens -= hicache_reserved_tokens
         return allocatable_tokens
 
+    def _dsv4_swa_peak_budget(
+        self, n_active, extra_reserved_reqs, count_retracted
+    ):
+        """Reserve a full live envelope for every admitted/in-flight request.
+
+        For this opt-in chunk-cache path, all unavailable target-SWA slots
+        belong to live requests. Charge only envelope headroom not already
+        physically used; a request never becomes cheaper as output_ids grows.
+        """
+        cap = self._dsv4_swa_live_cap
+        if n_active is None:
+            n_active = self._active_req_count(extra_reserved_reqs)
+
+        # A prebuilt batch can temporarily be absent from running/waiting/
+        # transfer queues. Count only its still-owned KV, and never count a
+        # request twice or reserve a stale, already-freed last batch forever.
+        represented = {id(r) for r in self.scheduler.running_batch.reqs}
+        represented.update(id(r) for r in self.scheduler.waiting_queue)
+        represented.update(id(r.req) for r in self.transfer_queue.queue)
+        last = self.scheduler.last_batch
+        if last is not None and last.forward_mode.is_prebuilt():
+            for req in last.reqs:
+                if id(req) not in represented and req.kv.holds_kv:
+                    n_active += 1
+                    represented.add(id(req))
+
+        allocator = self.token_to_kv_pool_allocator
+        available = allocator.swa_available_size()
+        evictable = self.tree_cache.swa_evictable_size()
+        used = max(0, allocator.size_swa - available - evictable)
+        headroom = max(0, n_active * cap - used)
+        budget = available + evictable - headroom
+        if count_retracted:
+            for req in self.retracted_queue:
+                _, required = self._prealloc_required_tokens(req)
+                budget -= max(required, cap)
+        return budget
+
     def _swa_tail_allocatable_token_budget(
         self,
         retractable_tokens: Optional[int] = None,
@@ -1975,6 +2091,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         reserved_tokens: Optional[int] = None,
         extra_reserved_reqs: int = 0,
     ) -> int:
+        if self._dsv4_swa_live_cap is not None:
+            return self._dsv4_swa_peak_budget(
+                n_active, extra_reserved_reqs, count_retracted
+            )
         need_swa_space_for_single_req = self._need_space_for_single_req(
             retractable_tokens
         )
@@ -2501,9 +2621,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None
         elif _is_fake_transfer(decode_req.req):
-            committed_output_id = _generate_fake_prefill_handoff_output_id(
-                decode_req.req
-            )
+            if envs.MX_ENABLE_WARMUP_OUTPUT.get():
+                committed_output_id = output_id[0].item()
+            else:
+                committed_output_id = _generate_fake_prefill_handoff_output_id(
+                    decode_req.req
+                )
         else:
             committed_output_id = output_id[0].item()
         decode_req.req.output_ids.append(committed_output_id)

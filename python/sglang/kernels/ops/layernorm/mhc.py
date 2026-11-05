@@ -506,6 +506,12 @@ def hc_split_sinkhorn(
     )
     return pre, post, comb
 
+if _is_maca:
+    MHC_PRE_THREAD_NUM = 128
+    MHC_PRE_THREAD_BOUND = 64
+else:
+    MHC_PRE_THREAD_NUM = 96
+    MHC_PRE_THREAD_BOUND = 32
 
 @tilelang.jit(
     pass_configs={
@@ -549,7 +555,7 @@ def mhc_pre_big_fuse_tilelang(
     layer_input: T.Tensor[[num_tokens, hidden_size], T.bfloat16]
 
     ENABLE_PDL = is_arch_support_pdl()
-    with T.Kernel(num_tokens, threads=96) as i:
+    with T.Kernel(num_tokens, threads=MHC_PRE_THREAD_NUM) as i:
         rms = T.alloc_fragment(1, T.float32)
         mixes = T.alloc_fragment(hc_mult3, T.float32)
         T.clear(mixes)
@@ -569,7 +575,7 @@ def mhc_pre_big_fuse_tilelang(
         mixes_shared = T.alloc_shared(hc_mult3, T.float32)
         T.copy(mixes, mixes_shared)
 
-        if T.get_thread_binding() < 32:
+        if T.get_thread_binding() < MHC_PRE_THREAD_BOUND:
             cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
             for j in T.Parallel(hc_mult):
                 post_mix[i, j] = (
@@ -988,7 +994,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
     norm_weight: T.Tensor[[hidden_size], T.bfloat16]
 
     ENABLE_PDL = is_arch_support_pdl()
-    with T.Kernel(num_tokens, threads=96) as i:
+    with T.Kernel(num_tokens, threads=MHC_PRE_THREAD_NUM) as i:
         rms = T.alloc_fragment(1, T.float32)
         mixes = T.alloc_fragment(hc_mult3, T.float32)
         T.clear(mixes)
@@ -1008,7 +1014,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
         mixes_shared = T.alloc_shared(hc_mult3, T.float32)
         T.copy(mixes, mixes_shared)
 
-        if T.get_thread_binding() < 32:
+        if T.get_thread_binding() < MHC_PRE_THREAD_BOUND:
             cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
             for j in T.Parallel(hc_mult):
                 post_mix[i, j] = (
@@ -2225,6 +2231,7 @@ def _hc_mix_stats_partial_kernel(
     NUM_SLICES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    PART_MIX_MAJOR: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     """Mixing dot products and row sum of squares over one K slice."""
@@ -2253,11 +2260,18 @@ def _hc_mix_stats_partial_kernel(
         ).to(tl.float32)
         acc += tl.dot(x_tile, w_tile, input_precision=DOT_PRECISION)
         sq += tl.sum(x_tile * x_tile, axis=1)
-    tl.store(
-        part_mix_ptr + (pid_s * M + offs_m[:, None]) * MIX + offs_n[None, :],
-        acc,
-        mask=mask_m[:, None] & mask_n[None, :],
-    )
+    if PART_MIX_MAJOR:
+        tl.store(
+            part_mix_ptr + (pid_s * MIX + offs_n[:, None]) * M + offs_m[None, :],
+            tl.trans(acc),
+            mask=mask_n[:, None] & mask_m[None, :],
+        )
+    else:
+        tl.store(
+            part_mix_ptr + (pid_s * M + offs_m[:, None]) * MIX + offs_n[None, :],
+            acc,
+            mask=mask_m[:, None] & mask_n[None, :],
+        )
     tl.store(part_sq_ptr + pid_s * M + offs_m, sq, mask=mask_m)
 
 
@@ -2273,6 +2287,7 @@ def _hc_mix_stats_reduce_kernel(
     MIX_PAD: tl.constexpr,
     NUM_SLICES: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    PART_MIX_MAJOR: tl.constexpr,
 ):
     """Sum the NUM_SLICES partials in slice order and apply the rms scaling."""
     pid_m = tl.program_id(0)
@@ -2283,11 +2298,18 @@ def _hc_mix_stats_reduce_kernel(
     acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
     sq = tl.zeros([BLOCK_M], dtype=tl.float32)
     for s in tl.static_range(NUM_SLICES):
-        acc += tl.load(
-            part_mix_ptr + (s * M + offs_m[:, None]) * MIX + offs_n[None, :],
-            mask=mask_m[:, None] & mask_n[None, :],
-            other=0.0,
-        )
+        if PART_MIX_MAJOR:
+            acc += tl.load(
+                part_mix_ptr + (s * MIX + offs_n[None, :]) * M + offs_m[:, None],
+                mask=mask_m[:, None] & mask_n[None, :],
+                other=0.0,
+            )
+        else:
+            acc += tl.load(
+                part_mix_ptr + (s * M + offs_m[:, None]) * MIX + offs_n[None, :],
+                mask=mask_m[:, None] & mask_n[None, :],
+                other=0.0,
+            )
         sq += tl.load(part_sq_ptr + s * M + offs_m, mask=mask_m, other=0.0)
     rsqrt = 1.0 / tl.sqrt(sq * inv_k + eps)
     tl.store(
@@ -2308,11 +2330,13 @@ _HC_MIX_DOT_PRECISION = "ieee" if _is_hip else "tf32x3"
 # num_stages only reorders memory issue, not arithmetic; 2 is enough to cover the
 # short k_per_slice loop (K=20480 gives 80 slices, i.e. 4 BLOCK_K tiles per CTA).
 _HC_MIX_NUM_STAGES = 2
+_HC_MIX_NUM_STAGES_PREFILL = 1
 
 # BLOCK_M 8/16/32 preserve each row's K reduction order; thresholds were measured on GB300.
 # Keep BLOCK_M below 64, where Triton lowers tf32x3 to plain TF32 and changes rounding.
 _HC_MIX_BLOCK_M_SMALL = 8
 _HC_MIX_BLOCK_M_MID = 16
+_HC_MIX_NUM_WARPS_PREFILL = 8
 _HC_MIX_MID_MAX_M = 2048
 
 
@@ -2321,6 +2345,8 @@ def _block_m_for(m: int) -> int:
     if _is_hip:
         # fp32 MFMA tile heights do not share a per-row reduction order, so one height serves every M
         return _HC_MIX_BLOCK_M_MID
+    if _is_maca:
+        return _HC_MIX_BLOCK_M_SMALL if m <= 32 else _HC_MIX_BLOCK_M
     if m <= _HC_MIX_BLOCK_M_SMALL:
         return _HC_MIX_BLOCK_M_SMALL
     if m <= _HC_MIX_MID_MAX_M:
@@ -2332,7 +2358,22 @@ def _num_stages_for(m: int, k: int) -> int:
     # GB300 verify batches benefit from a smaller shared-memory footprint.
     if get_platform().is_blackwell and k == 20480 and 64 <= m <= 384:
         return 1
+    if _is_maca and k == 20480:
+        return _HC_MIX_NUM_STAGES_PREFILL
     return _HC_MIX_NUM_STAGES
+
+
+def _num_warps_for(m: int) -> int:
+    return (
+        _HC_MIX_NUM_WARPS_PREFILL
+        if _part_mix_major_for(m)
+        else _HC_MIX_NUM_WARPS
+    )
+
+
+def _part_mix_major_for(m: int) -> bool:
+    # C600U tuning; the HIP vector reducer requires [slice, row, mix].
+    return _is_maca and 32 < m <= _HC_MIX_MID_MAX_M
 
 
 def _num_slices_for(k: int) -> int:
@@ -2360,8 +2401,11 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
     assert hc_fn.shape[1] == k
     num_slices = _num_slices_for(k)
     mix_pad = max(16, triton.next_power_of_2(mix))
+    part_mix_major = _part_mix_major_for(m)
     part_mix = torch.empty(
-        (num_slices, m, mix), dtype=torch.float32, device=x_flat.device
+        (num_slices, mix, m) if part_mix_major else (num_slices, m, mix),
+        dtype=torch.float32,
+        device=x_flat.device,
     )
     part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=x_flat.device)
     mixes = torch.empty((m, mix), dtype=torch.float32, device=x_flat.device)
@@ -2383,8 +2427,9 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
         NUM_SLICES=num_slices,
         BLOCK_M=block_m,
         BLOCK_K=_HC_MIX_BLOCK_K,
+        PART_MIX_MAJOR=part_mix_major,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
-        num_warps=_HC_MIX_NUM_WARPS,
+        num_warps=_num_warps_for(m),
         num_stages=_num_stages_for(m, k),
     )
     _hc_mix_stats_reduce_kernel[(grid_m,)](
@@ -2398,6 +2443,7 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
         MIX_PAD=mix_pad,
         NUM_SLICES=num_slices,
         BLOCK_M=block_m,
+        PART_MIX_MAJOR=part_mix_major,
         num_warps=4,
     )
     return mixes
@@ -2421,6 +2467,7 @@ def _hc_mix_reduce_sinkhorn_kernel(
     ITERS: tl.constexpr,
     EPS: tl.constexpr,
     part_mix_residual_ptr=None,
+    PART_MIX_MAJOR: tl.constexpr = False,
 ):
     """One CTA per row keeps the sinkhorn reductions two-dimensional."""
     row = tl.program_id(0)
@@ -2435,14 +2482,23 @@ def _hc_mix_reduce_sinkhorn_kernel(
     a_comb = tl.zeros([HC, HC], dtype=tl.float32)
     sq = tl.zeros([], dtype=tl.float32)
     for s in tl.static_range(NUM_SLICES):
-        off = (s * m + row) * MIX
-        v_pre = tl.load(part_mix_ptr + off + j)
-        v_post = tl.load(part_mix_ptr + off + HC + j)
-        v_comb = tl.load(part_mix_ptr + off + 2 * HC + jj * HC + kk)
+        if PART_MIX_MAJOR:
+            off = s * MIX * m + row
+            pre_off = off + j * m
+            post_off = off + (HC + j) * m
+            comb_off = off + (2 * HC + jj * HC + kk) * m
+        else:
+            off = (s * m + row) * MIX
+            pre_off = off + j
+            post_off = off + HC + j
+            comb_off = off + 2 * HC + jj * HC + kk
+        v_pre = tl.load(part_mix_ptr + pre_off)
+        v_post = tl.load(part_mix_ptr + post_off)
+        v_comb = tl.load(part_mix_ptr + comb_off)
         if part_mix_residual_ptr is not None:
-            v_pre += tl.load(part_mix_residual_ptr + off + j)
-            v_post += tl.load(part_mix_residual_ptr + off + HC + j)
-            v_comb += tl.load(part_mix_residual_ptr + off + 2 * HC + jj * HC + kk)
+            v_pre += tl.load(part_mix_residual_ptr + pre_off)
+            v_post += tl.load(part_mix_residual_ptr + post_off)
+            v_comb += tl.load(part_mix_residual_ptr + comb_off)
         a_pre += v_pre
         a_post += v_post
         a_comb += v_comb
@@ -2498,7 +2554,12 @@ def hc_mix_stats_sinkhorn(
 
     num_slices = _num_slices_for(k)
     mix_pad = max(16, triton.next_power_of_2(mix))
-    part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
+    part_mix_major = _part_mix_major_for(m)
+    part_mix = torch.empty(
+        (num_slices, mix, m) if part_mix_major else (num_slices, m, mix),
+        dtype=torch.float32,
+        device=dev,
+    )
     part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
     block_m = _block_m_for(m)
     _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
@@ -2515,8 +2576,9 @@ def hc_mix_stats_sinkhorn(
         NUM_SLICES=num_slices,
         BLOCK_M=block_m,
         BLOCK_K=_HC_MIX_BLOCK_K,
+        PART_MIX_MAJOR=part_mix_major,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
-        num_warps=_HC_MIX_NUM_WARPS,
+        num_warps=_num_warps_for(m),
         num_stages=_num_stages_for(m, k),
     )
     if _is_hip:
@@ -2553,6 +2615,7 @@ def hc_mix_stats_sinkhorn(
         NUM_SLICES=num_slices,
         ITERS=sinkhorn_iters,
         EPS=hc_eps,
+        PART_MIX_MAJOR=part_mix_major,
         num_warps=1,
     )
     return pre, post, comb

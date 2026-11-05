@@ -2390,6 +2390,8 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
+            if envs.MX_ENABLE_WARMUP_OUTPUT.get():
+                logger.info(f'warmup request returns: {res.text}')
             # Skip server_status update for Rust server
             if not envs.SGLANG_RUST_SERVER.get():
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up

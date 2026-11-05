@@ -248,8 +248,12 @@ def all_gather_kv_cache_for_mla_extend(
     k_nope,
     k_pe,
 ):
-    # On hip, skip the all-gather when there is no cached prefix to avoid crash
-    if not _is_hip or dcp_extend_prefix_lens_sum > 0:
+    mla_pool = getattr(token_to_kv_pool, "full_kv_pool", token_to_kv_pool)
+    # All ranks must enter when any prefix exists, including empty local shards.
+    # HIP and INT8 MLA cannot issue a zero-count prefix collective.
+    if dcp_extend_prefix_lens_sum > 0 or (
+        not _is_hip and not getattr(mla_pool, "mla_kv_cache_store_int8", False)
+    ):
         cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
             attn_mqa,
             dcp_local_prefix_kv_indices,

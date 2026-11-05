@@ -249,10 +249,12 @@ def _update_gather_batch(
     batch: ScheduleBatch,
     mlp_sync_info: MLPSyncBatchInfo,
     require_mlp_tp_gather: bool,
+    require_global_token_counts: bool = False,
     draft_require_mlp_tp_gather: Optional[bool] = None,
     skip_global_metadata=False,
 ):
-    if not require_mlp_tp_gather:
+    # TODO: handle the case when moe_dense_tp_size != 1
+    if not require_mlp_tp_gather and not require_global_token_counts:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
     else:
@@ -553,10 +555,20 @@ def prepare_mlp_sync_batch_raw(
             batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
 
     if batch_to_gather is not None:
+        hf_config = getattr(model_runner.model_config, "hf_text_config", None)
+        if hf_config is None:
+            hf_config = getattr(model_runner.model_config, "hf_config", None)
+        # Engram embeddings are TP-sharded. Under DP attention they gather the
+        # indices from every DP rank even when DeepEP itself does not require
+        # an MLP input gather, so their offsets need the full per-rank counts.
+        require_global_token_counts = bool(
+            getattr(hf_config, "engram_layer_ids", None)
+        )
         _update_gather_batch(
             batch_to_gather,
             mlp_sync_info,
             require_mlp_tp_gather,
+            require_global_token_counts,
             draft_require_mlp_tp_gather,
             skip_global_metadata=not metadata_ready,
         )

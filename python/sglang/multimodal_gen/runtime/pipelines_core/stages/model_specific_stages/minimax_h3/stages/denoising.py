@@ -407,7 +407,11 @@ def _precompute_refined_prompt_embeds(
             refiner_cu = refiner_params["cu_seqlens_q"]
         else:
             refiner_cu = refiner_params.cu_seqlens_q
-        with torch.inference_mode():
+        # FSDP fully-shard pre-forward preserves parameter version counters.
+        # Inference tensors do not expose those counters, so retain the stage
+        # executor's no-grad execution mode here instead of re-enabling
+        # inference mode around the sharded refiner.
+        with torch.no_grad():
             refined = refine(prompt_embeds, refiner_cu, device=device)
     if not torch.is_tensor(refined):
         raise TypeError("MiniMax H3 refine_prompt_embeds must return a torch.Tensor")

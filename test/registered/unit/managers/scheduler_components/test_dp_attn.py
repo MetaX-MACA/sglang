@@ -16,6 +16,53 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
+    def test_engram_keeps_all_dp_token_counts_without_mlp_gather(self):
+        batch = SimpleNamespace()
+        info = SimpleNamespace(
+            num_tokens=6,
+            num_tokens_for_logprob=1,
+            global_num_tokens=[6, 0, 12],
+            global_num_tokens_for_logprob=[1, 0, 2],
+            is_extend_in_batch=False,
+            tbo_split_seq_index=None,
+            global_forward_mode=ForwardMode.TARGET_VERIFY,
+            can_run_decode_cuda_graph=False,
+            can_run_prefill_cuda_graph=False,
+        )
+
+        dp_attn._update_gather_batch(
+            batch,
+            info,
+            require_mlp_tp_gather=False,
+            require_global_token_counts=True,
+        )
+
+        self.assertEqual(batch.global_num_tokens, [6, 0, 12])
+        self.assertEqual(batch.global_num_tokens_for_logprob, [1, 0, 2])
+
+    def test_non_engram_keeps_local_count_without_mlp_gather(self):
+        batch = SimpleNamespace()
+        info = SimpleNamespace(
+            num_tokens=6,
+            num_tokens_for_logprob=1,
+            global_num_tokens=[6, 0, 12],
+            global_num_tokens_for_logprob=[1, 0, 2],
+            is_extend_in_batch=False,
+            tbo_split_seq_index=None,
+            global_forward_mode=ForwardMode.TARGET_VERIFY,
+            can_run_decode_cuda_graph=False,
+            can_run_prefill_cuda_graph=False,
+        )
+
+        dp_attn._update_gather_batch(
+            batch,
+            info,
+            require_mlp_tp_gather=False,
+        )
+
+        self.assertEqual(batch.global_num_tokens, [6])
+        self.assertEqual(batch.global_num_tokens_for_logprob, [1])
+
     def test_skip_all_gather_policy(self):
         with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False):
             self.assertTrue(dp_attn.should_skip_scheduler_all_gather(dp_size=1))

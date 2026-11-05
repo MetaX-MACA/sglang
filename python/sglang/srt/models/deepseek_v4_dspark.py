@@ -20,6 +20,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -256,7 +257,7 @@ class DSparkAttention(MqaAttentionBase):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if _is_npu and forward_batch.forward_mode.is_idle():
+        if forward_batch.forward_mode.is_idle():
             return torch.zeros_like(hidden_states)
 
         from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -792,6 +793,24 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
     uses_own_vocab_modules = _is_npu
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        draft_config = parse_dspark_draft_config(draft_hf_config=config)
+        num_layers = (
+            len(draft_config.target_layer_ids)
+            if draft_config.target_layer_ids is not None
+            else int(getattr(config, "num_nextn_predict_layers", 1) or 1)
+        )
+        num_logical_experts = int(
+            getattr(config, "dspark_n_routed_experts", 0)
+            or config.n_routed_experts
+        )
+        return ModelConfigForExpertLocation(
+            num_layers=num_layers,
+            num_logical_experts=num_logical_experts,
+            num_groups=None,
+        )
 
     @classmethod
     def shared_experts_fusion_disable_reason(

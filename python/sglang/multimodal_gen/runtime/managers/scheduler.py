@@ -21,7 +21,6 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
     release_retained_producer_tensors,
     spill_cuda_tensors,
 )
-from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     GetDisaggStatsReq,
     ListLorasReq,
@@ -1228,31 +1227,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         if self.server_args.comfyui_mode and self._is_multi_rank():
             recv_reqs = self._broadcast_recv_reqs(recv_reqs)
-        else:
-            # TODO: fix this condition
-            if self.server_args.sp_degree != 1:
-                recv_reqs = broadcast_pyobj(
-                    recv_reqs,
-                    self.worker.sp_group.rank,
-                    self.worker.sp_cpu_group,
-                    src=self.worker.sp_group.ranks[0],
-                )
-
-            if self.server_args.enable_cfg_parallel:
-                recv_reqs = broadcast_pyobj(
-                    recv_reqs,
-                    self.worker.cfg_group.rank,
-                    self.worker.cfg_cpu_group,
-                    src=self.worker.cfg_group.ranks[0],
-                )
-
-            if self.server_args.tp_size > 1:
-                recv_reqs = broadcast_pyobj(
-                    recv_reqs,
-                    self.worker.tp_group.rank,
-                    self.worker.tp_cpu_group,
-                    src=self.worker.tp_group.ranks[0],
-                )
+        elif self._is_multi_rank():
+            recv_reqs = self._broadcast_to_all_ranks(recv_reqs)
 
         assert recv_reqs is not None
 

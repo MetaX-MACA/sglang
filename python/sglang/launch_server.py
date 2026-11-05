@@ -29,6 +29,11 @@ def run_server(server_args):
     server_args.resolve_once()
     cfg = resolving_view(server_args)
 
+    # Validate resolved topology before launching any server workers.
+    from sglang._maca_device_order import validate_maca_device_order
+
+    validate_maca_device_order(cfg)
+
     if cfg.encoder_only:
         # For encoder disaggregation
         if cfg.smg_grpc_mode or cfg.grpc_mode:

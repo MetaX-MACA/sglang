@@ -2651,7 +2651,7 @@ def _maca_fast_decode_plan(
 
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
 
-            self._plan_info = self._cached_module.plan(
+            plan_args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -2667,7 +2667,14 @@ def _maca_fast_decode_plan(
                 head_dim,
                 head_dim,
                 False,  # causal
-            )
+            ]
+            # Legacy MACA wrappers have no backend selector and use the 15-arg ABI.
+            if getattr(self, "_backend", None) == "fa2":
+                # Keep the MACA fast path aligned with FlashInfer's FA2 plan ABI.
+                plan_args.extend(
+                    [window_left, fixed_split_size, disable_split_kv, 0, 0]
+                )  # num_colocated_ctas=0, uniform_q_len=0 for single-token decode
+            self._plan_info = self._cached_module.plan(*plan_args)
         else:
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,

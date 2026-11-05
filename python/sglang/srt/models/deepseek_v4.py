@@ -3924,7 +3924,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                     parallel.attn_cp_rank
                 ].contiguous()
             else:
-                hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
+                #hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
+                # NOTE: `attn_cp_interleave_reduce_scatter` only exists in the
+                # newer layer_boundary API (0.5.22+); in this tree the identical
+                # implementation lives in the CP adapter and is already imported
+                # above. Symmetric with the dsa_cp_gather_hidden_states() call at
+                # the MoE input.
+                hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),
@@ -4481,6 +4487,12 @@ class DeepseekV4Model(nn.Module):
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
+            assert self.start_layer <= self.late_layer_start < self.end_layer, (
+                "decoder SWA bounded replay switches layers at late_layer_start, so"
+                f" this rank must own it: start_layer={self.start_layer},"
+                f" end_layer={self.end_layer},"
+                f" late_layer_start={self.late_layer_start}"
+            )
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
@@ -4931,10 +4943,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         ):
             if (
                 get_parallel().pp_group.world_size != 1
-                or not get_moe_a2a_backend().is_none()
             ):
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without PP or MoE A2A"
+                    "V4.1 vision currently supports TP/EP/DP without PP"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
