@@ -1500,13 +1500,18 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         shared_output = None
         shared_event = None
-        sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
+        sbo_fusion_enabled = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
-            sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
+            not self.is_nextn
+            and (
+                SboFlags.enable_dispatch_shared_one_stream_overlap()
+                or envs.MX_ENABLE_SBO_OVERLAP_DISPATCH.get()
+            )
         )
         sbo_overlap_combine_flag = (
-            sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
+            sbo_fusion_enabled and SboFlags.enable_combine_shared_two_stream_overlap()
         )
+        sbo_enabled_flag = sbo_overlap_dispatch_flag or sbo_overlap_combine_flag
 
         tensor_scale_tuple = None
         if isinstance(hidden_states, tuple):
