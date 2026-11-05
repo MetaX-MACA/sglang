@@ -3924,7 +3924,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                     parallel.attn_cp_rank
                 ].contiguous()
             else:
-                hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
+                #hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
+                # NOTE: `attn_cp_interleave_reduce_scatter` only exists in the
+                # newer layer_boundary API (0.5.22+); in this tree the identical
+                # implementation lives in the CP adapter and is already imported
+                # above. Symmetric with the dsa_cp_gather_hidden_states() call at
+                # the MoE input.
+                hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),
