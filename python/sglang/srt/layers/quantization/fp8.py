@@ -1130,7 +1130,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if not get_moe_a2a_backend().is_none():
                 raise ValueError(
                     "--moe-runner-backend mxfp4_w4a8 currently requires "
-                    "--moe-a2a-backend none (the MCTlass fused MoE path)."
+                    "--moe-a2a-backend none (the fused MoE path)."
                 )
         self.with_bias = False
         # The MxFP4 wrapper methods borrow this instance for weight loading;
@@ -1496,7 +1496,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             scale_param = getattr(layer, f"{name}_weight_scale_inv")
             if weight.shape[1] % 128 or (weight.shape[2] * 2) % 128:
                 raise ValueError(
-                    "MCTlass MXFP4 W4A8 requires each expert GEMM's N and K "
+                    "MXFP4 W4A8 requires each expert GEMM's N and K "
                     f"to be multiples of 128; got {name} packed shape "
                     f"{tuple(weight.shape)}."
                 )
