@@ -401,12 +401,24 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_int8 = getattr(
             model_runner.token_to_kv_pool, "dsa_kv_cache_store_int8", False
         )
+        self.glm53_flash_int8 = (
+            self.dsa_kv_cache_store_int8
+            and hf_config.architectures[0]
+            in (
+                "Glm5NextForConditionalGeneration",
+                "Glm5NextForConditionalGenerationNextN",
+            )
+        )
         self.dsa_kv_cache_is_quantized = (
             self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8
         )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
-        if self.dsa_kv_cache_store_int8 and self.dsa_index_kpool != 1:
+        if (
+            self.dsa_kv_cache_store_int8
+            and not self.glm53_flash_int8
+            and self.dsa_index_kpool != 1
+        ):
             raise ValueError("DSA INT8 main KV cache currently requires index_kpool=1")
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
         self._init_kpool_metadata_fusion()
@@ -424,10 +436,17 @@ class DeepseekSparseAttnBackend(
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         if self.dsa_kv_cache_store_int8:
             from sglang.kernels.ops.attention.dsa.kv_cache_layout import (
+                packed_kv_row_bytes,
                 validate_int8_kv_cache,
             )
 
             validate_int8_kv_cache(self.kv_lora_rank, self.qk_rope_head_dim)
+            expected_kv_cache_dim = packed_kv_row_bytes(self.qk_rope_head_dim)
+            if self.kv_cache_dim != expected_kv_cache_dim:
+                raise ValueError(
+                    f"DSA INT8 KV pool must use {expected_kv_cache_dim}-byte rows; "
+                    f"got kv_cache_dim={self.kv_cache_dim}"
+                )
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -2152,6 +2171,16 @@ class DeepseekSparseAttnBackend(
                 ).to(torch.int32)
 
         if dsa_impl == "tilelang":
+            if (
+                self.glm53_flash_int8
+                and topk_transform_method == TopkTransformMethod.RAGGED
+            ):
+                # Regular prefill indexes the request-local KV stream.  Feed
+                # TileLang BF16 rows whose indices remain in that logical space.
+                page_table_1 = topk_indices
+                kv_cache = self._prepare_tilelang_prefill_kv(
+                    k, k_rope, kv_cache, forward_batch
+                )
             if q_rope is not None:
                 # Cat-skip, as in forward_decode: q_rope=None means the caller
                 # already handed us the concatenated form and q_all is a
@@ -3240,6 +3269,20 @@ class DeepseekSparseAttnBackend(
             causal=causal,
         )
 
+    def _prepare_tilelang_prefill_kv(
+        self,
+        k: torch.Tensor,
+        k_rope: Optional[torch.Tensor],
+        kv_cache: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if any(forward_batch.extend_prefix_lens_cpu):
+            # The current chunk has already been written to the paged INT8 pool.
+            slots = self.forward_metadata.page_table_1_flattened
+            assert slots is not None
+            return dequantize_k_cache_paged(kv_cache, slots)
+        return k if k_rope is None else torch.cat((k, k_rope), dim=-1)
+
     def _forward_tilelang(
         self,
         q_all: torch.Tensor,
@@ -3249,6 +3292,11 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
+
+        if self.glm53_flash_int8 and kv_cache.dtype is torch.int8:
+            kv_cache, page_table_1 = _dequantize_selected_kv_cache(
+                kv_cache, page_table_1
+            )
 
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
         # index_topk columns. TileLang processes indices in 64-column blocks,
@@ -3846,6 +3894,12 @@ class DeepseekSparseAttnBackend(
         This method is used to select the topk transform method which can be fused or unfused.
         """
         if (
+            self.glm53_flash_int8
+            and self.dsa_prefill_impl == "tilelang"
+            and forward_mode == ForwardMode.EXTEND
+        ):
+            topk_transform_method = TopkTransformMethod.RAGGED
+        elif (
             # disable for MTP
             self.dsa_kv_cache_is_quantized
             # flashmla_sparse_q8 shares flashmla_sparse's RAGGED prefill routing — the q8

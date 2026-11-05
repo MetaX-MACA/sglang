@@ -100,6 +100,15 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
     )
 
 
+def _uses_dcp_sharded_mla(attn, forward_batch: ForwardBatch) -> bool:
+    return is_dcp_mla_decode_phase(forward_batch) or (
+        get_parallel().dcp_enabled
+        and attn.current_attention_backend == "flashmla"
+        and attn.kv_cache_dtype == "int8"
+        and forward_batch.forward_mode.is_extend_without_speculative()
+    )
+
+
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
@@ -638,7 +647,7 @@ class DeepseekMLAForwardMixin:
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if get_parallel().dcp_enabled:
-            if is_dcp_mla_decode_phase(forward_batch):
+            if _uses_dcp_sharded_mla(self, forward_batch):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
@@ -770,7 +779,13 @@ class DeepseekMLAForwardMixin:
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
 
-            attn_output = self.attn_mqa(
+            flashmla_dcp_decode = (
+                self.current_attention_backend == "flashmla"
+                and self.kv_cache_dtype == "int8"
+                and _uses_dcp_sharded_mla(self, forward_batch)
+            )
+            attn = self.attn_mqa_for_dcp_decode if flashmla_dcp_decode else self.attn_mqa
+            attn_output = attn(
                 q,
                 k,
                 k_nope,
@@ -778,9 +793,11 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+            if flashmla_dcp_decode:
+                attn_output, lse = attn_output
 
         # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch):
+        if _uses_dcp_sharded_mla(self, forward_batch):
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,

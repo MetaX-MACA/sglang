@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from itertools import groupby
 from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
 import torch
@@ -31,6 +32,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 64
+
+
+def _expand_int8_dcp_verify_queries(req_pool_indices, seq_lens, window: int):
+    """Turn static linear verify into causal single-query batches for INT8 MLA."""
+    if window < 1:
+        raise ValueError("INT8 DCP verify requires a positive static window")
+    offsets = torch.arange(
+        1, window + 1, dtype=seq_lens.dtype, device=seq_lens.device
+    )
+    # Query i sees prefix_len + i + 1 keys before the owner-rule DCP split.
+    return (
+        req_pool_indices.repeat_interleave(window),
+        (seq_lens[:, None] + offsets[None, :]).reshape(-1),
+    )
 
 
 @dataclass
@@ -70,7 +85,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
     ):
         super().__init__(
-            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
+            model_runner,
+            skip_prefill,
+            kv_indptr_buf,
+            kv_last_page_len_buf,
+            native_int8_kv=True,
         )
 
         self.num_q_heads = (
@@ -123,8 +142,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         in_capture: bool = False,
     ):
         forward_mode = forward_batch.forward_mode
-        if self.is_int8_kvcache and not forward_mode.is_decode_or_idle():
-            raise ValueError("FlashMLA INT8 requires FlashInfer for prefill and verify")
+        if self.is_int8_kvcache and forward_mode.is_extend_without_speculative():
+            self.init_forward_metadata(forward_batch)
+            return
         if (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
@@ -137,6 +157,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 forward_mode=forward_mode,
             )
+        elif self.is_int8_kvcache:
+            raise ValueError(f"Unsupported FlashMLA INT8 mode: {forward_mode}")
         else:
             super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
@@ -157,8 +179,40 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         return buf[:bs, :max_seqlen_pad]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if self.is_int8_kvcache and not forward_batch.forward_mode.is_decode_or_idle():
-            raise ValueError("FlashMLA INT8 requires FlashInfer for prefill and verify")
+        int8_prefill = (
+            self.is_int8_kvcache
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
+        if self.is_int8_kvcache and self.dcp_world_size > 1:
+            req_indices = forward_batch.req_pool_indices
+            seq_lens = forward_batch.seq_lens
+            if forward_batch.forward_mode.is_target_verify():
+                req_indices, seq_lens = _expand_int8_dcp_verify_queries(
+                    req_indices, seq_lens, self.num_draft_tokens
+                )
+            block_table = None
+            if int8_prefill:
+                query_lens = forward_batch.extend_seq_lens
+                prefix_lens = forward_batch.extend_prefix_lens
+                num_queries = sum(forward_batch.extend_seq_lens_cpu)
+                rows = torch.arange(len(req_indices), device=seq_lens.device)
+                rows = rows.repeat_interleave(query_lens, output_size=num_queries)
+                starts = query_lens.cumsum(0) - query_lens
+                offsets = torch.arange(num_queries, device=seq_lens.device)
+                max_k = (
+                    forward_batch.seq_lens_cpu.max().item()
+                    if forward_batch.seq_lens_cpu is not None
+                    else self.max_context_len
+                )
+                width = triton.cdiv(triton.cdiv(max_k, self.dcp_world_size), PAGE_SIZE)
+                block_table = self._eager_block_kv_indices(num_queries, max(1, width))
+                req_indices = req_indices[rows]
+                seq_lens = prefix_lens[rows] + offsets - starts[rows] + 1
+            self._init_int8_dcp_metadata(
+                len(req_indices), req_indices, seq_lens, block_table,
+                in_graph=False,
+            )
+            return
         bs = forward_batch.batch_size
         # Host max only sizes the block table: CPU mirror when published,
         # else the static bound (kernel reads are capped by seq_lens_k).
@@ -168,7 +222,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             if seq_lens_cpu is not None
             else self.max_context_len
         )
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if forward_batch.forward_mode.is_decode_or_idle() or int8_prefill:
             max_seqlen_pad = triton.cdiv(eager_max_k, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
             if self.kv_index_translator.is_translating:
@@ -223,6 +277,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.num_draft_tokens * self.num_q_heads,
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
+                **({"is_int8_kvcache": True} if self.is_int8_kvcache else {}),
             )
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
@@ -262,6 +317,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 block_kv_indices,
                 seq_lens_k,
             )
+        elif self.is_int8_kvcache:
+            raise ValueError(
+                f"Unsupported FlashMLA INT8 mode: {forward_batch.forward_mode}"
+            )
         else:
             super().init_forward_metadata(forward_batch)
 
@@ -271,9 +330,15 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         max_num_tokens: int,
         block_kv_indices: Optional[torch.Tensor] = None,
     ):
+        # Static DSPARK verify needs one metadata row per query token.
+        metadata_rows = (
+            max(max_bs, max_num_tokens)
+            if self.is_int8_kvcache and self.dcp_world_size > 1
+            else max_bs
+        )
         if block_kv_indices is None:
             self.cuda_graph_kv_indices = torch.full(
-                (max_bs, (self.max_context_len + PAGE_SIZE) // PAGE_SIZE),
+                (metadata_rows, (self.max_context_len + PAGE_SIZE) // PAGE_SIZE),
                 1,
                 dtype=torch.int32,
                 device="cuda",
@@ -297,6 +362,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         self.cuda_graph_mla_metadata_view = None
         self.cuda_graph_num_splits_view = None
+
+        if self.is_int8_kvcache and self.dcp_world_size > 1:
+            self.cuda_graph_dcp_seq_lens = torch.zeros(
+                metadata_rows, dtype=torch.int32, device=self.device
+            )
 
         if self.num_draft_tokens:
             self.cuda_graph_draft_extend_seq_lens_k = torch.ones(
@@ -328,6 +398,23 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         forward_mode: ForwardMode,
     ):
         """Shared decode/target-verify/draft-extend capture+replay body."""
+        if self.is_int8_kvcache and self.dcp_world_size > 1:
+            req_pool_indices = req_pool_indices[:bs]
+            seq_lens = seq_lens[:bs]
+            if forward_mode.is_target_verify():
+                req_pool_indices, seq_lens = _expand_int8_dcp_verify_queries(
+                    req_pool_indices, seq_lens, self.num_draft_tokens
+                )
+                bs = len(req_pool_indices)
+            if bs > self.cuda_graph_kv_indices.shape[0]:
+                raise ValueError(
+                    "INT8 DCP graph metadata has fewer rows than verify queries"
+                )
+            self._init_int8_dcp_metadata(
+                bs, req_pool_indices, seq_lens, self.cuda_graph_kv_indices[:bs],
+                in_graph=True,
+            )
+            return
         if True:
             seq_lens = seq_lens[:bs]
             seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
@@ -433,6 +520,48 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 seq_lens_k,
             )
 
+    def _init_int8_dcp_metadata(
+        self, bs, req_pool_indices, seq_lens, block_table=None, *, in_graph=False
+    ):
+        from sglang.srt.layers.dcp.layout import get_dcp_lens
+
+        # INT8 DCP is limited to the static pool (unified memory is rejected
+        # by argument validation). Both the scheduler and kernel need local lengths.
+        local_lens = get_dcp_lens(
+            seq_lens[:bs], self.dcp_world_size, self.dcp_rank
+        ).to(torch.int32)
+        if block_table is None:
+            width = triton.cdiv(
+                triton.cdiv(self.max_context_len, self.dcp_world_size), PAGE_SIZE
+            )
+            block_table = self._eager_block_kv_indices(bs, max(1, width))
+        if in_graph:
+            # Replay updates the same storage that the decode graph captured.
+            self.cuda_graph_dcp_seq_lens[:bs].copy_(local_lens)
+            local_lens = self.cuda_graph_dcp_seq_lens[:bs]
+        create_flashmla_kv_indices_triton[
+            (bs, get_num_kv_index_blocks_flashmla(block_table.shape[1], PAGE_SIZE))
+        ](
+            self.req_to_token,
+            req_pool_indices[:bs],
+            local_lens,
+            None,
+            block_table,
+            self.req_to_token.stride(0),
+            block_table.stride(0),
+            DCP_WORLD_SIZE=self.dcp_world_size,
+            DCP_RANK=self.dcp_rank,
+        )
+        metadata, splits = get_mla_metadata(
+            local_lens,
+            self.num_q_heads * self.dcp_world_size,
+            1,
+            is_int8_kvcache=True,
+        )
+        self.forward_metadata = FlashMLADecodeMetadata(
+            metadata, splits, block_table, local_lens
+        )
+
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
@@ -455,24 +584,45 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    cache_loc,
-                    k,
-                    v,
-                )
+                if self.is_int8_kvcache and self.dcp_world_size > 1:
+                    # The split writer masks owners and translates locations on
+                    # device; the combined-row writer rejects unresolved DCP locations.
+                    self.token_to_kv_pool.set_mla_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k[..., : self.kv_lora_rank],
+                        k[..., self.kv_lora_rank :],
+                    )
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                    )
         bs = forward_batch.batch_size
+        if self.is_int8_kvcache and self.dcp_world_size > 1:
+            # Metadata is flattened to (request, query-position) for verify.
+            bs = self.forward_metadata.seq_lens_k.numel()
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         if self.is_int8_kvcache:
-            if reshape_q.dtype != torch.bfloat16 or reshape_q.shape[1] != 1:
-                raise ValueError("FlashMLA INT8 decode requires single-token BF16 Q")
-            o, _ = flash_mla_with_kvcache(
+            local_lens = (
+                self.forward_metadata.seq_lens_k
+                if self.dcp_world_size > 1
+                else forward_batch.seq_lens.to(torch.int32)
+            )
+            if (
+                self.dcp_world_size == 1
+                and forward_batch.forward_mode.is_target_verify()
+            ):
+                local_lens = local_lens + self.num_draft_tokens
+            o, lse = flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, 656),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
-                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                cache_seqlens=local_lens,
                 head_dim_v=self.kv_lora_rank,
                 tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
                 num_splits=self.forward_metadata.num_splits,
@@ -482,6 +632,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             if o.dtype != torch.bfloat16:
                 raise RuntimeError("FlashMLA dense INT8 kernel must return BF16 output")
+            if self.dcp_world_size > 1:
+                # Empty shards can return uninitialized data, including NaNs.
+                # Selection, rather than multiplication by zero, is required.
+                empty = local_lens == 0
+                o = torch.where(empty[:, None, None, None], 0.0, o)
+                lse = torch.where(empty[:, None, None], -torch.inf, lse)
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), lse
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         if self.is_fp8_kvcache:
             assert self.dcp_world_size == 1, (
@@ -550,7 +707,49 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         save_kv_cache: bool = True,
     ):
         if self.is_int8_kvcache:
-            raise ValueError("FlashMLA INT8 requires FlashInfer for prefill and verify")
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or self.dcp_world_size > 1
+            ):
+                return self.forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
+            if not forward_batch.forward_mode.is_extend_without_speculative():
+                raise ValueError("Unsupported FlashMLA INT8 extend mode")
+            if k is not None and save_kv_cache:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
+
+            q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            k_cache = k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim)
+            block_table = self.forward_metadata.block_kv_indices
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            output = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+
+            # Each dense call takes one query length across its batch.
+            offset = row = 0
+            for query_len, requests in groupby(forward_batch.extend_seq_lens_cpu):
+                batch_size = sum(1 for _ in requests)
+                end_row = row + batch_size
+                end_offset = offset + batch_size * query_len
+                if query_len:
+                    o, _ = flash_mla_with_kvcache(
+                        q=q[offset:end_offset].view(
+                            batch_size, query_len, layer.tp_q_head_num, layer.head_dim
+                        ),
+                        k_cache=k_cache,
+                        block_table=block_table[row:end_row],
+                        cache_seqlens=seq_lens[row:end_row],
+                        head_dim_v=self.kv_lora_rank,
+                        tile_scheduler_metadata=type(self.forward_metadata.flashmla_metadata)(),
+                        num_splits=None,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                        is_int8_kvcache=True,
+                    )
+                    output[offset:end_offset] = o.flatten(0, 1).flatten(1)
+                row, offset = end_row, end_offset
+            return output
         if forward_batch.forward_mode == ForwardMode.EXTEND:
             return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
         else:

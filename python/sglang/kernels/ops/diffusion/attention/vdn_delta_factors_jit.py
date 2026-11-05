@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.ops.diffusion.common.platform import is_maca
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -80,6 +81,7 @@ def can_use_vdn_delta_factors(
 ) -> bool:
     return (
         A.is_cuda
+        and not is_maca()
         and A.dtype is torch.float32
         and B.dtype is torch.float32
         and alpha.dtype is torch.float32

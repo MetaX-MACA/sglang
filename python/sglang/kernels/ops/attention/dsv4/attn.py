@@ -141,6 +141,58 @@ def fused_store_cache(
             module.run_rope(input, cache, indices, freqs_cis.contiguous())
 
 
+@cache_once
+def _jit_fused_store_module_int8_v41(
+    input_dtype: torch.dtype,
+    index_dtype: torch.dtype,
+    store_dtype: torch.dtype,
+    page_size: int,
+):
+    """Load JIT module for V4.1 INT8 fused store cache kernel."""
+    args = make_cpp_args(
+        input_dtype, index_dtype, store_dtype, page_size, is_arch_support_pdl()
+    )
+    assert store_dtype is torch.int8, "V4.1 store must be int8"
+    kernel_class = f"FusedStoreCacheFlashMLAInt8V41Kernel<{args}>"
+    return load_jit(
+        make_name("store_flashmla_int8_v41_maca"),
+        *args,
+        cuda_files=["deepseek_v4/store_int8_v41_maca.cuh"],
+        cuda_wrappers=[("run", f"{kernel_class}::run")],
+    )
+
+
+def fused_store_cache_int8_v41(
+    input: torch.Tensor,
+    cache: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    page_size: int,
+) -> None:
+    """Store BF16 input into V4.1 INT8 KV cache.
+
+    Args:
+        input: (N, 512) BF16 tensor.
+        cache: (num_pages, bytes_per_page) INT8 paged cache.
+        indices: (N,) int32/int64 token slot IDs.
+        page_size: tokens per page (must be power of 2).
+    """
+    assert input.dtype == torch.bfloat16, f"input must be bf16, got {input.dtype}"
+    assert cache.dtype == torch.int8, f"cache must be int8, got {cache.dtype}"
+    assert indices.dtype in (torch.int32, torch.int64)
+
+    if is_hip_runtime():
+        raise NotImplementedError("V4.1 INT8 fused store not supported on HIP")
+
+    module = _jit_fused_store_module_int8_v41(
+        input_dtype=input.dtype,
+        index_dtype=indices.dtype,
+        store_dtype=cache.dtype,
+        page_size=page_size,
+    )
+    module.run(input, cache, indices)
+
+
 @triton.jit
 def create_paged_compress_data_kernel(
     req_pool_indices_ptr,

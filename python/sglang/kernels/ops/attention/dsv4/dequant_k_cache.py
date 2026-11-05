@@ -8,9 +8,10 @@ from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     DSV4KVCacheFormat,
+    HEAD_DIM,
     KVLayout,
-    FP8_SCALE_BYTES_PER_TOKEN,
-    INT8_SCALE_BYTES_PER_TOKEN,
+    NOPE_DIM,
+    ROPE_DIM,
     get_kv_cache_format,
 )
 from sglang.srt.utils import is_gfx95_supported
@@ -22,12 +23,88 @@ fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 #              7 ue8m0 scales padded to 8 bytes.
 #   per-page:  [token 0..P-1 nope+rope (P*576 bytes)] [token 0..P-1 scale (P*8 bytes)]
 #              padded up to a multiple of 576.
-DIM_NOPE = 448
-DIM_ROPE = 64
-TILE_SIZE = 64  # one nope scale tile = 64 fp8 values
+# These are read off KVLayout.V4 rather than repeated here. They stay module
+# constants by construction: the V4 kernel is hard-wired to that row (it reads
+# the RoPE tail as bf16), so it can never be handed another layout.
+DIM_NOPE = NOPE_DIM  # 448
+DIM_ROPE = ROPE_DIM  # 64
+TILE_SIZE = KVLayout.V4.tile_size  # 64, one nope scale tile = 64 fp8 values
 NUM_SCALE_TILES = DIM_NOPE // TILE_SIZE  # 7
-NOPE_ROPE_BYTES = DIM_NOPE + DIM_ROPE * 2  # 576
-PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
+NOPE_ROPE_BYTES = KVLayout.V4.data_bytes  # 576
+PADDED_SCALE_PER_TOKEN = KVLayout.V4.scale_bytes  # 8
+
+# V4.1 INT8 layout constants: 512 int8 (rope quantized into the data region,
+# unlike V4) + 16 fp32 scales, one per 32 values.
+V41_HEAD_DIM = HEAD_DIM  # 512
+V41_TILE_SIZE = KVLayout.V41_INT8.tile_size  # 32
+V41_NUM_SCALE_TILES = V41_HEAD_DIM // V41_TILE_SIZE  # 16
+V41_NOPE_ROPE_BYTES = KVLayout.V41_INT8.data_bytes  # 512
+V41_SCALE_BYTES_PER_TOKEN = KVLayout.V41_INT8.int8_scale_bytes  # 64
+
+
+@triton.jit
+def _gather_bf16_k_cache_paged_kernel(
+    cache,
+    token_ids,
+    out,
+    CACHE_PAGE_STRIDE: tl.constexpr,
+    OUT_STRIDE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    token = tl.load(token_ids + row).to(tl.int64)
+    cols = tl.arange(0, BLOCK_DIM)
+    values = tl.load(
+        cache
+        + (token // PAGE_SIZE) * CACHE_PAGE_STRIDE
+        + (token % PAGE_SIZE) * HEAD_DIM
+        + cols,
+        mask=(token >= 0) & (cols < HEAD_DIM),
+        other=0,
+    )
+    tl.store(out + row * OUT_STRIDE + cols, values, mask=cols < HEAD_DIM)
+
+
+def gather_k_cache_paged(
+    k_cache: torch.Tensor,
+    token_ids: torch.Tensor,
+    page_size: int,
+    out: torch.Tensor,
+    layout: Union[KVLayout, str] = KVLayout.V4,
+) -> torch.Tensor:
+    """Gather live rows into an existing BF16 sparse-prefill workspace.
+
+    Quantized inputs retain their layout-specific dequantization. BF16 inputs
+    use physical page strides directly, without flattening the entire pool.
+    Negative token IDs produce zero BF16 rows.
+    """
+    if k_cache.dtype != torch.bfloat16:
+        return dequantize_k_cache_paged(
+            k_cache, token_ids, page_size=page_size, out=out, layout=layout
+        )
+
+    head_dim = DIM_NOPE + DIM_ROPE
+    assert k_cache.ndim == 2 and k_cache.stride(1) == 1
+    assert page_size > 0 and k_cache.shape[1] >= page_size * head_dim
+    assert token_ids.ndim == 1 and token_ids.is_contiguous()
+    assert token_ids.dtype in (torch.int32, torch.int64)
+    assert out.shape == (token_ids.numel(), 1, head_dim)
+    assert out.dtype == torch.bfloat16 and out.stride(-1) == 1
+    assert k_cache.device == token_ids.device == out.device
+    if token_ids.numel():
+        _gather_bf16_k_cache_paged_kernel[(token_ids.numel(),)](
+            k_cache,
+            token_ids,
+            out,
+            CACHE_PAGE_STRIDE=k_cache.stride(0),
+            OUT_STRIDE=out.stride(0),
+            PAGE_SIZE=page_size,
+            HEAD_DIM=head_dim,
+            BLOCK_DIM=triton.next_power_of_2(head_dim),
+        )
+    return out
 
 
 def dequantize_k_cache_paged(
@@ -42,17 +119,28 @@ def dequantize_k_cache_paged(
     Args:
         quant_k_cache: FP8/uint8 or INT8 view of
             (num_pages, bytes_per_page_padded).
-        page_table_1_flattened: (num_tokens,) int — token IDs into the cache.
+        page_table_1_flattened: (num_tokens,) int ??token IDs into the cache.
         page_size: number of tokens per page.
         out: optional (num_tokens, 1, DIM_NOPE + DIM_ROPE) bf16 destination.
             May be a slice of a larger workspace; the kernel uses out.stride(0)
             so contiguous-along-dim-0 slices work.
-        layout: the cache's :class:`KVLayout`.
+        layout: the cache's :class:`KVLayout`. This is the single dispatch point
+            for the paged readers: V4 is decoded here (FP8 or INT8 by buffer
+            dtype), V41 / V41_FP4 go to :func:`dequantize_k_cache_paged_v41`,
+            V41_INT8 to :func:`dequantize_k_cache_paged_int8_v41`.
 
     Returns:
         (num_tokens, 1, DIM_NOPE + DIM_ROPE) bfloat16.
     """
     layout = KVLayout.parse(layout)
+    # Dispatch on layout, never on dtype: V4-INT8 and V41_INT8 both carry
+    # torch.int8 but have different rows (576 B with a bf16 RoPE tail plus 32 B
+    # of scales, vs 512 B of quantized RoPE plus 64 B of fp32 scales), so
+    # falling through to the V4 reader would silently misread the buffer.
+    if layout is KVLayout.V41_INT8:
+        return dequantize_k_cache_paged_int8_v41(
+            quant_k_cache, page_table_1_flattened, page_size, out=out, layout=layout
+        )
     if layout is not KVLayout.V4:
         return dequantize_k_cache_paged_v41(
             quant_k_cache, page_table_1_flattened, page_size, out=out, layout=layout
@@ -103,9 +191,11 @@ def dequantize_k_cache_paged(
         NUM_SCALE_TILES=NUM_SCALE_TILES,
         NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
         SCALE_BYTES_PER_TOKEN=(
-            FP8_SCALE_BYTES_PER_TOKEN
+            # V4 is hard-wired to this row: 7 ue8m0 scale bytes for FP8, 7 fp32
+            # scales padded to a 32-byte record for INT8.
+            KVLayout.V4.scale_bytes
             if cache_format == DSV4KVCacheFormat.FP8
-            else INT8_SCALE_BYTES_PER_TOKEN
+            else KVLayout.V4.int8_scale_bytes
         ),
         S_OFFSET_BYTES=s_offset_bytes,
         CACHE_FORMAT=int(cache_format),
@@ -177,6 +267,72 @@ def dequantize_k_cache_paged_v41(
         TILE_SIZE=layout.tile_size,
         S_OFFSET_BYTES=layout.scale_offset(page_size),
         IS_HIP=is_hip_runtime(),
+    )
+    return out
+
+
+def dequantize_k_cache_paged_int8_v41(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    page_size: int,
+    out: Optional[torch.Tensor] = None,
+    layout: KVLayout = KVLayout.V41_INT8,
+) -> torch.Tensor:
+    """Dequantize V4.1 INT8 KV cache (all-INT8 with per-32-element FP32 scales).
+
+    Layout per token (576 bytes):
+      [0, 512)   INT8 data  (16 groups x 32 dims = 448 nope + 64 rope)
+      [512, 576) FP32 scales (16 x 4 bytes)
+
+    Args:
+        quant_k_cache: (num_pages, bytes_per_page) int8/uint8 view.
+        page_table_1_flattened: (num_tokens,) token IDs into the cache.
+        page_size: number of tokens per page.
+        out: optional (num_tokens, 1, 512) bf16 destination.
+
+    Returns:
+        (num_tokens, 1, 512) bfloat16.
+    """
+    layout = KVLayout.parse(layout)
+    assert layout is KVLayout.V41_INT8, layout
+    assert quant_k_cache.ndim == 2
+    assert quant_k_cache.is_contiguous()
+    assert quant_k_cache.dtype in (torch.int8, torch.uint8)
+    assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
+
+    quant_k_cache_u8 = quant_k_cache.view(torch.uint8)
+    num_tokens = page_table_1_flattened.shape[0]
+    bytes_per_page = quant_k_cache_u8.shape[-1]
+    assert bytes_per_page >= page_size * layout.int8_bytes_per_token, (
+        f"{bytes_per_page=} cannot hold {page_size} tokens of {layout}"
+    )
+
+    buf_int8 = quant_k_cache_u8.view(torch.int8).reshape(-1)
+    buf_fp32 = quant_k_cache_u8.view(torch.float32).reshape(-1)
+
+    if out is None:
+        out = torch.empty(
+            (num_tokens, 1, HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=quant_k_cache.device,
+        )
+    else:
+        assert out.shape == (num_tokens, 1, HEAD_DIM)
+        assert out.dtype == torch.bfloat16
+
+    _dequantize_k_cache_paged_int8_v41_kernel[(num_tokens,)](
+        out,
+        buf_int8,
+        buf_fp32,
+        page_table_1_flattened,
+        out.stride(0),
+        BYTES_PER_PAGE=bytes_per_page,
+        PAGE_SIZE=page_size,
+        DATA_BYTES=layout.data_bytes,
+        SCALE_BYTES=layout.int8_scale_bytes,
+        TILE_SIZE=layout.tile_size,
+        NUM_SCALE_TILES=HEAD_DIM // layout.tile_size,
+        S_OFFSET_BYTES=layout.scale_offset(page_size),
     )
     return out
 
@@ -484,6 +640,50 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
 
 
 @triton.jit
+def _dequantize_k_cache_paged_int8_v41_kernel(
+    output_ptr,
+    buf_int8_ptr,
+    buf_fp32_ptr,
+    page_table_ptr,
+    output_stride_0,
+    BYTES_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DATA_BYTES: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    NUM_SCALE_TILES: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+):
+    """Dequantize V4.1 INT8 KV cache: all 512 dims are INT8 with per-32 FP32 scales."""
+    # V41_INT8: 512 int8 values per token, then 16 fp32 scales (one per 32 values).
+    tl.static_assert(DATA_BYTES == 512 and SCALE_BYTES == 64 and TILE_SIZE == 32)
+    token_id = tl.program_id(0).to(tl.int64)
+    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+    page_idx = loc // PAGE_SIZE
+    in_page = loc % PAGE_SIZE
+    page_byte_base = page_idx * BYTES_PER_PAGE
+    token_data_base = page_byte_base + in_page * DATA_BYTES
+    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
+    out_row_base = token_id * output_stride_0
+
+    offs = tl.arange(0, TILE_SIZE)
+    for tile_id in tl.static_range(NUM_SCALE_TILES):
+        # Load 32 INT8 values
+        data_off = token_data_base + tile_id * TILE_SIZE + offs
+        quant_vals = tl.load(buf_int8_ptr + data_off).to(tl.float32)
+
+        # Load 1 FP32 scale (token_scale_base is in bytes, buf_fp32_ptr is float32)
+        scale = tl.load(buf_fp32_ptr + token_scale_base // 4 + tile_id)
+
+        # Dequantize and store
+        out_off = out_row_base + tile_id * TILE_SIZE + offs
+        tl.store(
+            output_ptr + out_off,
+            (quant_vals * scale).to(output_ptr.dtype.element_ty),
+        )
+
+
+@triton.jit
 def _gather_dequant_requant_fp8_paged_kernel(
     output_ptr,
     buf_fp8_ptr,
@@ -566,9 +766,9 @@ def dequantize_k_cache_paged_ref(
     page_byte_base = page_idx * bytes_per_page
     token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
     scale_stride = (
-        FP8_SCALE_BYTES_PER_TOKEN
+        KVLayout.V4.scale_bytes
         if cache_format == DSV4KVCacheFormat.FP8
-        else INT8_SCALE_BYTES_PER_TOKEN
+        else KVLayout.V4.int8_scale_bytes
     )
     token_scale_base = page_byte_base + s_offset_bytes + in_page * scale_stride
 

@@ -30,12 +30,9 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     DSV4KVCacheFormat,
-    FP8_SCALE_BYTES_PER_TOKEN,
-    INT8_SCALE_BYTES_PER_TOKEN,
+    KVLayout,
     NOPE_DIM,
-    QUANT_GROUP_SIZE,
     ROPE_DIM,
-    VALUE_BYTES_PER_TOKEN,
     get_kv_cache_format,
 )
 
@@ -47,7 +44,7 @@ LOG2E = tl.constexpr(1.4426950408889634)
 _NOPE_DIM = NOPE_DIM
 _ROPE_DIM = ROPE_DIM
 _D = _NOPE_DIM + _ROPE_DIM  # 512
-_TOKEN_DATA_STRIDE = VALUE_BYTES_PER_TOKEN
+_TOKEN_DATA_STRIDE = KVLayout.V4.data_bytes
 
 
 @triton.autotune(
@@ -285,9 +282,9 @@ def _run_triton_sparse_decode(
         int(page_bytes),  # page_bytes (int64)
         int(page_size * _TOKEN_DATA_STRIDE),  # scale_section_off (int64)
         (
-            FP8_SCALE_BYTES_PER_TOKEN
+            KVLayout.V4.scale_bytes
             if cache_format == DSV4KVCacheFormat.FP8
-            else INT8_SCALE_BYTES_PER_TOKEN
+            else KVLayout.V4.int8_scale_bytes
         ),
         H,
         topk,
@@ -515,8 +512,8 @@ def _run_int8_sparse_decode(q, k_cache, indices, topk_length, attn_sink,
             STRIDE_QB=query.stride(0), STRIDE_QH=query.stride(1),
             STRIDE_IB=flat_indices.stride(0), HAS_LENGTH=length is not None,
             SPLITS=splits, BLOCK_H=32, BLOCK_T=32, num_warps=4, num_stages=1,
-            DATA_BYTES=VALUE_BYTES_PER_TOKEN, SCALE_BYTES=INT8_SCALE_BYTES_PER_TOKEN,
-            NOPE_DIM=_NOPE_DIM, GROUP_SIZE=QUANT_GROUP_SIZE,
+            DATA_BYTES=KVLayout.V4.data_bytes, SCALE_BYTES=KVLayout.V4.int8_scale_bytes,
+            NOPE_DIM=_NOPE_DIM, GROUP_SIZE=KVLayout.V4.tile_size,
         )
         return values, lse
 

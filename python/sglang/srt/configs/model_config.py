@@ -279,6 +279,11 @@ def is_deepseek_v4(config) -> bool:
         "DeepseekV4ForCausalLMDSpark",
     )
 
+
+def is_deepseek_v41(config) -> bool:
+    return _hf_attr(config, "model_type") == "deepseek_v41"
+
+
 def is_glm5_3(config) -> bool:
     return _hf_arch(config) in (
         "Glm5NextForConditionalGeneration",

@@ -89,7 +89,8 @@ template <
     ForwardMode kMode,
     int32_t kPageBits,
     bool kUsePDL,
-    int32_t kPreshuffleSize = 0>
+    int32_t kPreshuffleSize = 0,
+    bool kUseHadamard = true>
 INDEXER_KERNEL void fused_norm_rope_indexer(const FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
@@ -182,8 +183,11 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const FusedNormRopeStoreParams param
     data[3] = y_real * freq_y_imag + y_imag * freq_y_real;
   }
 
-  // part 3: hadamard transform
-  {
+  // part 3: hadamard transform. The V4 route applies the full 128-dim
+  // rotation; the V4.1 reference indexer (dsv41_sparse) has no Hadamard on
+  // either Q or K, so kUseHadamard=false skips this whole block and stores
+  // the norm+rope vector directly.
+  if constexpr (kUseHadamard) {
     // Stage 1: butterfly (data[0], data[1]) and (data[2], data[3]).
     {
       const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];
@@ -620,7 +624,8 @@ template <
     int64_t kRopeDim,
     uint32_t kPageSize,
     bool kUsePDL,
-    int32_t kPreshuffleSize = 0>
+    int32_t kPreshuffleSize = 0,
+    bool kUseHadamard = true>
 struct FusedNormRopeKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr bool kIsIndexer = (kHeadDim == 128);
@@ -647,7 +652,7 @@ struct FusedNormRopeKernel {
   template <ForwardMode kMode>
   static constexpr auto select_kernel() {
     if constexpr (kIsIndexer) {
-      return fused_norm_rope_indexer<DType, CacheDType, kMode, kLogPageSize, kUsePDL, kPreshuffleSize>;
+      return fused_norm_rope_indexer<DType, CacheDType, kMode, kLogPageSize, kUsePDL, kPreshuffleSize, kUseHadamard>;
     } else {
       return fused_norm_rope_flashmla<DType, CacheDType, kMode, kLogPageSize, kUsePDL>;
     }

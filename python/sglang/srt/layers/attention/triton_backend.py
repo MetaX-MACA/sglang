@@ -48,6 +48,7 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_cuda_graph_max_batch_size,
     get_device_core_count,
     get_int_env_var,
     is_cuda,
@@ -204,6 +205,13 @@ class TritonAttnBackend(AttentionBackend):
         # Parse args
         self.skip_prefill = skip_prefill
         max_bs = model_runner.req_to_token_pool.size
+        if (
+            is_maca()
+            and model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dspark()
+        ):
+            # DP attention pads the draft graph beyond the real request count.
+            max_bs = get_cuda_graph_max_batch_size(max_bs)
         self.sliding_window_size = model_runner.sliding_window_size
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -248,13 +256,13 @@ class TritonAttnBackend(AttentionBackend):
             "mla_kv_cache_store_int8",
             False,
         )
-        # TODO: this logic should be fixed in non-hip platform
-        self.is_hip_dspark_draft = (
-            _is_hip
+        # HIP/MACA DSpark draft pools use replicated, widened virtual locs.
+        self.is_replicated_dspark_draft = (
+            (_is_hip or is_maca())
             and model_runner.is_draft_worker
             and model_runner.spec_algorithm.is_dspark()
         )
-        if self.is_hip_dspark_draft:
+        if self.is_replicated_dspark_draft:
             # Drafts never join the dcp group so we ignore it
             self.dcp_size = 1
             self.dcp_rank = 0
@@ -266,7 +274,7 @@ class TritonAttnBackend(AttentionBackend):
             // get_parallel().attn_tp_size
         ) * self.dcp_size
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            get_parallel().attn_tp_size, self.dcp_size
         )
         mla_config = model_runner.model_config
         self.use_dense_fp8_chunked_prefill = (

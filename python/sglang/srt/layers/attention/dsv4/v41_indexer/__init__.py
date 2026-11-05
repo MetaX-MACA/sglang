@@ -19,7 +19,6 @@ from .types import (
     DecodeInputs,
     PrefillCandidates,
     PrefillInputs,
-    Selection,
 )
 from sglang.srt.utils.common import is_maca
 from sglang.srt.environ import envs
@@ -36,7 +35,6 @@ __all__ = [
     "FullTopKIndexer",
     "PrefillCandidates",
     "PrefillInputs",
-    "Selection",
     "has_dense_fp4_indexer",
     "has_dense_int8_indexer",
     "is_sm100_or_newer",

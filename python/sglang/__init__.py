@@ -18,6 +18,12 @@ if _sys.platform == "darwin" and _platform.machine() == "arm64":
 
     _install_platform_stubs()
 
+# Set parent visibility before imports that can discover or initialize GPUs.
+from sglang._maca_device_order import maybe_configure_maca_devices
+
+maybe_configure_maca_devices()
+del maybe_configure_maca_devices
+
 from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
 
 _apply_hf_patches()

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
+    _deepseek_v4_kv_cache_layout,
     _deepseek_v4_index_cache_dtype,
     declare_resolution,
     model_config_of,
@@ -42,6 +43,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # its legacy slot.
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
+    run_post_process_pass(server_args, _deepseek_v4_kv_cache_layout)
     run_post_process_pass(server_args, _deepseek_v4_index_cache_dtype)
 
     if get_platform().is_maca:
@@ -254,7 +256,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend != "mooncake"
+            or cfg.disaggregation_transfer_backend not in ("mooncake", "fake")
             or (
                 (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
                 and not supported_prefill_cp
@@ -263,6 +265,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
+                "fake test backend, "
                 "DCP=1, and CP=1 on decode. Prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "

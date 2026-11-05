@@ -252,6 +252,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             require_mlp_tp_gather() and not self._forward_is_dp_local(model_runner)
         )
         self.require_attn_tp_gather = require_attn_tp_gather()
+        # Engram tables are row-sharded across the attention-DP group.  Their
+        # lookup gathers indices from every DP rank even when neither the MLP
+        # nor attention path otherwise requests a TP gather.  CUDA-graph
+        # capture must therefore keep the full per-rank token metadata.
+        self.require_engram_dp_gather = bool(
+            get_parallel().enable_dp_attention
+            and getattr(
+                model_runner.model_config.hf_text_config,
+                "engram_layer_ids",
+                None,
+            )
+        )
         # Composite predicates derive from the instance values so the dp-local
         # draft exemption above stays consistent (require_gathered_buffer ==
         # mlp_tp_gather or attn_tp_gather; require_mlp_sync adds dp attention).
@@ -418,7 +430,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             dp_size=self.dp_size,
             pp_size=self.pp_size,
             is_encoder_decoder=self.is_encoder_decoder,
-            require_mlp_tp_gather=self.require_mlp_tp_gather,
+            require_mlp_tp_gather=(
+                self.require_mlp_tp_gather or self.require_engram_dp_gather
+            ),
             seq_len_fill_value=self.seq_len_fill_value,
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_req=self.captured_req_width,
@@ -454,9 +468,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             is_encoder_decoder=self.is_encoder_decoder,
             encoder_len_fill_value=self.encoder_len_fill_value,
             enable_num_token_non_padded=enable_num_token_non_padded(),
-            require_gathered_buffer=self.require_gathered_buffer,
+            # Engram also consumes the per-rank token-count slots.  Mark them
+            # gathered for registry replay so every graph bucket refreshes the
+            # shared buffers with its own padded token count.
+            require_gathered_buffer=(
+                self.require_gathered_buffer or self.require_engram_dp_gather
+            ),
             enable_prefill_cp=self.enable_prefill_cp,
-            require_mlp_tp_gather=self.require_mlp_tp_gather,
+            require_mlp_tp_gather=(
+                self.require_mlp_tp_gather or self.require_engram_dp_gather
+            ),
             attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
             dp_size=self.dp_size,
             source=self.buffers,
@@ -583,7 +604,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return num_tokens if self.ragged_verify_mode else bs
 
     def _global_num_tokens_for_graph(self, num_tokens: int) -> Optional[list[int]]:
-        if self.require_mlp_tp_gather:
+        if self.require_mlp_tp_gather or self.require_engram_dp_gather:
             return [num_tokens] * self.dp_size
         if self.require_attn_tp_gather:
             return [num_tokens]
@@ -695,7 +716,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
-        if self.require_mlp_tp_gather:
+        # Every rank participating in an in-graph collective must replay the
+        # same graph bucket. Engram's row-sharded lookup performs its own DP
+        # gather/reduce-scatter even when the MLP path itself is DP-local.
+        if self.require_mlp_tp_gather or self.require_engram_dp_gather:
             cuda_graph_bs = self._max_dp_batch_size(forward_batch)
         else:
             cuda_graph_bs = forward_batch.batch_size
@@ -1360,7 +1384,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
         else:
             raw_num_token = raw_bs * self.captured_req_width
-            if self.require_mlp_tp_gather:
+            # Keep the replay bucket rank-uniform for both MLP and Engram
+            # collectives; otherwise ranks with different local batch sizes can
+            # replay graphs whose captured collective counts do not match.
+            if self.require_mlp_tp_gather or self.require_engram_dp_gather:
                 max_batch_size = self._max_dp_batch_size(forward_batch)
                 bs = self._pad_to_bucket(max_batch_size, self.capture_bs)
             else:

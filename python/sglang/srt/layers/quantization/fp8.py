@@ -1324,6 +1324,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
+        self.use_mxfp4_w4a8 = get_moe_runner_backend().is_mxfp4_w4a8()
+        if self.use_mxfp4_w4a8:
+            if not self.is_fp4_expert or not self.block_quant or self.use_mxfp8:
+                raise ValueError(
+                    "--moe-runner-backend mxfp4_w4a8 requires an FP4-expert "
+                    "checkpoint with block scales (expert_dtype=fp4)."
+                )
+            if self.dequant_fp4_to_fp8:
+                raise ValueError(
+                    "--moe-runner-backend mxfp4_w4a8 keeps weights in FP4; "
+                    "disable SGLANG_DSV4_FP4_DEQUANT."
+                )
+            if not get_moe_a2a_backend().is_none():
+                raise ValueError(
+                    "--moe-runner-backend mxfp4_w4a8 currently requires "
+                    "--moe-a2a-backend none (the MCTlass fused MoE path)."
+                )
         self.with_bias = False
         # The MxFP4 wrapper methods borrow this instance for weight loading;
         # they never call create_moe_runner, so moe_runner_config is unset.
@@ -1697,7 +1714,42 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = False
         logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
 
+    def _prepare_mxfp4_w4a8_scales(self, layer: Module) -> None:
+        # Unlike the similarly named helper in this module, this helper only
+        # factors scales; it does not expand the packed FP4 weights to FP8.
+        from sglang.srt.layers.quantization.mxfp4 import (
+            cast_e2m1fn_to_e4m3fn as factor_mxfp4_scales,
+        )
+
+        for name in ("w13", "w2"):
+            weight = getattr(layer, f"{name}_weight")
+            scale_param = getattr(layer, f"{name}_weight_scale_inv")
+            if weight.shape[1] % 128 or (weight.shape[2] * 2) % 128:
+                raise ValueError(
+                    "MCTlass MXFP4 W4A8 requires each expert GEMM's N and K "
+                    f"to be multiples of 128; got {name} packed shape "
+                    f"{tuple(weight.shape)}."
+                )
+            weight.data = weight.data.view(torch.int8)
+            # Fp8MoEMethod loads numeric FP32 scales in [E, N, K/32].
+            # Factor their E8M0 bytes BEFORE the W4A16/DeepGEMM transpose.
+            scales = scale_param.data
+            if scales.dtype != torch.uint8:
+                scales = scales.to(torch.float8_e8m0fnu).view(torch.uint8)
+            scale_b, scale_t = factor_mxfp4_scales(weight.data, scales)
+            setattr(layer, f"{name}_weight_scale_b", scale_b)
+            setattr(layer, f"{name}_weight_scale_t", scale_t)
+            scale_param.data = scales.transpose(1, 2).contiguous()
+
+        # W4A8 quantizes both GEMM inputs dynamically in fused MoE.
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if self.use_mxfp4_w4a8:
+            self._prepare_mxfp4_w4a8_scales(layer)
+            return
+
         if _use_aiter and self.is_fp4_expert:
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
             # claim the experts before the native-MXFP4 and dequant arms.
@@ -2811,6 +2863,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if (
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
+            or moe_runner_backend.is_mxfp4_w4a8()
             or moe_runner_backend.is_aiter()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
@@ -2825,6 +2878,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         use_rocm_mxfp8 = self.use_mxfp8 and _is_hip and _is_gfx95_supported
+        block_shape = [0, 32] if self.is_fp4_expert else self.weight_block_size
+        if self.use_mxfp4_w4a8:
+            block_shape = [128, 128]
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
@@ -2842,10 +2898,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ),
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            block_shape=(
-                [0, 32] if self.is_fp4_expert else self.weight_block_size
-            ),
+            block_shape=block_shape,
             is_fp4_experts=self.is_fp4_expert,
+            use_fp4_w4a8=self.use_mxfp4_w4a8,
+            w13_scale_b=layer.w13_weight_scale_b if self.use_mxfp4_w4a8 else None,
+            w13_scale_t=layer.w13_weight_scale_t if self.use_mxfp4_w4a8 else None,
+            w2_scale_b=layer.w2_weight_scale_b if self.use_mxfp4_w4a8 else None,
+            w2_scale_t=layer.w2_weight_scale_t if self.use_mxfp4_w4a8 else None,
         )
 
     def _process_npu_fp4_expert_weights(self, layer: torch.nn.Module) -> None:
@@ -3165,7 +3224,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         elif self.runner.runner_backend.is_hpc_ops():
             quant_info = self._get_hpc_ops_quant_info(layer)
-        elif self.runner.runner_backend.is_triton():
+        elif (
+            self.runner.runner_backend.is_triton()
+            or self.runner.runner_backend.is_mxfp4_w4a8()
+        ):
             quant_info = self.get_triton_quant_info(layer)
         else:
             raise NotImplementedError(
