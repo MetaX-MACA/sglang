@@ -585,6 +585,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     global_forward_mode: Optional[ForwardMode] = None
     is_dsa: bool = False
     is_ds_compressed: bool = False
+    is_kimi_k3: bool = False
 
     # Current layer-stack invocation; each TBO child owns a separate stream.
     residual_stream: Optional[ResidualStream] = None
@@ -1151,10 +1152,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         from sglang.srt.configs.model_config import (
             is_deepseek_dsa,
             is_deepseek_v4,
+            is_kimi_k3,
         )
 
         ret.is_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         ret.is_ds_compressed = is_deepseek_v4(model_runner.model_config.hf_config)
+        ret.is_kimi_k3 = is_kimi_k3(model_runner.model_config.hf_config)
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -1760,6 +1763,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.forward_mode.is_idle()
             and not self.is_dsa
             and not self.is_ds_compressed
+            and not self.is_kimi_k3
         )
 
         if (

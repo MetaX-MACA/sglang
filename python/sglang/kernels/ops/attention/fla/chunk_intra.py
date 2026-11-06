@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.fla.chunk_intra_token_parallel import (
+from mcoplib.triton_sglang_chunk_intra_token_parallel import (
     chunk_kda_fwd_intra_token_parallel,
 )
 from sglang.kernels.ops.attention.fla.index import (

@@ -80,6 +80,9 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
+import logging
+logger = logging.getLogger(__name__)
+import os
 
 if not (_is_npu or _is_hip) and _is_cuda:
     from sglang.kernels.ops.activation.activation import (
@@ -431,14 +434,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     hidden_states = self._run_masked_bf16_gemm(
                         runner_input, quant_info, running_state
                     )
-                elif quant_info.is_fp4_experts:
-                    hidden_states = self._run_masked_gemm_mx_fp4(
-                        runner_input, quant_info, running_state
-                    )
-                else:
+                elif weight_dtype == torch.float8_e4m3fn:
                     hidden_states = self._run_masked_gemm(
                         runner_input, quant_info, running_state
                     )
+                else:
+                    # Packed FP4 and quantized INT8 both use int8 storage.
+                    # Select the expert format before inspecting storage dtype.
+                    if getattr(quant_info, "is_fp4_experts", False) and quant_info.is_fp4_experts:
+                        hidden_states = self._run_masked_gemm_mx_fp4(
+                            runner_input, quant_info, running_state
+                        )
+                    else:
+                        assert weight_dtype == torch.int8, "weight_dtype expected torch.int8"
+                        hidden_states = self._run_masked_gemm_mx(
+                            runner_input, quant_info, running_state
+                        )
         return DeepGemmRunnerOutput(hidden_states=hidden_states)
 
     def _run_masked_int8_gemm(
@@ -1146,11 +1157,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             swiglu_limit_arg = self.swiglu_limit
 
         # Act
-        down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant_bf16(
-            gateup_output,
-            masked_m,
-            swiglu_limit_arg,
-        )
+        # Act
+        if self.config.activation == "situ":
+            down_input, down_input_scale = _varlen_deep_gemm_situ_mul_w4a16(
+                gateup_output=gateup_output,
+                masked_m=masked_m,
+                beta=self.config.gemm1_alpha,
+                linear_beta=self.config.gemm1_clamp_limit,
+            )
+        else:
+            down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant_bf16(
+                gateup_output,
+                masked_m,
+                swiglu_limit_arg,
+            )
         del gateup_output
 
         # GroupGemm-1
@@ -2047,6 +2067,31 @@ def _varlen_deep_gemm_silu_mul_quant_bf16(
     )
 
     silu_mul_mask(down_input, gateup_output, masked_m, swiglu_limit)
+
+    return down_input, None
+
+def _varlen_deep_gemm_situ_mul_w4a16(
+    gateup_output: torch.Tensor,
+    masked_m: Optional[torch.Tensor],
+    beta: float,
+    linear_beta: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    assert masked_m is not None
+    hidden_states_device = gateup_output.device
+    E, N, D_2 = gateup_output.shape
+    down_input = torch.empty(
+        (E, N, D_2 // 2),
+        device=hidden_states_device,
+        dtype=torch.bfloat16,
+    )
+    torch.ops._C.masked_situ_and_mul(
+        down_input,
+        gateup_output,
+        masked_m,
+        beta,
+        linear_beta,
+    )
 
     return down_input, None
 
