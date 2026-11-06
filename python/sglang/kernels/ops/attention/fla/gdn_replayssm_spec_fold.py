@@ -164,7 +164,8 @@ def commit_gdn_replayssm_fold_all_layers(
     V = rawv_cache.shape[-1]
     B = ssm_state_indices.shape[0]
     BK = triton.next_power_of_2(K)
-    BV = min(triton.next_power_of_2(V), 32)
+    # opt for C600U
+    BV = min(triton.next_power_of_2(V), 16)
     grid = (triton.cdiv(V, BV), B, HV * num_layers)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
     if has_track:
@@ -213,7 +214,7 @@ def commit_gdn_replayssm_fold_all_layers(
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         num_warps=1,
-        num_stages=3,
+        num_stages=1,
     )
 
 
