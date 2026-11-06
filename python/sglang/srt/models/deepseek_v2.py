@@ -1572,7 +1572,7 @@ class DeepseekV2MoE(nn.Module):
 
             def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
                 nonlocal shared_output
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(tensor_scale_tuple if (self.use_fused_quant and tensor_scale_tuple is not None) else hidden_states)
                 for handle in deepep_dispatch_hook_handle:
                     handle.remove()
 
