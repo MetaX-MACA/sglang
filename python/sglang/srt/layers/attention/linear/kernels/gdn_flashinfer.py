@@ -199,7 +199,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # MetaX and SM120 prefill require float32 initial state.
         self._prefill_needs_fp32_state = maca_backend or sm_major >= 12
         logger.info("FlashInfer GDN state pool enabled: %s", self.use_state_pool)
-        self.supports_target_verify = sm_major in (9, 10)
+        # Like the gates above: MACA reports capability major 8, so key off
+        # is_maca() rather than the SM version for its FlashInfer build.
+        self.supports_target_verify = sm_major in (9, 10) or maca_backend
         self._aligned_input_buffers: dict[tuple, torch.Tensor] = {}
         self._aligned_parameter_cache: dict[
             tuple, tuple[torch.Tensor, torch.Tensor]
