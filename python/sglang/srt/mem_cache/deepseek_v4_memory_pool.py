@@ -38,7 +38,13 @@ from sglang.srt.mem_cache.dsv4_index_cache import (
     get_dsv4_index_cache_type,
 )
 from sglang.srt.mem_cache.memory_pool import KVCache, get_tensor_size_bytes
-from sglang.srt.runtime_context import get_exec, get_memory, get_platform, get_spec
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_platform,
+    get_spec,
+)
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
 
 logger = logging.getLogger(__name__)
@@ -83,16 +89,51 @@ def get_compress_state_ring_size(compress_ratio: int, num_draft_tokens: int = 0)
         return 8 if compress_ratio == 4 else 128
 
 
-def resolve_compress_state_ring_size(compress_ratio: int) -> int:
-    """Ring size under the published spec config. The pool allocates by this
-    and the configurator budgets by it, so both must call the same function."""
+def _pd_peer_num_draft_tokens() -> int:
+    """Draft-token count of the PD decode peer, as declared on this process.
+
+    A PD prefill node normally runs without a draft model, but the rings it
+    allocates for the c4/c128 compress state and for the SWA window must match
+    the decode peer byte-for-byte: the PD transfer addresses the destination as
+    ``dst_ptr + dst_index * src_item_len`` and the ring is indexed by
+    ``position % ring_size``. Sizing them from the local (spec-free) config
+    makes the decode peer reject the session with
+    "swa item length mismatch".
+
+    ``SGLANG_PD_PEER_SPECULATIVE_NUM_DRAFT_TOKENS`` lets the prefill node
+    declare the peer's value without loading DSPARK/EAGLE itself. Returns 0
+    outside PD prefill or when unset, i.e. behavior is unchanged by default.
+    """
+    declared = int(envs.SGLANG_PD_PEER_SPECULATIVE_NUM_DRAFT_TOKENS.get() or 0)
+    if declared <= 0:
+        return 0
+    try:
+        if get_disagg().disaggregation_mode != "prefill":
+            return 0
+    except Exception:
+        # The disagg bag may not be published yet (pool budgeting runs early).
+        # Trust the explicit declaration so allocation and budgeting still agree.
+        return declared
+    return declared
+
+
+def _effective_num_draft_tokens() -> int:
+    """Local spec config, widened to the PD peer's when one is declared."""
     spec = get_spec()
-    num_draft_tokens = (
+    local = (
         0
         if spec.speculative_algorithm is None
         else spec.speculative_num_draft_tokens or 0
     )
-    return get_compress_state_ring_size(compress_ratio, num_draft_tokens)
+    return max(local, _pd_peer_num_draft_tokens())
+
+
+def resolve_compress_state_ring_size(compress_ratio: int) -> int:
+    """Ring size under the published spec config. The pool allocates by this
+    and the configurator budgets by it, so both must call the same function."""
+    return get_compress_state_ring_size(
+        compress_ratio, _effective_num_draft_tokens()
+    )
 
 
 def collect_sources_by_ratio(
@@ -128,8 +169,11 @@ def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
 
 def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
     # A verify batch writes its draft tokens ahead of the committed position.
-    spec_extra = (get_spec().speculative_num_draft_tokens - 1) if is_speculative else 0
-    return sliding_window + spec_extra
+    local = (get_spec().speculative_num_draft_tokens - 1) if is_speculative else 0
+    # PD prefill: reserve the same slack the decode peer's draft window needs,
+    # so both sides page the SWA ring identically (see _pd_peer_num_draft_tokens).
+    peer = _pd_peer_num_draft_tokens() - 1
+    return sliding_window + max(local, peer, 0)
 
 
 def resolve_unified_kv_fp8(unified_fp8: Optional[bool] = None) -> bool:

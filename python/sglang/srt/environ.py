@@ -724,6 +724,14 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
+    # DeepSeek-V4 PD only: declare the DECODE peer's speculative draft-token
+    # count on the PREFILL node. The prefill node does not load a draft model,
+    # but its compress-state rings (c4/c128) and SWA ring must have the same
+    # shape as the decode peer's, or the state transfer stride mismatches and
+    # the peer is rejected ("swa item length mismatch"). Set this to the same
+    # value as decode's --speculative-num-draft-tokens; 0 keeps today's
+    # behavior (rings sized from this process's own spec config).
+    SGLANG_PD_PEER_SPECULATIVE_NUM_DRAFT_TOKENS = EnvInt(5)
     # Deferred decode-side KV release: on abort, hold an in-flight request's KV
     # pages/slot until the prefill acks the transfer drained, or the timeout
     # below fires. Only applies to backends that ack the drain
