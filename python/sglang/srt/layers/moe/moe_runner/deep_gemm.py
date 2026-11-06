@@ -460,7 +460,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         assert quant_info.w13_weight.dtype == torch.int8
         assert quant_info.w2_weight.dtype == torch.int8
         assert quant_info.w13_scale is not None and quant_info.w2_scale is not None
-        num_groups, max_tokens, hidden_size = hidden_states.shape
+        num_groups, max_tokens, _ = hidden_states.shape
         gateup_width = quant_info.w13_weight.shape[1]
         gateup_output = torch.empty(
             (num_groups, max_tokens, gateup_width),
@@ -469,7 +469,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
         # Quantize each received expert row; DeepEP keeps its BF16 wire format.
         deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
-            per_token_quant_int8(hidden_states),
+            hidden_states if self.use_fused_quant
+            else per_token_quant_int8(hidden_states),
             (quant_info.w13_weight, quant_info.w13_scale),
             gateup_output,
             masked_m,
@@ -478,8 +479,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         down_input = silu_and_mul_masked(gateup_output, masked_m, self.swiglu_limit)
         del gateup_output
+        down_width = quant_info.w2_weight.shape[1]
         down_output = torch.empty(
-            (num_groups, max_tokens, hidden_size),
+            (num_groups, max_tokens, down_width),
             device=down_input.device,
             dtype=torch.bfloat16,
         )
@@ -492,6 +494,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
         dispose_tensor(down_input)
         return down_output
+
 
     def _run_masked_int8_int4_gemm(
         self,
