@@ -18,6 +18,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
@@ -1575,19 +1576,27 @@ class FlashAttentionBackend(AttentionBackend):
                     #     ver=self.fa_impl_ver,
                     #     **kwargs,
                     # )
+                # q is a slice of the fused QKV projection: its head dim
+                # carries a stride of the full qkv width while the innermost
+                # dim stays contiguous, which is all the kernel needs.
+                if q.stride(-1) == 1 and envs.SGLANG_ENABLE_FA_COPY_OPT.get():
+                    q_attn = q
+                else:
+                    q_attn = q.contiguous()
+
                 is_target_or_draft = (
                     forward_batch.forward_mode.is_target_verify()
                     or forward_batch.forward_mode.is_draft_extend_v2()
                 )
                 if is_target_or_draft:
-                    q_cp = q.contiguous().view(
+                    q_cp = q_attn.view(
                         page_table.shape[0],
                         -1,
                         layer.tp_q_head_num,
                         layer.head_dim,
                     )
                 else:
-                    q_cp = q.contiguous().view(
+                    q_cp = q_attn.view(
                         -1,
                         layer.tp_q_head_num,
                         layer.head_dim,

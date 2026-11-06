@@ -1034,6 +1034,11 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Use CPU-known metadata for regular eager/PCG paged prefill planning.
     SGLANG_FLASHINFER_FAST_PREFILL_PLAN = EnvBool(True)
+    # Skip the pure-layout device-to-device copies around attention: q is a
+    # slice of the fused QKV projection whose head dim carries a stride of the
+    # full qkv width, and both flash-attn and flashinfer only need the
+    # innermost dim contiguous. Opt-in.
+    SGLANG_ENABLE_FA_COPY_OPT = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset

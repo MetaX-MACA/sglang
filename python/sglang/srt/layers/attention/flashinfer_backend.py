@@ -1535,9 +1535,17 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
+        # q is a slice of the fused QKV projection: its head dim carries a
+        # stride of the full qkv width while the innermost dim stays
+        # contiguous, which is all the kernel needs.
+        if q.stride(-1) == 1 and envs.SGLANG_ENABLE_FA_COPY_OPT.get():
+            q_attn = q
+        else:
+            q_attn = q.contiguous()
+
         # Call the wrapped function
         o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            q_attn.view(-1, layer.tp_q_head_num, layer.head_dim),
             kv_cache,
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
