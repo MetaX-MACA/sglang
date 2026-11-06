@@ -4242,7 +4242,13 @@ class DeepseekV4Model(nn.Module):
                 if not (
                     get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
                 ):
-                    input_ids_global = tail.rows(input_ids_global)
+                    # CP gathers the MoE input across ranks, so its per-token ids
+                    # cannot be selected with this rank's local tail indices.
+                    input_ids_global = (
+                        tail.global_rows(forward_batch.input_ids)
+                        if tail.cp_metadata is not None
+                        else tail.rows(input_ids_global)
+                    )
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
@@ -4652,15 +4658,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             and not getattr(config, "language_model_only", False)
         ):
             if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
+                get_parallel().pp_group.world_size != 1
                 or not (
                     get_moe_a2a_backend().is_none()
                     or (_is_cuda and get_moe_a2a_backend().is_megamoe())
                 )
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "V4.1 vision supports TP/EP/DP/CP without PP; "
                     "MoE A2A requires CUDA MegaMoE"
                 )
 
