@@ -12,6 +12,7 @@ from sglang.kernels.jit.utils import (
     cache_once,
     get_jit_cuda_arch,
     is_arch_support_pdl,
+    is_maca_runtime,
     load_jit,
     is_maca_runtime,
 )
