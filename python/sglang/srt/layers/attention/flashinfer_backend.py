@@ -283,12 +283,20 @@ def fast_prefill_plan(
         head_dim_qk,
         head_dim_vo,
         causal,
-        #window_left,
-        #fixed_split_size if fixed_split_size is not None else -1,
-        #False,  # disable_split_kv
-        #0,  # num_colocated_ctas
     ]
-    self._plan_info = self._cached_module.plan(*args)
+    # The trailing optional args plan() takes differ per FlashInfer build: try
+    # the longer fa2 signature first and fall back to the base one.
+    try:
+        self._plan_info = self._cached_module.plan(
+            *args,
+            window_left,
+            fixed_split_size if fixed_split_size is not None else -1,
+            False,  # disable_split_kv
+            0,  # num_colocated_ctas
+            0,  # uniform_q_len
+        )
+    except TypeError:
+        self._plan_info = self._cached_module.plan(*args)
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -2744,8 +2752,7 @@ def fast_decode_plan(
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
 
             try:
-                # Make sure we pass exactly 15 arguments for tensor core version
-                self._plan_info = self._cached_module.plan(
+                plan_args = [
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
                     self._pin_memory_int_workspace_buffer,
@@ -2761,9 +2768,25 @@ def fast_decode_plan(
                     head_dim,
                     head_dim,
                     False,  # causal
-                    *((fixed_split_size, disable_split_kv)
-                      if getattr(self, "_backend", None) == "fa2" else ()),
-                )
+                ]
+                if getattr(self, "_backend", None) == "fa2":
+                    # Trailing optional args differ per FlashInfer build: try
+                    # the longer signature first, fall back to the base one.
+                    try:
+                        self._plan_info = self._cached_module.plan(
+                            *plan_args,
+                            window_left,
+                            fixed_split_size,
+                            disable_split_kv,
+                            0,  # num_colocated_ctas
+                            0,  # uniform_q_len
+                        )
+                    except TypeError:
+                        self._plan_info = self._cached_module.plan(
+                            *plan_args, fixed_split_size, disable_split_kv
+                        )
+                else:
+                    self._plan_info = self._cached_module.plan(*plan_args)
             except Exception as e:
                 raise RuntimeError(f"Error in standard plan: {e}")
         else:
@@ -2932,7 +2955,7 @@ def fast_eager_prefill_plan(
 
     total_num_rows = int(qo_indptr_host[-1])
     wrapper._qo_indptr_last = total_num_rows
-    wrapper._plan_info = cached_module.plan(
+    plan_args = [
         wrapper._float_workspace_buffer,
         wrapper._int_workspace_buffer,
         wrapper._pin_memory_int_workspace_buffer,
@@ -2948,8 +2971,15 @@ def fast_eager_prefill_plan(
         head_dim_qk,
         head_dim_qk,
         False,  # causal; forward() supplies the real flag at call time
-        *wrapper._fast_prefill_plan_extra_args,
-    )
+    ]
+    # Trailing optional args differ per FlashInfer build: try the longer fa2
+    # signature first, fall back to the one the wrapper advertises.
+    try:
+        wrapper._plan_info = cached_module.plan(*plan_args, -1, -1, False, 0, 0)
+    except TypeError:
+        wrapper._plan_info = cached_module.plan(
+            *plan_args, *wrapper._fast_prefill_plan_extra_args
+        )
 
     # Mirror the cached state tail of plan(). forward() overwrites the
     # per-call fields (causal / window_left / ...) before ``run``.
