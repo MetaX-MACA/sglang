@@ -253,10 +253,10 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
   // PDL trigger secondary at the end the block typically has no use, so ignore it
 }
 
-#ifdef USE_ROCM
+// #ifdef USE_ROCM
 // Only the ROCm DSA prefill emits this layout today, so CUDA/XPU builds stay
 // unchanged. Nothing below is AMD-specific; the guard can be dropped later.
-
+// Packed DSA extend layout.
 /**
  * \brief Parameters of the packed (DSA extend) layout.
  *
@@ -348,7 +348,7 @@ TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams par
   __syncthreads();
   paged_transform<TopKMode::PAGE_TABLE>(problem, out, transform);
 }
-#endif  // USE_ROCM
+// #endif  // USE_ROCM
 
 /**
  * \brief Main kernel for the short items and epilogue of long items.
@@ -1235,7 +1235,7 @@ struct TopKKernel {
         .launch(topk_ragged_kernel<kUsePDL>, params);
   }
 
-#ifdef USE_ROCM  // see the packed kernel above
+// #ifdef USE_ROCM  // see the packed kernel above
   /**
    * \brief Packed (DSA extend prefill) variant of `transform_paged`: per-row
    * window inside one batch-global score buffer, page-table output, no plan.
@@ -1321,7 +1321,7 @@ struct TopKKernel {
         .config({.use_pdl = kUsePDL})
         .launch(topk_packed_kernel<kUsePDL>, params);
   }
-#endif  // USE_ROCM
+// #endif  // USE_ROCM
 };
 
 }  // namespace sglang

@@ -53,11 +53,12 @@ def _jit_topk_v2_module():
     wrappers = [
         ("topk_transform_paged", f"{kernel}::transform_paged"),
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
+        ("topk_transform_packed", f"{kernel}::transform_packed"),
         ("topk_plan", f"{kernel}::plan"),
     ]
-    if is_hip_runtime():
-        # transform_packed only exists under USE_ROCM, see topk_v2.cuh
-        wrappers.append(("topk_transform_packed", f"{kernel}::transform_packed"))
+    # if is_hip_runtime():
+    #     # transform_packed only exists under USE_ROCM, see topk_v2.cuh
+    #     wrappers.append(("topk_transform_packed", f"{kernel}::transform_packed"))
     return load_jit(
         make_name("topk_v2"),
         *args,
@@ -321,7 +322,7 @@ def topk_transform_packed_v2(
     builds are untouched. Nothing in it is AMD-specific -- no non-ROCm caller
     produces this layout today.
     """
-    assert is_hip_runtime(), "topk_transform_packed_v2 is compiled under USE_ROCM only"
+    # assert is_hip_runtime(), "topk_transform_packed_v2 is compiled under USE_ROCM only"
     module = _jit_topk_v2_module()
     module.topk_transform_packed(
         scores,

@@ -4178,6 +4178,7 @@ class HybridLinearKVPool(KVCache):
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
+        kv_scale_ue8m0: bool = False,
         # When provided (shared-KV-pool path), use this pool for the
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
@@ -4252,6 +4253,7 @@ class HybridLinearKVPool(KVCache):
                 index_kpool_compress=index_kpool_compress,
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
+                kv_scale_ue8m0=kv_scale_ue8m0,
                 skip_topk_layers=skip_topk_layers,
             )
         else:
@@ -4309,6 +4311,10 @@ class HybridLinearKVPool(KVCache):
     @property
     def dsa_kv_cache_is_quantized(self) -> bool:
         return self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8
+
+    @property
+    def kv_scale_ue8m0(self) -> bool:
+        return getattr(self.full_kv_pool, "kv_scale_ue8m0", False)
 
     @property
     def kv_cache_dim(self):
@@ -4678,6 +4684,9 @@ class HybridLinearKVPool(KVCache):
 
 
 class MLATokenToKVPool(KVCache):
+    # fp8_ds_mla tile scales rounded up to powers of two (Kimi-K3.1)
+    kv_scale_ue8m0 = False
+
     def __init__(
         self,
         size: int,
@@ -4880,7 +4889,12 @@ class MLATokenToKVPool(KVCache):
             self.write_loc_is_dcp_resolved
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
         ), "the DSA write paths have no resolved-loc variant"
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
+        if (
+            _is_hip
+            and self.use_dsa
+            and self.dtype == fp8_dtype
+            and not self.dsa_kv_cache_store_fp8
+        ):
             # HIP TileLang FP8 consumes the model's raw MLA layout
             # (NoPE + optional RoPE) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
@@ -4901,7 +4915,7 @@ class MLATokenToKVPool(KVCache):
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
             cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
-                cache_k_nope, cache_k_rope
+                cache_k_nope, cache_k_rope, scale_ue8m0=self.kv_scale_ue8m0
             )
 
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
@@ -5213,11 +5227,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         dcp_replicated: bool = False,
+        kv_scale_ue8m0: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
-
         super().__init__(
             size,
             page_size,
@@ -5235,6 +5249,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
+        self.kv_scale_ue8m0 = kv_scale_ue8m0
         self.index_head_dim = index_head_dim
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
