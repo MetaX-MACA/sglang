@@ -514,9 +514,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         """W4A8 MoE for DeepEP's low-latency masked expert layout."""
-        if self.config.activation != "silu":
+        if self.config.activation not in ("silu", "situ"):
             raise NotImplementedError(
-                "MACA W4A8 masked GEMM currently supports SiLU only"
+                "MACA W4A8 masked GEMM supports SiLU and SiTU only"
             )
         if not is_maca():
             raise NotImplementedError("W4A8 masked GEMM requires MACA mctlassEx")
@@ -544,6 +544,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         gateup_width = w13_weight.shape[1]
         assert w13_weight.shape[0] == num_groups
         assert w2_weight.shape[0] == num_groups
+        if self.config.activation == "situ":
+            input_width = w13_weight.shape[2] * 2
+            packed_input_width = (input_width // 2 + 257) // 256 * 256
+            assert hidden_states.shape[2] == packed_input_width, (
+                "W4A8 gate/up packed activation width mismatch: expected "
+                f"{packed_input_width} BF16 elements for K={input_width}, "
+                f"got {hidden_states.shape[2]}"
+            )
+            assert w13_scale.shape == (num_groups, gateup_width, 1), (
+                "DeepGEMM W4A8 requires per-channel w13 scales shaped [E, N, 1], "
+                f"got {tuple(w13_scale.shape)}"
+            )
+            assert w2_scale.shape == (num_groups, w2_weight.shape[1], 1), (
+                "DeepGEMM W4A8 requires per-channel w2 scales shaped [E, N, 1], "
+                f"got {tuple(w2_scale.shape)}"
+            )
         # Both the GEMM and fused activation skip rows outside masked_m.
         gateup_output = torch.empty(
             (num_groups, max_tokens, gateup_width),
@@ -569,11 +585,24 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             "W4A8 down-projection K mismatch: packed weight has "
             f"{w2_weight.shape[2]} bytes, activation K={down_width}"
         )
-        from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked
+        if self.config.activation == "situ":
+            from sglang.kernels.ops.activation import masked_situ_quant_int8_pack
 
-        down_input_packed = silu_and_mul_masked(
-            gateup_output, masked_m, self.swiglu_limit
-        )
+            beta = self.config.gemm1_alpha
+            linear_beta = self.config.gemm1_clamp_limit
+            assert beta is not None
+            down_input_packed = masked_situ_quant_int8_pack(
+                gateup_output,
+                masked_m,
+                beta=beta,
+                linear_beta=linear_beta,
+            )
+        else:
+            from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked
+
+            down_input_packed = silu_and_mul_masked(
+                gateup_output, masked_m, self.swiglu_limit
+            )
         del gateup_output
 
         output_width = w2_weight.shape[1]
