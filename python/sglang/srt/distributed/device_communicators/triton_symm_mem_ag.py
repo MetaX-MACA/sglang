@@ -445,6 +445,37 @@ def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
     except Exception:
         return floor
 
+def _tp_clique_peer_ok(tp_group):
+    """True iff every pair of dies in the TP group is bidirectional P2P.
+    Collective-safe: every rank computes the same boolean via all_reduce on
+    an int flag, so all ranks agree to enable/disable multimem together
+    (avoids partial-rank symm_mem.rendezvous hang on non-clique topologies)."""
+    try:
+        ws = tp_group.world_size
+        if ws <= 1:
+            return True
+        local_ok = 1
+        try:
+            import torch.distributed as dist
+            my_rank = tp_group.rank_in_group
+            cur = torch.cuda.current_device()
+            for peer in range(ws):
+                if peer == my_rank:
+                    continue
+                try:
+                    if not torch.cuda.can_device_access_peer(cur, peer):
+                        local_ok = 0
+                        break
+                except Exception:
+                    local_ok = 0
+                    break
+        except Exception:
+            local_ok = 0
+        t = torch.tensor(local_ok, dtype=torch.int32, device="cuda")
+        dist.all_reduce(t, group=tp_group.device_group, op=dist.ReduceOp.MIN)
+        return int(t.item()) == 1
+    except Exception:
+        return False
 
 class MultimemAllGatherer:
     """Guarded multimem all-gather (last dim) with NCCL fallback; the single
@@ -531,6 +562,11 @@ class MultimemAllGatherer:
 
             tp_group = get_tp_group()
             if tp_group.world_size <= 1:
+                return None
+            if not _tp_clique_peer_ok(tp_group):
+                logger.warning(
+                    "multimem all-gather disabled (TP group not a P2P clique); fallback to NCCL (patch-sglang-p2p)"
+                )
                 return None
             state = create_state(
                 group=tp_group.device_group,
