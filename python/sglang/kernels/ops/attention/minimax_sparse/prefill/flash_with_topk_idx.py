@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_maca
 
 from ..common.utils import (
     _bitonic_merge,
@@ -22,6 +22,22 @@ from ..common.utils import (
 _MAX_PER_PAGE_SLOT_UNROLL = 2
 
 
+def _prune_prefill_configs(configs, named_args, **kwargs):
+    # Each program emits scores for whole sparse blocks. A smaller K tile
+    # would violate the kernel's block-score reshape and static assertion.
+    args = {**named_args, **kwargs}
+    use_small_tiles = (
+        is_maca()
+        and not args["IS_FP8"]
+        and args["q_ptr"].dtype in (torch.float16, torch.bfloat16)
+    )
+    return [
+        config for config in configs
+        if config.kwargs["BLOCK_SIZE_K"] >= args["block_size"]
+        and (config.kwargs["BLOCK_SIZE_Q"] == 16) == use_small_tiles
+    ]
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"]),
@@ -31,6 +47,12 @@ _MAX_PER_PAGE_SLOT_UNROLL = 2
 )
 @triton.autotune(
     configs=[
+        *(
+            [triton.Config(
+                {"BLOCK_SIZE_Q": 16, "BLOCK_SIZE_K": 128}, num_warps=4, num_stages=1
+            )]
+            if is_maca() else []
+        ),
         # Small block (64x64): low shared mem, can use higher num_stages
         triton.Config(
             {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 64}, num_warps=4, num_stages=2
@@ -69,7 +91,9 @@ _MAX_PER_PAGE_SLOT_UNROLL = 2
         "use_gumbel_topk",
         "SCORE_TYPE",
         "DISABLE_INDEX_VALUE",
+        "IS_FP8",
     ],
+    prune_configs_by={"early_config_prune": _prune_prefill_configs},
 )
 @triton.jit
 def _flash_attn_fwd_with_block_score_kernel(

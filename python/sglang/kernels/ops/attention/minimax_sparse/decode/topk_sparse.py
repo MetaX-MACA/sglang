@@ -6,12 +6,19 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_maca
+
 from ..common.utils import (
     check_sparse_kv_fp8,
     robust_allocator,
     sparse_out_dtype,
     unit_scale,
 )
+
+
+def _prune_sparse_decode_configs(configs, named_args, **kwargs):
+    sub_k = kwargs.get("SUB_K", named_args.get("SUB_K", 0))
+    return [config for config in configs if (config.num_stages == 1) == (sub_k > 0)]
 
 
 @triton.heuristics(
@@ -27,12 +34,20 @@ from ..common.utils import (
     }
 )
 @triton.autotune(
-    configs=[
+    configs=[triton.Config({}, num_warps=4, num_stages=1)] + [
         triton.Config({}, num_warps=nw, num_stages=ns)
         for nw in [4, 8]
         for ns in [2, 3, 4, 5]
     ],
-    key=["BATCH_SIZE_BUCKET", "gqa_group_size", "head_dim", "block_size", "HAS_SINK"],
+    key=[
+        "BATCH_SIZE_BUCKET",
+        "gqa_group_size",
+        "head_dim",
+        "BLOCK_SIZE_N",
+        "SUB_K",
+        "HAS_SINK",
+    ],
+    prune_configs_by={"early_config_prune": _prune_sparse_decode_configs},
 )
 @triton.jit
 def _gqa_share_sparse_decode_kernel(
@@ -88,6 +103,7 @@ def _gqa_share_sparse_decode_kernel(
     BATCH_SIZE_BUCKET: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    SUB_K: tl.constexpr,
     PAGED_CONTIG: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
@@ -122,7 +138,9 @@ def _gqa_share_sparse_decode_kernel(
     real_topk = tl.sum(valid_idx != -1, axis=0)
     chunk_end_topk = tl.minimum(chunk_end_topk_compiletime, real_topk)
     # init pointer
-    off_n = tl.arange(0, BLOCK_SIZE_N)
+    TILE_K: tl.constexpr = SUB_K if SUB_K > 0 else BLOCK_SIZE_N
+    tl.static_assert(BLOCK_SIZE_N % TILE_K == 0)
+    off_n = tl.arange(0, TILE_K)
     off_d = tl.arange(0, BLOCK_SIZE_D)
     dim_mask = off_d < head_dim
     # init statistics — kept at -inf so empty chunks (chunk_start >= real_topk)
@@ -172,89 +190,94 @@ def _gqa_share_sparse_decode_kernel(
         # load index
         c = tl.load(cur_idx_ptr).to(tl.int32) * BLOCK_SIZE_N
         cur_idx_ptr = cur_idx_ptr + stride_ti_t
-        pos = c + off_n
-        pos_mask = pos < seq_len
-        if HAS_HISPARSE_SLOTS:
-            slots = tl.load(
-                hisparse_slots_ptr
-                + pid_kh * hisparse_slots_stride_h
-                + pid_b * hisparse_slots_stride_b
-                + hisparse_topk_counter * BLOCK_SIZE_N
-                + off_n,
-                mask=off_n < BLOCK_SIZE_N,
-                other=0,
-            ).to(tl.int64)
-            hisparse_topk_counter = hisparse_topk_counter + 1
-            slots = (slots + max_slots) % max_slots  # safety against negative
-        elif PAGED_CONTIG:
-            # A block lies inside one page, and slots are contiguous within a page,
-            # so the block's first slot fixes the whole tile.
-            base_slot = tl.load(
-                req_to_token_ptr + sid * stride_r2t_b + c, mask=c < seq_len, other=0
-            ).to(tl.int64)
-            base_slot = (base_slot + max_slots) % max_slots
-            slots = base_slot + off_n.to(tl.int64)
-        else:
-            slots = tl.load(
-                req_to_token_ptr + sid * stride_r2t_b + pos,
-                mask=pos_mask,
-                other=0,
-            ).to(tl.int64)
-            slots = (slots + max_slots) % max_slots  # safety against negative
-        # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
-        k_off = (
-            slots[None, :] * stride_k_s
-            + pid_kh * stride_k_h
-            + off_d[:, None] * stride_k_d
-        )
-        k = tl.load(
-            k_cache_ptr + k_off,
-            mask=dim_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        )
-        if IS_FP8:
-            # fp8 KV cache: with bf16/fp16 Q this widens K to the compute dtype
-            # (unit-scaled cache -> exact inverse dequant; k_scale covers
-            # calibrated caches). With fp8 Q (fp8 attn-GEMM mode) the cast is a
-            # no-op and tl.dot below runs fp8x8 on tensor cores. Matches the
-            # bf16 path bit-for-bit when the cache is bf16 (IS_FP8 False ->
-            # this branch is compiled out).
-            k = k.to(q.dtype)
-        # load V as (BLOCK_SIZE_N, head_dim) via indirect addressing
-        v_off = (
-            slots[:, None] * stride_v_s
-            + pid_kh * stride_v_h
-            + off_d[None, :] * stride_v_d
-        )
-        v = tl.load(
-            v_cache_ptr + v_off,
-            mask=pos_mask[:, None] & dim_mask[None, :],
-            other=0.0,
-        )
-        if IS_FP8:
-            # Cast V to the compute dtype. With bf16/fp16 Q this widens (so the
-            # `p.to(v.dtype)` below keeps P in the compute dtype); with fp8 Q it
-            # is a no-op and P is quantized to e4m3 for the fp8 PV MMA — the
-            # same accuracy contract as fmha_sm100's fp8 kernel.
-            v = v.to(q.dtype)
-        # compute qk
-        qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
-        qk += tl.where(off_n[None, :] < seq_len - c, 0, float("-inf"))
-        # [H, D], [D, N] -> [H, N]
-        qk += tl.dot(q, k) * (sm_scale * k_scale)
-        # compute m_ij and l_ij
-        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp(qk - m_ij[:, None])
-        l_ij = tl.sum(p, axis=1)
-        # scale acc_o
-        acc_o_scale = tl.exp(m_i - m_ij)
-        acc_o = acc_o * acc_o_scale[:, None]
-        # load v and update acc_o
-        # [H, N], [N, D] -> [H, D]
-        acc_o += tl.dot(p.to(v.dtype), v) * v_scale
-        # update statistics
-        m_i = m_ij
-        lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
+        # Match the upstream prefill SUB_K path: the sparse block ID keeps its
+        # original width while each QK/PV operation handles a smaller tile.
+        for sub_i in range(BLOCK_SIZE_N // TILE_K):
+            tile_offset = sub_i * TILE_K + off_n
+            pos = c + tile_offset
+            pos_mask = pos < seq_len
+            if HAS_HISPARSE_SLOTS:
+                slots = tl.load(
+                    hisparse_slots_ptr
+                    + pid_kh * hisparse_slots_stride_h
+                    + pid_b * hisparse_slots_stride_b
+                    + hisparse_topk_counter * BLOCK_SIZE_N
+                    + tile_offset,
+                    mask=pos_mask,
+                    other=0,
+                ).to(tl.int64)
+                slots = (slots + max_slots) % max_slots  # safety against negative
+            elif PAGED_CONTIG:
+                # A block lies inside one page, and slots are contiguous within a page,
+                # so the block's first slot fixes the whole tile.
+                base_slot = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + c, mask=c < seq_len, other=0
+                ).to(tl.int64)
+                base_slot = (base_slot + max_slots) % max_slots
+                slots = base_slot + tile_offset.to(tl.int64)
+            else:
+                slots = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + pos,
+                    mask=pos_mask,
+                    other=0,
+                ).to(tl.int64)
+                slots = (slots + max_slots) % max_slots  # safety against negative
+            # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
+            k_off = (
+                slots[None, :] * stride_k_s
+                + pid_kh * stride_k_h
+                + off_d[:, None] * stride_k_d
+            )
+            k = tl.load(
+                k_cache_ptr + k_off,
+                mask=dim_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            )
+            if IS_FP8:
+                # fp8 KV cache: with bf16/fp16 Q this widens K to the compute dtype
+                # (unit-scaled cache -> exact inverse dequant; k_scale covers
+                # calibrated caches). With fp8 Q (fp8 attn-GEMM mode) the cast is a
+                # no-op and tl.dot below runs fp8x8 on tensor cores. Matches the
+                # bf16 path bit-for-bit when the cache is bf16 (IS_FP8 False ->
+                # this branch is compiled out).
+                k = k.to(q.dtype)
+            # load V as (BLOCK_SIZE_N, head_dim) via indirect addressing
+            v_off = (
+                slots[:, None] * stride_v_s
+                + pid_kh * stride_v_h
+                + off_d[None, :] * stride_v_d
+            )
+            v = tl.load(
+                v_cache_ptr + v_off,
+                mask=pos_mask[:, None] & dim_mask[None, :],
+                other=0.0,
+            )
+            if IS_FP8:
+                # Cast V to the compute dtype. With bf16/fp16 Q this widens (so the
+                # `p.to(v.dtype)` below keeps P in the compute dtype); with fp8 Q it
+                # is a no-op and P is quantized to e4m3 for the fp8 PV MMA — the
+                # same accuracy contract as fmha_sm100's fp8 kernel.
+                v = v.to(q.dtype)
+            # compute qk
+            qk = tl.zeros((BLOCK_SIZE_H, TILE_K), dtype=tl.float32)
+            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+            # [H, D], [D, N] -> [H, N]
+            qk += tl.dot(q, k) * (sm_scale * k_scale)
+            # compute m_ij and l_ij
+            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+            m_safe = tl.where(m_ij == float("-inf"), 0.0, m_ij)
+            p = tl.exp(qk - m_safe[:, None])
+            l_ij = tl.sum(p, axis=1)
+            # scale acc_o
+            acc_o_scale = tl.exp(m_i - m_safe)
+            acc_o = acc_o * acc_o_scale[:, None]
+            # load v and update acc_o
+            # [H, N], [N, D] -> [H, D]
+            acc_o += tl.dot(p.to(v.dtype), v) * v_scale
+            # update statistics
+            m_i = m_ij
+            lse_i = m_safe + tl.log(tl.exp(lse_i - m_safe) + l_ij)
+        hisparse_topk_counter = hisparse_topk_counter + 1
     # final scale (matches the old non-split kernel for chunks where lse_i>-inf).
     # For empty chunks (chunk_start_topk >= real_topk) the inner loop never
     # runs, so m_i = lse_i = -inf and naive `tl.exp(m_i - lse_i)` would compute
@@ -325,8 +348,9 @@ def _merge_topk_attn_out_kernel(
     # standard flash-decoding merge in linear (not log2) space, matching the
     # decode kernel which uses tl.exp / tl.log.
     lse_max = tl.max(lse, axis=0)
-    weights = tl.exp(lse - lse_max)
-    weights = weights / tl.sum(weights, axis=0)
+    weights = tl.exp(lse - tl.where(lse_max > float("-inf"), lse_max, 0.0))
+    weight_sum = tl.sum(weights, axis=0)
+    weights = weights / tl.where(weight_sum > 0, weight_sum, 1.0)
     o_merged = tl.sum(o * weights[:, None], axis=0)
     o_out_ptrs = o_ptr + pid_b * stride_o_b + pid_h * stride_o_h + off_d * stride_o_d
     tl.store(o_out_ptrs, o_merged.to(o_ptr.dtype.element_ty), mask=off_d < head_dim)
@@ -389,13 +413,26 @@ def flash_decode_with_gqa_share_sparse(
         min(max_topk, TARGET_GRID // max(1, batch_size * num_kv_heads)),
     )
     NUM_TOPK_CHUNKS = 1 << (target.bit_length() - 1)
+    # MACA supports this same tiled path on C500 and C600. Bound the KV
+    # working set independently of the 128-token sparse selection granularity.
+    sub_k = (
+        16
+        if (
+            is_maca()
+            and block_size == 128
+            and head_dim == 128
+            and q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+        )
+        else 0
+    )
+    output_dtype = sparse_out_dtype(q)
     # output tensor: split-K partials, merged into chunk 0 by the merge kernel
     o_partial = torch.empty(
         NUM_TOPK_CHUNKS,
         batch_size,
         num_q_heads,
         head_dim,
-        dtype=sparse_out_dtype(q),
+        dtype=torch.float32 if sub_k else output_dtype,
         device=q.device,
     )
     lse_partial = torch.empty(
@@ -453,6 +490,7 @@ def flash_decode_with_gqa_share_sparse(
         lse_partial.stride(1),
         lse_partial.stride(2),
         BLOCK_SIZE_N=block_size,
+        SUB_K=sub_k,
         PAGED_CONTIG=paged_contig,
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
@@ -472,4 +510,4 @@ def flash_decode_with_gqa_share_sparse(
         lse_partial.stride(2),
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
     )
-    return o_partial[0].contiguous()
+    return o_partial[0].to(output_dtype).contiguous()
