@@ -571,15 +571,44 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=down_input_packed.device,
                 dtype=torch.bfloat16,
             )
-        gemm(
-            [max_tokens, output_width, w2_weight.shape[-1] * 2],
-            down_input_packed.view(torch.int8),
-            w2_weight,
-            down_output,
-            masked_m,
-            A_packed=True,
-            scale_b=w2_scale,
-        )
+
+        down_gemm_overlap_args = running_state.get("down_gemm_overlap_args")
+        if down_gemm_overlap_args is None:
+            gemm(
+                [max_tokens, output_width, w2_weight.shape[-1] * 2],
+                down_input_packed.view(torch.int8),
+                w2_weight,
+                down_output,
+                masked_m,
+                A_packed=True,
+                scale_b=w2_scale,
+            )
+        else:
+            meta_overlap_args = running_state.get("meta_overlap_args")
+            if meta_overlap_args is None:
+                raise RuntimeError(
+                    "W4A8 SBO down GEMM requires meta_overlap_args"
+                )
+
+            down_gemm_overlap_args.start_event.record()
+            gemm(
+                [max_tokens, output_width, w2_weight.shape[-1] * 2],
+                down_input_packed.view(torch.int8),
+                w2_weight,
+                down_output,
+                masked_m,
+                A_packed=True,
+                scale_b=w2_scale,
+                signal=down_gemm_overlap_args.signal,
+                single_batch_overlap=True,
+                num_blocks=down_gemm_overlap_args.num_sms,
+            )
+
+            block_m = 128
+            block_n = 128
+            meta_overlap_args["block_m"] = block_m
+            meta_overlap_args["threshold"] = ceil_div(output_width, block_n)
+
         dispose_tensor(down_input_packed)
         return down_output
 
@@ -1092,7 +1121,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         meta_overlap_args = running_state.get("meta_overlap_args", None)
         # Returns (block_m, threshold) only with down-gemm overlap, else None;
         # meta_overlap_args may be set without overlap, so guard the unpack.
-        if meta_overlap_args is not None and deep_gemm_return_value is not None:
+        if meta_overlap_args is not None:
             block_m, threshold = deep_gemm_return_value
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
@@ -1283,14 +1312,36 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
+        down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
+        if down_gemm_overlap_args is None:
+            gemm_overlap_args_dict = {}
+        else:
+            down_gemm_overlap_args.start_event.record()
+            max_block_n = 128
+            gemm_overlap_args_dict = {
+                "overlap_args": down_gemm_overlap_args,
+                "max_block_n": max_block_n,
+            }
+        # if self.config.gemm1_clamp_limit is not None:
+        #     gemm_overlap_args_dict["clamp_limit"] = self.config.gemm1_clamp_limit
+        #     down_input = per_token_quant_int8(down_input)
+
+        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
             down_input,
             (w2_weight, w2_scale),
             down_output,
             masked_m,
             expected_m,
+            **gemm_overlap_args_dict,
         )
 
+        meta_overlap_args = running_state.get("meta_overlap_args", None)
+        # meta_overlap_args may be set for shared-expert overlap even when the
+        # down-GEMM overlap path is disabled and the wrapper returns None.
+        if meta_overlap_args is not None:
+            block_m, threshold = deep_gemm_return_value
+            meta_overlap_args["block_m"] = block_m
+            meta_overlap_args["threshold"] = threshold
         return down_output
 
     @property

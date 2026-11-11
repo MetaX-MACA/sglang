@@ -105,6 +105,7 @@ from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import (
+    is_sbo_enabled,
     is_shared_experts_fusion_disabled,
     should_skip_post_experts_all_reduce,
     uses_per_rank_fused_shared_slots,
@@ -2747,6 +2748,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         compress_ratio_override: Optional[int] = None,
         engram_layout: Optional[EngramLayout] = None,
         hc_stats_stream: Optional[torch.cuda.Stream] = None,
+        moe_alt_stream: Optional[torch.cuda.Stream] = None,
         moe_routed_quant_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
@@ -2762,18 +2764,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_streams=None if _is_npu else alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
-        moe_alt_stream = (
-            alt_streams[0]
-            if (
-                alt_streams is not None
-                and (
-                    _is_cuda
-                    or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
-                    or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+        if moe_alt_stream is None:
+            moe_alt_stream = (
+                alt_streams[0]
+                if (
+                    alt_streams is not None
+                    and (
+                        _is_cuda
+                        or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
+                        or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                    )
                 )
+                else None
             )
-            else None
-        )
         self.mlp = deepseek_v2.DeepseekV2MoE(
             config=config,
             quant_config=moe_quant_config_override or quant_config,
@@ -3999,6 +4002,16 @@ class DeepseekV4Model(nn.Module):
             )
         else:
             self.alt_streams = None
+        # MetaX DeepSeek V4 SBO can use a MoE-only stream without enabling the
+        # attention multi-stream optimization. Keep the legacy shared-stream
+        # behavior unless the dedicated switch is explicitly enabled.
+        self.moe_alt_stream = (
+            device_module.Stream()
+            if _is_cuda
+            and is_sbo_enabled()
+            and envs.MX_ENABLE_DSV4_SBO_MOE_SEPARATE_STREAM.get()
+            else None
+        )
         # Routed-MoE input pre-quant, separate from the attention/indexer and
         # shared-expert streams.
         self.moe_routed_quant_stream = (
@@ -4029,6 +4042,7 @@ class DeepseekV4Model(nn.Module):
                 alt_streams=self.alt_streams,
                 engram_layout=self.engram_layout,
                 hc_stats_stream=self.hc_stats_stream,
+                moe_alt_stream=self.moe_alt_stream,
                 moe_routed_quant_stream=self.moe_routed_quant_stream,
             ),
             prefix=add_prefix("layers", prefix),
