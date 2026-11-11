@@ -45,11 +45,12 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
+from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip, is_maca
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_maca = is_maca()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
@@ -607,6 +608,8 @@ def dsv41_index_page_size() -> int:
     )
 
     if DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
+        if _is_maca:
+            return 64
         return 128
     return 64
 

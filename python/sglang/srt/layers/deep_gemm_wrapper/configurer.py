@@ -67,7 +67,7 @@ DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_maca or _is_
 
 
 def _supports_paged_sparse_mqa_logits() -> bool:
-    if not DEEPGEMM_BLACKWELL:
+    if (not DEEPGEMM_BLACKWELL) and (not _is_maca):
         return False
     import deep_gemm
 

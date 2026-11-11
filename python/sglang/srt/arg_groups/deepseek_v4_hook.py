@@ -56,6 +56,10 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         if quant_config and quant_config.get("quant_method") == "fp8":
             if not envs.SGLANG_ENABLE_JIT_DEEPGEMM.is_set():
                 envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(True)
+        
+        if model_config_of(server_args).hf_config.model_type == "deepseek_v41":
+            if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
+                envs.SGLANG_OPT_USE_TOPK_V2.set(True)
 
             if envs.SGLANG_ENABLE_JIT_DEEPGEMM.get() and \
                 not envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.is_set():
