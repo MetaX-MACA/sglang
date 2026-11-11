@@ -14,6 +14,64 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import enable_specific_device_opt
+
+_C600_DEVICE_OPT = enable_specific_device_opt()
+
+
+@triton.jit
+def gdn_replayssm_normalize_keys_kernel(
+    rawk,
+    normalized,
+    indices,
+    accept_lens,
+    STRIDE_RAW_SLOT: tl.constexpr,
+    STRIDE_RAW_LAYER: tl.constexpr,
+    # Runtime on purpose: the scratch layer stride is B * H * RL * K, so keeping
+    # it constexpr recompiles the kernel for every batch size.
+    STRIDE_OUT_REQUEST: tl.constexpr,
+    STRIDE_OUT_LAYER,
+    STRIDE_INDICES: tl.constexpr,
+    STRIDE_ACCEPT: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    RL: tl.constexpr,
+    BK: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
+):
+    request = tl.program_id(0)
+    head_layer = tl.program_id(1)
+    layer = (head_layer // H).to(tl.int64)
+    head = head_layer % H
+    slot = tl.load(indices + request * STRIDE_INDICES).to(tl.int64)
+    count = tl.load(accept_lens + request * STRIDE_ACCEPT)
+    if slot <= NULL_BLOCK_ID or count <= 0:
+        return
+    # Keep the original one-dimensional reduction for each accepted token.
+    # Processing the window here avoids launching a tiny program per token.
+    key = tl.arange(0, BK)
+    for step in range(0, tl.minimum(count, RL)):
+        value = tl.load(
+            rawk
+            + layer * STRIDE_RAW_LAYER
+            + slot * STRIDE_RAW_SLOT
+            + (head * RL + step) * K
+            + key,
+            mask=key < K,
+            other=0.0,
+        ).to(tl.float32)
+        # Preserve the recurrent baseline's division-form normalization.
+        value = value / tl.sqrt(tl.sum(value * value) + 1e-6)
+        tl.store(
+            normalized
+            + layer * STRIDE_OUT_LAYER
+            + request * STRIDE_OUT_REQUEST
+            + (head * RL + step) * K
+            + key,
+            value,
+            mask=key < K,
+        )
+
 
 @triton.jit
 def gdn_replayssm_exact_fold_kernel(
@@ -33,7 +91,9 @@ def gdn_replayssm_exact_fold_kernel(
     stride_beta_slot: tl.constexpr,
     stride_state_layer: tl.constexpr,
     stride_rawv_layer: tl.constexpr,
-    stride_rawk_layer: tl.constexpr,
+    # Runtime: points at the per-call normalized-key scratch in the precomputed
+    # path, whose layer stride is B * H * RL * K.
+    stride_rawk_layer,
     stride_g_layer: tl.constexpr,
     stride_beta_layer: tl.constexpr,
     stride_indices: tl.constexpr,
@@ -50,13 +110,21 @@ def gdn_replayssm_exact_fold_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
+    PRECOMPUTED_KEYS: tl.constexpr = False,
 ):
-    i_v = tl.program_id(0)
     i_n = tl.program_id(1)
-    i_hvl = tl.program_id(2)
-    # int64: layer stride * i_layer can overflow an int32 index product.
-    i_layer = (i_hvl // HV).to(tl.int64)
-    i_hv = i_hvl % HV
+    if PRECOMPUTED_KEYS:
+        # Group all heads of a state slot along the grid's contiguous axis.
+        # Each value tile performs the same arithmetic as the original grid.
+        i_v = tl.program_id(0) % tl.cdiv(V, BV)
+        i_hv = tl.program_id(0) // tl.cdiv(V, BV)
+        i_layer = tl.program_id(2).to(tl.int64)
+    else:
+        i_v = tl.program_id(0)
+        i_hvl = tl.program_id(2)
+        # int64: layer stride * i_layer can overflow an int32 index product.
+        i_layer = (i_hvl // HV).to(tl.int64)
+        i_hv = i_hvl % HV
     i_h = i_hv // (HV // H)
     h0 = h0 + i_layer * stride_state_layer
     rawv_cache = rawv_cache + i_layer * stride_rawv_layer
@@ -67,6 +135,7 @@ def gdn_replayssm_exact_fold_kernel(
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
     if state_idx <= NULL_BLOCK_ID:
         return
+    key_slot = i_n.to(tl.int64) if PRECOMPUTED_KEYS else state_idx
     n_commit = tl.load(accept_lens + i_n * stride_accept).to(tl.int32)
     if n_commit <= 0:
         return
@@ -99,7 +168,7 @@ def gdn_replayssm_exact_fold_kernel(
         phys = t.to(tl.int64)
         b_k = tl.load(
             rawk_cache
-            + state_idx * stride_rawk_slot
+            + key_slot * stride_rawk_slot
             + (i_h * MAX_CACHE_LEN + phys) * K
             + o_k,
             mask=mask_k,
@@ -156,9 +225,10 @@ def commit_gdn_replayssm_fold_all_layers(
     mamba_steps_to_track: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = -1,
+    precompute_keys: bool = True,
 ) -> None:
-    """Fold every layer's accepted window in one launch (layer packed into
-    grid axis 2); bit-identical to a per-layer loop."""
+    """Fold accepted windows across all layers, bit-identically to a per-layer
+    loop. The device-optimized path first normalizes the accepted keys."""
     num_layers, num_slots, HV = checkpoint_state.shape[:3]
     K = rawk_cache.shape[-1]
     V = rawv_cache.shape[-1]
@@ -179,6 +249,43 @@ def commit_gdn_replayssm_fold_all_layers(
         steps_t = accept_lens
         stride_track = 0
         stride_steps = 0
+    # Request-local scratch avoids allocating a normalized ring for every
+    # physical state slot. PyTorch's allocator keeps it alive through the
+    # current stream and owns its storage during CUDA Graph capture/replay.
+    use_precomputed_keys = (
+        precompute_keys
+        and _C600_DEVICE_OPT
+        and use_qk_l2norm_in_kernel
+        and K == 128
+        and V == 128
+    )
+    if use_precomputed_keys:
+        grid = (triton.cdiv(V, BV) * HV, B, num_layers)
+        normalized_keys = torch.empty(
+            (num_layers, B, num_k_heads, max_cache_len, K),
+            dtype=torch.float32,
+            device=rawk_cache.device,
+        )
+        gdn_replayssm_normalize_keys_kernel[(B, num_layers * num_k_heads)](
+            rawk_cache,
+            normalized_keys,
+            ssm_state_indices,
+            accept_lens,
+            rawk_cache.stride(1),
+            rawk_cache.stride(0),
+            normalized_keys.stride(1),
+            normalized_keys.stride(0),
+            ssm_state_indices.stride(0),
+            accept_lens.stride(0),
+            H=num_k_heads,
+            K=K,
+            RL=max_cache_len,
+            BK=BK,
+            NULL_BLOCK_ID=null_block_id,
+            num_warps=1,
+            num_stages=1,
+        )
+        rawk_cache = normalized_keys
     gdn_replayssm_exact_fold_kernel[grid](
         checkpoint_state,
         rawv_cache,
@@ -210,9 +317,10 @@ def commit_gdn_replayssm_fold_all_layers(
         BK=BK,
         BV=BV,
         MAX_CACHE_LEN=max_cache_len,
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel and not use_precomputed_keys,
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
+        PRECOMPUTED_KEYS=use_precomputed_keys,
         num_warps=1,
         num_stages=1,
     )
