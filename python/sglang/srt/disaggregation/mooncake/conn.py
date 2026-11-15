@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import heapq
 import logging
 import os
 import struct
@@ -2882,6 +2883,84 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         except Exception as exc:
             logger.debug("Failed to send ABORT_ACK for room %s: %s", room, exc)
 
+    # ---- orphan bootstrap_room lifecycle (minimal backport of PR #39623 / #39428) ----
+    # ABORT only marks a room Failed and never pops transfer_infos; the only pop
+    # happens in the transfer worker when a KV chunk actually arrives. Rooms that
+    # abort (or whose decode peer never shows up) therefore leak one entry each.
+    # Record activation time on a min-heap and sweep expired orphan rooms.
+    #
+    # 重要：
+    #  1) 不能删 request_status —— scheduler 线程仍在 check_status() 里按 key 取值，
+    #     删掉会直接 KeyError 打崩进程；只把状态置为 Failed，让上层正常走 abort/clear。
+    #  2) 只清理 Failed / 无状态 的房间；Bootstrapping / WaitingForInput / Transferring
+    #     都是活房间（长 prompt 排队可能远超 TTL），绝不能清。
+    # 两级 TTL：
+    #   ROOM_TTL       短 TTL，只清已终结（Failed / 无状态）的房间
+    #   ORPHAN_ROOM_TTL 长 TTL，兜底清长期滞留在 Bootstrapping/WaitingForInput 的僵尸房间
+    #                  （对齐框架自身的 SGLANG_DISAGGREGATION_WAITING_TIMEOUT）
+    def _room_ttl(self) -> float:
+        return float(os.environ.get("SGLANG_DISAGGREGATION_ROOM_TTL", "60"))
+
+    def _orphan_room_ttl(self) -> float:
+        return float(os.environ.get("SGLANG_DISAGGREGATION_ORPHAN_ROOM_TTL", "600"))
+
+    def _max_pending_rooms(self) -> int:
+        return int(os.environ.get("SGLANG_DISAGGREGATION_MAX_PENDING_ROOMS", "4096"))
+
+    def _room_state_init(self) -> None:
+        if not hasattr(self, "_room_lock"):
+            self._room_lock = threading.RLock()
+        if not hasattr(self, "_room_expiry_heap"):
+            self._room_expiry_heap = []
+
+    def record_room_active(self, room: int) -> None:
+        self._room_state_init()
+        now = time.time()
+        with self._room_lock:
+            # kind=0: 短 TTL（仅已终结房间）；kind=1: 长 TTL（僵尸房间兜底）
+            heapq.heappush(self._room_expiry_heap, (now + self._room_ttl(), room, 0))
+            heapq.heappush(
+                self._room_expiry_heap, (now + self._orphan_room_ttl(), room, 1)
+            )
+
+    def purge_room_state(self, room: int) -> None:
+        """只清房间的传输元数据；request_status 保留并置为 Failed。"""
+        self._room_state_init()
+        with self._room_lock:
+            self.transfer_infos.pop(room, None)
+            self.req_to_decode_prefix_len.pop(room, None)
+            if room in self.request_status:
+                try:
+                    self.request_status[room] = KVPoll.Failed
+                except Exception:
+                    pass
+
+    def sweep_stale_rooms(self, now: Optional[float] = None) -> int:
+        self._room_state_init()
+        if now is None:
+            now = time.time()
+        evicted = 0
+        with self._room_lock:
+            while self._room_expiry_heap and self._room_expiry_heap[0][0] <= now:
+                _, room, kind = heapq.heappop(self._room_expiry_heap)
+                if room not in self.transfer_infos:
+                    continue
+                status = self.request_status.get(room)
+                terminal = status is None or status == KVPoll.Failed
+                # 短 TTL 只处理已终结的房间；活状态房间交给长 TTL 兜底
+                if kind == 0 and not terminal:
+                    continue
+                logger.warning(
+                    "Purging stale/orphan bootstrap room %s (status=%s, tier=%s, ttl=%ss)",
+                    room,
+                    status,
+                    "terminal" if kind == 0 else "orphan",
+                    self._room_ttl() if kind == 0 else self._orphan_room_ttl(),
+                )
+                self.purge_room_state(room)
+                evicted += 1
+        return evicted
+
     def start_prefill_thread(self):
         recv = self._make_worker_recv(self.server_socket)
 
@@ -2892,6 +2971,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 waiting_req_bytes = recv()
                 if waiting_req_bytes is None:
                     continue
+                self.sweep_stale_rooms()
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -2943,7 +3023,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
                     if room not in self.transfer_infos:
+                        if len(self.transfer_infos) >= self._max_pending_rooms():
+                            logger.warning(
+                                "Rejecting bootstrap room %s: max pending rooms limit (%s) reached",
+                                room,
+                                self._max_pending_rooms(),
+                            )
+                            continue
                         self.transfer_infos[room] = {}
+                        self.record_room_active(room)
 
                     self.transfer_infos[room][mooncake_session_id] = (
                         TransferInfo.from_zmq(waiting_req_bytes)
@@ -3210,7 +3298,18 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         if self.conclude_state is not None:
             return self.conclude_state
 
-        status = check_status(self.bootstrap_room)
+        # 防御：房间状态可能已被清理（abort / orphan TTL sweep），
+        # upstream 用 terminal status LRU 兜底；这里直接按 Failed 处理，
+        # 避免 scheduler 线程因 KeyError 被打崩。
+        try:
+            status = check_status(self.bootstrap_room)
+        except KeyError:
+            logger.debug(
+                "Room %s disappeared from request_status; treating as Failed",
+                self.bootstrap_room,
+            )
+            self.conclude_state = KVPoll.Failed
+            return KVPoll.Failed
         # Hold Success until all staging chunks transferred. With deferred
         # allocation also wait for worker cleanup (the zero entry is only
         # removed after cleanup), before permitting the room to be reused.
