@@ -1457,9 +1457,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
-            def _full_kv_pages_payload():
+            def _full_kv_pages_payload(start: int = 0):
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.kv.req_pool_idx, :seq_len
+                    decode_req.req.kv.req_pool_idx, start:seq_len
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
@@ -1494,6 +1494,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
             state_types = self.kv_manager.kv_args.state_types
+            dsa_prefix_len = total_prefix_len if StateType.MAMBA in state_types else 0
             if StateType.C128_STATE in state_types:
                 clear_c128_state = getattr(
                     self.token_to_kv_pool, "clear_c128_req_state", None
@@ -1503,7 +1504,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA: lambda: _full_kv_pages_payload(dsa_prefix_len),
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,

@@ -110,7 +110,7 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         from sglang.srt.environ import envs
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
-        fake = SimpleNamespace(server_args=SimpleNamespace())
+        fake = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace()))
         # Every input is a published leaf now: the extra-buffer predicates read
         # the radix-cache strategy off the bags, so the fixture publishes the
         # strategy that produces the combination under test.
@@ -128,6 +128,27 @@ class TestMambaRatioEnvGate(unittest.TestCase):
                 mamba_radix_cache_strategy=strategy,
             ):
                 return KVCacheConfigurator._calculate_mamba_ratio(fake)
+
+    def test_glm5_next_pd_decode_uses_request_local_slots(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            KVCacheConfigurator,
+            _pd_decode_extra_mamba_slots,
+        )
+        from sglang.srt.runtime_context import get_context
+
+        hf_config = SimpleNamespace(
+            model_type="glm5_next", get_text_config=lambda: object()
+        )
+        model_config = SimpleNamespace(hf_config=hf_config)
+        fake = SimpleNamespace(model_config=model_config)
+        with get_context().override_server_args(
+            disable_radix_cache=False,
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_decode_extra_slots=2,
+        ):
+            self.assertEqual(KVCacheConfigurator._calculate_mamba_ratio(fake), 1)
+            self.assertEqual(_pd_decode_extra_mamba_slots(model_config), 2)
 
     def test_flag_off_restores_original_ratios(self):
         def r(**kwargs):

@@ -1782,11 +1782,20 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     guard replicates the union of the legacy call-site guards so the pass is
     self-sufficient in the end-state pass list.
     """
+    from sglang.srt.configs.hybrid_arch import uses_glm5_next_pd_decode_radix_cache
     from sglang.srt.configs.linear_attn_model_registry import (
         get_linear_attn_spec_by_arch,
     )
 
-    hf_config = model_config_of(view).hf_config
+    model_config = model_config_of(view)
+    if uses_glm5_next_pd_decode_radix_cache(model_config, view):
+        # Decode receives per-request recurrent state. The radix tree tracks KV only.
+        return {
+            "uses_mamba_radix_cache": False,
+            "mamba_radix_cache_strategy": "no_buffer",
+        }
+
+    hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
 
     in_branch = model_arch in _MAMBA_RADIX_CACHE_ARCHS

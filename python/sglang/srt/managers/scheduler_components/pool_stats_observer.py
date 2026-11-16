@@ -248,7 +248,9 @@ class SchedulerPoolStatsObserver:
         )
         full_available_size = self.token_to_kv_pool_allocator.available_size()
         full_evictable_size = (
-            self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
+            self.tree_cache.full_evictable_size()
+            if is_mamba_radix_cache
+            else self.tree_cache.evictable_size()
         )
         mamba_available_size = self.req_to_token_pool.mamba_allocator.available_size()
         # `mamba_usage`/`mamba_num_used` track the ACTIVE bf16 pool occupancy (running

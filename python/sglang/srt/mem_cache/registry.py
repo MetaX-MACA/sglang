@@ -45,6 +45,7 @@ class TreeCacheBuildContext:
     tp_group: Any
     full_tokens_per_layer: Optional[int] = None
     is_dsa: bool = False
+    mamba_state_from_prefill: bool = False
 
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
@@ -161,7 +162,7 @@ def _create_unified_radix_cache(
     tree_components = [ComponentType.FULL]
     if ctx.is_hybrid_swa:
         tree_components.append(ComponentType.SWA)
-    if ctx.is_hybrid_ssm:
+    if ctx.is_hybrid_ssm and not ctx.mamba_state_from_prefill:
         tree_components.append(ComponentType.MAMBA)
 
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):

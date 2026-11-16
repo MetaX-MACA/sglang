@@ -3,12 +3,18 @@ hybrid-linear models (HybridLinearKVPool)."""
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
+import torch
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
-from sglang.srt.disaggregation.prefill import _transfer_start_layer
+from sglang.srt.disaggregation.prefill import (
+    SchedulerDisaggregationPrefillMixin,
+    _transfer_start_layer,
+)
 from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_transfer_entry_pairs,
@@ -28,6 +34,53 @@ def _hybrid_pool(*, start_layer: int) -> HybridLinearKVPool:
     pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
     pool.start_layer = start_layer
     return pool
+
+
+class TestHybridDSAPrefixTransfer(CustomTestCase):
+    def test_send_keeps_recurrent_state_on_partial_and_full_kv_hits(self):
+        state_types = [StateType.MAMBA, StateType.DSA]
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=4, translate_kv_indices_for_transfer=lambda indices: indices
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.tensor([[8, 9, 10, 11, 20, 21, 22, 23]]),
+                req_index_to_mamba_index_mapping=torch.tensor([3]),
+                translate_mamba_indices=lambda indices: indices,
+            ),
+            disagg_prefill_bootstrap_queue=SimpleNamespace(
+                kv_manager=SimpleNamespace(
+                    kv_args=SimpleNamespace(state_types=state_types)
+                )
+            ),
+            disagg_metadata_buffers=Mock(),
+            disagg_prefill_pending_chunk_rids=set(),
+            enable_staging=False,
+        )
+        for prefix_len, expected_pages in ((0, [2, 5]), (4, [5]), (8, [])):
+            with self.subTest(prefix_len=prefix_len):
+                sender = Mock()
+                req = SimpleNamespace(
+                    rid="req",
+                    origin_input_ids=list(range(8)),
+                    extend_range=SimpleNamespace(end=8),
+                    kv=SimpleNamespace(req_pool_idx=0),
+                    disagg_kv_sender=sender,
+                    disagg_decode_prefix_len=prefix_len,
+                    start_send_idx=prefix_len,
+                )
+                SchedulerDisaggregationPrefillMixin.send_kv_chunk(
+                    scheduler, req, last_chunk=True
+                )
+                args, kwargs = sender.send.call_args
+                pages, (mamba, dsa) = args
+                np.testing.assert_array_equal(pages, expected_pages)
+                self.assertEqual(mamba[0].item(), 3)
+                if expected_pages:
+                    np.testing.assert_array_equal(dsa, expected_pages)
+                else:
+                    self.assertIsNone(dsa)
+                self.assertEqual(kwargs["num_kv_tokens"], 8 - prefix_len)
 
 
 class TestTransferStartLayer(CustomTestCase):

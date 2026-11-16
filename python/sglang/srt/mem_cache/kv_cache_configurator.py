@@ -15,6 +15,7 @@ from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
     kimi_linear_config,
     mambaish_config,
+    uses_glm5_next_pd_decode_radix_cache,
 )
 from sglang.srt.configs.model_config import (
     ModelConfig,
@@ -95,6 +96,14 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _pd_decode_extra_mamba_slots(model_config: ModelConfig) -> Optional[int]:
+    """Extra request slots for KV-only decode, or None for other cache modes."""
+    disagg = get_disagg()
+    if uses_glm5_next_pd_decode_radix_cache(model_config, disagg):
+        return disagg.disaggregation_decode_extra_slots or 0
+    return None
 
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
@@ -2149,7 +2158,10 @@ class KVCacheConfigurator:
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def _calculate_mamba_ratio(self) -> int:
-        if get_memory().disable_radix_cache:
+        if (
+            get_memory().disable_radix_cache
+            or _pd_decode_extra_mamba_slots(self.model_config) is not None
+        ):
             return 1
 
         skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
@@ -2226,7 +2238,10 @@ class KVCacheConfigurator:
         capped_by_mamba = False
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
-            mamba_cap = get_schedule().max_mamba_cache_size // ratio
+            mamba_cap = (
+                get_schedule().max_mamba_cache_size // ratio
+                - (_pd_decode_extra_mamba_slots(self.model_config) or 0)
+            )
             if mamba_cap < max_num_reqs:
                 capped_by_mamba = True
                 logger.warning(
@@ -2373,6 +2388,8 @@ class KVCacheConfigurator:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
 
+        kv_only_extra_slots = _pd_decode_extra_mamba_slots(self.model_config)
+        decode_extra_slots = kv_only_extra_slots or 0
         if get_schedule().max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             get_context().override(
@@ -2396,14 +2413,15 @@ class KVCacheConfigurator:
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
-            get_memory().disable_radix_cache
+            (get_memory().disable_radix_cache or kv_only_extra_slots is not None)
             and get_schedule().max_running_requests is not None
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
             get_context().override(
                 "mamba_pool.from_max_running_requests",
                 max_mamba_cache_size=get_schedule().max_running_requests
-                // self.ps.attn_dp_size,
+                // self.ps.attn_dp_size
+                + decode_extra_slots,
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm.

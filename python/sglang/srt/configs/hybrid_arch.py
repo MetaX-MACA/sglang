@@ -122,6 +122,14 @@ def glm5_next_config(model_config: ModelConfig):
     return None
 
 
+def uses_glm5_next_pd_decode_radix_cache(model_config: ModelConfig, disagg) -> bool:
+    return (
+        disagg.disaggregation_mode == "decode"
+        and disagg.disaggregation_decode_enable_radix_cache
+        and glm5_next_config(model_config) is not None
+    )
+
+
 def linear_attn_model_spec(model_config: ModelConfig):
     result = _get_linear_attn_registry_result(model_config)
     return result[0] if result else None

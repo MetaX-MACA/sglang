@@ -362,20 +362,28 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             self.assertIs(result, PureSWA.return_value)
 
     def test_mamba_radix_cache_when_hybrid_ssm(self):
-        ctx = _make_ctx(self, is_hybrid_ssm=True)
-        # Mamba hybrid models now default to the unified radix tree.
-        fake_components = MagicMock()
-        fake_radix = MagicMock()
-        with patch.dict(
-            "sys.modules",
-            {
-                "sglang.srt.mem_cache.unified_cache.components": fake_components,
-                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
-            },
-        ):
-            result = default_radix_cache_factory(ctx)
-            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
-            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
+        for state_from_prefill in (False, True):
+            with self.subTest(state_from_prefill=state_from_prefill):
+                ctx = _make_ctx(self, is_hybrid_ssm=True)
+                ctx.mamba_state_from_prefill = state_from_prefill
+                ctx.params.req_to_token_pool = object()
+                fake_components = MagicMock()
+                fake_radix = MagicMock()
+                with patch.dict(
+                    "sys.modules",
+                    {
+                        "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                        "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+                    },
+                ):
+                    result = default_radix_cache_factory(ctx)
+                component_type = fake_components.ComponentType
+                expected = (component_type.FULL,)
+                if not state_from_prefill:
+                    expected += (component_type.MAMBA,)
+                self.assertEqual(ctx.params.tree_components, expected)
+                fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
+                self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
     def test_lmc_radix_cache_when_enable_lmcache(self):
         ctx = _make_ctx(self, enable_lmcache=True)

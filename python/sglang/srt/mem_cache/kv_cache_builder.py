@@ -31,6 +31,7 @@ from sglang.srt.configs.hybrid_arch import (
     kimi_linear_config,
     linear_attn_model_spec,
     mamba2_config,
+    uses_glm5_next_pd_decode_radix_cache,
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.disaggregation.utils import should_bypass_dsa_cp_prefix_cache
@@ -49,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_serving,
 )
 from sglang.srt.utils import is_hip
 
@@ -258,10 +260,11 @@ def build_kv_cache(
                 "Transformers backend to avoid multimodal prefix-cache mismatches."
             )
 
-    # Decode-side radix cache supports SWA only through the unified tree, whose
-    # component pools preserve the full-attention prefix while transferring the
-    # SWA window fresh. The legacy SWA cache and hybrid SSM pools remain
-    # incompatible with the prefix-match-and-lock allocation path.
+    mamba_state_from_prefill = uses_glm5_next_pd_decode_radix_cache(
+        model_config, get_disagg()
+    )
+    # The unified tree keeps the full-attention prefix while SWA transfers its
+    # window and GLM5Next receives a request-local KDA state from prefill.
     if (
         get_disagg().disaggregation_decode_enable_radix_cache
         and get_disagg().disaggregation_mode == "decode"
@@ -290,11 +293,36 @@ def build_kv_cache(
                     "--disaggregation-decode-enable-radix-cache does not support "
                     "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
                 )
-        if is_hybrid_ssm:
+        if is_hybrid_ssm and not mamba_state_from_prefill:
             raise ValueError(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
                 "with Mamba/SSM models"
             )
+        if mamba_state_from_prefill:
+            memory = get_memory()
+            if (
+                not is_dsa
+                or is_hybrid_swa
+                or disable_radix_cache
+                or get_disagg().disaggregation_transfer_backend not in ("mooncake", "nixl")
+                or enable_hierarchical_cache
+                or memory.enable_lmcache
+                or memory.enable_flexkv
+                or memory.radix_cache_backend is not None
+                or memory.enable_session_radix_cache
+                or get_serving().enable_streaming_session
+                or envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get()
+                or use_mlx()
+            ):
+                raise ValueError(
+                    "GLM5Next PD decode radix cache requires DSA, Mooncake or NIXL, "
+                    "and the built-in device radix cache without SWA or session caching."
+                )
+            if not spec_algorithm.is_none() and spec_algorithm.name != "EAGLE":
+                raise ValueError(
+                    "GLM5Next PD decode radix cache supports NEXTN/EAGLE "
+                    "as its speculative decoding algorithm."
+                )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
@@ -339,6 +367,7 @@ def build_kv_cache(
             is_hybrid_swa=is_hybrid_swa,
             full_tokens_per_layer=full_tokens_per_layer,
             is_hybrid_ssm=is_hybrid_ssm,
+            mamba_state_from_prefill=mamba_state_from_prefill,
             is_dsa=is_dsa,
             enable_hierarchical_cache=enable_hierarchical_cache,
             disable_radix_cache=disable_radix_cache,

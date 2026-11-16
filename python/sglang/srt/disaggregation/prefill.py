@@ -1282,9 +1282,9 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
-            def _full_kv_pages_payload():
+            def _full_kv_pages_payload(start: int = 0):
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.kv.req_pool_idx, :seq_len
+                    req.kv.req_pool_idx, start:seq_len
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 
@@ -1327,10 +1327,19 @@ class SchedulerDisaggregationPrefillMixin:
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
+            # Hybrid DSA's page-indexed state shares the KV prefix. Its Mamba
+            # state and DSA tail are request-local and still travel in full.
+            dsa_prefix_len = (
+                req.disagg_decode_prefix_len if StateType.MAMBA in state_types else 0
+            )
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
-                StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA: lambda: (
+                    _full_kv_pages_payload(dsa_prefix_len)
+                    if dsa_prefix_len < seq_len
+                    else None
+                ),
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,

@@ -190,12 +190,17 @@ def test_reserved_slots_are_excluded_from_full_pool_invariant():
     assert not leak, message
 
 
-def test_hybrid_pool_stats_exclude_reserved_slots():
+@pytest.mark.parametrize("cached_tokens", [0, 16])
+def test_hybrid_pool_stats_exclude_reserved_slots(cached_tokens):
     pool, _, _, allocator = make_pool_and_req(capacity=69)
     pool.mamba_allocator = SimpleNamespace(available_size=lambda: 1)
     pool.mamba_pool = SimpleNamespace(size=1)
+    if cached_tokens:
+        assert allocator.alloc(cached_tokens) is not None
     observer = SchedulerPoolStatsObserver(
-        tree_cache=SimpleNamespace(supports_mamba=lambda: False),
+        tree_cache=SimpleNamespace(
+            supports_mamba=lambda: False, evictable_size=lambda: cached_tokens
+        ),
         token_to_kv_pool_allocator=allocator,
         req_to_token_pool=pool,
         session_controller=None,
@@ -214,6 +219,8 @@ def test_hybrid_pool_stats_exclude_reserved_slots():
 
     assert stats.full_num_used == 0
     assert stats.full_token_usage == 0
+    assert stats.full_evictable_size == cached_tokens
+    assert stats.mamba_evictable_size == 0
 
 
 def test_streaming_session_release_frees_compressed_slots():
