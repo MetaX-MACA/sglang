@@ -445,37 +445,53 @@ def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
     except Exception:
         return floor
 
-def _tp_clique_peer_ok(tp_group):
-    """True iff every pair of dies in the TP group is bidirectional P2P.
-    Collective-safe: every rank computes the same boolean via all_reduce on
-    an int flag, so all ranks agree to enable/disable multimem together
-    (avoids partial-rank symm_mem.rendezvous hang on non-clique topologies)."""
+def _tp_clique_peer_ok(tp_group) -> bool:
+    """True iff every rank's device is visible here and reachable over P2P.
+
+    Each rank reports its own device UUID, so the check does not assume TP
+    ranks map to local CUDA ordinals. Every rank votes; one rank's local
+    failure disables multimem everywhere, so no rank enters rendezvous alone.
+    """
+    if tp_group.world_size <= 1:
+        return True
+
+    # Match device identities rather than assuming TP ranks are CUDA ordinals.
+    device_uuid = None
     try:
-        ws = tp_group.world_size
-        if ws <= 1:
-            return True
-        local_ok = 1
-        try:
-            import torch.distributed as dist
-            my_rank = tp_group.rank_in_group
-            cur = torch.cuda.current_device()
-            for peer in range(ws):
-                if peer == my_rank:
-                    continue
-                try:
-                    if not torch.cuda.can_device_access_peer(cur, peer):
-                        local_ok = 0
-                        break
-                except Exception:
-                    local_ok = 0
-                    break
-        except Exception:
-            local_ok = 0
-        t = torch.tensor(local_ok, dtype=torch.int32, device="cuda")
-        dist.all_reduce(t, group=tp_group.device_group, op=dist.ReduceOp.MIN)
-        return int(t.item()) == 1
+        device_uuid = str(
+            torch.cuda.get_device_properties(torch.cuda.current_device()).uuid
+        )
     except Exception:
-        return False
+        pass
+    peer_uuids = [None] * tp_group.world_size
+    dist.all_gather_object(peer_uuids, device_uuid, group=tp_group.cpu_group)
+
+    local_ok = False
+    try:
+        device = torch.cuda.current_device()
+        visible_uuids = [
+            str(torch.cuda.get_device_properties(i).uuid)
+            for i in range(torch.cuda.device_count())
+        ]
+        # Ambiguous or unavailable identities conservatively disable the fast path.
+        local_ok = all(
+            uuid is not None and visible_uuids.count(uuid) == 1
+            for uuid in peer_uuids
+        ) and len(set(peer_uuids)) == tp_group.world_size
+        if local_ok:
+            local_ok = all(
+                peer == device or torch.cuda.can_device_access_peer(device, peer)
+                for peer in (visible_uuids.index(uuid) for uuid in peer_uuids)
+            )
+    except Exception:
+        local_ok = False
+
+    # Every rank votes, including those whose local probe failed. Collective
+    # errors must propagate: a local fallback would leave the ranks divergent.
+    ok = torch.tensor([int(local_ok)], dtype=torch.int32, device="cpu")
+    dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=tp_group.cpu_group)
+    return bool(ok.item())
+
 
 class MultimemAllGatherer:
     """Guarded multimem all-gather (last dim) with NCCL fallback; the single
@@ -561,13 +577,22 @@ class MultimemAllGatherer:
             from sglang.srt.distributed import get_tp_group
 
             tp_group = get_tp_group()
-            if tp_group.world_size <= 1:
-                return None
-            if not _tp_clique_peer_ok(tp_group):
-                logger.warning(
-                    "multimem all-gather disabled (TP group not a P2P clique); fallback to NCCL (patch-sglang-p2p)"
-                )
-                return None
+        except Exception as e:
+            logger.warning("multimem all-gather disabled (%s)", e)
+            return None
+        if tp_group.world_size <= 1:
+            return None
+        # Every rank must agree before any of them rendezvous. The probe is a
+        # collective, so run it outside the try below: a failure has to raise
+        # instead of leaving one rank on NCCL while the others build the
+        # symmetric buffer.
+        if not _tp_clique_peer_ok(tp_group):
+            logger.warning(
+                "multimem all-gather disabled (TP group is not a verified P2P "
+                "clique); fallback to NCCL"
+            )
+            return None
+        try:
             state = create_state(
                 group=tp_group.device_group,
                 rank_in_group=tp_group.rank_in_group,
