@@ -514,9 +514,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         """W4A8 MoE for DeepEP's low-latency masked expert layout."""
-        if self.config.activation != "silu":
+        if self.config.activation not in ("silu", "situ"):
             raise NotImplementedError(
-                "MACA W4A8 masked GEMM currently supports SiLU only"
+                "MACA W4A8 masked GEMM supports SiLU and SiTU only"
             )
         if not is_maca():
             raise NotImplementedError("W4A8 masked GEMM requires MACA mctlassEx")
@@ -544,6 +544,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         gateup_width = w13_weight.shape[1]
         assert w13_weight.shape[0] == num_groups
         assert w2_weight.shape[0] == num_groups
+        if self.config.activation == "situ":
+            input_width = w13_weight.shape[2] * 2
+            packed_input_width = (input_width // 2 + 257) // 256 * 256
+            assert hidden_states.shape[2] == packed_input_width, (
+                "W4A8 gate/up packed activation width mismatch: expected "
+                f"{packed_input_width} BF16 elements for K={input_width}, "
+                f"got {hidden_states.shape[2]}"
+            )
+            assert w13_scale.shape == (num_groups, gateup_width, 1), (
+                "DeepGEMM W4A8 requires per-channel w13 scales shaped [E, N, 1], "
+                f"got {tuple(w13_scale.shape)}"
+            )
+            assert w2_scale.shape == (num_groups, w2_weight.shape[1], 1), (
+                "DeepGEMM W4A8 requires per-channel w2 scales shaped [E, N, 1], "
+                f"got {tuple(w2_scale.shape)}"
+            )
         # Both the GEMM and fused activation skip rows outside masked_m.
         gateup_output = torch.empty(
             (num_groups, max_tokens, gateup_width),
@@ -569,11 +585,24 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             "W4A8 down-projection K mismatch: packed weight has "
             f"{w2_weight.shape[2]} bytes, activation K={down_width}"
         )
-        from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked
+        if self.config.activation == "situ":
+            from sglang.kernels.ops.activation import masked_situ_quant_int8_pack
 
-        down_input_packed = silu_and_mul_masked(
-            gateup_output, masked_m, self.swiglu_limit
-        )
+            beta = self.config.gemm1_alpha
+            linear_beta = self.config.gemm1_clamp_limit
+            assert beta is not None
+            down_input_packed = masked_situ_quant_int8_pack(
+                gateup_output,
+                masked_m,
+                beta=beta,
+                linear_beta=linear_beta,
+            )
+        else:
+            from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked
+
+            down_input_packed = silu_and_mul_masked(
+                gateup_output, masked_m, self.swiglu_limit
+            )
         del gateup_output
 
         output_width = w2_weight.shape[1]
@@ -585,15 +614,44 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=down_input_packed.device,
                 dtype=torch.bfloat16,
             )
-        gemm(
-            [max_tokens, output_width, w2_weight.shape[-1] * 2],
-            down_input_packed.view(torch.int8),
-            w2_weight,
-            down_output,
-            masked_m,
-            A_packed=True,
-            scale_b=w2_scale,
-        )
+
+        down_gemm_overlap_args = running_state.get("down_gemm_overlap_args")
+        if down_gemm_overlap_args is None:
+            gemm(
+                [max_tokens, output_width, w2_weight.shape[-1] * 2],
+                down_input_packed.view(torch.int8),
+                w2_weight,
+                down_output,
+                masked_m,
+                A_packed=True,
+                scale_b=w2_scale,
+            )
+        else:
+            meta_overlap_args = running_state.get("meta_overlap_args")
+            if meta_overlap_args is None:
+                raise RuntimeError(
+                    "W4A8 SBO down GEMM requires meta_overlap_args"
+                )
+
+            down_gemm_overlap_args.start_event.record()
+            gemm(
+                [max_tokens, output_width, w2_weight.shape[-1] * 2],
+                down_input_packed.view(torch.int8),
+                w2_weight,
+                down_output,
+                masked_m,
+                A_packed=True,
+                scale_b=w2_scale,
+                signal=down_gemm_overlap_args.signal,
+                single_batch_overlap=True,
+                num_blocks=down_gemm_overlap_args.num_sms,
+            )
+
+            block_m = 128
+            block_n = 128
+            meta_overlap_args["block_m"] = block_m
+            meta_overlap_args["threshold"] = ceil_div(output_width, block_n)
+
         dispose_tensor(down_input_packed)
         return down_output
 
@@ -1106,7 +1164,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         meta_overlap_args = running_state.get("meta_overlap_args", None)
         # Returns (block_m, threshold) only with down-gemm overlap, else None;
         # meta_overlap_args may be set without overlap, so guard the unpack.
-        if meta_overlap_args is not None and deep_gemm_return_value is not None:
+        if meta_overlap_args is not None:
             block_m, threshold = deep_gemm_return_value
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
@@ -1306,14 +1364,36 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
+        down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
+        if down_gemm_overlap_args is None:
+            gemm_overlap_args_dict = {}
+        else:
+            down_gemm_overlap_args.start_event.record()
+            max_block_n = 128
+            gemm_overlap_args_dict = {
+                "overlap_args": down_gemm_overlap_args,
+                "max_block_n": max_block_n,
+            }
+        # if self.config.gemm1_clamp_limit is not None:
+        #     gemm_overlap_args_dict["clamp_limit"] = self.config.gemm1_clamp_limit
+        #     down_input = per_token_quant_int8(down_input)
+
+        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_int8int8bf16_masked(
             down_input,
             (w2_weight, w2_scale),
             down_output,
             masked_m,
             expected_m,
+            **gemm_overlap_args_dict,
         )
 
+        meta_overlap_args = running_state.get("meta_overlap_args", None)
+        # meta_overlap_args may be set for shared-expert overlap even when the
+        # down-GEMM overlap path is disabled and the wrapper returns None.
+        if meta_overlap_args is not None:
+            block_m, threshold = deep_gemm_return_value
+            meta_overlap_args["block_m"] = block_m
+            meta_overlap_args["threshold"] = threshold
         return down_output
 
     @property

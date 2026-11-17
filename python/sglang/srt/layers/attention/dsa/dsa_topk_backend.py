@@ -105,6 +105,7 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        packed_extend_topk: bool = False,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
@@ -155,6 +156,10 @@ class DSATopKBackend(Enum):
         # fusion from RAGGED above. Unsupported shapes fall back, not raise.
         # The row -> request map is `token_to_batch_idx` for a whole-forward call
         # and the chunk's own `batch_idx_list` when the indexer split the logits.
+
+        # Packed PAGED extend (DSA prefill on ROCm and Kimi-K3.1): exact, where the
+        # legacy fused transform truncates the threshold bin. Unsupported shapes
+        # fall back, not raise.
         if batch_idx_list is None:
             row_to_batch = attn_metadata.token_to_batch_idx
         elif isinstance(batch_idx_list, torch.Tensor):
@@ -163,7 +168,8 @@ class DSATopKBackend(Enum):
             # The prefill-CP list selects requests, not rows: leave it on legacy.
             row_to_batch = None
         if (
-            _is_hip
+            # _is_hip
+            packed_extend_topk
             and self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.PAGED
             and 0 < topk <= 2048

@@ -25,6 +25,7 @@ def _engram_gather_kernel(
     DIM: tl.constexpr,
     BLK: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
+    USE_INT8: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     idx = tl.load(ids_ptr + row).to(tl.int64)
@@ -32,16 +33,26 @@ def _engram_gather_kernel(
     # comes out as zeros, which is what the sharded all-reduce sums.
     owned = (idx >= row_lo) & (idx < row_hi)
     local = tl.where(owned, idx - row_lo, 0)
-    w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
-    s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
     offs = tl.arange(0, DIM)
-    vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
-    exps = tl.load(s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0).to(
-        tl.int32
-    )
-    # 2**(e - 127) from the exponent bits: exact, no exp2 rounding or denormal flush.
-    scale = (exps << 23).to(tl.float32, bitcast=True)
-    scale = tl.where(exps == 0, E8M0_ZERO, scale)
+
+    if USE_INT8:
+        w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.int8))
+        vals = tl.load(w + local * DIM + offs, mask=owned, other=0).to(tl.float32)
+        s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
+        scale = tl.load(
+            s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0.0
+        ).to(tl.float32)
+    else:
+        w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+        vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
+        s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        exps = tl.load(
+            s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0.0
+        ).to(tl.int32)
+        # 2**(e - 127) from the exponent bits: exact, no exp2 rounding or denormal flush.
+        scale = (exps << 23).to(tl.float32, bitcast=True)
+        scale = tl.where(exps == 0, E8M0_ZERO, scale)
+
     out = tl.where(owned, vals * scale, 0.0)
     tl.store(out_ptr + row * DIM + offs, out.to(tl.bfloat16))
 
@@ -55,6 +66,7 @@ def engram_gather(
     block_size: int,
     row_lo: int = 0,
     row_hi: int = 2**62,
+    use_int8: bool = False,
 ) -> torch.Tensor:
     """Gather rows ``ids`` ([N] int) into ``out`` ([N, dim] bf16, contiguous).
 
@@ -81,5 +93,6 @@ def engram_gather(
             DIM=dim,
             BLK=block_size,
             E8M0_ZERO=_E8M0_ZERO,
+            USE_INT8=use_int8,
         )
     return out

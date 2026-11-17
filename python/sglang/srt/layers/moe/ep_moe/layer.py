@@ -23,6 +23,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.moe.utils import use_modern_deepep_normal_path
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
     moe_forward_piecewise_cuda_graph_impl,
@@ -201,7 +202,12 @@ class DeepEPMoE(FusedMoE):
             isinstance(quant_config, CompressedTensorsConfig) or \
             isinstance(quant_config, W8A8Int8Config)) or \
             isinstance(quant_config, Mxfp4Config):
-                self.deprecate_flag = True
+                # DeepEP-v1 *normal* mode must stay on the modern dispatcher
+                # contract (forward_impl -> run_moe_core -> forward_normal):
+                # the DeepEP-normal epilogue does not exist on the legacy
+                # FusedMoE path.  Keep the previous verdict for low_latency /
+                # auto / non-deepep backends.
+                self.deprecate_flag = not use_modern_deepep_normal_path()
             else:
                 self.deprecate_flag = False
         elif (

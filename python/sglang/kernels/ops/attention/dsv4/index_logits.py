@@ -63,13 +63,13 @@ def flat_index_logits_tiles(
         yield (
             tile,
             fp8_fp4_mqa_logits(
-                (q[0][tile], q[1][tile]),
-                kv,
-                weights[tile],
-                tile_starts,
-                tile_starts + lengths[tile],
-                False,
-                width,
+                q=(q[0][tile], q[1][tile]),
+                kv=kv,
+                weights=weights[tile],
+                cu_seq_len_k_start=tile_starts,
+                cu_seq_len_k_end=tile_starts + lengths[tile],
+                clean_logits=False,
+                max_seqlen_k=width,
             ),
         )
 
@@ -90,14 +90,14 @@ def deep_gemm_fp4_paged_mqa_logits(
     if sl.dim() == 1:
         sl = sl.unsqueeze(-1)
     return fp8_fp4_paged_mqa_logits(
-        q_fp4,
-        k_cache,
-        weights,
-        sl,
-        page_table,
-        deep_gemm_metadata,
-        max_seq_len,
-        False,
+        q=q_fp4,
+        kv_cache=k_cache,
+        weights=weights,
+        context_lens=sl,
+        block_table=page_table,
+        schedule_meta=deep_gemm_metadata,
+        max_context_len=max_seq_len,
+        clean_logits=False,
     )
 
 

@@ -348,6 +348,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
         "BailingMoeV3VLForConditionalGeneration",
@@ -403,6 +404,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         # Inkling asserts enable_mamba_extra_buffer and _inkling_overrides pins it,
         # so validate_mamba_extra_buffer runs for these archs and must accept them.
         "InklingForConditionalGeneration",
@@ -466,10 +468,11 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
 @register_post_process
 def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     """Default DSA KV-cache dtype before resolving split attention backends."""
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_kimi_k31
 
     hf_config = model_config_of(view).hf_config
-    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
+    kimi_k31 = is_kimi_k31(hf_config)
+    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS and not kimi_k31:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
@@ -482,6 +485,9 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
             )
             return {"kv_cache_dtype": "bfloat16"}
         return {}
+
+    if kimi_k31:
+        return _kimi_k31_kv_cache_dtype(view)
 
     import torch
 
@@ -612,10 +618,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     HiSparse settings take precedence when enabled.
     """
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_kimi_k31
 
     hf_config = model_config_of(view).hf_config
-    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
+    kimi_k31 = is_kimi_k31(hf_config)
+    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS and not kimi_k31:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
@@ -638,6 +645,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     import torch
 
     major, _ = torch.cuda.get_device_capability()
+    if kimi_k31:
+        return _kimi_k31_dsa_backends(view)
     kv_cache_dtype = view.kv_cache_dtype
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
@@ -652,18 +661,14 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     if getattr(hf_config, "learnable_sink", False):
         backend = "flashmla_sparse"
-        for field in ("dsa_prefill_backend", "dsa_decode_backend"):
-            value = getattr(view, field)
-            if value is not None and value != backend:
-                option = "--" + field.replace("_", "-")
-                raise ValueError(
-                    f"{model_arch} uses learnable attention sinks and requires "
-                    f"{option} {backend!r}; got {value!r}"
-                )
-        if not user_set_prefill:
-            declared["dsa_prefill_backend"] = backend
-        if not user_set_decode:
-            declared["dsa_decode_backend"] = backend
+        declared = _pin_dsa_backends(
+            view,
+            backend,
+            lambda option, value: (
+                f"{model_arch} uses learnable attention sinks and requires "
+                f"{option} {backend!r}; got {value!r}"
+            ),
+        )
         logger.warning(
             "Set DSA backends for learnable attention sinks: "
             f"prefill={declared.get('dsa_prefill_backend', view.dsa_prefill_backend)}, "
@@ -761,6 +766,56 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     )
     return declared
 
+def _pin_dsa_backends(
+    view: Any, backend: str, mismatch_error: Callable[[str, str], str]
+) -> Dict[str, Any]:
+    declared: Dict[str, Any] = {}
+    for field in ("dsa_prefill_backend", "dsa_decode_backend"):
+        value = getattr(view, field)
+        if value is None:
+            declared[field] = backend
+        elif value != backend:
+            option = "--" + field.replace("_", "-")
+            raise ValueError(mismatch_error(option, value))
+    return declared
+
+
+# Matches the reference fp8_ds_mla cache; trtllm's 576 B layout does not.
+_KIMI_K31_DSA_BACKEND = "flashmla_kv"
+# ROCm: the Triton kernels dequantize the same fp8_ds_mla rows and run BF16 dots.
+_KIMI_K31_DSA_BACKEND_HIP = "triton"
+
+
+def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
+    if view.kv_cache_dtype not in ("auto", "fp8_e4m3"):
+        raise ValueError(
+            "Kimi-K3.1 requires --kv-cache-dtype fp8_e4m3 (the reference "
+            f"fp8_ds_mla format); got {view.kv_cache_dtype!r}."
+        )
+    if view.kv_cache_dtype != "fp8_e4m3":
+        logger.warning("Setting KV cache dtype to fp8_e4m3 for Kimi-K3.1.")
+        return {"kv_cache_dtype": "fp8_e4m3"}
+    return {}
+
+
+def _kimi_k31_dsa_backends(view: Any) -> dict:
+    if view.enable_hisparse:
+        raise ValueError("Kimi-K3.1 does not support --enable-hisparse yet.")
+    backend = (
+        _KIMI_K31_DSA_BACKEND_HIP if get_platform().is_hip else _KIMI_K31_DSA_BACKEND
+    )
+    declared = _pin_dsa_backends(
+        view,
+        backend,
+        lambda option, value: (
+            f"Kimi-K3.1 requires {option} {backend!r} to match "
+            f"the reference fp8_ds_mla numerics; got {value!r}."
+        ),
+    )
+    logger.warning(
+        "Set DSA backends for Kimi-K3.1: prefill=%s, decode=%s.", backend, backend
+    )
+    return declared
 
 # Keep in sync with the DeepSeek family list on _deepseek_family_overrides.
 _DEEPSEEK_FAMILY_ARCHS = frozenset(
@@ -777,6 +832,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
         "Dots3NoteForCausalLM",
+        "KimiK31ForConditionalGeneration",
     }
 )
 
@@ -937,27 +993,35 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
     return {}
 
 
+# The default dsa index cache dtype per DeepSeek-V4 model family.
+_DSV4_INDEX_CACHE_DTYPES = {"deepseek_v41": "fp4", "deepseek_v4": "fp8"}
+
+
 @register_post_process
 def _deepseek_v4_index_cache_dtype(view: Any) -> dict:
     """Set dsa index cache by default according to model quantization method."""
     hf_config = model_config_of(view).hf_config
-    model_arch = hf_config.architectures[0]
-    if model_arch != "DeepseekV4ForCausalLM":
+    if hf_config.architectures[0] != "DeepseekV4ForCausalLM":
         return {}
 
-    if envs.SGLANG_DSV4_INDEX_CACHE_TYPE.is_set():
-        return {}
-    
-    quant_config = getattr(hf_config, "quantization_config", None)
-    if quant_config and quant_config.get("quant_method") == "fp8":
-        if getattr(hf_config, "model_type", None) == "deepseek_v41":
-            envs.SGLANG_DSV4_INDEX_CACHE_TYPE.set("fp4")
-            logger.warning(f"Setting Index cache dtype to fp4 for deepseek_v41.")
-        elif getattr(hf_config, "model_type", None) == "deepseek_v4":
-            envs.SGLANG_DSV4_INDEX_CACHE_TYPE.set("fp8")
-            logger.warning(f"Setting Index cache dtype to fp8 for deepseek_v4.")
-        else:
-            raise NotImplementedError
+    index_cache = envs.SGLANG_DSV4_INDEX_CACHE_TYPE
+    if not index_cache.is_set():
+        quant_config = getattr(hf_config, "quantization_config", None)
+        model_type = getattr(hf_config, "model_type", None)
+        if quant_config is None:
+            compression_config = getattr(hf_config, "compression_config", None)
+            if (
+                compression_config
+                and compression_config.get("format") == "int-quantized"
+            ):
+                index_cache.set("int8")
+                logger.warning(f"Setting Index cache dtype to int8 for {model_type}.")
+        elif quant_config.get("quant_method") == "fp8":
+            inferred = _DSV4_INDEX_CACHE_DTYPES.get(model_type)
+            if inferred is None:
+                raise NotImplementedError
+            index_cache.set(inferred)
+            logger.warning(f"Setting Index cache dtype to {inferred} for {model_type}.")
     return {}
 
 
@@ -1224,7 +1288,60 @@ def _mla_backend_page_constraints(view: Any) -> dict:
 
 @register_post_process
 def _mla_kv_cache_dtype_checks(view: Any) -> dict:
-    """Validate resolved KV-cache dtype for TRTLLM and tokenspeed MLA backends."""
+    """Validate resolved KV-cache dtype and MLA backend combinations."""
+    if (
+        view.kv_cache_dtype == "int8"
+        and model_config_of(view).hf_config.architectures[0]
+        == "KimiK3ForConditionalGeneration"
+    ):
+        prefill_backend, decode_backend = attention_backends_of(view)
+        triton_path = prefill_backend == decode_backend == "triton"
+        flashmla_path = prefill_backend == "flashinfer" and decode_backend == "flashmla"
+        if not (triton_path or flashmla_path):
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache requires Triton prefill/decode, or "
+                "FlashInfer prefill with FlashMLA decode."
+            )
+        if flashmla_path:
+            if not get_platform().is_maca:
+                raise ValueError("Kimi-K3 FlashMLA INT8 KV cache requires MACA.")
+            if view.speculative_algorithm is not None:
+                if view.speculative_attention_mode != "prefill":
+                    raise ValueError(
+                        "FlashMLA INT8 target verify must use prefill attention."
+                    )
+                if view.speculative_draft_kv_cache_dtype not in ("bf16", "bfloat16"):
+                    raise ValueError(
+                        "FlashMLA INT8 speculative decoding requires --speculative-draft-kv-cache-dtype bfloat16."
+                    )
+                if (
+                    view.speculative_algorithm == "DSPARK"
+                    and view.speculative_draft_attention_backend
+                    not in (None, "triton", "flashinfer")
+                ):
+                    raise ValueError(
+                        "DSpark draft must use a BF16 MHA backend, not FlashMLA."
+                    )
+        if view.dtype not in ("auto", "bfloat16", "bf16"):
+            raise ValueError("Kimi-K3 INT8 KV cache requires BF16 model inputs.")
+        if view.enable_deterministic_inference:
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache does not support deterministic attention."
+            )
+        if view.enable_unified_memory:
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache does not support --enable-unified-memory."
+            )
+        if view.enable_kv_cache_sharding:
+            # The striped pool stages raw MLA rows in its per-layer scratch.
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache does not support --enable-kv-cache-sharding."
+            )
+        if view.enable_hierarchical_cache or view.enable_lmcache:
+            raise ValueError(
+                "Kimi-K3 INT8 KV cache does not support host-tiered KV cache."
+            )
+
     if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"

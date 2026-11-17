@@ -14,6 +14,7 @@ FP8_BLOCK_SIZE = 32
 FP4_BLOCK_SIZE = 32
 FP4_AMAX_FLOOR = 6 * 2.0**-126
 
+INT8_BLOCK_SIZE = 32
 
 def ceil_pow2(x: torch.Tensor) -> torch.Tensor:
     """2 ** ceil(log2(x)) for positive fp32 x, computed on the IEEE bits so the

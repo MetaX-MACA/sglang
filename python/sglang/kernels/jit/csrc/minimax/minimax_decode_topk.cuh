@@ -611,6 +611,21 @@ __global__ void minimax_decode_topk_block_kernel(
       if (lane64 == 0) out[rank] = target;
     }
   }
+#elif defined(__MACACC__)
+  // Adapt block-ID output sorting for MACA.
+  static_assert(TopKTrait::kMaxTopK <= 64);
+  static_assert(TopKTrait::kCTASize % 64 == 0);
+  {
+    const uint32_t wave = tx / 64u;
+    const uint32_t lane64 = tx % 64u;
+    const int32_t tie = (lane64 < static_cast<uint32_t>(topk)) ? s_topk[lane64] : INT32_MAX;
+    for (uint32_t t = wave; t < static_cast<uint32_t>(topk); t += TopKTrait::kCTASize / 64u) {
+      const int32_t target = s_topk[t];
+      const unsigned long long bits = __ballot_sync(0xffffffffffffffffULL, tie < target);
+      const int rank = __popcll(bits);
+      if (lane64 == 0) out[rank] = target;
+    }
+  }
 #else
   const auto warp_id = tx / device::kWarpThreads;
   const auto lane_id = tx % device::kWarpThreads;

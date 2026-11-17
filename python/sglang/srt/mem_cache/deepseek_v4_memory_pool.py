@@ -45,11 +45,12 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
+from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip, is_maca
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_maca = is_maca()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
@@ -607,6 +608,8 @@ def dsv41_index_page_size() -> int:
     )
 
     if DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
+        if _is_maca:
+            return 64
         return 128
     return 64
 
@@ -2203,7 +2206,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id)),
             )
             return
-        if self.swa_kv_pool.dtype == torch.bfloat16:
+        window = self.request_window
+        kv_dtype = window.state.dtype if window is not None else self.swa_kv_pool.dtype
+        if kv_dtype == torch.bfloat16:
             # The FlashMLA fused writer requires the packed FP8/uint8 layout.
             # BF16 pages hold plain KV rows; normalize/rotate first, then use
             # the dtype-aware store. Fused QKV projection slices need a copy

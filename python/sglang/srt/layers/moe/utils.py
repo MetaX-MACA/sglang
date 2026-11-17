@@ -655,6 +655,24 @@ def get_deepep_mode() -> DeepEPMode:
     return moe.deepep_mode
 
 
+def use_modern_deepep_normal_path() -> bool:
+    """Whether DeepEP-v1 *normal* mode runs the modern dispatcher contract.
+
+    modern: ``ep_moe/layer.py::forward_impl`` -> ``dispatcher.dispatch`` ->
+    ``run_moe_core`` -> ``forward_normal`` (deprecate_flag == False).
+    legacy: ``FusedMoE.forward_impl`` (deprecate_flag == True).
+
+    The two paths disagree on the MoE output layout: ``forward_normal`` is not
+    an in-place runner, so DeepEP must not pad dispatch to 128 per expert and
+    must build the per-token combine buffer itself.  Keep this predicate as the
+    single source of truth (used by ep_moe/layer.py and deepep.py).
+    """
+    try:
+        return get_moe_a2a_backend().is_deepep() and get_deepep_mode().is_normal()
+    except Exception:
+        return False
+
+
 def get_deepep_config() -> str:
     moe = get_flags().moe
     if moe.deepep_config is None:

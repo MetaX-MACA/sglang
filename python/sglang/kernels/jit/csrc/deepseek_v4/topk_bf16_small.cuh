@@ -85,18 +85,12 @@ struct TopKBF16Params {
   uint32_t page_bits;
 };
 
-SGL_DEVICE uint32_t get_ptx_lane_id() {
-  uint32_t lane_id;
-  asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
-  return lane_id;
-}
-
 /// \brief Exclusive suffix scan: lane `L` gets the sum over lanes `> L`.
 SGL_DEVICE uint32_t warp_exclusive_suffix_sum(uint32_t x, uint32_t lane_id) {
   uint32_t inc = x;
 #pragma unroll
   for (uint32_t offset = 1; offset < device::kWarpThreads; offset <<= 1) {
-    const auto t = __shfl_down_sync(device::warp::kFullMask, inc, offset);
+    const auto t = __shfl_down_sync(device::warp::kFullMask, inc, offset, device::kWarpThreads);
     if (lane_id + offset < device::kWarpThreads) inc += t;
   }
   return inc - x;
@@ -164,13 +158,17 @@ SGL_DEVICE void topk_bf16_find_pivot_warp(
   }
 }
 
+/// Gather the low bit of four 0xFF/0x00 flag bytes into one nibble.
+SGL_DEVICE uint32_t topk_bf16_pack_flags(uint32_t flags) {
+  return (flags & 1u) | ((flags >> 7) & 0x2u) | ((flags >> 14) & 0x4u) | ((flags >> 21) & 0x8u);
+}
+
 /// One hit bit per element of an 8-wide vector, from the per-pair 16-bit masks of `__hgt2_mask` and friends.
 SGL_DEVICE uint32_t topk_bf16_pack_hits(const uint32_t (&m)[4]) {
-  // one flag byte per element (0xFF / 0x00), then signed dot products turn them into bits
+  // one flag byte per element (0xFF / 0x00), then one nibble per four bytes
   const auto lo = __byte_perm(m[0], m[1], 0x7531);
   const auto hi = __byte_perm(m[2], m[3], 0x7531);
-  const auto nib = __dp4a(static_cast<int>(lo), static_cast<int>(0xF8FCFEFFu), 0);  // -1,-2,-4,-8
-  return __dp4a(static_cast<int>(hi), static_cast<int>(0x80C0E0F0u), nib);          // -16..-128
+  return topk_bf16_pack_flags(lo) | (topk_bf16_pack_flags(hi) << 4);
 }
 
 template <bool kUsePDL>
@@ -183,7 +181,7 @@ __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupa
 
   const auto bx = blockIdx.x;
   const auto tx = threadIdx.x;
-  const auto lane_id = get_ptx_lane_id();
+  const auto lane_id = warp::get_lane_id();
   const auto warp_id = tx / kWarpThreads;
   const auto topk = params.topk;
   // a selected index i maps through this row's table to slot

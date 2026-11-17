@@ -78,6 +78,9 @@ _TRITON_KERNELS = [
     ("cache_move", "copy_all_layer_kv_cache_tiled"),
     ("mla_buffer", "set_mla_kv_buffer_triton"),
     ("mla_buffer", "get_mla_kv_buffer_triton"),
+    ("kimi_k3_int8", "quantize_k_cache_int8_separate"),
+    ("kimi_k3_int8", "dequantize_k_cache_paged_int8"),
+    ("kimi_k3_int8", "dequantize_k_cache_paged_int8_to_workspace"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

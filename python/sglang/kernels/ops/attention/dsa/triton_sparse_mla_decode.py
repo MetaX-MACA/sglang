@@ -18,6 +18,7 @@ import triton.language as tl
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _PREFERRED_BLOCK_K,
     _cu_count,
+    _as_scaled_fp8_kv,
     _gfx950_sparse_mla_kv_splits,
     _gfx950_sparse_mla_num_warps,
     _is_gfx950_sparse_mla_fp8,
@@ -515,8 +516,9 @@ def triton_sparse_mla_decode_splitk(
     workspace: backend-owned grow-only split-K buffers for graph-safe reuse
     returns: [1, bs, H, d_v] bf16
     """
+    kv, kv_scaled = _as_scaled_fp8_kv(kv, d_v, q_rope.shape[-1])
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
-    use_fp8_dot = is_fp8
+    use_fp8_dot = is_fp8 and not kv_scaled
     bs, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]
@@ -608,6 +610,7 @@ def triton_sparse_mla_decode_splitk(
                 STRIDE_QR_T=stride_qr_t,
                 STRIDE_QR_H=stride_qr_h,
                 USE_FP8_DOT=use_fp8_dot,
+                KV_SCALED=kv_scaled,
                 BLOCK_H=BLOCK_H,
                 BLOCK_K=BLOCK_K,
                 USE_I64_PAGE=not (
@@ -657,6 +660,7 @@ def triton_sparse_mla_decode_splitk(
             STRIDE_QR_T=stride_qr_t,
             STRIDE_QR_H=stride_qr_h,
             USE_FP8_DOT=use_fp8_dot,
+            KV_SCALED=kv_scaled,
             KV_SPLITS=kv_splits,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,

@@ -14,7 +14,7 @@ from typing import (
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa, is_kimi_k31
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
     get_buffer,
@@ -103,7 +103,8 @@ from sglang.srt.utils import (
     print_warning_once,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-
+import logging
+logger = logging.getLogger(__name__)
 _IS_GFX95 = is_gfx95_supported()
 
 if TYPE_CHECKING:
@@ -540,13 +541,16 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
+
         self.dsa_kv_cache_store_int8 = getattr(
             model_runner.token_to_kv_pool, "dsa_kv_cache_store_int8", False
         )
         self.dsa_kv_cache_is_quantized = (
             self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_int8
         )
+        self.kv_scale_ue8m0 = model_runner.token_to_kv_pool.kv_scale_ue8m0
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
+        self.dsa_packed_extend_topk = _is_hip or is_kimi_k31(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         if self.dsa_kv_cache_store_int8 and self.dsa_index_kpool != 1:
             raise ValueError("DSA INT8 main KV cache currently requires index_kpool=1")
@@ -3324,9 +3328,9 @@ class DeepseekSparseAttnBackend(
 
         sched_meta, _ = get_mla_metadata()
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
-        if self.dsa_kv_cache_is_quantized:
-            # MACA's packed FP8/INT8 decode consumes the absorbed NoPE query.
-            q_all = q_all[..., : self.kv_lora_rank]
+        # if self.dsa_kv_cache_is_quantized:
+        #     # MACA's packed FP8/INT8 decode consumes the absorbed NoPE query.
+        #     q_all = q_all[..., : self.kv_lora_rank]
         num_q_heads = q_all.shape[2]
         target_q_heads = self.flashmla_kv_num_q_heads
         if target_q_heads != num_q_heads:
@@ -3338,6 +3342,7 @@ class DeepseekSparseAttnBackend(
             q_input = q_all
 
         assert self.physical_page_size == 64, "only page size 64 is supported"
+        
         kv_cache = kv_cache.view(-1, self.physical_page_size, 1, self.kv_cache_dim)
         indices = page_table_1.unsqueeze(1)
         assert indices.shape[-1] == self.dsa_index_topk
@@ -3417,7 +3422,8 @@ class DeepseekSparseAttnBackend(
 
         if not self.dsa_kv_cache_store_fp8:
             # inefficiently quantize the whole cache
-            kv_cache = quantize_k_cache(kv_cache)
+            # kv_cache = quantize_k_cache(kv_cache)
+            kv_cache = quantize_k_cache(kv_cache, scale_ue8m0=self.kv_scale_ue8m0)
 
         indices = page_table_1.unsqueeze(1)
         assert (
@@ -4194,6 +4200,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
             force_unfused_topk=force_unfused,
+            packed_extend_topk=self.dsa_packed_extend_topk,
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):

@@ -1493,7 +1493,7 @@ def _kpool_decode_update_and_maybe_write_cache_int8_kernel(
             + row * block_tables_stride_0
             + token_page_row * block_tables_stride_1,
         )
-        loc_page_index = packed_page.to(tl.int64)
+        loc_page_index = packed_page.to(tl.int64) // POOL_SIZE
         loc_token_offset_in_page = pool_id % INDEX_PAGE_SIZE
         out_k_offsets = _kpool_cache_k_offsets(
             loc_page_index,

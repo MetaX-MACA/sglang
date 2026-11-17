@@ -549,11 +549,9 @@ class Envs:
     # plane; off, or no such plane, keeps the NCCL all-gather.
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
-    # Load draft-local vocabulary weights from quantized DSpark checkpoints.
-    SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD = EnvBool(False)
-    # FlashInfer does not support the current DSpark temperature path yet.
     # whether dspark share embed and lmhead with target model
     SGLANG_DSPARK_SEPARATE_EMBED_AND_LMHEAD = EnvBool(False)
+    # FlashInfer does not support the current DSpark temperature path yet.
     SGLANG_DSPARK_KERNEL_SOFTMAX_TEMP = EnvStr("triton")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
 
@@ -746,6 +744,7 @@ class Envs:
     MX_ENABLE_FUSE_SILUMUL_QUANT = EnvBool(False)
     MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE = EnvInt(256)
     MX_ENABLE_SBO_OVERLAP_DISPATCH = EnvBool(False)
+    MX_ENABLE_DSV4_SBO_MOE_SEPARATE_STREAM = EnvBool(False)
     MX_ENABLE_WARMUP_OUTPUT = EnvBool(True)
     MX_DSV4_PAGED_MQA_LOGITS_BACKEND = EnvStr("maca_c")
     MX_OPT_DSV4_PREFILL_ATTN = EnvBool(True)
@@ -818,6 +817,7 @@ class Envs:
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
+    SGLANG_HICACHE_USE_PIN_MEMORY = EnvBool(False)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
 
     # ===================================================================
@@ -1679,6 +1679,8 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Use the DeepGEMM dense indexer bypassing the SM check.
+    SGLANG_DSV41_FORCE_DEEPGEMM_INDEXER = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

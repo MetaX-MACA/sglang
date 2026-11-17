@@ -105,6 +105,7 @@ from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import (
+    is_sbo_enabled,
     is_shared_experts_fusion_disabled,
     should_skip_post_experts_all_reduce,
     uses_per_rank_fused_shared_slots,
@@ -169,6 +170,7 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     exit_late_layer_dp,
     late_layer_dp_counts,
 )
+from sglang.srt.models.deepseek_common.online_rotation import check_online_rotation_weights
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
@@ -2747,6 +2749,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         compress_ratio_override: Optional[int] = None,
         engram_layout: Optional[EngramLayout] = None,
         hc_stats_stream: Optional[torch.cuda.Stream] = None,
+        moe_alt_stream: Optional[torch.cuda.Stream] = None,
         moe_routed_quant_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
@@ -2762,18 +2765,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_streams=None if _is_npu else alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
-        moe_alt_stream = (
-            alt_streams[0]
-            if (
-                alt_streams is not None
-                and (
-                    _is_cuda
-                    or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
-                    or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+        if moe_alt_stream is None:
+            moe_alt_stream = (
+                alt_streams[0]
+                if (
+                    alt_streams is not None
+                    and (
+                        _is_cuda
+                        or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
+                        or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                    )
                 )
+                else None
             )
-            else None
-        )
         self.mlp = deepseek_v2.DeepseekV2MoE(
             config=config,
             quant_config=moe_quant_config_override or quant_config,
@@ -3999,6 +4003,16 @@ class DeepseekV4Model(nn.Module):
             )
         else:
             self.alt_streams = None
+        # MetaX DeepSeek V4 SBO can use a MoE-only stream without enabling the
+        # attention multi-stream optimization. Keep the legacy shared-stream
+        # behavior unless the dedicated switch is explicitly enabled.
+        self.moe_alt_stream = (
+            device_module.Stream()
+            if _is_cuda
+            and is_sbo_enabled()
+            and envs.MX_ENABLE_DSV4_SBO_MOE_SEPARATE_STREAM.get()
+            else None
+        )
         # Routed-MoE input pre-quant, separate from the attention/indexer and
         # shared-expert streams.
         self.moe_routed_quant_stream = (
@@ -4029,6 +4043,7 @@ class DeepseekV4Model(nn.Module):
                 alt_streams=self.alt_streams,
                 engram_layout=self.engram_layout,
                 hc_stats_stream=self.hc_stats_stream,
+                moe_alt_stream=self.moe_alt_stream,
                 moe_routed_quant_stream=self.moe_routed_quant_stream,
             ),
             prefix=add_prefix("layers", prefix),
@@ -4196,6 +4211,12 @@ class DeepseekV4Model(nn.Module):
             self.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
+            assert self.start_layer <= self.late_layer_start < self.end_layer, (
+                "decoder SWA bounded replay switches layers at late_layer_start, so"
+                f" this rank must own it: start_layer={self.start_layer},"
+                f" end_layer={self.end_layer},"
+                f" late_layer_start={self.late_layer_start}"
+            )
             self._check_late_layer_tail_readers(forward_batch)
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
@@ -4242,7 +4263,13 @@ class DeepseekV4Model(nn.Module):
                 if not (
                     get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
                 ):
-                    input_ids_global = tail.rows(input_ids_global)
+                    # CP gathers the MoE input across ranks, so its per-token ids
+                    # cannot be selected with this rank's local tail indices.
+                    input_ids_global = (
+                        tail.global_rows(forward_batch.input_ids)
+                        if tail.cp_metadata is not None
+                        else tail.rows(input_ids_global)
+                    )
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
@@ -4652,15 +4679,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             and not getattr(config, "language_model_only", False)
         ):
             if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
+                get_parallel().pp_group.world_size != 1
                 or not (
                     get_moe_a2a_backend().is_none()
                     or (_is_cuda and get_moe_a2a_backend().is_megamoe())
                 )
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "V4.1 vision supports TP/EP/DP/CP without PP; "
                     "MoE A2A requires CUDA MegaMoE"
                 )
 
@@ -5570,6 +5596,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 + ", ".join(f"{k}={v}" for k, v in sorted(skipped_by_group.items())),
             )
         unloaded_params = params_dict.keys() - loaded_params
+        check_online_rotation_weights(self, loaded_params)
 
         skipped_checking_patterns = [
             "attn_mqa.k_scale",

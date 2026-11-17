@@ -92,6 +92,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -763,7 +764,10 @@ class KimiK3MoE(nn.Module):
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
         self.experts = get_moe_impl_class(moe_quant_config)(
-            num_experts=getattr(config, "n_routed_experts", config.num_experts),
+            num_experts=(
+                getattr(config, "n_routed_experts", config.num_experts)
+                + get_exec().moe.ep_num_redundant_experts
+            ),
             top_k=config.num_experts_per_token,
             hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -2534,6 +2538,11 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             reduce_results=False,
             alt_stream=alt_stream,
         )
+        # Unquantized q_b_proj consumes a Tensor, not the fused INT8 tuple.
+        if self.q_lora_rank is not None and isinstance(
+            self.q_b_proj.quant_method, UnquantizedLinearMethod
+        ):
+            self.q_a_layernorm.fused_quant = False
         if split_gguf_kv_b:
             del self.fused_qkv_a_proj_with_mqa
             del self.kv_b_proj
@@ -3025,6 +3034,9 @@ class KimiK3DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+
+        if isinstance(result, tuple):
+            result = result[0]
 
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
@@ -3687,8 +3699,21 @@ class KimiK3LinearForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        self._check_dsa_indexer_loaded(loaded_params)
         self.post_load_weights()
         return loaded_params
+
+    def _check_dsa_indexer_loaded(self, loaded_params: set[str]) -> None:
+        if self.config.dsa_config is None:
+            return
+        expected = {
+            name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
+        }
+        missing = sorted(expected - loaded_params)
+        assert not missing, (
+            f"Kimi-K3.1: {len(missing)} DSA indexer params were not loaded, "
+            f"e.g. {missing[:4]}"
+        )
 
     def post_load_weights(self):
         # Also invoked by loader post-load hooks (DummyModelLoader,
@@ -4245,5 +4270,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
             for _ in stream_language_weights():
                 pass
 
+class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
+    pass
 
-EntryClass = [KimiK3ForConditionalGeneration, KimiK3LinearForCausalLM]
+
+EntryClass = [
+    KimiK3ForConditionalGeneration,
+    KimiK31ForConditionalGeneration,
+    KimiK3LinearForCausalLM,
+]

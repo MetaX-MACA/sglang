@@ -20,6 +20,7 @@ namespace sglang {
 /// \brief Round a float to the storage dtype and back (one eager aten step).
 /// The inline cvt keeps nvcc from folding the round-trip away: every eager
 /// bf16/fp16 aten op rounds its result, and this kernel must round likewise.
+/// MACA and ROCm use dtype conversion intrinsics instead of NVIDIA PTX.
 template <typename T>
 SGL_DEVICE float eager_round(float x) {
   return static_cast<float>(DTypeTrait<T>::from(x));
@@ -27,7 +28,7 @@ SGL_DEVICE float eager_round(float x) {
 
 template <>
 SGL_DEVICE float eager_round<bf16_t>(float x) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(__MACACC__)
   uint16_t u;
   asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(u) : "f"(x));
   return __bfloat162float(__ushort_as_bfloat16(u));
@@ -38,7 +39,7 @@ SGL_DEVICE float eager_round<bf16_t>(float x) {
 
 template <>
 SGL_DEVICE float eager_round<fp16_t>(float x) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(__MACACC__)
   uint16_t u;
   asm("cvt.rn.f16.f32 %0, %1;" : "=h"(u) : "f"(x));
   return __ushort_as_half(u);

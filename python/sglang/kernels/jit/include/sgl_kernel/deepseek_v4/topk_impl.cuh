@@ -146,7 +146,7 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
 }
 
 SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
-#ifdef USE_ROCM
+#if defined(USE_ROCM) || defined(__MACACC__)
   // The ballot covers the whole hardware wave, which on wave64 holds two of
   // these 32-lane logical warps, so a plain __popc would report the wave's
   // lower half to both of them. Shift the caller's mask onto this warp's half

@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_maca
 
 from ..common.utils import (
     check_sparse_kv_fp8,
@@ -17,9 +17,25 @@ from ..common.utils import (
 )
 
 
-def _sparse_subk(block_size_k: int) -> int:
-    """Sub-tile only the measured 128-token block; keep other widths unchanged."""
+def _sparse_subk(block_size_k: int, dtype: Optional[torch.dtype] = None) -> int:
+    """Choose the KV tile independently of the logical sparse block width."""
+    if is_maca() and block_size_k == 128 and dtype in (torch.float16, torch.bfloat16):
+        return 16
     return 64 if is_gfx95_supported() and block_size_k == 128 else 0
+
+
+def _prune_sparse_configs(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    use_small_tiles = (
+        is_maca()
+        and not args["IS_FP8"]
+        and args["q_ptr"].dtype in (torch.float16, torch.bfloat16)
+        and args["BLOCK_SIZE_K"] == 128
+    )
+    return [
+        config for config in configs
+        if (config.num_stages == 1 and not config.kwargs) == use_small_tiles
+    ]
 
 
 @triton.heuristics(
@@ -39,8 +55,9 @@ def _sparse_subk(block_size_k: int) -> int:
     }
 )
 @triton.autotune(
-    # Keep the additional configs on gfx95; gfx942 retains the original set.
+    # Single-stage KV loads fit the smaller MACA shared-memory budget.
     configs=[
+        *([triton.Config({}, num_warps=4, num_stages=1)] if is_maca() else []),
         # CDNA sub-tiled MFMA configs; NVIDIA's Triton rejects these launch kwargs.
         *(
             [
@@ -70,7 +87,9 @@ def _sparse_subk(block_size_k: int) -> int:
         "qk_head_dim",
         "v_head_dim",
         "gqa_group_size",
+        "IS_FP8",
     ],
+    prune_configs_by={"early_config_prune": _prune_sparse_configs},
 )
 @triton.jit
 def _gqa_share_sparse_fwd_kernel(
@@ -129,7 +148,7 @@ def _gqa_share_sparse_fwd_kernel(
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     BLOCK_SIZE_QH: tl.constexpr,
-    SUB_K: tl.constexpr,  # CDNA KV sub-tile width (0 = disabled)
+    SUB_K: tl.constexpr,  # KV sub-tile width (0 = disabled)
     # has sink
     HAS_SINK: tl.constexpr,
     USE_TMA: tl.constexpr,
@@ -220,6 +239,7 @@ def _gqa_share_sparse_fwd_kernel(
             # Split each BLOCK_SIZE_K-token KV block into SUB_K-token sub-tiles so
             # each QK/PV MFMA is right-sized. Numerically equivalent to the dense
             # path (flash-softmax reassociation).
+            tl.static_assert(BLOCK_SIZE_K % SUB_K == 0)
             NUM_SUB: tl.constexpr = BLOCK_SIZE_K // SUB_K
             for i in range(real_topk):
                 c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
@@ -264,9 +284,10 @@ def _gqa_share_sparse_fwd_kernel(
                     qk_s += tl.dot(q, k_s) * (sm_scale_log2e * k_scale)
                     qk_s += tl.where(pos_mask_s[None, :], 0, float("-inf"))
                     m_ij = tl.maximum(m_i, tl.max(qk_s, axis=1))
-                    p_s = tl.exp2(qk_s - m_ij[:, None])
+                    m_safe = tl.where(m_ij == float("-inf"), 0.0, m_ij)
+                    p_s = tl.exp2(qk_s - m_safe[:, None])
                     l_ij = tl.sum(p_s, axis=1)
-                    acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
+                    acc_o = acc_o * tl.exp2(m_i - m_safe)[:, None]
                     v_s = tl.load(
                         v_cache_ptr
                         + slots_s[:, None] * stride_vs
@@ -280,7 +301,7 @@ def _gqa_share_sparse_fwd_kernel(
                     p_s = p_s.to(v_s.dtype)
                     acc_o += tl.dot(p_s, v_s) * v_scale
                     m_i = m_ij
-                    lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+                    lse_i = m_safe + tl.log2(tl.exp2(lse_i - m_safe) + l_ij)
         else:
             for i in range(real_topk):
                 # get current block start index (absolute K position)
@@ -356,7 +377,8 @@ def _gqa_share_sparse_fwd_kernel(
                 m_i = m_ij
                 lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         # final scale
-        acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
+        out_scale = tl.where(lse_i == float("-inf"), 0.0, tl.exp2(m_i - lse_i))
+        acc_o = acc_o * out_scale[:, None]
         # save output
         acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_VD)
         o_ptrs = tl.make_block_ptr(
@@ -479,7 +501,7 @@ def flash_prefill_with_gqa_share_sparse(
         o.stride(2),
         req_to_token.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
-        SUB_K=_sparse_subk(BLOCK_SIZE_K),
+        SUB_K=_sparse_subk(BLOCK_SIZE_K, None if is_fp8 else q.dtype),
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         USE_TMA=use_tma,
         IS_FP8=is_fp8,

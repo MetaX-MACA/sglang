@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
+from threading import Lock
+
 from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
 
 import torch
@@ -264,6 +267,25 @@ class CompressorDecodePlan(NamedTuple):
         return True
 
 
+# MACA pinned plan lifetime: retain until the raw H2D copies complete.
+# The TVM FFI planner uses cudaMemcpyAsync directly, bypassing PyTorch's
+# CachingHostAllocator event registration. A NamedTuple reference alone does
+# not protect the source after the caller releases the plan.
+_pending_plan_copies = deque()
+_pending_plan_copies_lock = Lock()
+
+
+def _retain_plan_copy_source(pin_buffer, device):
+    if not is_maca() or pin_buffer.numel() == 0:
+        return
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream(device))
+    with _pending_plan_copies_lock:
+        while _pending_plan_copies and _pending_plan_copies[0][0].query():
+            _pending_plan_copies.popleft()
+        _pending_plan_copies.append((event, pin_buffer))
+
+
 class CompressorPrefillPlan(NamedTuple):
     compress_ratio: int
     plan_c: torch.Tensor  # [num_q_tokens, 16] uint8 --- CompressPlan
@@ -336,6 +358,7 @@ class CompressorPrefillPlan(NamedTuple):
             if _is_xpu
             else fn(*args, bool(use_req_ring), bool(use_cuda_graph))
         )
+        _retain_plan_copy_source(pin_buffer, req_pool_indices.device)
         return CompressorPrefillPlan(
             compress_ratio,
             torch.from_dlpack(plan_c) if not _is_xpu else plan_c,
@@ -373,6 +396,7 @@ class CompressorPrefillPlan(NamedTuple):
             int(compress_ratio),
             bool(use_cuda_graph),
         )
+        _retain_plan_copy_source(pin_buffer, req_pool_indices.device)
         return CompressorPrefillPlan(
             compress_ratio,
             torch.from_dlpack(plan_c) if not _is_xpu else plan_c,
@@ -414,6 +438,7 @@ class CompressorPrefillPlan(NamedTuple):
             int(state_slot_offset),
             bool(use_cuda_graph),
         )
+        _retain_plan_copy_source(pin_buffer, device)
         return CompressorPrefillPlan(
             128,
             plan_c_dev[: int(num_c)],
