@@ -591,6 +591,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 )
 
             down_gemm_overlap_args.start_event.record()
+            num_blocks = envs.MX_MASKED_INT8_INT4_GEMM_NUM_BLOCKS.get()
+            if num_blocks <= 0:
+                num_blocks = down_gemm_overlap_args.num_sms
             gemm(
                 [max_tokens, output_width, w2_weight.shape[-1] * 2],
                 down_input_packed.view(torch.int8),
@@ -601,7 +604,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 scale_b=w2_scale,
                 signal=down_gemm_overlap_args.signal,
                 single_batch_overlap=True,
-                num_blocks=down_gemm_overlap_args.num_sms,
+                num_blocks=num_blocks,
             )
 
             block_m = 128

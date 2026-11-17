@@ -747,6 +747,9 @@ class Envs:
     MX_DEEPEP_DISPATCH_PACK_ALIGN_SIZE = EnvInt(256)
     MX_ENABLE_SBO_OVERLAP_DISPATCH = EnvBool(False)
     MX_ENABLE_DSV4_SBO_MOE_SEPARATE_STREAM = EnvBool(False)
+    # Override the MACA W4A8 masked down-GEMM grid size in SBO mode.
+    # A non-positive value preserves the runtime-selected number of SMs.
+    MX_MASKED_INT8_INT4_GEMM_NUM_BLOCKS = EnvInt(0)
     MX_ENABLE_WARMUP_OUTPUT = EnvBool(True)
     MX_DSV4_PAGED_MQA_LOGITS_BACKEND = EnvStr("maca_c")
     MX_OPT_DSV4_PREFILL_ATTN = EnvBool(True)
