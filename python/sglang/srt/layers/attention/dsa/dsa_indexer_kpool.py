@@ -169,7 +169,6 @@ class IndexerKPool(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
-
     @staticmethod
     def _get_index_k_cache_type() -> Tuple[torch.dtype, torch.dtype]:
         """Return (raw storage dtype, real value dtype) of the index-k cache."""
@@ -248,6 +247,7 @@ class IndexerKPool(MultiPlatformOp):
             starts,
             ends,
             clean_logits=clean_logits,
+            backend=envs.MX_ENABLE_TILELANG_INT8_MQA_LOGITS.get().strip().lower()
         )
 
     @staticmethod
@@ -1048,6 +1048,7 @@ class IndexerKPool(MultiPlatformOp):
                 pool_schedule_metadata,
                 pool_max_seq_len,
                 clean_logits=False,
+                backend=envs.MX_ENABLE_TILELANG_INT8_MQA_LOGITS.get().strip().lower()
             )
 
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
