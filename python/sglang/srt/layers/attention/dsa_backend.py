@@ -113,6 +113,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
+    is_maca,
     print_warning_once,
 )
 
@@ -1007,13 +1008,18 @@ class DeepseekSparseAttnBackend(
             topk_indices is None
             or self.dsa_index_kpool <= 1
             or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or (
+                phase == "decode"
+                and dsa_impl == "flashmla_kv"
+                and is_maca()
+                and not self.dsa_kv_cache_is_quantized
+            )
             or (phase == "prefill" and dsa_impl == "flashmla_sparse")
         ):
             return
         raise NotImplementedError(
-            "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            "backend."
+            f"The DSA {phase} backend ({dsa_impl}) does not support the "
+            "tail-extended index table produced by index_kpool > 1."
         )
 
     def _resolve_kpool_tail_backend(
@@ -4181,9 +4187,15 @@ class DeepseekSparseAttnBackend(
         #     kv_cache = quantize_k_cache(kv_cache)
 
         indices = page_table_1.unsqueeze(1)
-        assert (
-            indices.shape[-1] == self.dsa_index_topk
-        )  # requirement of FlashMLA decode kernel
+        index_width = self.dsa_index_topk
+        if (
+            is_maca()
+            and self.dsa_index_kpool > 1
+            and not self.dsa_kv_cache_is_quantized
+        ):
+            # MACA sparse decode accepts the tail-extended width and masks -1.
+            index_width += self.dsa_index_kpool - 1
+        assert indices.shape[-1] == index_width
 
         flashmla_opt = get_bool_env_var("MX_ENABLE_FLASH_MLA_OPT", default="true")
         flashmla_kwargs = {
