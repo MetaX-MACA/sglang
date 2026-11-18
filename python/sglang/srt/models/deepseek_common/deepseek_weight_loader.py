@@ -94,8 +94,9 @@ def _load_fused_indexer_wk(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
     """Load an indexer wk / weights_proj shard into the fused bf16 wk_weights_proj
-    param: wk fills the top head_dim rows (dequantized from block-fp8 if needed),
-    weights_proj the bottom n_heads rows.
+    param: wk fills the top head_dim rows, weights_proj the bottom n_heads rows.
+    Quantized weights wait for their scales before being dequantized: channel
+    INT8 uses weight_scale, while block FP8 uses weight_scale_inv.
 
     Returns False when there is no fused param (non-CUDA, or CUDA with
     SGLANG_DISABLE_DSA_INDEXER_FUSION set, where wk and weights_proj are
@@ -106,44 +107,79 @@ def _load_fused_indexer_wk(
     if fused_param is None or fused_param.dtype != torch.bfloat16:
         return False
 
-    if ".indexer.weights_proj." in name:
-        is_scale = name.endswith(".weight_scale_inv")
-        if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
-            w = _clone_if_runai_streamed_tensor(loaded_weight)
-            fused_param.data[-w.shape[0] :].copy_(w)
-            return True
+    component = name.rsplit(".", 1)[-1]
+    if component not in ("weight", "weight_scale", "weight_scale_inv"):
+        return False
 
-        entry = pending.setdefault(fused_name + ".weights_proj", {})
-        entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
-            loaded_weight
+    is_weights_proj = ".indexer.weights_proj." in name
+    pending_key = fused_name + ".weights_proj" if is_weights_proj else fused_name
+
+    def copy_weight(weight: torch.Tensor) -> None:
+        # copy_ permits broadcasting; reject scales or malformed weights here.
+        if weight.ndim != 2:
+            raise ValueError(f"Expected a matrix for {name}, got {weight.shape}.")
+        rows = weight.shape[0]
+        target = (
+            fused_param.data[-rows:] if is_weights_proj else fused_param.data[:rows]
         )
-        if "weight" in entry and "scale" in entry:
-            pending.pop(fused_name + ".weights_proj")
-            block_size = _get_indexer_weight_block_size(quant_config)
-            weights_bf16 = block_quant_dequant(
-                entry["weight"], entry["scale"], block_size, torch.bfloat16
+        if weight.shape != target.shape:
+            raise ValueError(
+                f"Invalid fused indexer weight shape for {name}: "
+                f"expected {target.shape}, got {weight.shape}."
             )
-            fused_param.data[-weights_bf16.shape[0] :].copy_(weights_bf16)
+        target.copy_(weight)
+
+    if component == "weight" and loaded_weight.dtype in (
+        torch.bfloat16,
+        torch.float16,
+        torch.float32,
+    ):
+        copy_weight(_clone_if_runai_streamed_tensor(loaded_weight))
         return True
 
-    # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
-    is_scale = name.endswith(".weight_scale_inv")
-    if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
-        w = _clone_if_runai_streamed_tensor(loaded_weight)
-        fused_param.data[: w.shape[0]].copy_(w)
-        return True
-
-    entry = pending.setdefault(fused_name, {})
-    entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
-        loaded_weight
-    )
-    if "weight" in entry and "scale" in entry:
-        pending.pop(fused_name)
-        block_size = _get_indexer_weight_block_size(quant_config)
-        wk_bf16 = block_quant_dequant(
-            entry["weight"], entry["scale"], block_size, torch.bfloat16
+    if component == "weight" and loaded_weight.dtype not in (
+        torch.int8,
+        torch.float8_e4m3fn,
+    ):
+        raise ValueError(
+            f"Unsupported fused indexer weight dtype for {name}: {loaded_weight.dtype}."
         )
-        fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
+
+    entry = pending.setdefault(pending_key, {})
+    entry[component] = _clone_if_runai_streamed_tensor(loaded_weight)
+    if "weight" not in entry:
+        return True
+
+    weight = entry["weight"]
+    scale_name = "weight_scale" if weight.dtype == torch.int8 else "weight_scale_inv"
+    if scale_name not in entry:
+        other_scale = (
+            "weight_scale_inv" if scale_name == "weight_scale" else "weight_scale"
+        )
+        if other_scale in entry:
+            raise ValueError(
+                f"Expected {scale_name} for fused indexer weight {pending_key}."
+            )
+        return True
+
+    scale = entry[scale_name]
+    if weight.dtype == torch.int8:
+        # INT8 checkpoints use symmetric per-output-channel scales here.
+        if weight.ndim != 2 or scale.shape not in (
+            (weight.shape[0],),
+            (weight.shape[0], 1),
+        ):
+            raise ValueError(
+                f"Invalid channel INT8 shapes for {pending_key}: "
+                f"weight={weight.shape}, scale={scale.shape}."
+            )
+        weight_bf16 = (weight.float() * scale.float().reshape(-1, 1)).to(torch.bfloat16)
+    else:
+        block_size = _get_indexer_weight_block_size(quant_config)
+        weight_bf16 = block_quant_dequant(weight, scale, block_size, torch.bfloat16)
+
+    copy_weight(weight_bf16)
+    pending.pop(pending_key)
     return True
 
 
@@ -478,6 +514,12 @@ class DeepseekV2WeightLoaderMixin:
             # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+
+        if pending_indexer_wk:
+            raise ValueError(
+                "Missing weight or scale for fused DSA indexer parameters: "
+                f"{sorted(pending_indexer_wk)}"
+            )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
