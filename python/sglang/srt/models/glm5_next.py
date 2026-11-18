@@ -95,6 +95,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -136,6 +137,7 @@ from sglang.srt.utils.common import (
     LazyValue,
     add_prefix,
     align_packed_tensor_size,
+    is_maca,
     log_info_on_rank0,
     make_layers,
     set_weight_attrs,
@@ -822,6 +824,12 @@ class Glm5NextDecoderLayer(nn.Module):
             packed_quant=packed_quant,
             packed_size=align_packed_tensor_size(config.hidden_size),
         )
+        self.use_mega_mhc = (
+            self.config.mhc
+            and not is_nextn
+            and is_maca()
+            and envs.MX_ENABLE_GLM5_NEXT_MEGA_MHC.get()
+        )
 
         if self.config.mhc:
             hc_mult = config.hc_mult
@@ -978,6 +986,54 @@ class Glm5NextDecoderLayer(nn.Module):
             norm_fused,
         )
 
+    def _mega_mhc_attn_to_mlp(
+        self, hidden_states, residual, h_res, h_post, _out_norm_weight, _out_norm_eps
+    ):
+        num_tokens, hidden_size = hidden_states.shape
+        hc_mult = self.config.hc_mult
+        norm = self.post_attention_layernorm
+        # Match the native MACA backend's hidden size and residual stream limits.
+        if (
+            not 0 < num_tokens <= (1 << 20)
+            or hc_mult != 4
+            or not 0 < hidden_size <= 7424
+            or hidden_size % 512 != 0
+            or self.config.hc_sinkhorn_iters < 1
+            or hidden_states.dtype != torch.bfloat16
+            or residual.dtype != torch.bfloat16
+            or norm.weight.dtype != torch.bfloat16
+        ):
+            return None
+
+        from sglang.kernels.ops.layernorm.mhc_mega import mhc_mega_boundary
+
+        fused = mhc_mega_boundary(
+            x=hidden_states.contiguous(),
+            residual=residual.view(num_tokens, hc_mult, hidden_size).contiguous(),
+            post=h_post.view(num_tokens, hc_mult).contiguous(),
+            comb=h_res.view(num_tokens, hc_mult, hc_mult).contiguous(),
+            fn=self.hc_ffn_fn,
+            scale=self.hc_ffn_scale,
+            base=self.hc_ffn_base,
+            weight=norm.weight,
+            rms_eps=self.config.rms_norm_eps,
+            hc_eps=self.config.hc_eps,
+            norm_eps=norm.variance_epsilon,
+            sinkhorn_iters=self.config.hc_sinkhorn_iters,
+            quantize=norm.fused_quant,
+            packed_size=norm.packed_size if norm.packed_quant else None,
+        )
+        if fused is None:
+            return None
+        next_residual, layer_input, next_post, next_comb = fused
+        return (
+            layer_input,
+            next_residual.flatten(1),
+            next_comb.flatten(1),
+            next_post,
+            True,
+        )
+
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
             self.config.n_routed_experts is not None
@@ -1039,10 +1095,19 @@ class Glm5NextDecoderLayer(nn.Module):
             forward_batch, next_full_attention_layer_id
         )
 
+        mlp_kwargs = {}
+        if self.use_mega_mhc and hidden_states.is_cuda:
+            mode = forward_batch.forward_mode
+            # NEXTN runs the target model in verify mode on the decode worker.
+            use_mega_mhc = mode.is_decode() or mode.is_target_verify() or (
+                mode.is_extend_without_speculative()
+                and not get_is_capture_mode()
+                and not torch.cuda.is_current_stream_capturing()
+            )
+            if use_mega_mhc and not torch.compiler.is_compiling():
+                mlp_kwargs["hc_attn_to_mlp"] = self._mega_mhc_attn_to_mlp
         hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
+            hidden_states, residual, forward_batch, **mlp_kwargs
         )
 
         should_allreduce_fusion = (

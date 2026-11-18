@@ -543,20 +543,27 @@ class MHCLayerCommunicator(LayerCommunicator):
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         cache=None,
+        *,
+        hc_attn_to_mlp: Optional[Callable] = None,
     ):
         if cache is not None:
             self._context.cache = cache
 
-        hidden_states, residual = self._communicate_with_all_reduce_and_layer_norm_fn(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
-            layernorm=self.post_attention_layernorm,
-            context=self._context,
-            mhc=self.mhc,
-        )
-
-        return hidden_states, residual
+        default_boundary = self.mhc.hc_attn_to_mlp
+        if hc_attn_to_mlp is not None:
+            self.mhc.hc_attn_to_mlp = hc_attn_to_mlp
+        try:
+            return self._communicate_with_all_reduce_and_layer_norm_fn(
+                hidden_states=hidden_states,
+                residual=residual,
+                forward_batch=forward_batch,
+                layernorm=self.post_attention_layernorm,
+                context=self._context,
+                mhc=self.mhc,
+            )
+        finally:
+            if hc_attn_to_mlp is not None:
+                self.mhc.hc_attn_to_mlp = default_boundary
 
     def postprocess_layer(self, hidden_states, residual, forward_batch):
         hidden_states, residual = self._communicate_summable_tensor_pair_fn(
