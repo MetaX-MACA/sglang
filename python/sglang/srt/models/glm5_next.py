@@ -155,6 +155,28 @@ _GLM_AITER_FUSED_MHC_LOGGED = False
 _KDA_PROJ_NAMES = ("qkv_proj", "b_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj")
 
 
+def _kda_input_projs_w8a8(quant_config, prefix: str) -> bool:
+    from sglang.srt.layers.quantization.compressed_tensors.utils import (
+        should_ignore_layer,
+    )
+    from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+
+    if not isinstance(quant_config, W8A8Int8Config):
+        return False
+
+    def is_unquantized(name: str) -> bool:
+        return should_ignore_layer(
+            f"{prefix}.{name}",
+            ignore=quant_config.ignore,
+            fused_mapping=quant_config.packed_modules_mapping,
+        )
+
+    return not any(
+        is_unquantized(name)
+        for name in ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")
+    ) and all(is_unquantized(name) for name in ("f_b_proj", "g_b_proj"))
+
+
 def _kda_projs_unquantized(quant_config, prefix: str) -> bool:
     if quant_config is None:
         return True
@@ -431,10 +453,17 @@ class Glm5NextLinearAttention(nn.Module):
         # attention where the attention and global TP groups differ.
         # LoRA wraps the original projections, not these fused module types.
         self._fused_qkvbfg_original_n = None
-        self.do_fuse_qkvbfg = (
+        can_fuse_projection = (
             envs.MX_ENABLE_KDA_PROJECTION_FUSION.get()
             and not (get_lora().enable_lora or get_lora().lora_paths)
-            and _kda_projs_unquantized(quant_config, prefix)
+        )
+        fuse_w8a8 = (
+            can_fuse_projection
+            and is_maca()
+            and _kda_input_projs_w8a8(quant_config, prefix)
+        )
+        self.do_fuse_qkvbfg = fuse_w8a8 or (
+            can_fuse_projection and _kda_projs_unquantized(quant_config, prefix)
         )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
@@ -458,7 +487,7 @@ class Glm5NextLinearAttention(nn.Module):
                 self.qkvb_sizes,
                 self.fg_sizes + ([pad_n] if pad_n else []),
                 # Eligibility is resolved using the original projection names.
-                quant_config=None,
+                quant_config=quant_config if fuse_w8a8 else None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
                 tp_rank=head_shard_rank,
                 tp_size=head_shard_size,
@@ -624,7 +653,11 @@ class Glm5NextLinearAttention(nn.Module):
     def _zero_fused_qkvbfg_pad(self) -> None:
         """Zero the never-loaded padding rows of the fused projection weight."""
         if self.do_fuse_qkvbfg and self._fused_qkvbfg_original_n is not None:
-            self.fused_qkvbfg_a_proj.weight.data[self._fused_qkvbfg_original_n :].zero_()
+            projection = self.fused_qkvbfg_a_proj
+            tail = slice(self._fused_qkvbfg_original_n, None)
+            projection.weight.data[tail].zero_()
+            if hasattr(projection, "weight_scale"):
+                projection.weight_scale.data[tail].fill_(1)
 
     def forward_qkvbfg_fused(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
