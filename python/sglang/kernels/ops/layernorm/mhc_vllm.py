@@ -193,6 +193,9 @@ def mhc_pre_vllm(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     n_splits: int = 1,
+    *,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward pass for mHC pre block.
@@ -247,6 +250,40 @@ def mhc_pre_vllm(
         gemm_out_sqrsum,
         n_splits,
     )
+
+    if norm_weight is not None:
+        from sglang.kernels.ops.layernorm.mhc_norm_maca import mhc_pre_with_norm_tilelang
+
+        assert norm_eps is not None
+        assert norm_weight.shape == (hidden_size,)
+        assert norm_weight.dtype == torch.bfloat16
+        kernel = mhc_pre_with_norm_tilelang(
+            hidden_size,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            mhc_mult,
+            norm_eps,
+        )
+        kernel(
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            residual_flat,
+            post_mix,
+            comb_mix,
+            layer_input,
+            norm_weight.contiguous(),
+        )
+        return (
+            post_mix.view(*outer_shape, mhc_mult, 1),
+            comb_mix.view(*outer_shape, mhc_mult, mhc_mult),
+            layer_input.view(*outer_shape, hidden_size),
+        )
 
     from mcoplib.tilelang_mhc_pre import mhc_pre as mhc_pre_opt
     return mhc_pre_opt(

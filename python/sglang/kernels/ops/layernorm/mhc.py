@@ -19,6 +19,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.utils.common import is_gfx1250_supported, is_hip, get_bool_env_var
+from sglang.srt.utils.common import is_maca
 
 logger = logging.getLogger(__name__)
 
@@ -1979,7 +1980,13 @@ def _mhc_pre_dispatch(
         )
         return post_mix, comb_mix, layer_input, False
 
-    post_mix, comb_mix, layer_input = mhc_pre(
+    pre = mhc_pre
+    if is_maca() and norm_weight is not None:
+        from sglang.kernels.ops.layernorm.mhc_vllm import mhc_pre_vllm
+
+        pre = mhc_pre_vllm
+
+    post_mix, comb_mix, layer_input = pre(
         residual=residual,
         fn=fn,
         hc_scale=hc_scale,

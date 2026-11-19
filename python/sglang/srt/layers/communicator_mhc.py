@@ -25,6 +25,7 @@ from sglang.srt.distributed.communication_op import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import (
     AttentionInputs,
@@ -82,14 +83,17 @@ class MHCState:
     def _resolve_out_norm(out_norm):
         if out_norm is None:
             return None, None
+        if is_maca() and (
+            not envs.MX_ENABLE_GLM5_NEXT_TILELANG_MHC_RMSNORM.get()
+            or out_norm.fused_quant
+            or out_norm.weight.dtype != torch.bfloat16
+        ):
+            return None, None
         return out_norm.weight.data, out_norm.variance_epsilon
 
     def attn_split(self, hidden_states, out_norm: Optional[torch.nn.Module] = None):
         residual = hidden_states
-        if not is_maca():
-            out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
-        else:
-            out_norm_weight, out_norm_eps = None, None
+        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
         hidden_states, self.h_res, self.h_post, norm_fused = self.hc_attn_pre(
             hidden_states, out_norm_weight, out_norm_eps
         )
@@ -100,10 +104,7 @@ class MHCState:
     def attn_to_mlp(
         self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
     ):
-        if not is_maca():
-            out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
-        else:
-            out_norm_weight, out_norm_eps = None, None
+        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
         if self.hc_attn_to_mlp is not None:
             fused = self.hc_attn_to_mlp(
                 hidden_states,

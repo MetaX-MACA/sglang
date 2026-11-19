@@ -700,6 +700,7 @@ class Envs:
     # packed quant still follows MX_ENABLE_FUSE_RMSNORM_QUANT).
     MX_ENABLE_FUSE_RMSNORM_QUANT_PREFILL = EnvBool(False)
     MX_ENABLE_GLM5_NEXT_MEGA_MHC = EnvBool(False)
+    MX_ENABLE_GLM5_NEXT_TILELANG_MHC_RMSNORM = EnvBool(False)
     MX_ENABLE_FUSE_SILUMUL_QUANT = EnvBool(False)
     MX_ENABLE_FUSE_ACT_FP8_QUANT = EnvBool(False)
     # Triton MoE (standard dispatch) FP8 prefill for plain-SiLU models (no
