@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Numerical regression for V4 INT8 packed stores, gathers and sparse decode."""
 
 import unittest

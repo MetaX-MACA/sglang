@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Triton sparse-MLA forward for the DSA FP8 and BF16 paths.
 
 Two strategies, auto-selected by sequence length:

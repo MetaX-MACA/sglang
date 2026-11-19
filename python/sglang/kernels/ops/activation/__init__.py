@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Fused gated-activation kernels (``act(x[:h]) * x[h:]``).
 
 Each operator is a :class:`~sglang.kernels.fused_op.BaseFusedOp` with a

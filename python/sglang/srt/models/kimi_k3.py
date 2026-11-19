@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # Kimi-K3 multimodal model: KimiLinear text backbone + MoonViT3d vision tower.
 # Based on kimi_linear.py with K3-specific features:
 #   - Attention Residual (attn_res_block_size)

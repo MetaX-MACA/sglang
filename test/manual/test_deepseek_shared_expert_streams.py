@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """MACA numerical regression for shared/routed expert input aliasing.
 
 Run with ENABLE_MCTLASS_FUSED_MOE=0 ENABLE_MCTLASS_FUSED_MOE_PYTHON_API=0

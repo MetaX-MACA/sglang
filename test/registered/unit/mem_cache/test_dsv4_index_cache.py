@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """V4 index-cache selection and allocation agree in elements and bytes."""
 
 import unittest

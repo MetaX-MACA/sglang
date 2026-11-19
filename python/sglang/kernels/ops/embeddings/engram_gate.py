@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Fused FP32 Engram gate with a single final cast to the activation dtype."""
 
 import torch

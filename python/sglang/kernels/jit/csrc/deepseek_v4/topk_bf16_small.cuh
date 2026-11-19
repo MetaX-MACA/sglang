@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 /**
  * \brief DeepSeek-V4.1's bf16 top-k kernel for short rows (<= 16384 scores)
  * Adapted from https://github.com/deepseek-ai/DeepSelect

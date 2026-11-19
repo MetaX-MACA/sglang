@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """MACA V4 BF16 index cache: compressed writes, Q transform and paged logits."""
 
 import unittest

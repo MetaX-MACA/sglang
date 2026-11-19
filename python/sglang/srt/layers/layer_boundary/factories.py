@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Construct one computing stage and its transport from a predecessor contract."""
 
 from __future__ import annotations

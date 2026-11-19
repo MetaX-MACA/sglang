@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """The index logits of the DeepSeek V4.1 ratio-1/2 index layers, by the layout of
 the index K they read: the flattened K of a prefill chunk (tile by tile under a
 memory budget), the paged pool, or the published blocks of a sparse table."""

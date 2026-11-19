@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Resolve the fixed MACA package version without importing sglang.
 
 The default output is ``0.5.22+<commit>-maca<MACA_AI_VERSION>``.

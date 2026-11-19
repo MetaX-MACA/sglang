@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """CPU regression tests for multi-group ("mixed-precision") compressed-tensors configs.
 
 Such a checkpoint used to load completely unquantized. ``ignore`` was matched by

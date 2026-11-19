@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 /*
  * Copyright (c) 2026 by SGLang team.
  * Licensed under the Apache License, Version 2.0.

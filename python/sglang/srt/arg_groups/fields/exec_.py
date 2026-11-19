@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Config fields of the ``exec`` namespace."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Packed V4 dtype geometry and INT8 scale addressing across page boundaries."""
 
 import unittest

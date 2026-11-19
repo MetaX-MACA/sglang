@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Engram: gated n-gram hash memory added to the hc residual stream.
 
 The token map, hash multipliers and prime layout must match

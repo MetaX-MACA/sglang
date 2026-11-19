@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Packed GLM/DeepSeek DSA cache rows: quantized NoPE, FP32 scales, BF16 RoPE.
 
 The initial INT8 ABI matches the 512+64 FP8 layout (656 bytes per token).

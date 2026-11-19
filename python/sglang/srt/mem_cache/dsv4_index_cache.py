@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Storage selection shared by V4 indexer allocation, budgeting and scoring."""
 
 import torch

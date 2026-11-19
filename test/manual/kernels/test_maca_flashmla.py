@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Validate the sgl_kernel FlashMLA adapter against dense PyTorch attention."""
 
 import math

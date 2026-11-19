@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved. */
 #pragma once
 
 // Force-included by MACA AOT/JIT builds so kernels can retain CUDA declarations.

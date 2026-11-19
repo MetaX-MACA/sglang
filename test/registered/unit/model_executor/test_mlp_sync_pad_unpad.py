@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Unit tests for the DP-attention MLP-sync pad/unpad round-trip.
 
 ``prepare_mlp_sync_batch`` pads per-request tensors (positions / seq_lens /

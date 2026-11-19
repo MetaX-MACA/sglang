@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """sglang build hooks.
 
 Rust extensions are auto-discovered from the Cargo workspace in ../rust and

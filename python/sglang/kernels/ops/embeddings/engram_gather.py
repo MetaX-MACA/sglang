@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Triton gather of DeepSeek-V4.1 engram rows: fp8 e4m3 payload, e8m0 block scales.
 
 The table pointers arrive as raw addresses so one kernel serves a device table, a

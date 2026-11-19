@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """CPU contract checks for the MACA kernel port, using stubbed GPU operators.
 
 Run directly with Python. These tests execute the production control flow via

@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Shared CUDA graph executable-dedup plumbing for CUDA graph backends."""
 
 from __future__ import annotations

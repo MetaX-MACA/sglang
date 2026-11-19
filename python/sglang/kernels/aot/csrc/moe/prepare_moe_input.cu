@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 #include <c10/cuda/CUDAGuard.h>
 #include <cudaTypedefs.h>
 #include <torch/all.h>

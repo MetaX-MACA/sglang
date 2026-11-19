@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Kimi K3 multimodal processor.
 
 GPU image preprocessing dedicated to K3: unlike the K2.5 wrapper it keeps

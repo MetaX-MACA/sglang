@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // Radix top-k core adapted from https://github.com/tile-ai/tilelang/blob/main/examples/deepseek_v32/topk_selector.py.
 // This JIT variant adds pool expansion and page-table/ragged-offset transforms.
 #include <sgl_kernel/tensor.h>

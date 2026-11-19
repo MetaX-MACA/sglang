@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // Fused QSA (Qwen4-Exp sparse attention) indexer-prep kernels.
 // Outputs are bit-identical to the eager bf16/fp16 aten chain, mirrored step by step.
 

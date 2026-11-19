@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig

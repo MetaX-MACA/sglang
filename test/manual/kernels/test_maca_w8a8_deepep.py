@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """MACA W8A8 low-latency expert runner against a BF16 mathematical reference."""
 
 import unittest

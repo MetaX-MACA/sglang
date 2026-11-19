@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Compare MACA FP8 expert GEMM with Triton, including output-view fallbacks.
 
 Run in the MACA container with ENABLE_MCTLASS_FUSED_MOE_PYTHON_API=1.

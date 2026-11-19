@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Online C128 ragged prefix banks and accepted-prefix commits."""
 
 import unittest

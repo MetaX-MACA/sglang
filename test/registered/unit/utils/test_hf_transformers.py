@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Unit tests for the sglang.srt.utils.hf_transformers subpackage.
 
 Tests cover the pure utility functions (compat patches, config helpers,

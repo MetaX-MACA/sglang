@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 from sglang._build_version import (
     BASE_VERSION,
     SCM_VERSION,

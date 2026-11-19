@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Pure-torch FP4 fake quantization for DeepSeek-V4.1.
 
 Indexer values use per-32 UE8M0 scales; compressed KV uses per-16 E4M3 scales.

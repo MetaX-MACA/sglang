@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """PP metadata must not restore a sender's CUDA storage during unpickling.
 
 Nested top-logprob tensors previously bypassed the tensor transport and opened

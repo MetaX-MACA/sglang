@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """MACA regression for packed DSA INT8 KV, sparse decode and HiCache."""
 
 import unittest

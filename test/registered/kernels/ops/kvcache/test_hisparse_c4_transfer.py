@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Physical C4 cache transfers must preserve BF16 rows and split FP8 scales."""
 
 import unittest

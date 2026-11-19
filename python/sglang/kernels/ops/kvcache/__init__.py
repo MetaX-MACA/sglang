@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """KV-cache write/transfer kernels.
 
 This group wraps the Triton ``reshape_and_cache`` launcher, whose implementation

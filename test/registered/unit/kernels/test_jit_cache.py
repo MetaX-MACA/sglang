@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """CPU-only tests for the JIT build pipeline: ninja generation and the cache.
 
 Everything here runs against synthetic files, so the invariants that matter — a

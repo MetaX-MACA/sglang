@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """The top-k selection of the DeepSeek V4.1 ratio-1/2 index layers: the full top-k
 (``full_topk``), and the candidate schemes split by what a source publishes, a
 DeepGEMM sparse table (``sparse_table``) or dense block ids (``dense_blocks``)."""

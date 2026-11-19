@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Weight-free TileLang MQA operators for the simple QSA indexer;
 the torch implementations are the fallback and the reference."""
 

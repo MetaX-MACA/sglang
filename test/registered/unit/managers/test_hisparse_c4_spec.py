@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """C4 verify boundary routing and accepted-token commit on CPU."""
 
 import unittest

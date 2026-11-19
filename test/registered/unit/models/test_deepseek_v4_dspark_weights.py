@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Quantized DSpark vocabulary weights must load rather than remain initialized."""
 
 import unittest
