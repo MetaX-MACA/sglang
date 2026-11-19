@@ -61,7 +61,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.activation import SiluAndMul, fused_silu_mul_int8_quant_enabled
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
@@ -324,7 +324,13 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. "
                 "Only silu is supported for now."
             )
-        self.fused_quant = envs.MX_ENABLE_FUSE_SILUMUL_QUANT.get()
+        self.fused_quant = False
+        if fused_silu_mul_int8_quant_enabled():
+            from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
+
+            self.fused_quant = isinstance(
+                self.down_proj.quant_method, W8A8Int8LinearMethod
+            )
         self.act_fn = SiluAndMul(fused_quant=self.fused_quant)
         self.use_fused_clamp_act_mul = _is_hip
         self._fused_clamp_fp8_checked = False

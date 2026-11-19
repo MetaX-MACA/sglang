@@ -40,6 +40,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_maca,
     is_musa,
     is_npu,
     is_xpu,
@@ -131,6 +132,25 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 
+def fused_silu_mul_int8_quant_enabled() -> bool:
+    if not is_maca() or not envs.MX_ENABLE_FUSE_SILUMUL_QUANT.get():
+        return False
+    import mcoplib.sgl_kernel  # noqa: F401
+
+    return hasattr(torch.ops.sgl_kernel, "fused_silu_mul_dq_nomask_quant_nopack")
+
+
+def fused_silu_mul_int8_quant(
+    x: torch.Tensor, limit: Optional[float]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output = torch.empty((x.shape[0], x.shape[1] // 2), device=x.device, dtype=torch.int8)
+    scale = torch.empty((x.shape[0], 1), device=x.device, dtype=torch.float32)
+    torch.ops.sgl_kernel.fused_silu_mul_dq_nomask_quant_nopack.default(
+        output, scale, x, limit, None
+    )
+    return output, scale
+
+
 class SiluAndMul(BaseFusedOp):
     def __init__(self, fused_quant=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -149,10 +169,7 @@ class SiluAndMul(BaseFusedOp):
 
     def forward_cuda(self, x: torch.Tensor, limit: Optional[float]=None) -> torch.Tensor:
         if self.fused_quant:
-            output = torch.empty((x.shape[0], x.shape[1] // 2), device=x.device, dtype=torch.int8)
-            scale = torch.empty((x.shape[0],1), device=x.device, dtype=torch.float32)
-            torch.ops.sgl_kernel.fused_silu_mul_dq_nomask_quant_nopack.default(output, scale, x, limit, None)
-            return (output, scale)
+            return fused_silu_mul_int8_quant(x, limit)
         else:
             d = x.shape[-1] // 2
             output_shape = x.shape[:-1] + (d,)

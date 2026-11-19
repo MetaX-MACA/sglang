@@ -29,6 +29,10 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.activation import (
+    fused_silu_mul_int8_quant,
+    fused_silu_mul_int8_quant_enabled,
+)
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size, get_moe_runner_backend
@@ -138,6 +142,7 @@ enable_maca_sglang_fused_moe_mctlass_w4a16 = envs.ENABLE_MACA_SGLANG_FUSED_MOE_M
 # `_should_fuse_moe_act_quant` for the
 # exact preconditions -- every other shape keeps the two-kernel sequence.
 enable_fused_moe_act_quant = envs.MX_ENABLE_MOE_FUSE_ACT_QUANT.get()
+enable_fused_moe_int8_act_quant = fused_silu_mul_int8_quant_enabled()
 
 # The fused op is registered in the vllm-compatible `_C` namespace by
 # `mcoplib._C`, which sglang already imports for the per-token quantizer.
@@ -1110,7 +1115,28 @@ def _fused_moe_kernel_sequence(
             topk_ids,
         )
 
-    if not fuse_swiglu_interleaved:
+    use_fused_int8_act_quant = (
+        enable_fused_moe_int8_act_quant
+        and use_int8_w8a8
+        and per_channel_quant
+        and block_shape is None
+        and hidden_states.dtype == torch.bfloat16
+        and activation == "silu"
+        and is_gated
+        and swiglu_limit is not None
+        and gemm1_alpha is None
+        and gemm1_limit is None
+        and not hooks
+        and not filter_expert
+        and not down_moe_use_tma
+        and not fuse_swiglu_interleaved
+        and (
+            (N // 2 == 256 and 0 < total_tokens <= 128)
+            or (N // 2 in (1536, 2048) and 0 < total_tokens <= 1024)
+        )
+    )
+
+    if not fuse_swiglu_interleaved and not use_fused_int8_act_quant:
         intermediate_cache2 = torch.empty(
             (total_tokens, N // 2),
             device=hidden_states.device,
@@ -1139,6 +1165,10 @@ def _fused_moe_kernel_sequence(
     if fuse_swiglu_interleaved:
         # silu(gate) * up was already applied by the up-GEMM epilogue.
         pass
+    elif use_fused_int8_act_quant:
+        intermediate_cache2, a2_scale = fused_silu_mul_int8_quant(
+            intermediate_cache1.view(-1, N), swiglu_limit
+        )
     elif use_fused_act_quant:
         # MX_ENABLE_MOE_FUSE_ACT_QUANT: mcoplib's fused silu-and-mul + fp8
         # per-block quantization turns gate_up ([total_tokens, 2I] bf16) into the
