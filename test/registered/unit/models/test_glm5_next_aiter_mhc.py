@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch

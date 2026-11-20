@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 # ponytail: fake pools via spec-mocks, no real KV alloc; DSA must be checked
 # before MLA since DSATokenToKVPool subclasses MLATokenToKVPool.
 from unittest.mock import MagicMock

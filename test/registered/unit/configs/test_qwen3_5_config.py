@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Dense Qwen3_5TextConfig must not surface MoE-only sizes inherited from Qwen3NextConfig.
 
 If it does, check_quantized_moe_compatibility treats block-quantized FP8 dense

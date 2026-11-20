@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Benchmark for DeepSeek-V4 fused norm + RoPE kernels."""
 
 import itertools

@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // Fused attention prologues for Inkling: after the qkvr projection, ONE
 // kernel does {k_sconv + v_sconv + per-head q/k RMSNorm + the KV-cache
 // store}, in three variants -- TARGET-VERIFY (fixed q tokens/seq + both

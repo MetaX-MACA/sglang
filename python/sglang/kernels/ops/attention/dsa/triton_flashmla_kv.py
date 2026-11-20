@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Correctness-first Triton replacement for quantized flash_mla_with_kvcache."""
 
 from typing import Optional, Tuple

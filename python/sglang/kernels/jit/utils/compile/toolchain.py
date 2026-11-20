@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """The toolchain a JIT build runs on: compilers, tvm-ffi's headers, base flags.
 
 sglang generates its own ``build.ninja`` rather than going through

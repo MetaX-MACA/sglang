@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """NPU-only KV pool variant for DeepSeek-V4.
 
 The full/SWA/C4/C128 KV buffers keep their Ascend-specific PA_ND layout. The

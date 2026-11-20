@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Template utilities for Jinja template processing.
 
 This module provides utilities for analyzing and processing Jinja chat templates,

@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // Update the convolution cache from an extend/prefill token stream.
 //
 // For each sequence b with slot ci = cache_indices[b] and query range

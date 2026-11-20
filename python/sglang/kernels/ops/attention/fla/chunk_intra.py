@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # Adapted from flash-linear-attention project.
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 

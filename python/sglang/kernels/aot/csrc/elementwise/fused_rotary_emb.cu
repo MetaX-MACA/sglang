@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // #include "fused_rotary_emb.h"
 
 #include <cuda_bf16.h>

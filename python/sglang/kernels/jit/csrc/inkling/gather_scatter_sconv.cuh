@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // Fused gather and scatter into sconv_cache.
 //
 // For each batch element b where mask[b] is true, copy the W1 = W-1 token rows

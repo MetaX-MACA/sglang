@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 #include "shm.h"
 #if defined(__x86_64__)
 #include "x86_64/shm.h"

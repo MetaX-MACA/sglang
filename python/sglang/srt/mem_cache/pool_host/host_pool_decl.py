@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Declarations of the host pools a device pool needs HiCache to keep.
 
 A device pool declares them (``HostPoolDecl``) through ``host_pool_decls()``.

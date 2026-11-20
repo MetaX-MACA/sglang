@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // K3 MLA output gate: out = bf16(bf16(x) * bf16(sigmoid(gate))), replacing
 // the torch.sigmoid + mul elementwise pair (two launches, two memory passes)
 // with one kernel. sigmoid is computed in fp32 and rounded to bf16 before the

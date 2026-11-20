@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Targeted benchmark for the SM90 FP8 swap-AB dispatch path.
 
 Sweeps small batch sizes (M = 1..128) across N/K shapes that exercise each

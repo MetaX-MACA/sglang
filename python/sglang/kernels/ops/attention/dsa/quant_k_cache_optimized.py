@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """GLM-5.2 FP8 KV-cache quantization and paged dequantization operators."""
 
 from functools import lru_cache

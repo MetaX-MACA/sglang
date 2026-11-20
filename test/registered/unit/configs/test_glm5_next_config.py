@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Unit tests for GLM-5 Next configuration compatibility."""
 
 import unittest

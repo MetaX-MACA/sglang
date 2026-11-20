@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // CUDA port of the triton fused_recurrent_kda_packed_decode_kernel for
 // batched decode. The triton kernel holds a whole [BV, K] fp32 state tile in
 // the registers of a single warp, which caps it at ~5 TB/s of the ~9.6 TB/s

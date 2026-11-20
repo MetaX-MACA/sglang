@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Unit tests for srt/layers/quantization/fp8.py MoE runner ownership.
 
 MoE backend flags are global, so `Fp8MoEMethod.process_weights_after_loading`

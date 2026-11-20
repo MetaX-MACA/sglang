@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Glue-graph capture of the per-replay attention-metadata prep.
 
 ``decode_cuda_graph_runner.load_batch`` runs

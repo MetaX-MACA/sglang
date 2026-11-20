@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // Fused decode {all-reduce -> mlp/attn sconv -> residual-add + RMSNorm} for the
 // Inkling (Moonrise) small-batch decode path -- the v5 push one-shot all-reduce
 // (inkling_all_reduce.cuh) with the EPILOGUE SEAM filled in by the decode short-conv

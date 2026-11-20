@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Self-contained C500/MetaX-C550-optimized KDA Triton kernels (fast path).
 

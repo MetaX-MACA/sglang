@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 /// Four-bit radix-select router for K3 routing on CDNA (gfx942/gfx950).
 ///
 /// One block routes one token. Each thread keeps its slice of the 896 scores in

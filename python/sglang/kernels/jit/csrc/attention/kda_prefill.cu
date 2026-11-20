@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // kda_prefill.cu — self-contained KDA prefill forward (inference drop-in for
 // the FLA Triton chunk_kda_fwd path). Single-file artifact carrying ONLY the
 // shipping default paths — two routes, picked per shape from the launch

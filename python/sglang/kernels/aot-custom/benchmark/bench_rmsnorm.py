@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # Benchmarks SGLang RMSNorm kernels versus vLLM and FlashInfer across
 # (batch_size, seq_len, hidden_size) and prints speed-up.
 import argparse

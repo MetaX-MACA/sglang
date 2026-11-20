@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // MLA KV-cache write fused with the Q concat, bf16 and fp8 entry points.
 
 #pragma once

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Layout contract for the quantized GLM/DeepSeek-DSA MLA KV cache.
 
 FP8 and INT8 share the same packed row prefix:

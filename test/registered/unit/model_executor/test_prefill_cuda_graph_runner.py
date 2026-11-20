@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """CPU coverage for chunked-prefix Full prefill CUDA-graph state."""
 
 import unittest

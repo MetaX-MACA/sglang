@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // Top-k expert-output sum: out[M, K] = sum_j in[M, topk, K].
 //
 // Replaces sgl_kernel's moe_sum_reduce_kernel_general (~5.7us at decode

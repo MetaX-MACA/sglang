@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // K3 MoE-front prep in one launch: radix routing (+ trtllm packed ids) on the
 // first M CTAs, mxfp8 per-token-group quant of the routed activations on the
 // next M. At decode batch sizes the unfused chain is three tiny back-to-back

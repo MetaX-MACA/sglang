@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // MoE routing by radix select: the standalone route kernel and the fused-gate
 // front end, over one copy of the radix primitives (previously
 // moe/radix_select_common.cuh, folded in once its two consumers became one file).

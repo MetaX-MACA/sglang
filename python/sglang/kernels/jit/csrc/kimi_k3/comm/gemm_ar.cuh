@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // K3 fused o_proj GEMM + all-reduce for decode (bf16, TP row-parallel).
 //
 // CONTRACT (per rank r of R):  out[M, 7168] = sum_r x_r[M, K] @ W_r[7168, K]^T

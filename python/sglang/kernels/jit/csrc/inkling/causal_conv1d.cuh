@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // Depthwise causal conv1d (extend/prefill) with the W-1 prefix taps gathered
 // directly from sconv_cache.
 //

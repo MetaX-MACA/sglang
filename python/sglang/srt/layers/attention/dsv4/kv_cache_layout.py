@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Shared layout contract for the DeepSeek-V4 main KV caches.
 
 The packed formats keep every token's 448-D NOPE payload and 64-D BF16

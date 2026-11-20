@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize/DType/Device
 #include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil, pointer::offset
 

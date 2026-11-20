@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // Custom all-reduce kernels over the decoupled Communicator storage plane.
 //
 // Three algorithms are provided behind one entry point:

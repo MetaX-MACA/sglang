@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 /**
  * \brief Here's some dimension info for the main buffer used in C4 prefill and decode.
  *

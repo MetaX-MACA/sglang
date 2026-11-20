@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Equivalence tests for the EagleDraftWorker topk=1 chain fast path.
 
 For topk=1 the draft tree degenerates to a chain, so `draft_forward` skips the

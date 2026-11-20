@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 import logging
 from contextlib import contextmanager
 from typing import Any, Optional, Tuple, Union

@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Unified video decoder: torchcodec preferred, decord as fallback."""
 
 import logging

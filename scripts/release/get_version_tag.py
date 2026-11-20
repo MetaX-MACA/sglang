@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Resolve the correct version tag for setuptools-scm.
 
 Called by setuptools-scm via git_describe_command in pyproject.toml.

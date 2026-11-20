@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """AMD/ROCm multi-head attention forward path for DeepSeek models.
 
 `AttnForwardMethod.MHA_ROCM` and `AttnForwardMethod.MHA_ONE_SHOT_ROCM` route

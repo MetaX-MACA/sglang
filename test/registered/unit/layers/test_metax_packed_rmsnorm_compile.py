@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Regression tests for the MCOP packed RMSNorm torch.compile boundary."""
 
 import pytest

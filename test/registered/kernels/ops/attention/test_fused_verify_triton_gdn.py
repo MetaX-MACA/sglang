@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Tests for fused sigmoid gating delta rule MTP kernel (GDN target_verify).
 
 Compares the fused kernel `fused_sigmoid_gating_delta_rule_update` against

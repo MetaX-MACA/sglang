@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // Combined optimal: real AOT .metallib + Primitive integration + optimized
 // 3-kernel + 3D-grid dispatch + fused KV pool write.
 

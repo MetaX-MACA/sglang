@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging

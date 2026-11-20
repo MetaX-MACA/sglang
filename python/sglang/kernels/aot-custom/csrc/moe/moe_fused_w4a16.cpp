@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 #include <torch/extension.h>
 
 int64_t mctlass_moe_w4a16_gemm_kernel_mnk(int64_t num_valid_tokens, int64_t N, int64_t K, int64_t group);

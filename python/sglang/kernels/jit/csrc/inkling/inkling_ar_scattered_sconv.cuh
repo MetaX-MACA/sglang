@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // Fused {all-reduce + scattered short-conv} for Inkling (--enable-scattered-sconv
 // with SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV): the v3/v3b two-shot multimem
 // all-reduce (inkling_all_reduce.cuh) with its slice partition changed from the

@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 import pytest
 import torch
 from sgl_kernel import max_pooling_1d_varlen

@@ -1,0 +1,894 @@
+The MetaX project is modified from https://github.com/sgl-project/sglang.
+Please see the LICENSE for the license for this project.
+
+This project contains third-party components with separate copyright notices and license terms. Your use of the source code for these third-party components is subject to the terms and conditions of their licenses.
+
+The following files may have been modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. in 2026. Modification copyright 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd.
+
+  1. benchmark/hicache/data_processing.py
+  2. demo.py
+  3. python/demo.py
+  4. python/setup.py
+  5. python/sglang/__init__.py
+  6. python/sglang/benchmark/datasets/random.py
+  7. python/sglang/benchmark/serving.py
+  8. python/sglang/jit_kernel/hadamard_tilelang/__init__.py
+  9. python/sglang/jit_kernel/hadamard_tilelang/hadamard.py
+ 10. python/sglang/jit_kernel/hadamard_tilelang/tilelang_kernels.py
+ 11. python/sglang/jit_kernel/hadamard_tilelang/utils.py
+ 12. python/sglang/kernels/aot-custom/analyze_whl_kernel_sizes.py
+ 13. python/sglang/kernels/aot-custom/benchmark/bench_activation.py
+ 14. python/sglang/kernels/aot-custom/benchmark/bench_amd_deterministic_allreduce.py
+ 15. python/sglang/kernels/aot-custom/benchmark/bench_awq_dequant.py
+ 16. python/sglang/kernels/aot-custom/benchmark/bench_cutlass_mla.py
+ 17. python/sglang/kernels/aot-custom/benchmark/bench_dsv4_norm_rope.py
+ 18. python/sglang/kernels/aot-custom/benchmark/bench_es_fp8_blockwise_grouped_gemm.py
+ 19. python/sglang/kernels/aot-custom/benchmark/bench_fp4_gemm.py
+ 20. python/sglang/kernels/aot-custom/benchmark/bench_fp8_blockwise_group_gemm.py
+ 21. python/sglang/kernels/aot-custom/benchmark/bench_fp8_gemm.py
+ 22. python/sglang/kernels/aot-custom/benchmark/bench_fp8_gemm_swap_ab.py
+ 23. python/sglang/kernels/aot-custom/benchmark/bench_int8_gemm.py
+ 24. python/sglang/kernels/aot-custom/benchmark/bench_moe_align_block_size.py
+ 25. python/sglang/kernels/aot-custom/benchmark/bench_moe_ep_post_reorder.py
+ 26. python/sglang/kernels/aot-custom/benchmark/bench_moe_topk_sigmoid.py
+ 27. python/sglang/kernels/aot-custom/benchmark/bench_moe_topk_softmax.py
+ 28. python/sglang/kernels/aot-custom/benchmark/bench_mrope.py
+ 29. python/sglang/kernels/aot-custom/benchmark/bench_per_tensor_quant_fp8.py
+ 30. python/sglang/kernels/aot-custom/benchmark/bench_per_token_group_quant_8bit.py
+ 31. python/sglang/kernels/aot-custom/benchmark/bench_rmsnorm.py
+ 32. python/sglang/kernels/aot-custom/benchmark/bench_rotary_embedding.py
+ 33. python/sglang/kernels/aot-custom/benchmark/bench_sum_scale.py
+ 34. python/sglang/kernels/aot-custom/benchmark/bench_top_k_top_p_sampling.py
+ 35. python/sglang/kernels/aot-custom/csrc/allreduce/custom_all_reduce.cu
+ 36. python/sglang/kernels/aot-custom/csrc/allreduce/custom_all_reduce.cuh
+ 37. python/sglang/kernels/aot-custom/csrc/allreduce/custom_all_reduce_hip.cuh
+ 38. python/sglang/kernels/aot-custom/csrc/allreduce/quick_all_reduce.cu
+ 39. python/sglang/kernels/aot-custom/csrc/allreduce/quick_all_reduce.cuh
+ 40. python/sglang/kernels/aot-custom/csrc/allreduce/quick_all_reduce.h
+ 41. python/sglang/kernels/aot-custom/csrc/allreduce/quick_all_reduce_base.h
+ 42. python/sglang/kernels/aot-custom/csrc/attention/cutlass_mla_kernel.cu
+ 43. python/sglang/kernels/aot-custom/csrc/attention/merge_attn_states.cu
+ 44. python/sglang/kernels/aot-custom/csrc/attention/vertical_slash_index.cu
+ 45. python/sglang/kernels/aot-custom/csrc/common_extension.cc
+ 46. python/sglang/kernels/aot-custom/csrc/common_extension_musa.cc
+ 47. python/sglang/kernels/aot-custom/csrc/common_extension_rocm.cc
+ 48. python/sglang/kernels/aot-custom/csrc/cpu/aarch64/gemm_int8.cpp
+ 49. python/sglang/kernels/aot-custom/csrc/cpu/aarch64/moe.cpp
+ 50. python/sglang/kernels/aot-custom/csrc/cpu/aarch64/op.h
+ 51. python/sglang/kernels/aot-custom/csrc/cpu/aarch64/shm.h
+ 52. python/sglang/kernels/aot-custom/csrc/cpu/activation.cpp
+ 53. python/sglang/kernels/aot-custom/csrc/cpu/bmm.cpp
+ 54. python/sglang/kernels/aot-custom/csrc/cpu/common.h
+ 55. python/sglang/kernels/aot-custom/csrc/cpu/conv3d.cpp
+ 56. python/sglang/kernels/aot-custom/csrc/cpu/decode.cpp
+ 57. python/sglang/kernels/aot-custom/csrc/cpu/extend.cpp
+ 58. python/sglang/kernels/aot-custom/csrc/cpu/flash_attn.cpp
+ 59. python/sglang/kernels/aot-custom/csrc/cpu/flash_attn.h
+ 60. python/sglang/kernels/aot-custom/csrc/cpu/gemm.cpp
+ 61. python/sglang/kernels/aot-custom/csrc/cpu/gemm.h
+ 62. python/sglang/kernels/aot-custom/csrc/cpu/gemm_fp8.cpp
+ 63. python/sglang/kernels/aot-custom/csrc/cpu/gemm_int4.cpp
+ 64. python/sglang/kernels/aot-custom/csrc/cpu/gemm_int8.cpp
+ 65. python/sglang/kernels/aot-custom/csrc/cpu/interface.cpp
+ 66. python/sglang/kernels/aot-custom/csrc/cpu/kvcache.cpp
+ 67. python/sglang/kernels/aot-custom/csrc/cpu/mamba/conv.cpp
+ 68. python/sglang/kernels/aot-custom/csrc/cpu/mamba/fla.cpp
+ 69. python/sglang/kernels/aot-custom/csrc/cpu/model/qwen3.cpp
+ 70. python/sglang/kernels/aot-custom/csrc/cpu/moe.cpp
+ 71. python/sglang/kernels/aot-custom/csrc/cpu/moe.h
+ 72. python/sglang/kernels/aot-custom/csrc/cpu/moe_fp8.cpp
+ 73. python/sglang/kernels/aot-custom/csrc/cpu/moe_int4.cpp
+ 74. python/sglang/kernels/aot-custom/csrc/cpu/moe_int8.cpp
+ 75. python/sglang/kernels/aot-custom/csrc/cpu/norm.cpp
+ 76. python/sglang/kernels/aot-custom/csrc/cpu/numa_utils.cpp
+ 77. python/sglang/kernels/aot-custom/csrc/cpu/preprocessor.cpp
+ 78. python/sglang/kernels/aot-custom/csrc/cpu/qkv_proj.cpp
+ 79. python/sglang/kernels/aot-custom/csrc/cpu/rope.cpp
+ 80. python/sglang/kernels/aot-custom/csrc/cpu/shm.cpp
+ 81. python/sglang/kernels/aot-custom/csrc/cpu/shm.h
+ 82. python/sglang/kernels/aot-custom/csrc/cpu/spec.cpp
+ 83. python/sglang/kernels/aot-custom/csrc/cpu/topk.cpp
+ 84. python/sglang/kernels/aot-custom/csrc/cpu/torch_extension_cpu.cpp
+ 85. python/sglang/kernels/aot-custom/csrc/cpu/vec.h
+ 86. python/sglang/kernels/aot-custom/csrc/cpu/vec_pack.h
+ 87. python/sglang/kernels/aot-custom/csrc/cpu/x86_64/shm.h
+ 88. python/sglang/kernels/aot-custom/csrc/cutlass_extensions/epilogue/epilogue_per_row_per_col_scale.h
+ 89. python/sglang/kernels/aot-custom/csrc/cutlass_extensions/gemm/cutlass_gemm_caller.cuh
+ 90. python/sglang/kernels/aot-custom/csrc/cutlass_extensions/gemm/fp8_gemm_sm90_dispatch.cuh
+ 91. python/sglang/kernels/aot-custom/csrc/cutlass_extensions/gemm/gemm_universal_base_compat.h
+ 92. python/sglang/kernels/aot-custom/csrc/cutlass_extensions/gemm/gemm_with_epilogue_visitor.h
+ 93. python/sglang/kernels/aot-custom/csrc/cutlass_w8a8/scaled_mm_c2x.cu
+ 94. python/sglang/kernels/aot-custom/csrc/cutlass_w8a8/scaled_mm_c2x.cuh
+ 95. python/sglang/kernels/aot-custom/csrc/cutlass_w8a8/scaled_mm_c2x_sm75_dispatch.cuh
+ 96. python/sglang/kernels/aot-custom/csrc/cutlass_w8a8/scaled_mm_c2x_sm80_dispatch.cuh
+ 97. python/sglang/kernels/aot-custom/csrc/cutlass_w8a8/scaled_mm_c2x_sm89_fp8_dispatch.cuh
+ 98. python/sglang/kernels/aot-custom/csrc/cutlass_w8a8/scaled_mm_c2x_sm89_int8_dispatch.cuh
+ 99. python/sglang/kernels/aot-custom/csrc/cutlass_w8a8/scaled_mm_c3x_sm100.cu
+100. python/sglang/kernels/aot-custom/csrc/cutlass_w8a8/scaled_mm_c3x_sm120.cu
+101. python/sglang/kernels/aot-custom/csrc/cutlass_w8a8/scaled_mm_c3x_sm90.cu
+102. python/sglang/kernels/aot-custom/csrc/cutlass_w8a8/scaled_mm_entry.cu
+103. python/sglang/kernels/aot-custom/csrc/dispatch_utils.h
+104. python/sglang/kernels/aot-custom/csrc/elementwise/activation.cu
+105. python/sglang/kernels/aot-custom/csrc/elementwise/concat_mla.cu
+106. python/sglang/kernels/aot-custom/csrc/elementwise/copy.cu
+107. python/sglang/kernels/aot-custom/csrc/elementwise/deepseek_v4_topk.cu
+108. python/sglang/kernels/aot-custom/csrc/elementwise/dsv4_norm_rope.cu
+109. python/sglang/kernels/aot-custom/csrc/elementwise/fused_add_rms_norm_kernel.cu
+110. python/sglang/kernels/aot-custom/csrc/elementwise/fused_layernorm_dynamic_per_token_quant_custom.cu
+111. python/sglang/kernels/aot-custom/csrc/elementwise/fused_rotary_emb.cu
+112. python/sglang/kernels/aot-custom/csrc/elementwise/pos_enc.cu
+113. python/sglang/kernels/aot-custom/csrc/elementwise/topk.cu
+114. python/sglang/kernels/aot-custom/csrc/elementwise/utils.cuh
+115. python/sglang/kernels/aot-custom/csrc/expert_specialization/es_fp8_blockwise.cu
+116. python/sglang/kernels/aot-custom/csrc/expert_specialization/es_fp8_blockwise_functor.cuh
+117. python/sglang/kernels/aot-custom/csrc/expert_specialization/es_fp8_blockwise_launcher.cuh
+118. python/sglang/kernels/aot-custom/csrc/expert_specialization/es_fp8_blockwise_traits.cuh
+119. python/sglang/kernels/aot-custom/csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu
+120. python/sglang/kernels/aot-custom/csrc/expert_specialization/es_sm100_mxfp8_blockscaled_functor.cuh
+121. python/sglang/kernels/aot-custom/csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu
+122. python/sglang/kernels/aot-custom/csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cuh
+123. python/sglang/kernels/aot-custom/csrc/expert_specialization/es_sm100_mxfp8_blockscaled_launcher.cuh
+124. python/sglang/kernels/aot-custom/csrc/expert_specialization/es_sm100_mxfp8_blockscaled_traits.cuh
+125. python/sglang/kernels/aot-custom/csrc/flash_extension.cc
+126. python/sglang/kernels/aot-custom/csrc/flashmla_extension.cc
+127. python/sglang/kernels/aot-custom/csrc/gemm/awq_kernel.cu
+128. python/sglang/kernels/aot-custom/csrc/gemm/fp8_gemm_kernel.cu
+129. python/sglang/kernels/aot-custom/csrc/gemm/gptq/compat.cuh
+130. python/sglang/kernels/aot-custom/csrc/gemm/gptq/gptq_kernel.cu
+131. python/sglang/kernels/aot-custom/csrc/gemm/gptq/matrix_view.cuh
+132. python/sglang/kernels/aot-custom/csrc/gemm/gptq/qdq_2.cuh
+133. python/sglang/kernels/aot-custom/csrc/gemm/gptq/qdq_3.cuh
+134. python/sglang/kernels/aot-custom/csrc/gemm/gptq/qdq_4.cuh
+135. python/sglang/kernels/aot-custom/csrc/gemm/gptq/qdq_8.cuh
+136. python/sglang/kernels/aot-custom/csrc/gemm/gptq/qdq_util.cuh
+137. python/sglang/kernels/aot-custom/csrc/gemm/int8_gemm_kernel.cu
+138. python/sglang/kernels/aot-custom/csrc/gemm/per_token_group_quant_8bit.cu
+139. python/sglang/kernels/aot-custom/csrc/gemm/per_token_group_quant_8bit_v2.cu
+140. python/sglang/kernels/aot-custom/csrc/gemm/per_token_quant_fp8.cu
+141. python/sglang/kernels/aot-custom/csrc/grammar/apply_token_bitmask_inplace_cuda.cu
+142. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/flash_api.cpp
+143. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/block_info.h
+144. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/dropout.h
+145. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/flash.h
+146. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/flash_blockmask.h
+147. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/flash_fwd_kernel.h
+148. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/flash_fwd_launch_template.h
+149. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu
+150. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu
+151. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/flash_fwd_split_hdim64_bf16_causal_sm80.cu
+152. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/flash_fwd_split_hdim64_bf16_sm80.cu
+153. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/hardware_info.h
+154. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/kernel_traits.h
+155. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/mask.h
+156. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/philox.cuh
+157. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/philox_unpack.cuh
+158. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/rotary.h
+159. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/softmax.h
+160. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/static_switch.h
+161. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_attn/src/utils.h
+162. python/sglang/kernels/aot-custom/csrc/infllm_v2/flash_extension.cc
+163. python/sglang/kernels/aot-custom/csrc/infllm_v2/max_pooling.cu
+164. python/sglang/kernels/aot-custom/csrc/kvcacheio/transfer.cu
+165. python/sglang/kernels/aot-custom/csrc/mamba/causal_conv1d.cu
+166. python/sglang/kernels/aot-custom/csrc/mamba/causal_conv1d.h
+167. python/sglang/kernels/aot-custom/csrc/memory/weak_ref_tensor.cpp
+168. python/sglang/kernels/aot-custom/csrc/metal/rope_pool_fused.cpp
+169. python/sglang/kernels/aot-custom/csrc/moe/cutlass_moe/scaled_mm_c2x.cu
+170. python/sglang/kernels/aot-custom/csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu
+171. python/sglang/kernels/aot-custom/csrc/moe/cutlass_moe/w4a8/w4a8_get_group_starts.cuh
+172. python/sglang/kernels/aot-custom/csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu
+173. python/sglang/kernels/aot-custom/csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cuh
+174. python/sglang/kernels/aot-custom/csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu
+175. python/sglang/kernels/aot-custom/csrc/moe/cutlass_moe_helper.cu
+176. python/sglang/kernels/aot-custom/csrc/moe/fp8_blockwise_moe_kernel.cu
+177. python/sglang/kernels/aot-custom/csrc/moe/fused_qknorm_rope_kernel.cu
+178. python/sglang/kernels/aot-custom/csrc/moe/grouped_gemm.cpp
+179. python/sglang/kernels/aot-custom/csrc/moe/grouped_gemm_cuda.cu
+180. python/sglang/kernels/aot-custom/csrc/moe/moe_align_kernel.cu
+181. python/sglang/kernels/aot-custom/csrc/moe/moe_fused_gate_opt.cu
+182. python/sglang/kernels/aot-custom/csrc/moe/moe_fused_w4a16.cpp
+183. python/sglang/kernels/aot-custom/csrc/moe/moe_fused_w4a16_cuda.cu
+184. python/sglang/kernels/aot-custom/csrc/moe/moe_sum.cu
+185. python/sglang/kernels/aot-custom/csrc/moe/moe_sum_reduce.cu
+186. python/sglang/kernels/aot-custom/csrc/moe/moe_topk_sigmoid_kernels.cu
+187. python/sglang/kernels/aot-custom/csrc/moe/moe_topk_softmax_kernels.cu
+188. python/sglang/kernels/aot-custom/csrc/moe/prepare_moe_input.cu
+189. python/sglang/kernels/aot-custom/csrc/quantization/gguf/dequantize.cuh
+190. python/sglang/kernels/aot-custom/csrc/quantization/gguf/ggml-common.h
+191. python/sglang/kernels/aot-custom/csrc/quantization/gguf/gguf_kernel.cu
+192. python/sglang/kernels/aot-custom/csrc/quantization/gguf/mmq.cuh
+193. python/sglang/kernels/aot-custom/csrc/quantization/gguf/mmvq.cuh
+194. python/sglang/kernels/aot-custom/csrc/quantization/gguf/moe.cuh
+195. python/sglang/kernels/aot-custom/csrc/quantization/gguf/moe_vec.cuh
+196. python/sglang/kernels/aot-custom/csrc/quantization/gguf/vecdotq.cuh
+197. python/sglang/kernels/aot-custom/csrc/quantization/int8_quant_kernels.cu
+198. python/sglang/kernels/aot-custom/csrc/quantization/quantize_kernel.cu
+199. python/sglang/kernels/aot-custom/csrc/spatial/cuda_utils.h
+200. python/sglang/kernels/aot-custom/csrc/spatial/greenctx_stream.cu
+201. python/sglang/kernels/aot-custom/csrc/spatial/greenctx_stream.h
+202. python/sglang/kernels/aot-custom/csrc/spatial_extension.cc
+203. python/sglang/kernels/aot-custom/csrc/speculative/eagle_utils.cu
+204. python/sglang/kernels/aot-custom/csrc/speculative/ngram_utils.cu
+205. python/sglang/kernels/aot-custom/csrc/speculative/packbit.cu
+206. python/sglang/kernels/aot-custom/csrc/speculative/speculative_sampling.cu
+207. python/sglang/kernels/aot-custom/csrc/speculative/speculative_sampling.cuh
+208. python/sglang/kernels/aot-custom/include/fused_moe_gate.cuh
+209. python/sglang/kernels/aot-custom/include/hip/hip_act_and_mul.cuh
+210. python/sglang/kernels/aot-custom/include/hip/hip_math_def.h
+211. python/sglang/kernels/aot-custom/include/hip/hip_vec_dtypes.h
+212. python/sglang/kernels/aot-custom/include/hip/impl/hip_vec_bf16_impl.h
+213. python/sglang/kernels/aot-custom/include/hip/impl/hip_vec_fp32_impl.h
+214. python/sglang/kernels/aot-custom/include/hip/impl/hip_vec_half_impl.h
+215. python/sglang/kernels/aot-custom/include/musa/dispatch_utils.h
+216. python/sglang/kernels/aot-custom/include/musa/integer_subbyte.h
+217. python/sglang/kernels/aot-custom/include/pytorch_extension_utils_rocm.h
+218. python/sglang/kernels/aot-custom/include/sgl_flash_kernel_ops.h
+219. python/sglang/kernels/aot-custom/include/sgl_kernel_musa_ops.h
+220. python/sglang/kernels/aot-custom/include/sgl_kernel_ops.h
+221. python/sglang/kernels/aot-custom/include/sgl_kernel_torch_shim.h
+222. python/sglang/kernels/aot-custom/include/utils.h
+223. python/sglang/kernels/aot-custom/python/sgl_kernel/__init__.py
+224. python/sglang/kernels/aot-custom/python/sgl_kernel/allreduce.py
+225. python/sglang/kernels/aot-custom/python/sgl_kernel/attention.py
+226. python/sglang/kernels/aot-custom/python/sgl_kernel/cutlass_mm.py
+227. python/sglang/kernels/aot-custom/python/sgl_kernel/cutlass_moe.py
+228. python/sglang/kernels/aot-custom/python/sgl_kernel/debug_utils.py
+229. python/sglang/kernels/aot-custom/python/sgl_kernel/elementwise.py
+230. python/sglang/kernels/aot-custom/python/sgl_kernel/expert_specialization.py
+231. python/sglang/kernels/aot-custom/python/sgl_kernel/flash_attn.py
+232. python/sglang/kernels/aot-custom/python/sgl_kernel/flash_mla.py
+233. python/sglang/kernels/aot-custom/python/sgl_kernel/gemm.py
+234. python/sglang/kernels/aot-custom/python/sgl_kernel/grammar.py
+235. python/sglang/kernels/aot-custom/python/sgl_kernel/infllm_v2/__init__.py
+236. python/sglang/kernels/aot-custom/python/sgl_kernel/infllm_v2/_loader.py
+237. python/sglang/kernels/aot-custom/python/sgl_kernel/infllm_v2/attention.py
+238. python/sglang/kernels/aot-custom/python/sgl_kernel/infllm_v2/max_pooling.py
+239. python/sglang/kernels/aot-custom/python/sgl_kernel/kvcacheio.py
+240. python/sglang/kernels/aot-custom/python/sgl_kernel/load_utils.py
+241. python/sglang/kernels/aot-custom/python/sgl_kernel/mamba.py
+242. python/sglang/kernels/aot-custom/python/sgl_kernel/memory.py
+243. python/sglang/kernels/aot-custom/python/sgl_kernel/metal.py
+244. python/sglang/kernels/aot-custom/python/sgl_kernel/moe.py
+245. python/sglang/kernels/aot-custom/python/sgl_kernel/musa.py
+246. python/sglang/kernels/aot-custom/python/sgl_kernel/quantization/__init__.py
+247. python/sglang/kernels/aot-custom/python/sgl_kernel/quantization/gguf.py
+248. python/sglang/kernels/aot-custom/python/sgl_kernel/quantization/quantization.py
+249. python/sglang/kernels/aot-custom/python/sgl_kernel/sampling.py
+250. python/sglang/kernels/aot-custom/python/sgl_kernel/scalar_type.py
+251. python/sglang/kernels/aot-custom/python/sgl_kernel/sparse_flash_attn.py
+252. python/sglang/kernels/aot-custom/python/sgl_kernel/spatial.py
+253. python/sglang/kernels/aot-custom/python/sgl_kernel/speculative.py
+254. python/sglang/kernels/aot-custom/python/sgl_kernel/test_utils.py
+255. python/sglang/kernels/aot-custom/python/sgl_kernel/testing/__init__.py
+256. python/sglang/kernels/aot-custom/python/sgl_kernel/testing/rotary_embedding.py
+257. python/sglang/kernels/aot-custom/python/sgl_kernel/top_k.py
+258. python/sglang/kernels/aot-custom/python/sgl_kernel/utils.py
+259. python/sglang/kernels/aot-custom/python/sgl_kernel/version.py
+260. python/sglang/kernels/aot-custom/setup.py
+261. python/sglang/kernels/aot-custom/setup_metal.py
+262. python/sglang/kernels/aot-custom/setup_musa.py
+263. python/sglang/kernels/aot-custom/setup_rocm.py
+264. python/sglang/kernels/aot-custom/tests/conftest.py
+265. python/sglang/kernels/aot-custom/tests/spatial/test_greenctx_stream.py
+266. python/sglang/kernels/aot-custom/tests/speculative/test_eagle_utils.py
+267. python/sglang/kernels/aot-custom/tests/speculative/test_ngram_utils.py
+268. python/sglang/kernels/aot-custom/tests/speculative/test_speculative_sampling.py
+269. python/sglang/kernels/aot-custom/tests/test_activation.py
+270. python/sglang/kernels/aot-custom/tests/test_apply_token_bitmask_inplace.py
+271. python/sglang/kernels/aot-custom/tests/test_awq_dequant.py
+272. python/sglang/kernels/aot-custom/tests/test_copy.py
+273. python/sglang/kernels/aot-custom/tests/test_custom_allreduce.py
+274. python/sglang/kernels/aot-custom/tests/test_cutlass_mla.py
+275. python/sglang/kernels/aot-custom/tests/test_cutlass_w4a8_moe_mm.py
+276. python/sglang/kernels/aot-custom/tests/test_dsv4_norm_rope.py
+277. python/sglang/kernels/aot-custom/tests/test_es_fp8_blockwise_moe.py
+278. python/sglang/kernels/aot-custom/tests/test_es_mxfp8_blockscaled_moe.py
+279. python/sglang/kernels/aot-custom/tests/test_flash_attention.py
+280. python/sglang/kernels/aot-custom/tests/test_flash_attn_sparse.py
+281. python/sglang/kernels/aot-custom/tests/test_flashmla.py
+282. python/sglang/kernels/aot-custom/tests/test_fp8_blockwise_moe.py
+283. python/sglang/kernels/aot-custom/tests/test_fp8_gemm.py
+284. python/sglang/kernels/aot-custom/tests/test_fused_qk_norm_rope.py
+285. python/sglang/kernels/aot-custom/tests/test_gguf.py
+286. python/sglang/kernels/aot-custom/tests/test_gptq_kernel.py
+287. python/sglang/kernels/aot-custom/tests/test_infllm_v2_attention.py
+288. python/sglang/kernels/aot-custom/tests/test_infllm_v2_max_pooling.py
+289. python/sglang/kernels/aot-custom/tests/test_int8_gemm.py
+290. python/sglang/kernels/aot-custom/tests/test_kvcacheio.py
+291. python/sglang/kernels/aot-custom/tests/test_merge_state_v2.py
+292. python/sglang/kernels/aot-custom/tests/test_moe_align.py
+293. python/sglang/kernels/aot-custom/tests/test_moe_topk_sigmoid.py
+294. python/sglang/kernels/aot-custom/tests/test_moe_topk_softmax.py
+295. python/sglang/kernels/aot-custom/tests/test_norm.py
+296. python/sglang/kernels/aot-custom/tests/test_per_token_group_quant_8bit.py
+297. python/sglang/kernels/aot-custom/tests/test_sampling.py
+298. python/sglang/kernels/aot-custom/tests/test_topk.py
+299. python/sglang/kernels/aot-custom/tests/test_torch_defaults_reset.py
+300. python/sglang/kernels/aot-custom/tests/utils.py
+301. python/sglang/kernels/aot/csrc/allreduce/custom_all_reduce.cuh
+302. python/sglang/kernels/aot/csrc/common_extension.cc
+303. python/sglang/kernels/aot/csrc/cutlass_w8a8/scaled_mm_c2x.cu
+304. python/sglang/kernels/aot/csrc/cutlass_w8a8/scaled_mm_c2x.cuh
+305. python/sglang/kernels/aot/csrc/cutlass_w8a8/scaled_mm_c2x_sm75_dispatch.cuh
+306. python/sglang/kernels/aot/csrc/cutlass_w8a8/scaled_mm_c2x_sm80_dispatch.cuh
+307. python/sglang/kernels/aot/csrc/cutlass_w8a8/scaled_mm_c2x_sm89_fp8_dispatch.cuh
+308. python/sglang/kernels/aot/csrc/cutlass_w8a8/scaled_mm_c2x_sm89_int8_dispatch.cuh
+309. python/sglang/kernels/aot/csrc/cutlass_w8a8/scaled_mm_c3x_sm100.cu
+310. python/sglang/kernels/aot/csrc/cutlass_w8a8/scaled_mm_c3x_sm120.cu
+311. python/sglang/kernels/aot/csrc/cutlass_w8a8/scaled_mm_c3x_sm90.cu
+312. python/sglang/kernels/aot/csrc/cutlass_w8a8/scaled_mm_entry.cu
+313. python/sglang/kernels/aot/csrc/dispatch_utils.h
+314. python/sglang/kernels/aot/csrc/elementwise/concat_mla.cu
+315. python/sglang/kernels/aot/csrc/elementwise/dsv4_norm_rope.cu
+316. python/sglang/kernels/aot/csrc/elementwise/fused_layernorm_dynamic_per_token_quant_custom.cu
+317. python/sglang/kernels/aot/csrc/elementwise/fused_rotary_emb.cu
+318. python/sglang/kernels/aot/csrc/infllm_v2/flash_attn/src/flash_fwd_launch_template.h
+319. python/sglang/kernels/aot/csrc/kvcacheio/transfer.cu
+320. python/sglang/kernels/aot/csrc/mamba/causal_conv1d.cu
+321. python/sglang/kernels/aot/csrc/moe/cutlass_moe/scaled_mm_c2x.cu
+322. python/sglang/kernels/aot/csrc/moe/cutlass_moe_helper.cu
+323. python/sglang/kernels/aot/csrc/moe/grouped_gemm.cpp
+324. python/sglang/kernels/aot/csrc/moe/grouped_gemm_cuda.cu
+325. python/sglang/kernels/aot/csrc/moe/moe_fused_gate_opt.cu
+326. python/sglang/kernels/aot/csrc/moe/moe_topk_sigmoid_kernels.cu
+327. python/sglang/kernels/aot/csrc/moe/moe_topk_softmax_kernels.cu
+328. python/sglang/kernels/aot/csrc/moe/prepare_moe_input.cu
+329. python/sglang/kernels/aot/csrc/quantization/int8_quant_kernels.cu
+330. python/sglang/kernels/aot/csrc/quantization/quantize_kernel.cu
+331. python/sglang/kernels/aot/csrc/speculative/speculative_sampling.cuh
+332. python/sglang/kernels/aot/include/fused_moe_gate.cuh
+333. python/sglang/kernels/aot/include/sgl_kernel_ops.h
+334. python/sglang/kernels/aot/python/sgl_kernel/__init__.py
+335. python/sglang/kernels/aot/python/sgl_kernel/attention.py
+336. python/sglang/kernels/aot/python/sgl_kernel/cutlass_mm.py
+337. python/sglang/kernels/aot/python/sgl_kernel/elementwise.py
+338. python/sglang/kernels/aot/python/sgl_kernel/flash_attn.py
+339. python/sglang/kernels/aot/python/sgl_kernel/flash_mla.py
+340. python/sglang/kernels/aot/python/sgl_kernel/gemm.py
+341. python/sglang/kernels/aot/python/sgl_kernel/load_utils.py
+342. python/sglang/kernels/aot/python/sgl_kernel/moe.py
+343. python/sglang/kernels/aot/python/sgl_kernel/quantization/__init__.py
+344. python/sglang/kernels/aot/python/sgl_kernel/quantization/quantization.py
+345. python/sglang/kernels/aot/python/sgl_kernel/sampling.py
+346. python/sglang/kernels/aot/setup.py
+347. python/sglang/kernels/aot/tests/test_int8_gemm.py
+348. python/sglang/kernels/jit/csrc/attention/fused_fp8_qkv_kv_cache.cuh
+349. python/sglang/kernels/jit/csrc/attention/kda_packed_decode.cuh
+350. python/sglang/kernels/jit/csrc/attention/kda_prefill.cu
+351. python/sglang/kernels/jit/csrc/deepseek_v32/indexer_k.cuh
+352. python/sglang/kernels/jit/csrc/deepseek_v4/c128.cuh
+353. python/sglang/kernels/jit/csrc/deepseek_v4/c128_online.cuh
+354. python/sglang/kernels/jit/csrc/deepseek_v4/c128_online_v2.cuh
+355. python/sglang/kernels/jit/csrc/deepseek_v4/c128_v2.cuh
+356. python/sglang/kernels/jit/csrc/deepseek_v4/c4.cuh
+357. python/sglang/kernels/jit/csrc/deepseek_v4/c4_v2.cuh
+358. python/sglang/kernels/jit/csrc/deepseek_v4/common.cuh
+359. python/sglang/kernels/jit/csrc/deepseek_v4/fused_norm_rope.cuh
+360. python/sglang/kernels/jit/csrc/deepseek_v4/fused_norm_rope_v2.cuh
+361. python/sglang/kernels/jit/csrc/deepseek_v4/hash_topk.cuh
+362. python/sglang/kernels/jit/csrc/deepseek_v4/main_norm_rope.cuh
+363. python/sglang/kernels/jit/csrc/deepseek_v4/mega_moe_pre_dispatch.cuh
+364. python/sglang/kernels/jit/csrc/deepseek_v4/online_c128_mtp.cuh
+365. python/sglang/kernels/jit/csrc/deepseek_v4/rmsnorm.cuh
+366. python/sglang/kernels/jit/csrc/deepseek_v4/rope.cuh
+367. python/sglang/kernels/jit/csrc/deepseek_v4/silu_and_mul_masked_post_quant.cuh
+368. python/sglang/kernels/jit/csrc/deepseek_v4/silu_and_mul_masked_post_quant_tmp.cuh
+369. python/sglang/kernels/jit/csrc/deepseek_v4/store.cuh
+370. python/sglang/kernels/jit/csrc/deepseek_v4/topk.cuh
+371. python/sglang/kernels/jit/csrc/deepseek_v4/topk_v1.cuh
+372. python/sglang/kernels/jit/csrc/deepseek_v4/topk_v2.cuh
+373. python/sglang/kernels/jit/csrc/diffusion/norm_scale_shift.cuh
+374. python/sglang/kernels/jit/csrc/diffusion/qknorm_rope.cuh
+375. python/sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh
+376. python/sglang/kernels/jit/csrc/distributed/tp_qknorm.cuh
+377. python/sglang/kernels/jit/csrc/dsa/fused_store_index_cache.cuh
+378. python/sglang/kernels/jit/csrc/dsa/kpool_topk_transform.cuh
+379. python/sglang/kernels/jit/csrc/elementwise/activation.cuh
+380. python/sglang/kernels/jit/csrc/elementwise/add3.cuh
+381. python/sglang/kernels/jit/csrc/elementwise/concat_mla.cuh
+382. python/sglang/kernels/jit/csrc/elementwise/fused_eh_norm.cuh
+383. python/sglang/kernels/jit/csrc/elementwise/fused_metadata_copy.cuh
+384. python/sglang/kernels/jit/csrc/elementwise/kvcache.cuh
+385. python/sglang/kernels/jit/csrc/elementwise/qknorm.cuh
+386. python/sglang/kernels/jit/csrc/elementwise/rmsnorm.cuh
+387. python/sglang/kernels/jit/csrc/elementwise/rmsnorm_hf.cuh
+388. python/sglang/kernels/jit/csrc/elementwise/rope.cuh
+389. python/sglang/kernels/jit/csrc/elementwise/set_mla_kv_buffer.cuh
+390. python/sglang/kernels/jit/csrc/elementwise/set_mla_kv_concat_q.cuh
+391. python/sglang/kernels/jit/csrc/gemm/per_token_group_quant.cuh
+392. python/sglang/kernels/jit/csrc/gemm/tiny_gemm.cuh
+393. python/sglang/kernels/jit/csrc/inkling/causal_conv1d.cuh
+394. python/sglang/kernels/jit/csrc/inkling/draft_extend_sconv.cuh
+395. python/sglang/kernels/jit/csrc/inkling/fused_decode_update.cuh
+396. python/sglang/kernels/jit/csrc/inkling/gather_scatter_sconv.cuh
+397. python/sglang/kernels/jit/csrc/inkling/inkling_ar_fused_decode.cuh
+398. python/sglang/kernels/jit/csrc/inkling/inkling_ar_scattered_sconv.cuh
+399. python/sglang/kernels/jit/csrc/inkling/inkling_attn_prologue_fused.cuh
+400. python/sglang/kernels/jit/csrc/inkling/update_sconv_cache.cuh
+401. python/sglang/kernels/jit/csrc/kimi_k3/attn_res/fused_tma.cuh
+402. python/sglang/kernels/jit/csrc/kimi_k3/comm/ar_fusion.cuh
+403. python/sglang/kernels/jit/csrc/kimi_k3/comm/gemm_ag.cuh
+404. python/sglang/kernels/jit/csrc/kimi_k3/comm/gemm_ar.cuh
+405. python/sglang/kernels/jit/csrc/kimi_k3/comm/sp_collective.cuh
+406. python/sglang/kernels/jit/csrc/kimi_k3/mla_output_gate.cuh
+407. python/sglang/kernels/jit/csrc/kimi_k3/situ_and_mul.cuh
+408. python/sglang/kernels/jit/csrc/kv_canary/canary_plan_entries.cuh
+409. python/sglang/kernels/jit/csrc/kv_canary/canary_verify.cuh
+410. python/sglang/kernels/jit/csrc/kv_canary/canary_write.cuh
+411. python/sglang/kernels/jit/csrc/kvcacheio/hicache.cuh
+412. python/sglang/kernels/jit/csrc/kvcacheio/hisparse.cuh
+413. python/sglang/kernels/jit/csrc/kvcacheio/hisparse_spec.cuh
+414. python/sglang/kernels/jit/csrc/kvcacheio/hisparse_transfer.cuh
+415. python/sglang/kernels/jit/csrc/kvcacheio/relayout.cuh
+416. python/sglang/kernels/jit/csrc/kvcacheio/transfer_mamba.cuh
+417. python/sglang/kernels/jit/csrc/minimax/fused_gemma_qknorm_rope.cuh
+418. python/sglang/kernels/jit/csrc/minimax/fused_store_kv_index.cuh
+419. python/sglang/kernels/jit/csrc/minimax/minimax_decode_topk.cuh
+420. python/sglang/kernels/jit/csrc/minimax/per_token_quant_ue8m0.cuh
+421. python/sglang/kernels/jit/csrc/moe/align_single_token.cuh
+422. python/sglang/kernels/jit/csrc/moe/moe_fused_gate.cuh
+423. python/sglang/kernels/jit/csrc/moe/moe_topk_sigmoid.cuh
+424. python/sglang/kernels/jit/csrc/moe/route_quant_fused.cuh
+425. python/sglang/kernels/jit/csrc/moe/route_radix.cuh
+426. python/sglang/kernels/jit/csrc/moe/route_radix4_hip.cuh
+427. python/sglang/kernels/jit/csrc/moe/topk_sum.cuh
+428. python/sglang/kernels/jit/csrc/qprep_bf16_fp8_sm90/kernel.cuh
+429. python/sglang/kernels/jit/csrc/sparse_mla_q8kv8_prefill_sm90/kernel.cuh
+430. python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/kvcacheio.cuh
+431. python/sglang/kernels/jit/include/sgl_kernel/deepseek_v4/topk_impl.cuh
+432. python/sglang/kernels/jit/include/sgl_kernel/distributed/communicator.cuh
+433. python/sglang/kernels/jit/include/sgl_kernel/ptx/tma.cuh
+434. python/sglang/kernels/jit/include/sgl_kernel/utils.cuh
+435. python/sglang/kernels/jit/utils/__init__.py
+436. python/sglang/kernels/jit/utils/arch.py
+437. python/sglang/kernels/jit/utils/common.py
+438. python/sglang/kernels/jit/utils/compile/loader.py
+439. python/sglang/kernels/jit/utils/compile/ninja.py
+440. python/sglang/kernels/jit/utils/compile/toolchain.py
+441. python/sglang/kernels/ops/attention/__init__.py
+442. python/sglang/kernels/ops/attention/decode_attention.py
+443. python/sglang/kernels/ops/attention/dsa/dequant_k_cache.py
+444. python/sglang/kernels/ops/attention/dsa/index_buf_accessor.py
+445. python/sglang/kernels/ops/attention/dsa/paged_mqa_logits.py
+446. python/sglang/kernels/ops/attention/dsa/quant_k_cache.py
+447. python/sglang/kernels/ops/attention/dsa/quant_k_cache_optimized.py
+448. python/sglang/kernels/ops/attention/dsa/tilelang_kernel.py
+449. python/sglang/kernels/ops/attention/dsa/transform_index.py
+450. python/sglang/kernels/ops/attention/dsa/triton_kernel.py
+451. python/sglang/kernels/ops/attention/dsa/triton_sparse_mla.py
+452. python/sglang/kernels/ops/attention/dsa_metadata.py
+453. python/sglang/kernels/ops/attention/dsv4/attn.py
+454. python/sglang/kernels/ops/attention/dsv4/compress.py
+455. python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py
+456. python/sglang/kernels/ops/attention/dsv4/elementwise.py
+457. python/sglang/kernels/ops/attention/dsv4/index_buf_accessor.py
+458. python/sglang/kernels/ops/attention/dsv4/moe.py
+459. python/sglang/kernels/ops/attention/dsv4/online_c128_mtp.py
+460. python/sglang/kernels/ops/attention/dsv4/topk.py
+461. python/sglang/kernels/ops/attention/extend_attention.py
+462. python/sglang/kernels/ops/attention/fla/chunk_delta_h.py
+463. python/sglang/kernels/ops/attention/fla/chunk_intra.py
+464. python/sglang/kernels/ops/attention/fla/fused_recurrent.py
+465. python/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py
+466. python/sglang/kernels/ops/attention/fla/kda.py
+467. python/sglang/kernels/ops/attention/fla/kda_opt_c500.py
+468. python/sglang/kernels/ops/attention/fla/layernorm_gated.py
+469. python/sglang/kernels/ops/attention/fla/utils.py
+470. python/sglang/kernels/ops/attention/flash_mla_sm120.py
+471. python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py
+472. python/sglang/kernels/ops/attention/fused_qk_norm_rope_store.py
+473. python/sglang/kernels/ops/attention/helion/kda_prefill.py
+474. python/sglang/kernels/ops/attention/minimax_decode_topk.py
+475. python/sglang/kernels/ops/attention/minimax_qknorm_rope.py
+476. python/sglang/kernels/ops/attention/minimax_sparse/common/utils.py
+477. python/sglang/kernels/ops/attention/minimax_sparse/decode/flash_with_topk_idx.py
+478. python/sglang/kernels/ops/attention/minimax_sparse/decode/topk_sparse.py
+479. python/sglang/kernels/ops/attention/minimax_sparse/prefill/flash_with_topk_idx.py
+480. python/sglang/kernels/ops/attention/minimax_sparse/prefill/topk_sparse.py
+481. python/sglang/kernels/ops/attention/prefill_attention.py
+482. python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py
+483. python/sglang/kernels/ops/attention/utils.py
+484. python/sglang/kernels/ops/diffusion/common/platform.py
+485. python/sglang/kernels/ops/diffusion/modulate/scale_shift_triton.py
+486. python/sglang/kernels/ops/elementwise/elementwise.py
+487. python/sglang/kernels/ops/grammar/bitmask_ops.py
+488. python/sglang/kernels/ops/kimi_k3/__init__.py
+489. python/sglang/kernels/ops/kimi_k3/activation.py
+490. python/sglang/kernels/ops/kvcache/hisparse.py
+491. python/sglang/kernels/ops/kvcache/kv_indices.py
+492. python/sglang/kernels/ops/kvcache/mla_buffer.py
+493. python/sglang/kernels/ops/kvcache/triton_store_cache.py
+494. python/sglang/kernels/ops/layernorm/mhc.py
+495. python/sglang/kernels/ops/layernorm/mhc_mega.py
+496. python/sglang/kernels/ops/layernorm/mhc_vllm.py
+497. python/sglang/kernels/ops/mamba/causal_conv1d_triton.py
+498. python/sglang/kernels/ops/memory/allocator.py
+499. python/sglang/kernels/ops/memory/memcpy_triton.py
+500. python/sglang/kernels/ops/moe/__init__.py
+501. python/sglang/kernels/ops/moe/ep_moe_kernels.py
+502. python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py
+503. python/sglang/kernels/ops/moe/kpool_topk_transform.py
+504. python/sglang/kernels/ops/moe/moe_fused_gate.py
+505. python/sglang/kernels/ops/moe/trtllm_lora_temp/virtual_experts.py
+506. python/sglang/kernels/ops/moe/virtual_experts.py
+507. python/sglang/kernels/ops/quantization/__init__.py
+508. python/sglang/kernels/ops/quantization/fp8_kernel.py
+509. python/sglang/kernels/ops/quantization/hadamard.py
+510. python/sglang/kernels/ops/quantization/int8_kernel.py
+511. python/sglang/kernels/ops/speculative/dspark/dspark_accept.py
+512. python/sglang/kernels/ops/speculative/eagle.py
+513. python/sglang/launch_server.py
+514. python/sglang/multimodal_gen/envs.py
+515. python/sglang/multimodal_gen/runtime/distributed/group_coordinator.py
+516. python/sglang/multimodal_gen/runtime/distributed/parallel_state.py
+517. python/sglang/multimodal_gen/runtime/layers/activation.py
+518. python/sglang/multimodal_gen/runtime/layers/attention/backends/sparse_linear_attn.py
+519. python/sglang/multimodal_gen/runtime/layers/layernorm.py
+520. python/sglang/multimodal_gen/runtime/layers/visual_embedding.py
+521. python/sglang/multimodal_gen/runtime/models/dits/flux_2.py
+522. python/sglang/multimodal_gen/runtime/models/dits/glm_image.py
+523. python/sglang/multimodal_gen/runtime/models/encoders/gemma_3.py
+524. python/sglang/multimodal_gen/runtime/models/encoders/mistral_3.py
+525. python/sglang/multimodal_gen/runtime/models/encoders/qwen2_5vl.py
+526. python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/minimax_h3/reference_encoding.py
+527. python/sglang/multimodal_gen/runtime/pipelines_core/stages/text_encoding.py
+528. python/sglang/multimodal_gen/runtime/platforms/__init__.py
+529. python/sglang/multimodal_gen/test/unit/test_diffusion_import_isolation.py
+530. python/sglang/multimodal_gen/utils.py
+531. python/sglang/srt/arg_groups/cuda_graph_hook.py
+532. python/sglang/srt/arg_groups/hisparse_hook.py
+533. python/sglang/srt/arg_groups/memory_hook.py
+534. python/sglang/srt/arg_groups/overrides.py
+535. python/sglang/srt/arg_groups/pd_disaggregation_hook.py
+536. python/sglang/srt/arg_groups/pipeline.py
+537. python/sglang/srt/arg_groups/speculative_hook.py
+538. python/sglang/srt/arg_groups/validation_hook.py
+539. python/sglang/srt/batch_overlap/single_batch_overlap.py
+540. python/sglang/srt/batch_overlap/two_batch_overlap.py
+541. python/sglang/srt/configs/__init__.py
+542. python/sglang/srt/configs/glm5_next.py
+543. python/sglang/srt/configs/hybrid_arch.py
+544. python/sglang/srt/configs/kimi_k25.py
+545. python/sglang/srt/configs/model_config.py
+546. python/sglang/srt/configs/qwen3_5.py
+547. python/sglang/srt/configs/qwen3_asr.py
+548. python/sglang/srt/disaggregation/base/conn.py
+549. python/sglang/srt/disaggregation/common/conn.py
+550. python/sglang/srt/disaggregation/decode.py
+551. python/sglang/srt/disaggregation/decode_kvcache_offload_manager.py
+552. python/sglang/srt/disaggregation/encoder/preprocessor.py
+553. python/sglang/srt/disaggregation/encoder/receiver.py
+554. python/sglang/srt/disaggregation/minilb.py
+555. python/sglang/srt/disaggregation/mooncake/conn.py
+556. python/sglang/srt/disaggregation/nixl/conn.py
+557. python/sglang/srt/disaggregation/prefill.py
+558. python/sglang/srt/disaggregation/utils.py
+559. python/sglang/srt/distributed/bootstrap.py
+560. python/sglang/srt/distributed/communication_op.py
+561. python/sglang/srt/distributed/device_communicators/custom_all_reduce_utils.py
+562. python/sglang/srt/distributed/device_communicators/pynccl.py
+563. python/sglang/srt/distributed/device_communicators/pynccl_allocator.py
+564. python/sglang/srt/distributed/device_communicators/pynccl_wrapper.py
+565. python/sglang/srt/distributed/device_communicators/triton_symm_mem_ag.py
+566. python/sglang/srt/distributed/parallel_state.py
+567. python/sglang/srt/entrypoints/engine.py
+568. python/sglang/srt/entrypoints/http_server.py
+569. python/sglang/srt/entrypoints/openai/protocol.py
+570. python/sglang/srt/entrypoints/openai/serving_chat.py
+571. python/sglang/srt/environ.py
+572. python/sglang/srt/eplb/eplb_manager.py
+573. python/sglang/srt/eplb/expert_distribution.py
+574. python/sglang/srt/function_call/glm47_moe_detector.py
+575. python/sglang/srt/function_call/inkling_detector.py
+576. python/sglang/srt/function_call/kimik3_detector.py
+577. python/sglang/srt/hardware_backend/gpu/quantization/awq_kernels.py
+578. python/sglang/srt/hardware_backend/npu/dsv4/dsv4_memory_pool.py
+579. python/sglang/srt/hardware_backend/npu/memory_pool_npu.py
+580. python/sglang/srt/layers/activation.py
+581. python/sglang/srt/layers/attention/attention_registry.py
+582. python/sglang/srt/layers/attention/base_attn_backend.py
+583. python/sglang/srt/layers/attention/deepseek_v4_backend.py
+584. python/sglang/srt/layers/attention/dsa/dsa_backend_mtp_precompute.py
+585. python/sglang/srt/layers/attention/dsa/dsa_indexer.py
+586. python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
+587. python/sglang/srt/layers/attention/dsa/dsa_topk_backend.py
+588. python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py
+589. python/sglang/srt/layers/attention/dsa/kpool_plan.py
+590. python/sglang/srt/layers/attention/dsa/utils.py
+591. python/sglang/srt/layers/attention/dsa_backend.py
+592. python/sglang/srt/layers/attention/dsv4/compressor.py
+593. python/sglang/srt/layers/attention/dsv4/compressor_v2.py
+594. python/sglang/srt/layers/attention/dsv4/indexer.py
+595. python/sglang/srt/layers/attention/flashattention_backend.py
+596. python/sglang/srt/layers/attention/flashinfer_backend.py
+597. python/sglang/srt/layers/attention/flashinfer_mla_backend.py
+598. python/sglang/srt/layers/attention/flashmla_backend.py
+599. python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+600. python/sglang/srt/layers/attention/linear/gdn_backend.py
+601. python/sglang/srt/layers/attention/linear/kda_backend.py
+602. python/sglang/srt/layers/attention/linear/kernels/gdn_flashinfer.py
+603. python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
+604. python/sglang/srt/layers/attention/linear/kernels/kda_cutedsl.py
+605. python/sglang/srt/layers/attention/linear/kernels/kda_flashkda.py
+606. python/sglang/srt/layers/attention/linear/kernels/kda_triton.py
+607. python/sglang/srt/layers/attention/minimax_sparse_backend.py
+608. python/sglang/srt/layers/attention/minimax_sparse_ops/minimax_sparse.py
+609. python/sglang/srt/layers/attention/minimax_sparse_ops/naive/topk_sparse.py
+610. python/sglang/srt/layers/attention/triton_backend.py
+611. python/sglang/srt/layers/attention/vision.py
+612. python/sglang/srt/layers/attn_residual.py
+613. python/sglang/srt/layers/communicator.py
+614. python/sglang/srt/layers/communicator_dsa_cp.py
+615. python/sglang/srt/layers/communicator_mhc.py
+616. python/sglang/srt/layers/communicator_mhc_hybrid_cp.py
+617. python/sglang/srt/layers/dcp/comm.py
+618. python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py
+619. python/sglang/srt/layers/deep_gemm_wrapper/configurer.py
+620. python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py
+621. python/sglang/srt/layers/dp_attention.py
+622. python/sglang/srt/layers/layernorm.py
+623. python/sglang/srt/layers/linear.py
+624. python/sglang/srt/layers/logits_processor.py
+625. python/sglang/srt/layers/moe/ep_moe/layer.py
+626. python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+627. python/sglang/srt/layers/moe/hash_topk.py
+628. python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+629. python/sglang/srt/layers/moe/moe_runner/runner.py
+630. python/sglang/srt/layers/moe/moe_runner/triton.py
+631. python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
+632. python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_config.py
+633. python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+634. python/sglang/srt/layers/moe/token_dispatcher/flashinfer.py
+635. python/sglang/srt/layers/moe/token_dispatcher/flashinfer_utils.py
+636. python/sglang/srt/layers/moe/token_dispatcher/standard.py
+637. python/sglang/srt/layers/moe/topk.py
+638. python/sglang/srt/layers/moe/utils.py
+639. python/sglang/srt/layers/quantization/__init__.py
+640. python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+641. python/sglang/srt/layers/quantization/compressed_tensors/schemes/__init__.py
+642. python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxint4_moe.py
+643. python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a8_int8_moe.py
+644. python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8.py
+645. python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_int8_moe.py
+646. python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16.py
+647. python/sglang/srt/layers/quantization/fp8.py
+648. python/sglang/srt/layers/quantization/fp8_utils.py
+649. python/sglang/srt/layers/quantization/gptq.py
+650. python/sglang/srt/layers/quantization/marlin_utils.py
+651. python/sglang/srt/layers/quantization/marlin_utils_fp8.py
+652. python/sglang/srt/layers/quantization/modelopt_quant.py
+653. python/sglang/srt/layers/quantization/mxfp4.py
+654. python/sglang/srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py
+655. python/sglang/srt/layers/quantization/quark/quark.py
+656. python/sglang/srt/layers/quantization/quark/utils.py
+657. python/sglang/srt/layers/quantization/w8a8_int8.py
+658. python/sglang/srt/layers/rotary_embedding/base.py
+659. python/sglang/srt/layers/sampler.py
+660. python/sglang/srt/layers/utils/cp_utils.py
+661. python/sglang/srt/layers/vocab_parallel_embedding.py
+662. python/sglang/srt/managers/cache_controller.py
+663. python/sglang/srt/managers/data_parallel_controller.py
+664. python/sglang/srt/managers/hisparse_coordinator.py
+665. python/sglang/srt/managers/io_struct.py
+666. python/sglang/srt/managers/multimodal_processor.py
+667. python/sglang/srt/managers/prefill_delayer.py
+668. python/sglang/srt/managers/schedule_batch.py
+669. python/sglang/srt/managers/schedule_policy.py
+670. python/sglang/srt/managers/scheduler.py
+671. python/sglang/srt/managers/scheduler_components/dp_attn.py
+672. python/sglang/srt/managers/scheduler_components/dynamic_chunk_sizer.py
+673. python/sglang/srt/managers/scheduler_components/pool_stats_observer.py
+674. python/sglang/srt/managers/scheduler_pp_mixin.py
+675. python/sglang/srt/managers/tokenizer_manager.py
+676. python/sglang/srt/managers/tp_worker.py
+677. python/sglang/srt/mem_cache/allocation.py
+678. python/sglang/srt/mem_cache/allocator/base.py
+679. python/sglang/srt/mem_cache/allocator/paged.py
+680. python/sglang/srt/mem_cache/allocator/swa.py
+681. python/sglang/srt/mem_cache/allocator/token.py
+682. python/sglang/srt/mem_cache/deepseek_v4_compress_state.py
+683. python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+684. python/sglang/srt/mem_cache/dsa_cache_layer_split.py
+685. python/sglang/srt/mem_cache/hicache_storage.py
+686. python/sglang/srt/mem_cache/hisparse_memory_pool.py
+687. python/sglang/srt/mem_cache/hisparse_spec.py
+688. python/sglang/srt/mem_cache/hybrid_cache/host_pool_config.py
+689. python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
+690. python/sglang/srt/mem_cache/index_key_cache.py
+691. python/sglang/srt/mem_cache/kv_cache_builder.py
+692. python/sglang/srt/mem_cache/kv_cache_configurator.py
+693. python/sglang/srt/mem_cache/kv_cache_dtype.py
+694. python/sglang/srt/mem_cache/kv_region.py
+695. python/sglang/srt/mem_cache/memory_pool.py
+696. python/sglang/srt/mem_cache/memory_pool_host.py
+697. python/sglang/srt/mem_cache/pool_host/common.py
+698. python/sglang/srt/mem_cache/pool_host/dsa.py
+699. python/sglang/srt/mem_cache/pool_host/host_pool_decl.py
+700. python/sglang/srt/mem_cache/pool_host/mha.py
+701. python/sglang/srt/mem_cache/pool_host/mla.py
+702. python/sglang/srt/mem_cache/radix_cache.py
+703. python/sglang/srt/mem_cache/registry.py
+704. python/sglang/srt/mem_cache/sparsity/factory.py
+705. python/sglang/srt/mem_cache/storage/lmcache/lmc_radix_cache.py
+706. python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+707. python/sglang/srt/mem_cache/swa_memory_pool.py
+708. python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+709. python/sglang/srt/mem_cache/unified_memory_pool.py
+710. python/sglang/srt/model_executor/forward_batch_info.py
+711. python/sglang/srt/model_executor/graph_shared_output.py
+712. python/sglang/srt/model_executor/input_buffers.py
+713. python/sglang/srt/model_executor/model_runner.py
+714. python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py
+715. python/sglang/srt/model_executor/model_runner_components/layer_setup.py
+716. python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
+717. python/sglang/srt/model_executor/model_runner_components/misc_utils.py
+718. python/sglang/srt/model_executor/model_runner_components/spec_aux_hidden_state.py
+719. python/sglang/srt/model_executor/pool_configurator.py
+720. python/sglang/srt/model_executor/runner/base_cuda_graph_runner.py
+721. python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+722. python/sglang/srt/model_executor/runner/eager_runner.py
+723. python/sglang/srt/model_executor/runner/metadata_glue_graph.py
+724. python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
+725. python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/breakable_cuda_graph.py
+726. python/sglang/srt/model_executor/runner_utils/buffers.py
+727. python/sglang/srt/model_loader/loader.py
+728. python/sglang/srt/model_loader/weight_utils.py
+729. python/sglang/srt/models/deepseek_common/attention_backend_handler.py
+730. python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py
+731. python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha_rocm.py
+732. python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
+733. python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla_fused_rope_rocm.py
+734. python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
+735. python/sglang/srt/models/deepseek_common/online_rotation.py
+736. python/sglang/srt/models/deepseek_common/utils.py
+737. python/sglang/srt/models/deepseek_nextn.py
+738. python/sglang/srt/models/deepseek_v2.py
+739. python/sglang/srt/models/deepseek_v4.py
+740. python/sglang/srt/models/deepseek_v4_dspark.py
+741. python/sglang/srt/models/deepseek_v4_nextn.py
+742. python/sglang/srt/models/glm5_next.py
+743. python/sglang/srt/models/glm5_next_nextn.py
+744. python/sglang/srt/models/glm_ocr.py
+745. python/sglang/srt/models/joyai_llm_flash_nextn.py
+746. python/sglang/srt/models/kimi_k25.py
+747. python/sglang/srt/models/kimi_k3.py
+748. python/sglang/srt/models/kimi_linear.py
+749. python/sglang/srt/models/longcat_flash.py
+750. python/sglang/srt/models/mimo_v2.py
+751. python/sglang/srt/models/mimo_v2_nextn.py
+752. python/sglang/srt/models/minimax_m2.py
+753. python/sglang/srt/models/minimax_m3.py
+754. python/sglang/srt/models/qwen2_moe.py
+755. python/sglang/srt/models/qwen3.py
+756. python/sglang/srt/models/qwen3_5.py
+757. python/sglang/srt/models/qwen3_5_mtp.py
+758. python/sglang/srt/models/qwen3_moe.py
+759. python/sglang/srt/models/qwen3_next.py
+760. python/sglang/srt/models/registry.py
+761. python/sglang/srt/multimodal/mm_utils.py
+762. python/sglang/srt/multimodal/processors/base_processor.py
+763. python/sglang/srt/multimodal/processors/dots_note_omni_video_core/preprocess.py
+764. python/sglang/srt/multimodal/processors/glm4v.py
+765. python/sglang/srt/multimodal/processors/kimi_k25.py
+766. python/sglang/srt/multimodal/processors/mimo_audio.py
+767. python/sglang/srt/multimodal/processors/mimo_v2.py
+768. python/sglang/srt/observability/metrics_collector.py
+769. python/sglang/srt/parser/conversation.py
+770. python/sglang/srt/parser/jinja_template_utils.py
+771. python/sglang/srt/parser/template_manager.py
+772. python/sglang/srt/runtime_context.py
+773. python/sglang/srt/server_args.py
+774. python/sglang/srt/speculative/adaptive_spec_params.py
+775. python/sglang/srt/speculative/base_spec_worker.py
+776. python/sglang/srt/speculative/dflash_info_v2.py
+777. python/sglang/srt/speculative/dflash_worker_v2.py
+778. python/sglang/srt/speculative/draft_utils.py
+779. python/sglang/srt/speculative/draft_worker_common.py
+780. python/sglang/srt/speculative/dspark_components/dspark_draft.py
+781. python/sglang/srt/speculative/dspark_components/dspark_verify.py
+782. python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+783. python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+784. python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py
+785. python/sglang/srt/speculative/eagle_info.py
+786. python/sglang/srt/speculative/eagle_utils.py
+787. python/sglang/srt/speculative/eagle_worker_common.py
+788. python/sglang/srt/speculative/eagle_worker_v2.py
+789. python/sglang/srt/speculative/frozen_kv_mtp_cuda_graph_runner.py
+790. python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
+791. python/sglang/srt/speculative/multi_layer_eagle_draft_extend_cuda_graph_runner.py
+792. python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py
+793. python/sglang/srt/speculative/spec_info.py
+794. python/sglang/srt/speculative/spec_utils.py
+795. python/sglang/srt/speculative/standalone_worker_v2.py
+796. python/sglang/srt/utils/common.py
+797. python/sglang/srt/utils/hf_transformers/common.py
+798. python/sglang/srt/utils/hf_transformers/config.py
+799. python/sglang/srt/utils/hf_transformers_patches.py
+800. python/sglang/srt/utils/numa_utils.py
+801. python/sglang/srt/utils/video_decoder.py
+802. python/sglang/utils.py
+803. scripts/release/get_version_tag.py
+804. sgl-model-gateway/bindings/python/src/sglang_router/launch_router.py
+805. sgl-model-gateway/bindings/python/src/sglang_router/mini_lb.py
+806. sgl-model-gateway/bindings/python/src/sglang_router/router.py
+807. sgl-model-gateway/bindings/python/src/sglang_router/router_args.py
+808. sgl-model-gateway/bindings/python/tests/test_pyo3_binding.py
+809. sgl-model-gateway/e2e_test/infra/gpu_allocator.py
+810. test/manual/chunked_prefill/test_scripted_pp.py
+811. test/manual/chunked_prefill/test_scripted_special_case.py
+812. test/registered/cp/test_dsa_trtllm_fp8_cp.py
+813. test/registered/dcp/test_dcp_layout_unit.py
+814. test/registered/kernels/ops/attention/test_dsa_indexer.py
+815. test/registered/kernels/ops/attention/test_dsa_transform_index.py
+816. test/registered/kernels/ops/attention/test_fused_store_cache_flashmla.py
+817. test/registered/kernels/ops/attention/test_fused_verify_triton_gdn.py
+818. test/registered/kernels/ops/attention/test_kda_helion.py
+819. test/registered/kernels/ops/kvcache/test_set_mla_kv_buffer.py
+820. test/registered/kernels/test_dsa_kpool_multi_pool.py
+821. test/registered/models_e2e/test_glm53_flash_b200.py
+822. test/registered/scheduler/test_prefill_delayer.py
+823. test/registered/unit/configs/test_glm5_next_config.py
+824. test/registered/unit/configs/test_qwen3_5_config.py
+825. test/registered/unit/disaggregation/test_decode_queue_cleanup.py
+826. test/registered/unit/disaggregation/test_nixl_backend_basic.py
+827. test/registered/unit/disaggregation/test_pp_hybrid_kv_transfer.py
+828. test/registered/unit/entrypoints/openai/test_serving_chat.py
+829. test/registered/unit/function_call/test_function_call_parser.py
+830. test/registered/unit/layers/quantization/test_fp8_moe_runner_ownership.py
+831. test/registered/unit/layers/quantization/test_quark_config.py
+832. test/registered/unit/layers/quantization/test_quark_utils.py
+833. test/registered/unit/layers/test_dsa_indexer_kpool_backend.py
+834. test/registered/unit/layers/test_minicpm_sparse_cache.py
+835. test/registered/unit/managers/test_generation_auxiliary_output.py
+836. test/registered/unit/managers/test_scheduler_chunked_abort_race.py
+837. test/registered/unit/managers/test_tokenizer_manager_rid_cleanup.py
+838. test/registered/unit/mem_cache/test_dsa_pool_host_unit.py
+839. test/registered/unit/mem_cache/test_dsv4_cpu_copy.py
+840. test/registered/unit/mem_cache/test_hicache_host_register.py
+841. test/registered/unit/mem_cache/test_hicache_staged_write_back_dispatch.py
+842. test/registered/unit/mem_cache/test_hybrid_pool_assembler.py
+843. test/registered/unit/mem_cache/test_kv_region.py
+844. test/registered/unit/mem_cache/test_mamba_donated_alloc_ratio.py
+845. test/registered/unit/mem_cache/test_mem_pool_host.py
+846. test/registered/unit/mem_cache/test_mooncake_ssd_offload_path.py
+847. test/registered/unit/mem_cache/test_registry.py
+848. test/registered/unit/mem_cache/test_retraction_mamba_backup.py
+849. test/registered/unit/model_executor/model_runner_components/test_cuda_graph_setup.py
+850. test/registered/unit/model_executor/model_runner_components/test_spec_aux_hidden_state.py
+851. test/registered/unit/model_executor/test_model_runner_decode_rows.py
+852. test/registered/unit/model_executor/test_pool_configurator.py
+853. test/registered/unit/model_executor/test_prefill_cuda_graph_runner.py
+854. test/registered/unit/models/test_glm5_next_aiter_mhc.py
+855. test/registered/unit/models/test_glm5_next_dflash_capture.py
+856. test/registered/unit/models/test_nope_mha_k_cast.py
+857. test/registered/unit/models/test_shared_experts_fusion_gates.py
+858. test/registered/unit/multimodal/test_alpha_channel_gating.py
+859. test/registered/unit/multimodal/test_gpu_feature_transport.py
+860. test/registered/unit/parser/test_jinja_template_utils.py
+861. test/registered/unit/spec/test_adaptive_spec_params.py
+862. test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py
+863. test/registered/unit/spec/test_ngram_mamba_verify_update.py
+864. test/registered/unit/test_model_overrides.py
+
+
+The following files are newly added by MetaX Integrated Circuits (Shanghai) Co., Ltd. in 2026. All rights reserved.
+
+  1. infer_transfomers_dsv4.py
+  2. infer_transfomers_glm5.py
+  3. infer_transfomers_k3.py
+  4. python/sglang/_maca_device_order.py
+  5. python/sglang/kernels/aot/csrc/moe/moe_fused_w4a16.cpp
+  6. python/sglang/kernels/aot/csrc/moe/moe_fused_w4a16_cuda.cu
+  7. python/sglang/kernels/ops/attention/dsa/triton_flashmla_kv.py
+  8. python/sglang/kernels/ops/attention/fla/kda_opt_config.py
+  9. python/sglang/kernels/ops/kimi_k3/int8_kv_cache.py
+ 10. python/sglang/srt/eplb/mock_balance_tensor.py
+ 11. python/sglang/srt/layers/attention/dsa/kv_cache_layout.py
+ 12. python/sglang/srt/layers/attention/dsv4/kv_cache_layout.py
+ 13. python/sglang/srt/layers/attention/linear/kernels/gdn_external_fla.py
+ 14. python/sglang/test/metax/mx_env_chk.py
+ 15. test/manual/test_kda_optional_imports.py
+ 16. test/manual/test_logits_gather_bf16.py
+ 17. test/registered/unit/layers/test_metax_packed_rmsnorm_compile.py
+ 18. test/registered/unit/managers/test_pp_bootstrap_decision.py
+ 19. test/srt/mem_cache/test_select_register_pools.py

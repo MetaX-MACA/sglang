@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """CPU dispatch checks for the opt-in MACA BF16 logits collective."""
 
 import ast

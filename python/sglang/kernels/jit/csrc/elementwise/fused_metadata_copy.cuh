@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 /*
  * Fused metadata copy kernel for DSA backend CUDA graph replay.
  * JIT-compiled version for python/sglang/kernels/jit.

@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // K3 MNNVL fused all-reduce (bf16-only), two zero-copy algorithm families:
 //
 //   - push (1shot): lamport-style push, but the data staging is a SINGLE

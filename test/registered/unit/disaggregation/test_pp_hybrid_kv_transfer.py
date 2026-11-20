@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Unit tests for full-attention KV transfer with prefill pp_size > 1 on
 hybrid-linear models (HybridLinearKVPool)."""
 

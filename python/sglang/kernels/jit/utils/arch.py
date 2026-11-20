@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """CUDA/ROCm architecture detection and default compile target flags."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Generating and running the ``build.ninja`` for one JIT module.
 
 Owning this file is what makes the cache key exact. Every compiler, flag,

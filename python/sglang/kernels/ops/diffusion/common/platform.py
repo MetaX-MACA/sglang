@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Platform predicates and the import-time fallback selector.
 
 Several diffusion Triton kernels have no Triton on the live device (Ascend

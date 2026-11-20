@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """``load_jit``: resolve a request, reuse a cached build, or make one."""
 
 from __future__ import annotations

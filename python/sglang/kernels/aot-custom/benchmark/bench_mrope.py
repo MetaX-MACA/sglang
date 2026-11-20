@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # Adapted from vLLM benchmark_mrope.py
 
 # This script benchmarks the mrope kernel (mainly for Qwen2VL and Qwen2.5VL models).

@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Stateful audio preprocessing pipeline shared by MiMo multimodal and ASR processors."""
 
 import io

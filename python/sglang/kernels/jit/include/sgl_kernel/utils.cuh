@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 /// \file utils.cuh
 /// \brief Core CUDA/device utilities: type aliases, PDL helpers,
 ///        typed pointer access, kernel launch wrapper, and error checking.

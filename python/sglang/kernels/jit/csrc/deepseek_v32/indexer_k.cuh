@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // DeepSeek-V3.2 only.
 //
 // DSA indexer K kernels: single-head LayerNorm (not RMS), ropes the leading

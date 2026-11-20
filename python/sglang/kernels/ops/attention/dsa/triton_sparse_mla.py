@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Triton sparse-MLA forward for the DSA fp8 prefill path.
 
 A per-query flash-attention kernel over the indexer-selected topk KV. On

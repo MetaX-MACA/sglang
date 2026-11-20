@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 #include <torch/all.h>
 
 #include "es_sm100_mxfp8_blockscaled_launcher.cuh"

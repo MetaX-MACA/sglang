@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Equivalence tests for the migrated InfLLM-V2 FlashAttention API.
 
 These compare the ``sgl_kernel.infllm_v2`` implementations against the original

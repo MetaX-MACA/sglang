@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """CPU-bound multimodal preprocessing for the EPD encoder.
 
 This module is designed to be replaceable by a Rust implementation.

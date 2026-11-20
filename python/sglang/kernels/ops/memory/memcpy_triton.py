@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Offset/size-driven device memcpy kernel, migrated from
 ``sglang.srt.layers.dp_attention`` (RFC #29630, Phase 2.5).
 """

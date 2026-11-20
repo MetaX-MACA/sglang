@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """GPU regressions for DSA kpool speculative writes and cache layout."""
 
 import unittest

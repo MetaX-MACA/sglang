@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved. */
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>

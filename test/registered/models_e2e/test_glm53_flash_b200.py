@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """B200 per-commit coverage for the GLM-5.3-Flash serving recipes.
 
 Runs the Low Latency and High Throughput TP4/EP4 recipes on four B200 GPUs.

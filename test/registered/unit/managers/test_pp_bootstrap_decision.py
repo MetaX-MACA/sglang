@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock

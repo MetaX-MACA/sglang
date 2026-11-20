@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 """Check optional kernel switches without requiring Triton, mcoplib, or GPUs."""
 
 import ast

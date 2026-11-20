@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Every MoE family's fusion gate, asked the way the loader asks it.
 
 `install_shared_experts_fusion_decision` calls

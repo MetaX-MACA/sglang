@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """CPU unit test for the decode-context-parallel (DCP) per-rank KV-length math.
 
 Pins ``get_dcp_lens`` (the single, superset implementation in

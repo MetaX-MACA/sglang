@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // InfLLM-V2 variable-length max pooling, AOT build.
 //
 // Migrated from `3rdparty/infllmv2_cuda_impl/csrc/max_pooling_1d.cuh`. The

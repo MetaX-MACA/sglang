@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Pure HiCache declaration validation and transfer-layer binding."""
 
 from __future__ import annotations

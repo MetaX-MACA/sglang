@@ -1,3 +1,4 @@
+# Copyright (c) 2026 MetaX Integrated Circuits (Shanghai) Co., Ltd. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Early, dependency-free MACA device ordering for supported CLI launches.
 

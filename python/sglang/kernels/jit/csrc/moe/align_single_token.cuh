@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // Tiny moe_align_block_size for M == 1 decode: one warp replaces the
 // moe_align_block_size + count_and_sort_expert_tokens kernel pair (~4.4us)
 // with a single ~1.5us launch.

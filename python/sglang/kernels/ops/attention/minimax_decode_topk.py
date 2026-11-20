@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Block top-k over per-row block scores for the MiniMax-M3 sparse decode indexer.
 
 Drop-in replacement for the 2-stage split-K Triton topk

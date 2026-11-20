@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """InfLLM-V2 sparse FlashAttention public API.
 
 Ported (drop-in) from ``3rdparty/infllmv2_cuda_impl/infllm_v2/infllmv2_sparse_attention.py``.

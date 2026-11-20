@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Unit tests for pool_configurator.py -- CPU only, no GPU required.
 
 Tests the end-to-end computation: available_bytes -> MemoryPoolConfig,

@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # Benchmarks SGLang kernels versus vLLM across
 # (kernel, dtype, batch_size, seq_len, dim) and prints speed-up.
 import argparse

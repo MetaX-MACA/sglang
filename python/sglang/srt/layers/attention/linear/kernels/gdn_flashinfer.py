@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """FlashInfer-based kernels for GDN (Gated Delta Network) linear attention.
 
 Both SM90 and SM100 use the same pool layout: [pool, HV, V, K] (K-last).

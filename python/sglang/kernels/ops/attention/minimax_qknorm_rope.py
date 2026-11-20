@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Fused per-head Gemma-RMSNorm + partial NeoX RoPE for MiniMax-M3 attention.
 
 In-place over a fused QKV tensor: normalizes + rotates one or more groups of

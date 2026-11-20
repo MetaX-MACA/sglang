@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Helion kernels for SGLang's Kimi Delta Attention prefill path.
 
 The public :func:`chunk_kda` entry point in this module is intended to match

@@ -1,3 +1,4 @@
+/* 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved. */
 // Fused draft-extend convolution-cache update.
 //
 // Speculative draft-extend: for each sequence b (slot ci = cache_indices[b]) the new

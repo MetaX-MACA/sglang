@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Attention compute kernels (Triton): decode / extend / prefill / metadata.
 
 The Triton kernels migrated here live in this package

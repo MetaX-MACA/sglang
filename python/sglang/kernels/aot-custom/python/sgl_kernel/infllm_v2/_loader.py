@@ -1,3 +1,4 @@
+# 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Robust loader for the standalone ``infllm_ops`` pybind extension.
 
 The InfLLM-V2 FlashAttention backend is built as its own module ``infllm_ops``
