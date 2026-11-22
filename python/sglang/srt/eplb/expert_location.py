@@ -666,7 +666,15 @@ def compute_logical_to_rank_dispatch_physical_map(
                 for moe_ep_rank, choice in zip(remaining_ranks, choices, strict=True):
                     result_list[moe_ep_rank][layer_id][logical_expert_id] = choice
 
-    logical_to_rank_dispatch_physical_map = torch.tensor(result_list, dtype=dtype)
+    # int32 on purpose: this table is only ever used as an index table by
+    # _topk_ids_logical_to_physical_static, and topk_ids is int32.  Building it
+    # as int64 forced an extra `.to(topk_ids.dtype)` cast kernel on every layer
+    # of every forward (measured: 3 -> 2 kernels/layer after this change, see
+    # profile_ep_and_tp/test_eplb_dtype.py).  Values are expert ids < 256, so
+    # int32 is lossless.
+    logical_to_rank_dispatch_physical_map = torch.tensor(
+        result_list, dtype=torch.int32
+    )
     assert torch.all(logical_to_rank_dispatch_physical_map != -1)
 
     return logical_to_rank_dispatch_physical_map[ep_rank, :, :].to(device)

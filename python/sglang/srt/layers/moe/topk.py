@@ -96,6 +96,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.eplb_remap_fused import try_eplb_remap_mask
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -1771,6 +1772,14 @@ def _zero_topk_weights_padded_region(
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):
+    # Fused logical->physical remap + padded-row mask (SGLANG_EPLB_FUSED_REMAP=1).
+    # One Triton kernel instead of four (gather + 2 casts + mask); output is
+    # bit-identical.  Returns None when the fused path does not apply.
+    fused = try_eplb_remap_mask(
+        topk_ids, expert_location_dispatch_info, num_token_non_padded
+    )
+    if fused is not None:
+        return fused
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids
