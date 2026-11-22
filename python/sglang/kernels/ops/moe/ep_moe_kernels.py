@@ -209,26 +209,87 @@ def deepep_compute_src2dst_triton_kernel(
     tl.store(src2dst + src_id, dst_id - num_invalid, mask=mask)
 
 
+# --- counting-sort based deepep preprocess ------------------------------------
+# Expert ids are in [-1, num_local_experts), so a counting sort replaces
+# torch.sort(stable=True) (8 CUB kernels) + arange + searchsorted with 3 triton
+# kernels.  Intra-expert order may differ from a stable sort, which is harmless:
+# downstream only needs "every dst slot of expert e holds e".
+
+
+@triton.jit
+def _deepep_pre_hist_kernel(topk_ptr, hist_ptr, num_toks, E: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < num_toks
+    v = tl.load(topk_ptr + offs, mask=mask, other=-1)
+    # bin 0 == expert -1 (i.e. "not on this rank")
+    b = tl.where(v < 0, 0, tl.minimum(v, E - 1) + 1)
+    tl.atomic_add(hist_ptr + b, 1, mask=mask)
+
+
+@triton.jit
+def _deepep_pre_scan_kernel(hist_ptr, cursor_ptr, seg_ptr, nmo_ptr, E: tl.constexpr, N2: tl.constexpr):
+    offs = tl.arange(0, N2)
+    m = offs <= E + 1
+    c = tl.load(hist_ptr + offs, mask=m, other=0).to(tl.int64)
+    inc = tl.cumsum(c, axis=0)      # inc[k] = count(v < k)
+    exc = inc - c                   # exc[k] = count(v < k - 1)  == start of bin k
+    nmo = tl.load(hist_ptr)         # count(v == -1)
+    tl.store(cursor_ptr + offs, exc, mask=offs <= E)
+    tl.store(seg_ptr + offs, inc - nmo, mask=offs <= E)   # seg[e] = count(0 <= v < e)
+    tl.store(nmo_ptr, nmo)
+
+
+@triton.jit
+def _deepep_pre_scatter_kernel(
+    topk_ptr, cursor_ptr, reorder_ptr, src2dst_ptr, num_toks, nmo_ptr,
+    E: tl.constexpr, BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < num_toks
+    v = tl.load(topk_ptr + offs, mask=mask, other=-1)
+    b = tl.where(v < 0, 0, tl.minimum(v, E - 1) + 1)
+    nmo = tl.load(nmo_ptr).to(tl.int64)
+    dst = tl.atomic_add(cursor_ptr + b, 1, mask=mask)   # returns the old value
+    tl.store(src2dst_ptr + offs, dst - nmo, mask=mask)
+    tl.store(reorder_ptr + dst, v, mask=mask)
+
+
 def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_local_experts: int):
-    reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
-    seg_indptr = torch.empty(num_local_experts + 1, device=topk_ids.device, dtype=torch.int64)
-    src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int64)
+    num_tokens = topk_ids.numel()
+    E = int(num_local_experts)
+    dev = topk_ids.device
+    seg_indptr = torch.empty(E + 1, device=dev, dtype=torch.int64)
+    if num_tokens == 0:
+        seg_indptr.zero_()
+        return (
+            torch.empty(0, device=dev, dtype=topk_ids.dtype),
+            torch.empty(0, device=dev, dtype=torch.int64),
+            seg_indptr,
+        )
 
-    # Find offset
-    expert_ids = torch.arange(
-        num_local_experts + 1, device=topk_ids.device, dtype=reorder_topk_ids.dtype
-    )
-    torch.searchsorted(reorder_topk_ids, expert_ids, out=seg_indptr)
-    num_minus_one = seg_indptr[0]
-    seg_indptr = seg_indptr - num_minus_one
+    flat = topk_ids.view(-1)
+    BLOCK = 512
+    grid = (triton.cdiv(num_tokens, BLOCK),)
+    N2 = triton.next_power_of_2(E + 2)
 
-    BLOCK_SIZE = 512
-    grid = (triton.cdiv(topk_ids.numel(), BLOCK_SIZE),)
-    deepep_compute_src2dst_triton_kernel[grid](
-        reorder_ids, src2dst, topk_ids.numel(), num_minus_one, BLOCK_SIZE
+    hist = torch.zeros(E + 2, device=dev, dtype=torch.int32)
+    _deepep_pre_hist_kernel[grid](flat, hist, num_tokens, E, BLOCK)
+
+    cursor = torch.empty(E + 1, device=dev, dtype=torch.int64)
+    nmo_dev = torch.empty(1, device=dev, dtype=torch.int32)
+    _deepep_pre_scan_kernel[(1,)](hist, cursor, seg_indptr, nmo_dev, E, N2)
+
+    reorder_topk_ids = torch.empty(num_tokens, device=dev, dtype=topk_ids.dtype)
+    src2dst = torch.empty(num_tokens, device=dev, dtype=torch.int64)
+    _deepep_pre_scatter_kernel[grid](
+        flat, cursor, reorder_topk_ids, src2dst, num_tokens, nmo_dev, E, BLOCK
     )
-    reorder_topk_ids = reorder_topk_ids[num_minus_one:]
-    return reorder_topk_ids, src2dst, seg_indptr
+
+    # Keep the blocking read: it is the per-layer rendezvous between EP ranks.
+    num_minus_one = int(nmo_dev.item())
+    return reorder_topk_ids[num_minus_one:], src2dst, seg_indptr
 
 
 def cutlass_w4_run_moe_ep_preproess(topk_ids: torch.Tensor):
