@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_output_dtype,
     is_tbo_enabled,
     get_moe_runner_backend,
+    use_modern_deepep_normal_path,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
@@ -769,7 +770,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            # The modern DeepEP-normal path (forward_normal) is not an
+            # in-place runner: 128-alignment padding only wastes work.
+            expert_alignment=(
+                128
+                if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and not use_modern_deepep_normal_path()
+                else 1
+            ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
             **npu_quantization_opts,
         )
@@ -795,7 +803,19 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
+        # Only an in-place MoE runner may hand its own buffer to combine.
+        # forward_normal() allocates its own output with L rows, so combine
+        # must build the per-token buffer here (deep_ep asserts
+        # src_idx.size(0) == num_tokens otherwise).
+        inplace_moe_output = (
+            (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and not use_modern_deepep_normal_path()
+            )
+            or _use_aiter
+            or _is_npu
+        )
+        if inplace_moe_output:
             output = hidden_states
         else:
             # raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
